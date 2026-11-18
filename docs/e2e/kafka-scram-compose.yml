@@ -1,0 +1,31 @@
+name: ferrika-scram-e2e
+
+# Single-node KRaft broker for SASL SCRAM tests: SASL_PLAINTEXT with
+# SCRAM-SHA-256/512 on localhost:19392, PLAINTEXT inside the container for
+# setup. Create the users after start:
+#   docker exec kafka-scram-1 /opt/kafka/bin/kafka-configs.sh \
+#     --bootstrap-server localhost:29092 --alter --entity-type users \
+#     --entity-name admin \
+#     --add-config 'SCRAM-SHA-256=[password=admin-scram-password],SCRAM-SHA-512=[password=admin-scram-password]'
+services:
+  kafka-scram-1:
+    image: apache/kafka:latest
+    container_name: kafka-scram-1
+    hostname: kafka-scram-1
+    ports: ["19392:19392"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-scram-1:9090"
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:19392,CONTROLLER://0.0.0.0:9090"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://localhost:29092,EXTERNAL://localhost:19392"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_SASL_ENABLED_MECHANISMS: "SCRAM-SHA-256,SCRAM-SHA-512"
+      KAFKA_LISTENER_NAME_EXTERNAL_SASL_ENABLED_MECHANISMS: "SCRAM-SHA-256,SCRAM-SHA-512"
+      KAFKA_LISTENER_NAME_EXTERNAL_SCRAM-SHA-256_SASL_JAAS_CONFIG: "org.apache.kafka.common.security.scram.ScramLoginModule required;"
+      KAFKA_LISTENER_NAME_EXTERNAL_SCRAM-SHA-512_SASL_JAAS_CONFIG: "org.apache.kafka.common.security.scram.ScramLoginModule required;"

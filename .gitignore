@@ -1,0 +1,23 @@
+# Rust target directory
+/target/
+/target-*/
+/crates/*/target/
+/crates/*/target-*/
+
+# Backup and temp files
+*.rs.bk
+*.obj
+*.exe
+*.pdb
+*.ilk
+
+# OS / Editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# Python bytecode
+__pycache__/
+*.pyc

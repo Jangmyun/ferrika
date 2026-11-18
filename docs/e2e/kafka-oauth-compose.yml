@@ -1,0 +1,65 @@
+name: ferrika-oauth-e2e
+
+# SASL OAUTHBEARER end-to-end test: one KRaft broker whose EXTERNAL listener
+# (localhost:19096, SASL_PLAINTEXT) accepts unsecured JWTs (alg "none"), and a
+# tiny client-credentials token endpoint (localhost:18080) that issues them
+# with sub = the client id.
+#
+#   docker compose -f docs/e2e/kafka-oauth-compose.yml up -d
+#   ferrika profile add oauth-e2e -b localhost:19096 \
+#     --security-protocol sasl_plaintext --sasl-mechanism oauthbearer \
+#     --oauth-token-endpoint http://localhost:18080/token \
+#     --oauth-client-id admin --oauth-client-secret e2e-secret
+#   ferrika -p oauth-e2e acl list            # native wire path, any build
+#   ferrika -p oauth-e2e topics list         # librdkafka path, --features ssl build
+#
+# The unsecured validator below is Kafka's default for OAUTHBEARER; it is set
+# explicitly so the test does not depend on that default. The class lives in
+# org.apache.kafka.common.security.oauthbearer.internals.unsecured in the 3.x
+# line pinned here; check the path before moving the image to a newer major.
+
+services:
+  kafka-oauth:
+    image: apache/kafka:3.9.1
+    container_name: kafka-oauth
+    hostname: kafka-oauth
+    ports: ["19096:19096"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-oauth:9090"
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:19096,CONTROLLER://0.0.0.0:9090"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka-oauth:29092,EXTERNAL://localhost:19096"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:SASL_PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      CLUSTER_ID: "4L6g3nShT-eMCtK--X86sw"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_JVM_PERFORMANCE_OPTS: "-Xms512m -Xmx512m"
+      KAFKA_SASL_ENABLED_MECHANISMS: "OAUTHBEARER"
+      KAFKA_LISTENER_NAME_EXTERNAL_SASL_ENABLED_MECHANISMS: "OAUTHBEARER"
+      KAFKA_LISTENER_NAME_EXTERNAL_OAUTHBEARER_SASL_JAAS_CONFIG: >-
+        org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required
+        unsecuredLoginStringClaim_sub="admin";
+      KAFKA_LISTENER_NAME_EXTERNAL_OAUTHBEARER_SASL_SERVER_CALLBACK_HANDLER_CLASS: >-
+        org.apache.kafka.common.security.oauthbearer.internals.unsecured.OAuthBearerUnsecuredValidatorCallbackHandler
+      KAFKA_AUTHORIZER_CLASS_NAME: "org.apache.kafka.metadata.authorizer.StandardAuthorizer"
+      KAFKA_ALLOW_EVERYONE_IF_NO_ACL_FOUND: "false"
+      # The token endpoint issues sub=<client id>; client id "admin" is superuser.
+      KAFKA_SUPER_USERS: "User:admin;User:ANONYMOUS"
+    networks: [kafka-oauth-net]
+
+  oauth-idp:
+    image: python:3.12-alpine
+    container_name: kafka-oauth-idp
+    ports: ["18080:18080"]
+    volumes: ["./oauth-idp.py:/idp.py:ro"]
+    command: ["python", "-u", "/idp.py"]
+    networks: [kafka-oauth-net]
+
+networks:
+  kafka-oauth-net:
+    name: ferrika-oauth-e2e-net

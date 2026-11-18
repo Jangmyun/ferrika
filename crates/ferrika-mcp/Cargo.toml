@@ -1,0 +1,22 @@
+[package]
+name = "ferrika-mcp"
+version.workspace = true
+edition.workspace = true
+description = "Ferrika MCP server: Kafka cluster tools for AI agents, read-only by default, policy-gated writes"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+ferrika-core.workspace = true
+ferrika-governance.workspace = true
+ferrika-ops.workspace = true
+rdkafka.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+ring.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+ferrika-governance = { path = "../ferrika-governance", features = ["test-util"] }

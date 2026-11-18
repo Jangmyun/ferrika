@@ -1,0 +1,40 @@
+[package]
+name = "ferrika-governance"
+version.workspace = true
+edition.workspace = true
+description = "Ferrika governance: signed company policy, hash-chained audit log, audit anchors and SIEM forwarding"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+ferrika-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rustls.workspace = true
+chrono.workspace = true
+ring.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# Audit log: the signed-in account (GetUserNameW) and the profile folder
+# (known folder, not %USERPROFILE%), the Event Log audit anchor, and the
+# policy's ProgramData known folder (SHGetKnownFolderPath, freed with CoTaskMemFree).
+windows-sys = { version = "0.61", features = ["Win32_System_WindowsProgramming", "Win32_System_EventLog", "Win32_Security", "Win32_UI_Shell", "Win32_System_Com", "Win32_Foundation"] }
+dirs = "5"
+
+# Audit log: the account and home directory from getuid + passwd
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+# Honour FERRIKA_POLICY_DIR in optimized builds (demos, end-to-end tests).
+# Debug builds always honour it. Shipped release builds must not enable it,
+# or a user could point Ferrika at a policy they signed themselves.
+dev-policy-dir = []
+# Exposes `test_policy` (hand-built policies and an in-memory audit sink) to
+# other crates' tests. Tests only: the module builds `Verified` policies
+# without a signature. Not for shipped binaries; a build without debug
+# assertions refuses it (compile_error in src/lib.rs).
+test-util = []

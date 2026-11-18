@@ -1,0 +1,8 @@
+# Build-time settings shared by every machine, so a build does not depend on
+# what is installed on it.
+[env]
+# librdkafka 2.12.1 includes <curl/curl.h> even when libcurl support is off
+# (-DWITH_CURL=0). tools/build-stubs/curl/curl.h is an empty stand-in; see the
+# comment in that file. C_INCLUDE_PATH is read by gcc and clang; a value already
+# set in your shell wins over this one.
+C_INCLUDE_PATH = { value = "tools/build-stubs", relative = true }

@@ -1,0 +1,67 @@
+name: ferrika-bench
+
+# Benchmark setup for tools/bench/run.py: one KRaft broker and four web UIs
+# (Kafbat UI, AKHQ, Redpanda Console, Kafdrop) on it, all with default settings.
+#   localhost:39092  Kafka, PLAINTEXT, reached from the host by Ferrika
+#   localhost:38080  Kafbat UI, which reaches the broker on kafka-bench:29092
+#   localhost:38081  AKHQ, likewise
+#   localhost:38082  Redpanda Console, likewise
+#   localhost:38083  Kafdrop, likewise
+# Ports sit outside the Hyper-V reserved ranges that often cover 9092.
+services:
+  kafka-bench:
+    image: apache/kafka:latest
+    container_name: kafka-bench
+    hostname: kafka-bench
+    ports: ["39092:39092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka-bench:9090"
+      KAFKA_LISTENERS: "INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:39092,CONTROLLER://0.0.0.0:9090"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka-bench:29092,EXTERNAL://localhost:39092"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+  kafbat-ui:
+    image: ghcr.io/kafbat/kafka-ui:v1.5.0
+    container_name: kafbat-ui-bench
+    ports: ["38080:8080"]
+    depends_on: [kafka-bench]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: bench
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: "kafka-bench:29092"
+
+  akhq:
+    image: tchiotludo/akhq:0.28.0
+    container_name: akhq-bench
+    ports: ["38081:8080"]
+    depends_on: [kafka-bench]
+    environment:
+      AKHQ_CONFIGURATION: |
+        akhq:
+          connections:
+            bench:
+              properties:
+                bootstrap.servers: "kafka-bench:29092"
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:v3.12.0
+    container_name: redpanda-console-bench
+    ports: ["38082:8080"]
+    depends_on: [kafka-bench]
+    environment:
+      KAFKA_BROKERS: "kafka-bench:29092"
+
+  kafdrop:
+    image: obsidiandynamics/kafdrop:latest
+    container_name: kafdrop-bench
+    ports: ["38083:9000"]
+    depends_on: [kafka-bench]
+    environment:
+      KAFKA_BROKERCONNECT: "kafka-bench:29092"

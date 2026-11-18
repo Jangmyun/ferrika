@@ -1,0 +1,1137 @@
+use std::io::{BufWriter, Write};
+use std::path::Path;
+use std::time::Duration;
+
+use clap::Args;
+use colored::Colorize;
+use rdkafka::consumer::CommitMode;
+use rdkafka::Offset;
+
+use crate::cli::{print_connection_hint, GlobalOpts, OutputFormat};
+use crate::codec::pii::{mask_payload, MaskStrategy};
+use crate::codec::schema::{format_hexdump, parse_confluent_wire_format};
+use crate::kafka::config::AutoOffsetReset;
+use crate::kafka::consumer::{
+    timestamp_start_offsets, ConsumedMessage, KafkaConsumerClient, ParallelReader, PartitionRead,
+    ReadEvent, TimestampStop,
+};
+use crate::kafka::filter::{FilterStats, MessageFilter};
+use crate::ops::backup::jsonl_record;
+
+/// Command line arguments for message consumption.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ConsumeArgs {
+    /// Topic name to consume messages from
+    pub topic: String,
+
+    /// Consumer group identifier (defaults to a temporary group if omitted)
+    #[arg(short, long)]
+    pub group: Option<String>,
+
+    /// Start consuming from the earliest available offset
+    #[arg(short = 'b', long)]
+    pub from_beginning: bool,
+
+    /// Offset to start from. A negative value -N starts N messages before the end.
+    /// Applies to --partition, or to every partition of the topic when omitted.
+    #[arg(long, allow_hyphen_values = true)]
+    pub offset: Option<i64>,
+
+    /// Target partition to consume from (if omitted, subscribes to all partitions)
+    #[arg(short, long)]
+    pub partition: Option<i32>,
+
+    /// Maximum number of messages to consume before exiting
+    #[arg(short = 'n', long)]
+    pub max_messages: Option<usize>,
+
+    /// Maximum idle wait time in milliseconds before exiting
+    #[arg(short = 't', long)]
+    pub timeout: Option<u64>,
+
+    /// Pretty-print JSON payloads
+    #[arg(long)]
+    pub pretty_json: bool,
+
+    /// Show message headers
+    #[arg(long)]
+    pub show_headers: bool,
+
+    /// Filter payload with a regular expression (case-insensitive by default)
+    #[arg(short = 'G', long = "grep")]
+    pub grep: Option<String>,
+
+    /// Filter key by substring / pattern
+    #[arg(short = 'k', long = "key-filter")]
+    pub key_filter: Option<String>,
+
+    /// Keep records matching an expression, e.g. '$.amount > 100 && $.status == "PAID"'.
+    /// Fields: $.path (JSON value, decoded first with -D), key, partition,
+    /// offset, timestamp, headers.<name>; operators == != > >= < <= =~
+    /// contains exists && || !
+    #[arg(short = 'W', long = "where", value_name = "EXPR")]
+    pub where_expr: Option<String>,
+
+    /// Filter by required header in KEY:VALUE format
+    #[arg(long = "header-filter")]
+    pub header_filter: Vec<String>,
+
+    /// Start each partition at its first record on or after this epoch
+    /// millisecond (unless --offset is given), and keep only those records
+    #[arg(long = "from-timestamp")]
+    pub from_timestamp: Option<i64>,
+
+    /// Keep records on or before this epoch millisecond; a partition stops at
+    /// its first record after it, and consuming ends when all have stopped
+    #[arg(long = "to-timestamp")]
+    pub to_timestamp: Option<i64>,
+
+    /// Perform case-sensitive matching for text filters
+    #[arg(long)]
+    pub case_sensitive: bool,
+
+    /// Save matched messages to a file in JSON Lines (.jsonl) format
+    #[arg(short = 's', long = "save")]
+    pub save: Option<String>,
+
+    /// Decode Confluent Schema Registry wire-format headers (Magic byte 0x00 + 4-byte Schema ID)
+    #[arg(short = 'D', long = "decode-wire-format")]
+    pub decode_wire_format: bool,
+
+    /// Display payload as canonical 16-byte hexdump
+    #[arg(long = "hex")]
+    pub hex: bool,
+
+    /// Schema Registry URL used with --decode-wire-format to decode Avro and
+    /// Protobuf payloads (defaults to the profile's)
+    #[arg(short = 'S', long = "schema-registry")]
+    pub schema_registry: Option<String>,
+
+    /// Mask card numbers, emails, SSNs, Korean IDs/phones and secrets in keys,
+    /// payloads and headers (always on when a company policy enforces masking)
+    #[arg(long = "mask-pii")]
+    pub mask_pii: bool,
+}
+
+/// Executes the consumer CLI command.
+pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<()> {
+    let mut kafka_config = global.to_kafka_config();
+    let policy = crate::governance::policy::current();
+    let mask = args.mask_pii || policy.masking_enforced();
+    // Under an enforced policy, filters see only the masked rendering: matching
+    // raw values would let `--where value.rrn =~ "^9001"` recover masked data.
+    let mask_filters = policy.masking_enforced();
+    if mask && !args.mask_pii {
+        eprintln!(
+            "{}",
+            format!("PII masking is enforced by {}.", policy.label()).bright_black()
+        );
+    }
+    if mask && args.hex {
+        // A hexdump would show the raw bytes.
+        eprintln!(
+            "{}",
+            "--hex is ignored while PII masking is on.".bright_black()
+        );
+        args.hex = false;
+    }
+
+    if let Some(ref g) = args.group {
+        kafka_config = kafka_config.with_group_id(g);
+    }
+    // Without an explicit group, partitions are assigned directly and nothing is committed,
+    // so no consumer group is created and there is no group-join delay.
+    let use_group = kafka_config.group_id.is_some();
+    if use_group {
+        // librdkafka would store (and auto-commit) the offset of every record it
+        // hands over, including ones fetched after --max-messages stopped the
+        // loop. Store only records this command actually processed.
+        kafka_config = kafka_config.with_property("enable.auto.offset.store", "false");
+    } else {
+        kafka_config = kafka_config.with_auto_commit(false, 5000);
+    }
+    if args.from_beginning || args.offset.is_some() {
+        kafka_config = kafka_config.with_auto_offset_reset(AutoOffsetReset::Earliest);
+    }
+
+    // With a registry, wire-format payloads are decoded (Avro/Protobuf to JSON).
+    let mut decoder = if args.decode_wire_format {
+        args.schema_registry
+            .clone()
+            .or_else(|| kafka_config.schema_registry_url.clone())
+            .map(|url| crate::kafka::schema::PayloadDecoder::new(Some(&url)))
+    } else {
+        None
+    };
+
+    // Build and validate the filter before opening a broker connection so an
+    // invalid expression always produces its actionable validation error.
+    let mut filter = MessageFilter::new()
+        .with_case_sensitive(args.case_sensitive)
+        .with_timestamp_range(args.from_timestamp, args.to_timestamp);
+
+    if let Some(ref g) = args.grep {
+        filter = filter.with_grep(g)?;
+    }
+    if let Some(ref k) = args.key_filter {
+        filter = filter.with_key(k);
+    }
+    for h in &args.header_filter {
+        let (k, v) = crate::kafka::filter::parse_header_pair(h)
+            .map_err(|e| anyhow::anyhow!("--header-filter: {e}"))?;
+        filter = filter.with_header(k, v);
+    }
+    let where_expr = match &args.where_expr {
+        Some(text) => Some(
+            crate::model::expr::Expr::parse(crate::model::expr::expression_text(text))
+                .map_err(|e| anyhow::anyhow!("--where: {e}"))?,
+        ),
+        None => None,
+    };
+
+    let consumer = match KafkaConsumerClient::new(&kafka_config) {
+        // Without a group nothing is left to commit or leave, so the client
+        // can shut down in the background.
+        Ok(client) if !use_group => client.detached(),
+        Ok(client) => client,
+        Err(err) => {
+            print_connection_hint(&global.to_kafka_config(), &err);
+            return Err(err.into());
+        }
+    };
+
+    // Without a group, partitions are read by a ParallelReader, which filters
+    // as it reads; with one, offsets are stored, so the group's consumer reads.
+    let mut reader = None;
+    // --to-timestamp finishes a partition at its first record past it; the
+    // command ends once all are finished.
+    let mut time_stop = TimestampStop::new(args.to_timestamp, &[]);
+    let timestamps = args.from_timestamp.is_some() || args.to_timestamp.is_some();
+    if args.partition.is_some() || args.offset.is_some() || timestamps || !use_group {
+        let existing = consumer.topic_partitions(&args.topic, None)?;
+        let partitions = match args.partition {
+            Some(p) => {
+                crate::kafka::filter::ensure_partition(&args.topic, &existing, p)?;
+                vec![p]
+            }
+            None => existing,
+        };
+        time_stop = TimestampStop::new(args.to_timestamp, &partitions);
+        let starts: Vec<(i32, Offset)> = match (args.offset, args.from_timestamp) {
+            // --from-timestamp seeks to the first record at or after it.
+            (None, Some(ts)) => {
+                let keys: Vec<(&str, i32)> = partitions
+                    .iter()
+                    .map(|&p| (args.topic.as_str(), p))
+                    .collect();
+                let lookup = consumer.offsets_for_timestamp(&keys, ts, None)?;
+                let starts = timestamp_start_offsets(&args.topic, &partitions, &lookup);
+                // Nothing at or after --from-timestamp, and --to-timestamp
+                // has passed: the window is empty.
+                let window_closed = args
+                    .to_timestamp
+                    .is_some_and(|to| to < chrono::Utc::now().timestamp_millis());
+                for &(p, start) in &starts {
+                    if window_closed && start == Offset::End {
+                        time_stop.finish(p);
+                    }
+                }
+                starts
+            }
+            (Some(off), None) if off >= 0 => {
+                clamped_starts(&consumer, &args.topic, &partitions, off)?
+            }
+            _ => {
+                let start = start_offset(args.offset, args.from_beginning, use_group);
+                partitions.iter().map(|&p| (p, start)).collect()
+            }
+        };
+        let assignments: Vec<(&str, i32, Offset)> = starts
+            .iter()
+            .map(|&(p, start)| (args.topic.as_str(), p, start))
+            .collect();
+        if use_group {
+            consumer.assign_with_offsets(&assignments)?;
+        } else {
+            let reads: Vec<PartitionRead> = assignments
+                .iter()
+                .map(|&(topic, partition, start)| PartitionRead {
+                    topic,
+                    partition,
+                    start,
+                    end: None,
+                })
+                .collect();
+            let keep = filter.clone();
+            // The first record past --to-timestamp of each partition is
+            // handed over too, so the loop below sees the partition finish.
+            let to = args.to_timestamp;
+            let passed = std::sync::Mutex::new(std::collections::HashSet::new());
+            reader = Some(ParallelReader::start(&kafka_config, &reads, move |msg| {
+                if TimestampStop::is_past(to, msg.timestamp_ms) {
+                    return passed
+                        .lock()
+                        .map_or(true, |mut passed| passed.insert(msg.partition));
+                }
+                if mask_filters {
+                    keep.matches(&msg.masked())
+                } else {
+                    keep.matches(msg)
+                }
+            })?);
+        }
+    } else {
+        consumer.subscribe(&[&args.topic])?;
+    }
+
+    // Optional file output stream
+    let mut file_writer = if let Some(ref path_str) = args.save {
+        let path = Path::new(path_str);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        // Record data: owner-only (0600) on unix, not the umask default.
+        let file = crate::files::open_private_file(path, true)?;
+        Some(BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, file))
+    } else {
+        None
+    };
+
+    eprintln!(
+        "{}",
+        format!(
+            "Subscribed to topic '{}'. Awaiting messages... (Ctrl+C to quit)",
+            args.topic
+        )
+        .bright_black()
+        .italic()
+    );
+
+    if filter.is_active() {
+        eprintln!(
+            "{}",
+            "Active filter applied. Only matching messages will be shown."
+                .yellow()
+                .italic()
+        );
+    }
+
+    let mut stats = FilterStats::default();
+    let idle_timeout = args.timeout.map(Duration::from_millis);
+    // Buffer terminal output: println! issues one write per message, which dominates
+    // the cost of consuming large topics. Buffers are flushed whenever the stream pauses.
+    let mut out = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, std::io::stdout());
+    // `--format json` prints one JSON object per record (JSON Lines, the same
+    // shape as --save); status lines go to stderr in every mode.
+    let json_lines = global.format == OutputFormat::Json;
+    let mut unflushed = false;
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let mut idle_deadline = idle_timeout.map(|d| tokio::time::Instant::now() + d);
+
+    loop {
+        if let Some(max) = args.max_messages {
+            if stats.matched >= max as u64 {
+                break;
+            }
+        }
+        if time_stop.all_done() {
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            _ = &mut ctrl_c => {
+                out.flush()?;
+                eprintln!("\n{}", "Consumer interrupted by user (Ctrl+C).".yellow());
+                break;
+            }
+            event = next_event(&consumer, reader.as_mut()) => {
+                match event {
+                    ReadEvent::Skipped(count) => {
+                        idle_deadline = idle_timeout.map(|d| tokio::time::Instant::now() + d);
+                        stats.record_skips(count);
+                    }
+                    ReadEvent::Record(msg) => {
+                        idle_deadline = idle_timeout.map(|d| tokio::time::Instant::now() + d);
+                        // Past --to-timestamp: not processed (nor stored).
+                        if !time_stop.admit(msg.partition, msg.timestamp_ms) {
+                            stats.record_skip();
+                            continue;
+                        }
+                        if use_group {
+                            if let Err(e) = consumer.store_processed(&msg) {
+                                eprintln!("{} Could not store offset: {e}", "✖".red());
+                            }
+                        }
+                        let masked = mask.then(|| msg.masked());
+                        let filtered = match &masked {
+                            Some(m) if mask_filters => m,
+                            _ => &msg,
+                        };
+                        if !filter.matches(filtered) {
+                            stats.record_skip();
+                            continue;
+                        }
+
+                        // Decoded before --where so expressions see Avro and
+                        // Protobuf records as JSON.
+                        let decode = !args.hex && (where_expr.is_some() || !json_lines);
+                        let decoded = match (&mut decoder, msg.payload.as_deref()) {
+                            (Some(decoder), Some(payload)) if decode => {
+                                decoder.decode(payload).await
+                            }
+                            _ => None,
+                        };
+                        // Schema-encoded keys are shown decoded too.
+                        let decoded_key = match (&mut decoder, msg.key.as_deref()) {
+                            (Some(decoder), Some(key)) if decode => decoder.decode(key).await,
+                            _ => None,
+                        };
+                        let mask_decoded = |d: Option<crate::codec::schema::DecodedPayload>| {
+                            if mask {
+                                d.map(|d| crate::codec::schema::DecodedPayload {
+                                    text: mask_payload(&d.text, MaskStrategy::Partial),
+                                    ..d
+                                })
+                            } else {
+                                d
+                            }
+                        };
+                        // Masked before --where when the policy enforces it.
+                        let (decoded, decoded_key) = if mask_filters {
+                            (mask_decoded(decoded), mask_decoded(decoded_key))
+                        } else {
+                            (decoded, decoded_key)
+                        };
+                        if let Some(expr) = &where_expr {
+                            if !crate::kafka::filter::expression_matches(expr, filtered, decoded.as_ref(), decoded_key.as_ref()) {
+                                stats.record_skip();
+                                continue;
+                            }
+                        }
+
+                        stats.record_match();
+                        let (decoded, decoded_key) = if mask_filters {
+                            (decoded, decoded_key)
+                        } else {
+                            (mask_decoded(decoded), mask_decoded(decoded_key))
+                        };
+                        let msg = masked.unwrap_or(msg);
+
+                        if let Some(ref mut writer) = file_writer {
+                            writeln!(writer, "{}", jsonl_record(&msg))?;
+                        }
+
+                        if json_lines {
+                            writeln!(out, "{}", jsonl_record(&msg))?;
+                        } else {
+                            let shown;
+                            let msg_ref = match decoded_key {
+                                Some(k) => {
+                                    shown = ConsumedMessage {
+                                        key: Some(
+                                            crate::codec::schema::key_text(&k.text).into_bytes(),
+                                        ),
+                                        ..msg.clone()
+                                    };
+                                    &shown
+                                }
+                                None => &msg,
+                            };
+                            let formatted = format_message(
+                                msg_ref,
+                                args.pretty_json,
+                                args.show_headers,
+                                args.decode_wire_format,
+                                args.hex,
+                                decoded.as_ref(),
+                            );
+                            writeln!(out, "{formatted}")?;
+                        }
+                        unflushed = true;
+                    }
+                    ReadEvent::Error(err) => {
+                        eprintln!("{} Consumer error: {err}", "✖".red());
+                    }
+                }
+            }
+            _ = tokio::time::sleep(OUTPUT_FLUSH_INTERVAL), if unflushed => {
+                out.flush()?;
+                if let Some(ref mut writer) = file_writer {
+                    writer.flush()?;
+                }
+                unflushed = false;
+            }
+            _ = sleep_until_or_forever(idle_deadline) => {
+                out.flush()?;
+                eprintln!(
+                    "{}",
+                    format!("Idle timeout of {} ms reached with no incoming messages.", args.timeout.unwrap_or(0))
+                        .bright_black()
+                );
+                break;
+            }
+        }
+    }
+
+    out.flush()?;
+    if let Some(ref mut writer) = file_writer {
+        writer.flush()?;
+    }
+    // Every matched record went to the file or the (redirected) stdout.
+    crate::cli::export_finished(stats.matched);
+    if use_group {
+        if let Err(e) = consumer.commit_stored(CommitMode::Sync) {
+            eprintln!("{} Final offset commit failed: {e}", "✖".red());
+        }
+    }
+
+    eprintln!(
+        "{} Consumed {} matched message(s) from topic '{}'.",
+        "✔".green().bold(),
+        stats.matched.to_string().cyan().bold(),
+        args.topic.yellow().bold()
+    );
+
+    if filter.is_active() {
+        eprintln!("{}", stats.summary_string().bright_black().italic());
+    }
+
+    if let Some(ref path_str) = args.save {
+        eprintln!(
+            "{} Saved matched records to '{}'",
+            "💾".cyan(),
+            path_str.green().bold()
+        );
+    }
+
+    Ok(())
+}
+
+/// The next record from `reader` when there is one, else from `consumer`.
+async fn next_event(
+    consumer: &KafkaConsumerClient,
+    reader: Option<&mut ParallelReader>,
+) -> ReadEvent {
+    match reader {
+        // Every reader thread has stopped; the idle timeout or Ctrl+C ends the command.
+        Some(reader) => match reader.recv().await {
+            Some(event) => event,
+            None => std::future::pending().await,
+        },
+        None => match consumer.recv().await {
+            Ok(msg) => ReadEvent::Record(msg),
+            Err(err) => ReadEvent::Error(err),
+        },
+    }
+}
+
+/// Size of the stdout and --save buffers.
+const OUTPUT_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Buffered output is flushed when no message arrives within this interval.
+const OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+/// An explicit `--offset` moved into a partition's available range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OffsetClamp {
+    /// The offset actually used.
+    pub to: i64,
+    /// Requested offset was past the high watermark (else: before the low one).
+    pub above: bool,
+}
+
+/// Moves a non-negative `--offset` into `[low, high]`; `None` when it already
+/// lies inside. Past `high` nothing exists yet, so reading starts at `high`
+/// (new records only) instead of silently falling back to the beginning.
+pub(crate) fn clamp_offset(requested: i64, low: i64, high: i64) -> Option<OffsetClamp> {
+    if requested > high {
+        Some(OffsetClamp {
+            to: high,
+            above: true,
+        })
+    } else if requested < low {
+        Some(OffsetClamp {
+            to: low,
+            above: false,
+        })
+    } else {
+        None
+    }
+}
+
+/// Start offsets for `--offset N` (N >= 0) per partition, clamped to each
+/// partition's watermarks, with one stderr warning per adjusted partition.
+fn clamped_starts(
+    consumer: &KafkaConsumerClient,
+    topic: &str,
+    partitions: &[i32],
+    requested: i64,
+) -> anyhow::Result<Vec<(i32, Offset)>> {
+    let mut starts = Vec::with_capacity(partitions.len());
+    for &p in partitions {
+        let (low, high) = consumer.fetch_watermarks(topic, p, None)?;
+        let start = match clamp_offset(requested, low, high) {
+            Some(c) => {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "Warning: --offset {requested} is {} partition {p} ({low}..{high}); starting at offset {}.",
+                        if c.above { "past the end of" } else { "before the start of" },
+                        c.to
+                    )
+                    .yellow()
+                );
+                c.to
+            }
+            None => requested,
+        };
+        starts.push((p, Offset::Offset(start)));
+    }
+    Ok(starts)
+}
+
+/// Resolves the starting offset for an explicit partition assignment.
+/// Without a group there are no stored offsets, so it starts at the end (new messages only)
+/// unless --from-beginning is given.
+fn start_offset(offset: Option<i64>, from_beginning: bool, use_group: bool) -> Offset {
+    match offset {
+        Some(off) if off >= 0 => Offset::Offset(off),
+        Some(off) => Offset::OffsetTail(off.unsigned_abs() as i64),
+        None if from_beginning => Offset::Beginning,
+        None if use_group => Offset::Stored,
+        None => Offset::End,
+    }
+}
+
+async fn sleep_until_or_forever(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Formats a consumed message with terminal colors and optional pretty JSON, wire format decoding, or hex dump.
+pub fn format_message_display_ext(
+    msg: &ConsumedMessage,
+    pretty_json: bool,
+    show_headers: bool,
+    decode_wire_format: bool,
+    show_hex: bool,
+) -> String {
+    format_message(
+        msg,
+        pretty_json,
+        show_headers,
+        decode_wire_format,
+        show_hex,
+        None,
+    )
+}
+
+/// [`format_message_display_ext`] with a payload already decoded through the
+/// Schema Registry, shown in place of the raw wire-format body.
+fn format_message(
+    msg: &ConsumedMessage,
+    pretty_json: bool,
+    show_headers: bool,
+    decode_wire_format: bool,
+    show_hex: bool,
+    decoded: Option<&crate::codec::schema::DecodedPayload>,
+) -> String {
+    let mut out = String::new();
+
+    // Meta header line
+    let partition_info = format!("[P:{} | O:{}]", msg.partition, msg.offset);
+    let time_info = if let Some(ts) = msg.timestamp_ms {
+        format!(" @ {ts}")
+    } else {
+        String::new()
+    };
+
+    let meta_str = format!("{partition_info}{time_info}").cyan().to_string();
+    out.push_str(&meta_str);
+
+    // Key
+    if let Some(key) = msg.key_str() {
+        out.push_str(&format!(
+            "  {} {}",
+            "key:".bright_black(),
+            key.yellow().bold()
+        ));
+    }
+
+    // Headers
+    if show_headers && !msg.headers.is_empty() {
+        let mut header_parts = Vec::new();
+        for (k, v) in &msg.headers {
+            let val_str = std::str::from_utf8(v).unwrap_or("<binary>");
+            header_parts.push(format!("{k}={val_str}"));
+        }
+        out.push_str(&format!(
+            "  {} [{}]",
+            "headers:".bright_black(),
+            header_parts.join(", ").magenta()
+        ));
+    }
+
+    // Check Confluent Schema Registry wire format if requested
+    let wire_format = if decode_wire_format {
+        msg.payload.as_deref().and_then(parse_confluent_wire_format)
+    } else {
+        None
+    };
+
+    if let Some(decoded) = decoded {
+        out.push_str(&format!(
+            "  {}",
+            format!("[{}]", decoded.label).magenta().bold()
+        ));
+    } else if let Some(ref wire) = wire_format {
+        out.push_str(&format!(
+            "  {} {}",
+            "[Schema ID:".magenta().bold(),
+            format!("{}]", wire.schema_id).yellow().bold()
+        ));
+    }
+
+    out.push('\n');
+
+    // Hex mode
+    if show_hex {
+        if let Some(ref wire) = wire_format {
+            out.push_str(&format_hexdump(&wire.payload));
+        } else if let Some(ref payload) = msg.payload {
+            out.push_str(&format_hexdump(payload));
+        } else {
+            out.push_str("<null payload>");
+        }
+        return out;
+    }
+
+    // Payload text / JSON formatting
+    if let Some(decoded) = decoded {
+        let pretty = pretty_json
+            .then(|| serde_json::from_str::<serde_json::Value>(&decoded.text).ok())
+            .flatten()
+            .and_then(|v| serde_json::to_string_pretty(&v).ok());
+        out.push_str(pretty.as_deref().unwrap_or(&decoded.text));
+    } else if let Some(ref wire) = wire_format {
+        if let Some(payload_str) = wire.payload_as_str() {
+            if pretty_json && wire.is_json {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(payload_str) {
+                    if let Ok(pretty) = serde_json::to_string_pretty(&val) {
+                        out.push_str(&pretty);
+                        return out;
+                    }
+                }
+            }
+            out.push_str(payload_str);
+        } else {
+            out.push_str(&wire.preview(64));
+        }
+    } else if let Some(payload_str) = msg.payload_str() {
+        if pretty_json {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(payload_str) {
+                if let Ok(pretty) = serde_json::to_string_pretty(&val) {
+                    out.push_str(&pretty);
+                    return out;
+                }
+            }
+        }
+        out.push_str(payload_str);
+    } else if let Some(ref payload) = msg.payload {
+        out.push_str(&format_hexdump(payload));
+    } else {
+        out.push_str("<null payload>");
+    }
+
+    out
+}
+
+/// Backwards-compatible wrapper for format_message_display_ext.
+pub fn format_message_display(
+    msg: &ConsumedMessage,
+    pretty_json: bool,
+    show_headers: bool,
+) -> String {
+    format_message_display_ext(msg, pretty_json, show_headers, false, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_offset_past_high_watermark_starts_at_high() {
+        assert_eq!(
+            clamp_offset(99, 0, 10),
+            Some(OffsetClamp {
+                to: 10,
+                above: true
+            })
+        );
+    }
+
+    #[test]
+    fn clamp_offset_before_low_watermark_starts_at_low() {
+        assert_eq!(
+            clamp_offset(2, 5, 10),
+            Some(OffsetClamp {
+                to: 5,
+                above: false
+            })
+        );
+    }
+
+    #[test]
+    fn clamp_offset_inside_range_is_untouched() {
+        assert_eq!(clamp_offset(0, 0, 10), None);
+        assert_eq!(clamp_offset(7, 5, 10), None);
+        assert_eq!(
+            clamp_offset(10, 5, 10),
+            None,
+            "high itself waits for new records"
+        );
+        assert_eq!(clamp_offset(0, 0, 0), None);
+    }
+
+    fn header(msg: &ConsumedMessage, name: &str) -> Vec<u8> {
+        msg.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.clone())
+            .unwrap()
+    }
+
+    #[test]
+    fn masked_message_hides_pii_in_key_payload_and_headers() {
+        let msg = ConsumedMessage {
+            topic: "users".into(),
+            partition: 0,
+            offset: 7,
+            key: Some(b"kim@example.com".to_vec()),
+            payload: Some(
+                br#"{"name":"kim","password":"hunter2","card":"4111111111111111"}"#.to_vec(),
+            ),
+            timestamp_ms: None,
+            headers: Vec::from([
+                ("trace".to_string(), b"ok".to_vec()),
+                ("bin".to_string(), vec![0xff, 0xfe]),
+            ]),
+        };
+        let masked = msg.masked();
+        let payload = String::from_utf8(masked.payload.clone().unwrap()).unwrap();
+        assert!(!payload.contains("hunter2") && !payload.contains("4111111111111111"));
+        // The name is masked by its key, not hidden whole.
+        assert!(payload.contains(r#""name":"k**""#), "{payload}");
+        assert_ne!(masked.key.clone().unwrap(), b"kim@example.com".to_vec());
+        assert_eq!(header(&masked, "trace"), b"ok".to_vec());
+        assert_eq!(header(&masked, "bin"), b"[binary 2 bytes hidden]".to_vec());
+    }
+
+    #[test]
+    fn masked_message_judges_header_values_by_name() {
+        let msg = ConsumedMessage {
+            topic: "users".into(),
+            partition: 0,
+            offset: 1,
+            key: None,
+            payload: None,
+            timestamp_ms: None,
+            headers: Vec::from([
+                ("customer_name".to_string(), "김민준".as_bytes().to_vec()),
+                ("x-api-key".to_string(), b"abc".to_vec()),
+            ]),
+        };
+        let masked = msg.masked();
+        assert_eq!(
+            header(&masked, "customer_name"),
+            "김*준".as_bytes().to_vec()
+        );
+        assert_eq!(header(&masked, "x-api-key"), b"****".to_vec());
+    }
+
+    #[test]
+    fn filters_on_the_masked_rendering_cannot_see_raw_values() {
+        let msg = ConsumedMessage {
+            topic: "users".into(),
+            partition: 0,
+            offset: 1,
+            key: Some(b"kim@example.com".to_vec()),
+            payload: Some(br#"{"rrn":"900101-1234567","note":"kim@example.com"}"#.to_vec()),
+            timestamp_ms: None,
+            headers: Vec::from([("x-api-key".to_string(), b"abc123".to_vec())]),
+        };
+        let masked = msg.masked();
+        let checks = [
+            MessageFilter::new().with_grep("1234567").unwrap(),
+            MessageFilter::new().with_key("kim@"),
+            MessageFilter::new().with_header("x-api-key", "abc123"),
+        ];
+        for f in &checks {
+            // The raw record matches, the masked one the policy shows does not.
+            assert!(f.matches(&msg) && !f.matches(&masked), "{f:?}");
+        }
+        let expr = crate::model::expr::Expr::parse(r#"$.rrn =~ "^900101-1234""#).unwrap();
+        assert!(crate::kafka::filter::expression_matches(
+            &expr, &msg, None, None
+        ));
+        assert!(!crate::kafka::filter::expression_matches(
+            &expr, &masked, None, None
+        ));
+        let decoded = crate::codec::schema::DecodedPayload {
+            text: mask_payload(r#"{"rrn":"900101-1234567"}"#, MaskStrategy::Partial),
+            label: "AVRO schema 1".into(),
+            schema_ref: Some(crate::model::schema::SchemaRef::id(1)),
+        };
+        assert!(!crate::kafka::filter::expression_matches(
+            &expr,
+            &masked,
+            Some(&decoded),
+            None
+        ));
+    }
+
+    #[test]
+    fn test_format_message_display_plain() {
+        let msg = ConsumedMessage {
+            topic: "events".into(),
+            partition: 1,
+            offset: 42,
+            key: Some(b"order_key".to_vec()),
+            payload: Some(b"hello world".to_vec()),
+            timestamp_ms: Some(1726900000000),
+            headers: Vec::new(),
+        };
+
+        let formatted = format_message_display(&msg, false, false);
+        assert!(formatted.contains("P:1 | O:42"));
+        assert!(formatted.contains("order_key"));
+        assert!(formatted.contains("hello world"));
+    }
+
+    #[test]
+    fn test_format_message_display_pretty_json() {
+        let msg = ConsumedMessage {
+            topic: "events".into(),
+            partition: 0,
+            offset: 10,
+            key: None,
+            payload: Some(b"{\"name\":\"Alice\",\"age\":30}".to_vec()),
+            timestamp_ms: None,
+            headers: Vec::new(),
+        };
+
+        let formatted = format_message_display(&msg, true, false);
+        assert!(formatted.contains("\"name\": \"Alice\""));
+        assert!(formatted.contains("\"age\": 30"));
+    }
+
+    #[test]
+    fn show_headers_lists_repeated_keys_in_order() {
+        let msg = ConsumedMessage {
+            topic: "events".into(),
+            partition: 0,
+            offset: 10,
+            key: None,
+            payload: Some(b"data".to_vec()),
+            timestamp_ms: None,
+            headers: vec![
+                ("x".to_string(), b"1".to_vec()),
+                ("x".to_string(), b"2".to_vec()),
+                ("y".to_string(), b"z".to_vec()),
+            ],
+        };
+        let formatted = format_message_display(&msg, false, true);
+        assert!(formatted.contains("x=1, x=2, y=z"), "{formatted}");
+    }
+
+    #[test]
+    fn saved_jsonl_keeps_repeated_headers_and_unique_ones_as_before() {
+        let mut msg = ConsumedMessage {
+            topic: "t".into(),
+            partition: 0,
+            offset: 1,
+            key: None,
+            payload: Some(b"p".to_vec()),
+            timestamp_ms: None,
+            headers: vec![
+                ("a".to_string(), b"1".to_vec()),
+                ("b".to_string(), vec![0xff]),
+            ],
+        };
+        let plain = jsonl_record(&msg);
+        assert!(plain.get("header_list").is_none());
+        assert_eq!(plain["headers"]["a"], "1");
+        assert_eq!(plain["headers_base64"]["b"], "/w==");
+
+        msg.headers = vec![
+            ("x".to_string(), b"1".to_vec()),
+            ("x".to_string(), b"2".to_vec()),
+        ];
+        let line = jsonl_record(&msg).to_string();
+        let record: crate::ops::backup::DumpRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(record.extract_headers().unwrap(), msg.headers, "{line}");
+    }
+
+    #[test]
+    fn test_format_message_display_with_headers() {
+        let headers = vec![("trace_id".to_string(), b"xyz789".to_vec())];
+
+        let msg = ConsumedMessage {
+            topic: "events".into(),
+            partition: 0,
+            offset: 10,
+            key: None,
+            payload: Some(b"data".to_vec()),
+            timestamp_ms: None,
+            headers,
+        };
+
+        let formatted = format_message_display(&msg, false, true);
+        assert!(formatted.contains("headers:"));
+        assert!(formatted.contains("trace_id=xyz789"));
+    }
+
+    #[test]
+    fn test_clap_consume_args_parsing() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(flatten)]
+            args: ConsumeArgs,
+        }
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "my-topic",
+            "-g",
+            "group-1",
+            "-b",
+            "-n",
+            "50",
+            "-t",
+            "1000",
+            "--pretty-json",
+            "--show-headers",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.args.topic, "my-topic");
+        assert_eq!(cli.args.group.as_deref(), Some("group-1"));
+        assert!(cli.args.from_beginning);
+        assert_eq!(cli.args.max_messages, Some(50));
+        assert_eq!(cli.args.timeout, Some(1000));
+        assert!(cli.args.pretty_json);
+        assert!(cli.args.show_headers);
+    }
+
+    #[test]
+    fn test_clap_consume_args_filtering_and_save() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(flatten)]
+            args: ConsumeArgs,
+        }
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "orders",
+            "-G",
+            "ERROR",
+            "-k",
+            "order-",
+            "--header-filter",
+            "env:prod",
+            "--case-sensitive",
+            "-s",
+            "output.jsonl",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.args.topic, "orders");
+        assert_eq!(cli.args.grep.as_deref(), Some("ERROR"));
+        assert_eq!(cli.args.key_filter.as_deref(), Some("order-"));
+        assert_eq!(cli.args.header_filter, vec!["env:prod".to_string()]);
+        assert!(cli.args.case_sensitive);
+        assert_eq!(cli.args.save.as_deref(), Some("output.jsonl"));
+    }
+
+    #[test]
+    fn test_format_message_display_confluent_wire_format() {
+        use crate::codec::schema::encode_confluent_wire_format;
+
+        let wire_payload = encode_confluent_wire_format(42, b"{\"order_id\":101}");
+        let msg = ConsumedMessage {
+            topic: "orders".into(),
+            partition: 0,
+            offset: 5,
+            key: Some(b"k1".to_vec()),
+            payload: Some(wire_payload),
+            timestamp_ms: None,
+            headers: Vec::new(),
+        };
+
+        // Without decode_wire_format
+        let raw = format_message_display_ext(&msg, false, false, false, false);
+        assert!(!raw.contains("Schema ID"));
+
+        // With decode_wire_format
+        let decoded = format_message_display_ext(&msg, false, false, true, false);
+        assert!(decoded.contains("Schema ID:"));
+        assert!(decoded.contains("42"));
+        assert!(decoded.contains("{\"order_id\":101}"));
+    }
+
+    #[test]
+    fn test_format_message_display_hex_dump() {
+        let msg = ConsumedMessage {
+            topic: "telemetry".into(),
+            partition: 0,
+            offset: 12,
+            key: None,
+            payload: Some(vec![0x00, 0x01, 0x02, 0xfe, 0xff]),
+            timestamp_ms: None,
+            headers: Vec::new(),
+        };
+
+        let dump = format_message_display_ext(&msg, false, false, false, true);
+        assert!(dump.contains("00000000"));
+        assert!(dump.contains("00 01 02 fe ff"));
+    }
+
+    #[test]
+    fn test_clap_consume_args_wire_format_and_hex() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(flatten)]
+            args: ConsumeArgs,
+        }
+
+        let cli = TestCli::try_parse_from([
+            "test",
+            "telemetry",
+            "-D",
+            "--hex",
+            "-S",
+            "http://registry:8081",
+        ])
+        .unwrap();
+
+        assert!(cli.args.decode_wire_format);
+        assert!(cli.args.hex);
+        assert_eq!(
+            cli.args.schema_registry.as_deref(),
+            Some("http://registry:8081")
+        );
+    }
+}

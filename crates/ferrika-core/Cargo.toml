@@ -1,0 +1,41 @@
+[package]
+name = "ferrika-core"
+version.workspace = true
+edition.workspace = true
+description = "Ferrika engine: Kafka clients, record formats and domain model"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+tokio.workspace = true
+rdkafka.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+tokio-rustls.workspace = true
+chrono.workspace = true
+ring.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# OS credential store for profile passwords (Windows Credential Manager,
+# macOS Keychain, Linux Secret Service). Other targets keep them in the file.
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust", "vendored"] }
+
+[features]
+# TLS (SSL/SASL_SSL) and SASL SCRAM for the librdkafka paths. OpenSSL is
+# built from source and linked statically, so the binary needs no DLLs.
+# Building it needs Perl (on Windows a native one such as Strawberry Perl);
+# NASM is optional. Release builds enable this; the default build has no
+# OpenSSL dependency.
+ssl = ["rdkafka/ssl-vendored"]

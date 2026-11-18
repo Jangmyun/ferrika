@@ -1,0 +1,47 @@
+[package]
+name = "ferrika-cli"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+name = "ferrika_cli"
+path = "src/lib.rs"
+
+# The command-line binary is `ferrika`. Keep it distinct from `Ferrika.exe`,
+# the name of the separately distributed desktop app: a case-insensitive file
+# system would merge the two.
+[[bin]]
+name = "ferrika"
+path = "src/main.rs"
+
+[dependencies]
+ferrika-core.workspace = true
+ferrika-governance.workspace = true
+ferrika-ops.workspace = true
+ferrika-mcp.workspace = true
+clap = { version = "4.5", features = ["derive", "env"] }
+tokio.workspace = true
+rdkafka.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+chrono.workspace = true
+ring.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+comfy-table = "8.0"
+colored = "3.1"
+
+[dev-dependencies]
+ferrika-governance = { path = "../ferrika-governance", features = ["test-util"] }
+
+[features]
+# Forwarded to ferrika-core, see there.
+ssl = ["ferrika-core/ssl"]
+dev-policy-dir = ["ferrika-governance/dev-policy-dir"]

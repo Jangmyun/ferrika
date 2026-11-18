@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Ferrika company policy: WiX v4/v5 fragment. Same result as
+  Install-FerrikaPolicy.ps1: <ProgramData>\Ferrika with company.policy and
+  policy.pub, owner Administrators, inheritance off, Administrators/SYSTEM
+  full control, Users read and execute; and the "Ferrika" Application event
+  log source for the audit anchor.
+
+  Use it from a per-machine package:
+
+    <Package ... Scope="perMachine">
+      <FeatureRef Id="..."><ComponentGroupRef Id="FerrikaPolicy" /></FeatureRef>
+    </Package>
+
+    wix build Product.wxs FerrikaPolicy.wxs -d PolicySourceDir=path\to\policy
+
+  PermissionEx/@Sddl writes the MsiLockPermissionsEx table (Windows Installer
+  5.0+). The SDDL sets the owner too (O:BA), so a folder a user created
+  before the install loses that user as owner. Files a user put into the
+  folder before the install are not touched by Windows Installer; run
+  Install-FerrikaPolicy.ps1 -AclOnly for those (see packaging/README.md).
+
+  policy.keys is optional: enable the FerrikaPolicyKeys component with
+  -d PolicyKeys=1 when the source folder has one.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <?ifndef PolicySourceDir ?>
+  <?define PolicySourceDir = "policy" ?>
+  <?endif ?>
+
+  <!-- D:PAI = protected DACL (nothing inherited from ProgramData, where Users may create files).
+       FA = full access, 0x1200a9 = read and execute, OICI = inherited by files and subfolders. -->
+  <?define FolderSddl = "O:BAG:SYD:PAI(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1200a9;;;BU)" ?>
+  <?define FileSddl = "O:BAG:SYD:PAI(A;;FA;;;BA)(A;;FA;;;SY)(A;;0x1200a9;;;BU)" ?>
+
+  <Fragment>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="FERRIKAPOLICYDIR" Name="Ferrika" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="FerrikaPolicy" Directory="FERRIKAPOLICYDIR">
+      <Component Id="FerrikaPolicyFolder" Guid="5F0B7A2E-3C1D-4E8A-9B6F-2A4D8C1E7F30">
+        <CreateFolder>
+          <PermissionEx Sddl="$(var.FolderSddl)" />
+        </CreateFolder>
+      </Component>
+
+      <!-- company.policy and policy.pub always go together: one without the
+           other puts Ferrika into strictest mode. -->
+      <Component Id="FerrikaPolicyFiles" Guid="9C3E1B54-7A2F-4D60-8E1B-5F7C2A9D4E61">
+        <File Id="CompanyPolicy" Name="company.policy" Source="$(var.PolicySourceDir)\company.policy" KeyPath="yes">
+          <PermissionEx Sddl="$(var.FileSddl)" />
+        </File>
+        <File Id="PolicyPub" Name="policy.pub" Source="$(var.PolicySourceDir)\policy.pub">
+          <PermissionEx Sddl="$(var.FileSddl)" />
+        </File>
+      </Component>
+
+      <?ifdef PolicyKeys ?>
+      <Component Id="FerrikaPolicyKeys" Guid="2B8D6F13-4E7A-4C95-A1D3-6E9F0B2C5A72">
+        <File Id="PolicyKeys" Name="policy.keys" Source="$(var.PolicySourceDir)\policy.keys" KeyPath="yes">
+          <PermissionEx Sddl="$(var.FileSddl)" />
+        </File>
+      </Component>
+      <?endif ?>
+
+      <!-- What New-EventLog -LogName Application -Source Ferrika creates. -->
+      <Component Id="FerrikaEventSource" Guid="E4A17C38-0D5B-4F2E-B96A-3C8D1F5E2B07">
+        <RegistryKey Root="HKLM" Key="SYSTEM\CurrentControlSet\Services\EventLog\Application\Ferrika">
+          <RegistryValue Name="EventMessageFile" Type="expandable"
+                         Value="%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\EventLogMessages.dll"
+                         KeyPath="yes" />
+        </RegistryKey>
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>

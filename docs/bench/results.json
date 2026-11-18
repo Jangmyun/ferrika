@@ -1,0 +1,211 @@
+{
+  "environment": {
+    "date": "2026-10-13T22:54:28+09:00",
+    "os": "Windows-10-10.0.19045-SP0",
+    "cpu": "AMD Ryzen 5 5600X 6-Core Processor",
+    "ram_gib": 31.9,
+    "wsl_vm_gib": 15.6,
+    "ferrika": "0.1.0",
+    "rustc_linux": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "kafbat_ui": "v1.5.0",
+    "akhq": "0.28.0",
+    "redpanda_console": "v3.12.0",
+    "kafdrop": "4.3.0",
+    "kafka": "4.3.1",
+    "topic": "bench-10m",
+    "partitions": 3,
+    "records": 10000001,
+    "topic_bytes": 3163667102,
+    "ferrika_binary": "Windows desktop build's executable in CLI mode (same engine as `ferrika`; measured 2026-10-13, not re-measured with the CLI binary)"
+  },
+  "kafbat": {
+    "startup_s": 5.92,
+    "idle_mib": 386.8,
+    "topics_s": 0.028,
+    "search": {
+      "runs": [
+        {
+          "found_s": 269.7,
+          "total_s": 269.7,
+          "peak_mib": 2589.7
+        },
+        {
+          "found_s": 225.96,
+          "total_s": 225.96,
+          "peak_mib": 2602.3
+        },
+        {
+          "found_s": 239.33,
+          "total_s": 239.33,
+          "peak_mib": 2352.0
+        }
+      ],
+      "found_s": 239.33,
+      "found_all": true,
+      "peak_mib": 2602.3
+    },
+    "parallel": {
+      "wall_s": 714.05,
+      "found_all": true,
+      "peak_mib": 4342.4
+    }
+  },
+  "akhq": {
+    "startup_s": 3.16,
+    "idle_mib": 355.8,
+    "topics_s": 0.029,
+    "search": {
+      "runs": [
+        {
+          "found_s": 25.91,
+          "total_s": 26.96,
+          "peak_mib": 944.6
+        },
+        {
+          "found_s": 23.77,
+          "total_s": 24.78,
+          "peak_mib": 958.6
+        },
+        {
+          "found_s": 23.94,
+          "total_s": 24.96,
+          "peak_mib": 959.4
+        }
+      ],
+      "found_s": 23.94,
+      "found_all": true,
+      "peak_mib": 959.4
+    },
+    "parallel": {
+      "wall_s": 33.66,
+      "found_all": true,
+      "peak_mib": 1614.4
+    }
+  },
+  "ferrika_net": {
+    "search": {
+      "runs": [
+        {
+          "found_s": 2.81,
+          "found": true,
+          "peak_mib": 75.2
+        },
+        {
+          "found_s": 3.1,
+          "found": true,
+          "peak_mib": 75.9
+        },
+        {
+          "found_s": 3.07,
+          "found": true,
+          "peak_mib": 76.0
+        }
+      ],
+      "found_s": 3.07,
+      "found_all": true,
+      "peak_mib": 76.0
+    },
+    "parallel": {
+      "wall_s": 5.83,
+      "found_all": true,
+      "peak_mib": 225.7
+    },
+    "read_all_s": 2.77
+  },
+  "ferrika_host": {
+    "topics_s": 0.128,
+    "search": {
+      "runs": [
+        {
+          "found_s": 5.38,
+          "found": true,
+          "peak_mib": 70.4
+        },
+        {
+          "found_s": 5.14,
+          "found": true,
+          "peak_mib": 71.3
+        },
+        {
+          "found_s": 5.09,
+          "found": true,
+          "peak_mib": 71.4
+        }
+      ],
+      "found_s": 5.14,
+      "found_all": true,
+      "peak_mib": 71.4
+    },
+    "parallel": {
+      "wall_s": 9.74,
+      "found_all": true,
+      "peak_mib": 216.1
+    },
+    "read_all_s": 4.78
+  },
+  "redpanda": {
+    "startup_s": 0.51,
+    "idle_mib": 55.1,
+    "topics_s": 0.003,
+    "search": {
+      "runs": [
+        {
+          "found_s": 39.03,
+          "total_s": 39.03,
+          "peak_mib": 90.7
+        },
+        {
+          "found_s": 38.44,
+          "total_s": 38.44,
+          "peak_mib": 95.7
+        },
+        {
+          "found_s": 38.04,
+          "total_s": 38.04,
+          "peak_mib": 95.3
+        }
+      ],
+      "found_s": 38.44,
+      "found_all": true,
+      "peak_mib": 95.7
+    },
+    "parallel": {
+      "wall_s": 83.29,
+      "found_all": true,
+      "peak_mib": 197.1
+    }
+  },
+  "kafdrop": {
+    "startup_s": 3.95,
+    "idle_mib": 328.7,
+    "topics_s": 0.02,
+    "search": {
+      "runs": [
+        {
+          "found_s": null,
+          "total_s": 0.52,
+          "peak_mib": 337.6
+        },
+        {
+          "found_s": null,
+          "total_s": 0.2,
+          "peak_mib": 375.7
+        },
+        {
+          "found_s": null,
+          "total_s": 0.18,
+          "peak_mib": 378.1
+        }
+      ],
+      "found_s": null,
+      "found_all": false,
+      "peak_mib": 378.1
+    },
+    "parallel": {
+      "wall_s": 0.51,
+      "found_all": false,
+      "peak_mib": 412.8
+    },
+    "scanned_before_stopping": 100012
+  }
+}

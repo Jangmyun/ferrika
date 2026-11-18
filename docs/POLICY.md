@@ -1,0 +1,673 @@
+# Signed company policy
+
+A security team writes one policy, signs it with a private key it keeps, and
+installs the signed file plus the public key on developer machines. Every
+Ferrika on such a machine enforces the policy with no server: read-only
+targets, forbidden actions, mandatory PII masking and auditing, no record
+export, and a screen watermark. Changing one
+character of the policy is detected, and Ferrika then falls back to its
+strictest mode.
+
+The policy file is shared with the commercial Ferrika desktop app, which is
+not part of this repository. Rules and behaviour that act only in the desktop
+app (the watermark, the unmask toggle, badges, buttons) are marked "desktop
+app" below; the `ferrika` CLI reads the same rules and ignores those parts.
+
+**Read [Threat model](#threat-model-and-what-open-source-changes) before you
+rely on this.** Ferrika is open source, so anyone can build a binary that
+skips the checks. A policy is enforced only on machines that are allowed to
+run signed official binaries and nothing else.
+
+Without the profile setting a developer could switch read-only and masking
+off. With a policy they are mandatory in the official binary.
+
+## Files and location
+
+| File | What it is |
+|---|---|
+| `company.policy` | The signed policy (JSON, below) |
+| `policy.pub` | The trusted Ed25519 public key (64 hex digits) |
+| `policy.keys` | Optional: further trusted keys, for key rotation (below) |
+| `policy-signing.pk8` | The private key (PKCS#8). **Stays with the security team, never installed.** |
+
+Ferrika looks in a machine-wide directory that normal users cannot write:
+
+- Windows: `Ferrika\` in the ProgramData known folder
+  (`SHGetKnownFolderPath(FOLDERID_ProgramData)`, usually
+  `C:\ProgramData\Ferrika\`). The `%ProgramData%` environment variable is
+  not used, since any user can change it; if the known folder cannot be
+  resolved, `C:\ProgramData\Ferrika\` is used.
+- macOS / Linux: `/etc/ferrika/`
+- `FERRIKA_POLICY_DIR` overrides the directory in **debug builds and builds
+  with the `dev-policy-dir` feature only** (tests, demos:
+  `cargo build --release -p ferrika-cli --features dev-policy-dir`). Shipped
+  release builds
+  ignore it, print a warning on stderr and record `policy.override_ignored`
+  in the audit log, so a user cannot point Ferrika at a policy they signed
+  themselves.
+
+| Directory contains | Result |
+|---|---|
+| neither file | No policy: Ferrika behaves exactly as without this feature |
+| both, signature valid | The policy is enforced; desktop app badge "Company policy active · signature verified (issuer)" |
+| a policy directory that cannot be read (for example permission denied; only "not found" counts as absent) | **Fail closed**, as below: strictest mode and a `policy.invalid` audit entry, never "no policy" |
+| a key file (`policy.pub`/`policy.keys`) only, `company.policy` only, bad signature, a key that is not trusted, a malformed line in `policy.keys`, unparsable JSON, unknown rule or category, unparsable `expires_at` | **Fail closed**: strictest mode (everything read-only, every change refused, masking enforced, unmasking forbidden, auditing required, record export forbidden, watermark on), red desktop app badge "Policy signature invalid · strictest mode", and a `policy.invalid` audit entry |
+
+## Format
+
+```json
+{
+  "format": 1,
+  "key_id": "ef93539e524d8949",
+  "payload": "{\"issuer\":\"Security team\",\"issued_at\":\"2026-11-02\",\"rules\":{...}}",
+  "signature": "<128 hex digits>"
+}
+```
+
+- `format`: 1, or 2 when the payload uses a format 2 field (`expires_at`,
+  `on_expiry`, `read_only_brokers`, `audit_forward`, `audit_anchor`,
+  `anchor_required`, `export`, `export_clusters`, `watermark`,
+  `watermark_text`; below). Rules left at their defaults are not written
+  out, so they do not make a policy format 2.
+- `key_id`: first 16 hex digits of SHA-256 of the public key.
+- `signature`: Ed25519 over the exact bytes of the `payload` string, so no
+  JSON canonicalisation is involved.
+- `payload` (what `ferrika policy sign --in` reads; `ferrika policy example`
+  prints this one; it stays format 1 so older builds can read it, and
+  `read_only_brokers` below makes it format 2):
+
+```json
+{
+  "issuer": "Security team",
+  "issued_at": "2026-11-02",
+  "rules": {
+    "read_only": ["prod-*"],
+    "forbid": ["topics.delete", "topics.purge", "offsets.reset", "acl.change"],
+    "masking": "enforced",
+    "unmask": "with_reason",
+    "audit": "required"
+  }
+}
+```
+
+| Rule | Values |
+|---|---|
+| `read_only` | Globs (`*`, `?`, case-insensitive) matched against the profile name and each bootstrap address (`prod-*`, `*.prod.corp:*`). `*` = everything. Every change to a match is refused. The profile name is chosen by the user, so a name glob alone can be avoided by renaming a profile; use `read_only_brokers` for clusters that must stay read-only. |
+| `read_only_brokers` | v2, optional: globs matched against broker addresses only, never the profile name (see [Read-only brokers](#read-only-brokers-format-2)). |
+| `forbid` | Categories refused everywhere: `topics.create`, `topics.delete`, `topics.purge`, `topics.alter` (partitions, replication, leader election, reassignment), `config.change`, `produce` (also generate, mirror, restore, probe, bench produce, DLQ redrive), `offsets.reset`, `offsets.commit` (`consume --group`, which commits the group's offsets), `groups.delete`, `acl.change`, `users.change`, `quota.change`, `schema.change`, `connect.change`; `*` = every change. |
+| `masking` | `optional` (default) or `enforced`: PII stays masked in the desktop app's Message Studio, `consume`, `dlq`, `diff`, `trace`, `compact` and MCP; `dump` and `mirror` are refused. |
+| `unmask` | With enforced masking: `allowed`, `with_reason` (the desktop app asks for a reason and records `record.unmask`), `forbidden` (the toggle is disabled). |
+| `audit` | `optional` or `required`: a CLI change whose audit entry cannot be written is refused, and so is a desktop app unmask. The desktop app checks that the audit log can be written before it runs a change and refuses it otherwise ("Refused by company policy: the audit log cannot be written (audit: required)"). |
+| `audit_anchor` | v2, optional: `none` (default) or `os_log`: every audit line's `seq` and `hash` are also written to the OS log so `audit verify --anchor` can detect a truncated or replaced log (see below). |
+| `anchor_required` | v2, optional, default `false`: when `true`, a failed anchor write counts as a failed audit write (under `audit: required` the CLI change is refused). When `false` it only prints a warning. |
+
+| `audit_forward` | Optional. Also send every audit entry to a SIEM; see [Forwarding audit entries](#forwarding-audit-entries-siem). |
+| `export` | v2, optional: `allowed` (default), `audited` or `forbidden`: whether record data (keys, payloads, header values) may leave the app (see [Record export and watermark](#record-export-and-watermark-format-2)). |
+| `export_clusters` | v2, optional: broker-address globs `export` applies to (matched like `read_only_brokers`, never the profile name). Empty (default) = every cluster. |
+| `watermark` | v2, optional: `off` (default) or `on`: the desktop app draws user, host, time and cluster over the whole window (no effect in the CLI). |
+| `watermark_text` | v2, optional: 1–40 characters (no control characters) put in front of the watermark, e.g. `"CONFIDENTIAL"`. |
+
+Unknown rule names or categories make the policy invalid (fail closed), so a
+typo cannot silently weaken it.
+
+### Read-only brokers (format 2)
+
+```json
+"rules": { "read_only_brokers": ["*.prod.corp", "10.20.*", "kafka-dr.corp:9094"] }
+```
+
+- Matched against every bootstrap address of the profile (or `--bootstrap`),
+  never against the profile name, so a production profile renamed to `dev`
+  is still read-only.
+- Addresses and patterns are normalized before matching: surrounding spaces
+  and a `SASL_SSL://`-style scheme are dropped, the host is lowercase, and
+  an address without a port is on 9092. IPv6 hosts are compared in brackets
+  (`[fd00::5]:9092`).
+- A pattern without a port matches the host on any port (`*.prod.corp`
+  covers `kafka1.prod.corp:9093`); a pattern with a port also matches the
+  port (`10.20.*:9092`).
+- The brokers' advertised addresses from the cluster metadata count too, so
+  connecting to a read-only cluster through an IP or another DNS name still
+  matches (this applies to `read_only` broker globs too). The desktop app uses the
+  metadata it polls, so the first poll must have listed the brokers. The CLI
+  (and MCP write tools) fetch the metadata right before a change, but only
+  when `read_only_brokers` is set; with no such rule no request is made. If
+  the metadata cannot be read, the change is refused rather than waved
+  through. Cover a cluster's IP ranges as well as its names if you want the
+  rule to hold without a metadata lookup.
+- Refusals name the matching address and rule: "Refused by company policy
+  …: 'kafka1.prod.corp:9093' is read-only (rule "*.prod.corp"), so
+  `produce` is not allowed." The desktop app shows the `read-only (policy)` tag,
+  and the badge's rules window lists "Read-only brokers".
+- `policy show` prints a `read-only brokers:` line when the rule is set;
+  `-f json policy show` has it in `rules`.
+- Older builds reject the unknown rule and fall back to the strictest mode:
+  update Ferrika before installing a policy that uses it.
+
+### Expiry (format 2)
+
+Two optional payload fields make a policy expire:
+
+```json
+{
+  "issuer": "Security team",
+  "issued_at": "2026-11-02",
+  "expires_at": "2027-06-30T23:59:59+09:00",
+  "on_expiry": "warn",
+  "rules": { ... }
+}
+```
+
+| Field | Values |
+|---|---|
+| `expires_at` | RFC 3339 time with an offset (`2027-06-30T23:59:59+09:00`, `2027-06-30T15:00:00Z`). A plain date or anything unparsable makes the policy invalid (fail closed). |
+| `on_expiry` | `warn` (default): the rules keep applying, with a warning. `strictest`: the strictest mode, as for an unverifiable policy. |
+
+- An expired policy never turns into "no policy": it keeps its rules or
+  becomes stricter.
+- From 14 days before `expires_at` the CLI prints a warning on stderr
+  ("The company policy by Security team, key … expires in 9 days …"), refusal
+  messages carry "(expires in 9 days)", and the desktop app badge turns amber
+  ("… · expires in 9 days"). Once expired: amber "Company policy expired ·
+  rules still apply" (`warn`) or red "Company policy expired · strictest
+  mode" (`strictest`). The desktop app checks the time whenever it consults the
+  policy, so a window left open past `expires_at` switches too.
+- `policy sign` writes `"format": 2` when the payload uses either field (or
+  the rules `read_only_brokers`, `audit_forward`, `audit_anchor`,
+  `anchor_required`, `export`, `export_clusters`, `watermark` or
+  `watermark_text`) and
+  `"format": 1` otherwise, so policies without them stay readable by older
+  Ferrika builds. `verify` accepts both; a file marked format 1 that uses
+  the new fields is invalid.
+- Older builds refuse format 2 (they fall back to the strictest mode).
+  **Update Ferrika on the machines before installing a policy with
+  `expires_at`.**
+- `policy show` and `policy verify` print the expiry; `-f json policy show`
+  adds `expires_at`, `on_expiry`, `expiry` (`current`, `expires_soon`,
+  `expired`, `expired_strictest`) and `strictest`, and its `rules` are the
+  ones in force now.
+
+### Record export and watermark (format 2)
+
+```json
+{
+  "issuer": "Security team",
+  "issued_at": "2026-11-03",
+  "rules": {
+    "masking": "enforced",
+    "export": "forbidden",
+    "export_clusters": ["*.prod.corp", "10.20.*"],
+    "watermark": "on",
+    "watermark_text": "CONFIDENTIAL"
+  }
+}
+```
+
+`export` governs **record data** (keys, payloads, header values) leaving the
+app. Looking at records on screen is never refused; the watermark leaves a
+trace on photos and screen shares instead.
+
+| `export` | Effect |
+|---|---|
+| `allowed` (default) | As without the rule; nothing is recorded. |
+| `audited` | Every export goes ahead and is recorded first as `record.export` (target `export:<channel> <command> <topic>`, outcome `requested`); when the export finishes, a second `record.export` line with the same target records `records: N` where the command knows the count (`dump`, `consume` to a file or redirected stdout, `dlq export`, `compact snapshot`, `mirror`). Under `audit: required` an export whose entry cannot be written is refused. The CLI says so on stderr. |
+| `forbidden` | Every export is refused and recorded as `policy.blocked` ("Refused by company policy …: exporting record data is forbidden (export: forbidden), so `dump` is not allowed."). |
+
+What counts as an export:
+
+| Where | Exports (gated) | Not gated |
+|---|---|---|
+| CLI, files | `dump`, `consume --save`, `dlq export`, `compact snapshot` | `report`, `monitor export`, `topics analyze` and other metadata (topics, groups, lag, brokers) |
+| CLI, stdout | `consume` (also `-f json`), `dlq inspect`, `compact tombstones`, `diff`, `trace inspect`, `crypto mask --topic`: only when stdout is redirected or piped. On a terminal the records are only viewed and are allowed. | `crypto mask` reading stdin (the user's own input) |
+| CLI, other cluster | `mirror` whose destination shares no broker address with the source (normalized like `read_only_brokers`; the same brokers under another profile name are the same cluster). Under enforced masking `mirror` is refused outright anyway. | `mirror` within one cluster (a `produce`) |
+| Desktop app | Message Studio: Export (JSONL), Save payload, Copy record as JSON, Copy payload, and Resend (its text can be copied from the producer form). Under `forbidden` these buttons are disabled with the tooltip "Disabled by company policy (export: forbidden)", and pressing one anyway is refused. | Topics/Consumers Export CSV, Overview Report (metadata) |
+| MCP | `peek_messages` hands records to an outside AI service: under `forbidden` it is left out of `tools/list` and refused if called; under `audited` each call is recorded. | The other tools (metadata) |
+
+- `crypto audit` is a CI gate run in pipelines, so it is not refused: under
+  `forbidden` it keeps its counts (and `--fail-on-leak`) but leaves out the
+  findings, whose masked samples are parts of records.
+- Masking is a separate rule. Masked records are still record data:
+  `export: forbidden` refuses them too, and `masking: enforced` with
+  `export: allowed` exports masked values as before.
+- `export_clusters` is matched against the cluster's bootstrap addresses and
+  the brokers from its metadata, never the profile name; the source cluster
+  for `mirror`. A cluster none of the globs matches is treated as `allowed`.
+  When `export` is not `allowed` and `export_clusters` is set, the CLI looks
+  up the metadata before the export; if that fails, the export is refused.
+- **stdout rule.** There is no flag or variable to get around it. Known false
+  refusal: older Git Bash (mintty without winpty) presents the console as a
+  pipe, so record output is refused there; the message says to use
+  PowerShell or Windows Terminal. Not prevented: copying from the terminal's
+  scrollback, terminal session recording (`script`, ConPTY recorders) and
+  terminal log features.
+- File paths are never recorded (a path can name a customer); entries name
+  the channel, command and topic (and partition/offset in the desktop app).
+- `watermark: on` tiles `[watermark_text ·] user@host · YYYY-MM-DD HH:MM
+  zone · cluster` faintly over the whole desktop app window, above dialogs,
+  notifications, menus and tooltips; clicks, scrolling and typing pass
+  through. The time follows the UTC setting and moves on every 30 seconds;
+  the cluster is the connected profile (or the first bootstrap address). It
+  is separate from `export`: turning export off does not turn the watermark
+  on. Blocking screen capture altogether (Windows
+  `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`) is not done: it would
+  also block screen sharing during incidents.
+- The strictest mode (an unverifiable policy, or `on_expiry: strictest`
+  after expiry) forbids export everywhere and turns the watermark on.
+- `policy show` prints `record export:` and `watermark:` lines; `-f json
+  policy show` always has `export`, `export_clusters` and `watermark` in
+  `rules`. The desktop app's rules window lists Export, Export clusters and Watermark.
+- **Rolling out.** Older builds reject the unknown rules and fall back to the
+  strictest mode, where every change is refused. Update Ferrika on every
+  machine before installing a policy that uses them. A typo in a value
+  (`"forbiden"`), an empty `export_clusters` entry or a bad `watermark_text`
+  makes the policy invalid; `policy sign` refuses them.
+
+
+## Forwarding audit entries (SIEM)
+
+`rules.audit_forward` sends each audit entry, **after** it has been appended
+to the local hash-chained log, to syslog and/or a spool folder:
+
+```json
+{
+  "issuer": "Security team",
+  "issued_at": "2026-11-02",
+  "rules": {
+    "audit": "required",
+    "audit_forward": {
+      "syslog": "tcp://siem.corp:601",
+      "facility": "auth",
+      "app_name": "ferrika",
+      "spool_dir": "C:\\ProgramData\\Ferrika\\spool",
+      "timeout_ms": 1000,
+      "required": false
+    }
+  }
+}
+```
+
+| Field | Values |
+|---|---|
+| `syslog` | `udp://host[:port]` (RFC 5426, default port 514), `tcp://host[:port]` (RFC 6587 octet counting, default 514) or `tls://host[:port]` (RFC 5425, default 6514). IPv6 as `[::1]`. |
+| `spool_dir` | A folder a log collector (Splunk Universal Forwarder, Filebeat, NXLog…) watches. Each entry is appended as one JSON line to `ferrika-audit-<host>-<user>.jsonl`, one file per machine and account. |
+| `facility` | Syslog facility name, default `auth` (`kern`, `user`, `daemon`, `auth`, `authpriv`, `security`, `local0`…`local7`, …). |
+| `app_name` | RFC 5424 APP-NAME, default `ferrika` (1–48 printable ASCII, no spaces). |
+| `timeout_ms` | Longest a command or desktop app action waits for one forward, default 1000, allowed 50–10000. |
+| `required` | Default `false`. With `true` **and** `audit: required`, a failed forward refuses the CLI change (and a desktop app unmask); the entry is still in the local log. |
+| `ca_file` | PEM CA file for `tls://` (the OS trust store otherwise). |
+
+At least one of `syslog` and `spool_dir` is needed; both may be set. Bad
+values or unknown fields make the policy invalid (fail closed), and
+`policy sign` refuses them.
+
+**Message format.** One RFC 5424 message per entry:
+
+```
+<37>1 2026-11-02T09:30:00.123Z DEV-PC-01 ferrika 4242 audit - {"time_ms":…,"action":"topics delete",…,"user":"kim","prev":"…","hash":"…"}
+```
+
+PRI = facility × 8 + severity (notice 5 for `ok`, warning 4 for failed or
+refused operations), UTC timestamp with milliseconds, host name, APP-NAME,
+process id, MSGID `audit`, no structured data (`-`), and as MSG the exact
+JSON line from the local log, `prev` and `hash` included (no BOM), so the
+SIEM can check the chain and notice when the end of a PC's log was cut off.
+Over TCP/TLS each message is framed as `LEN SP MSG` (byte count) on its own
+connection; over UDP it is one datagram.
+
+**Behaviour.**
+
+- Forwarding happens after the local append succeeds; if the local append
+  fails nothing is forwarded (and the existing `audit: required` rules apply).
+- Each target is sent on a worker thread; the caller waits at most
+  `timeout_ms` (DNS, connect, TLS handshake and write included), so a dead
+  collector can never hang the CLI or the desktop app.
+- A failure is counted and logged (`FERRIKA_LOG=ferrika=warn`); the CLI also
+  prints `warning: audit entry saved locally but not forwarded to the SIEM (…)`
+  on stderr. Nothing about the failure is written into the chain.
+- Default: a failed forward does **not** block the action (a network outage
+  should not stop operations that are already recorded locally). Set
+  `required: true` together with `audit: required` to make it block.
+- "Sent" means handed to the network or written to the spool folder: syslog
+  has no acknowledgement. There is no local retry queue yet; an entry that
+  failed to forward is only in the local log (and in the spool, if both are
+  configured).
+
+**Without a policy (individual use).** `FERRIKA_AUDIT_FORWARD` sets
+forwarding for one user: `udp://host:514`, `tcp://host:514`,
+`tls://host:6514`, `spool:C:\path\to\folder`, or the JSON of an
+`audit_forward` section. A verified policy with `audit_forward` always wins
+(the variable is then ignored); a policy without it leaves the variable in
+effect. `required` from the variable is ignored: only a signed policy can make
+forwarding block actions. An invalid policy's section is never trusted.
+
+**Testing.**
+
+```bash
+ferrika audit forward-test                          # configured targets; writes a real, chained audit.forward_test entry
+ferrika audit forward-test --to udp://127.0.0.1:514 # try a target before signing it (entry not written locally)
+ferrika -f json audit forward-test                  # per-target ok/error/elapsed_ms; exit code 1 if any failed
+```
+
+`ferrika policy show` lists the forwarding targets.
+
+**Rolling out.** Ferrika versions without this feature reject the unknown
+`audit_forward` rule and fall back to the strictest mode. Upgrade every
+machine before signing a policy that contains it. Policies without it verify
+and behave exactly as before.
+
+## Commands
+
+```bash
+ferrika policy example --out policy.json                   # starting point (or print to stdout)
+ferrika policy keygen --out keys/                          # keys/policy-signing.pk8 + keys/policy.pub
+ferrika policy sign --key keys/policy-signing.pk8 --in policy.json --out company.policy
+ferrika policy verify [company.policy] [--pub policy.pub]  # defaults: the installed files
+ferrika policy show                                        # effective policy, source, key id, valid/invalid
+ferrika -f json policy show
+```
+
+`policy verify` without `--pub` checks against every trusted key of the
+policy directory; `policy show` lists them and marks the one that signed
+the policy.
+
+## Deployment
+
+Install the policy with the scripts in [`packaging/`](../packaging/README.md),
+not by copying the files by hand:
+
+- Windows (Intune, GPO, SCCM): `packaging/windows/Install-FerrikaPolicy.ps1 -SourceDir <folder>`
+  (`-WhatIf` previews), or the WiX fragment `packaging/windows/FerrikaPolicy.wxs` for an MSI.
+- Linux / macOS: `sudo packaging/linux/install-ferrika-policy.sh <folder>`.
+
+They copy `company.policy`, `policy.pub` and (if present) `policy.keys`,
+and lock the folder: on Windows owner Administrators, inheritance off,
+Administrators and SYSTEM full control, Users read only; on Linux
+`root:root` `0755`/`0644`. An existing folder gets its owner and ACL reset,
+because ProgramData lets any user create `Ferrika\` first and, as its owner,
+later delete the policy. The Windows script also registers the `Ferrika`
+event log source for the audit anchor (below). Roll out the Ferrika binary
+before a policy that uses newer fields.
+
+## Key rotation (`policy.keys`)
+
+Ferrika trusts the key in `policy.pub` plus every key listed in an
+optional `policy.keys` next to it, and checks a policy with the trusted key
+its `key_id` names. A policy signed by a key in neither file is invalid
+(fail closed), and so is the whole policy when `policy.keys` has a line
+that is not a key.
+
+```text
+# policy.keys: one key per line, then an optional label; # starts a comment
+3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29  security team 2026
+9f0e1d2c3b4a59687766554433221100ffeeddccbbaa99887766554433221100  security team 2027
+```
+
+Rotating from an old key to a new one without a moment in strictest mode:
+
+1. `ferrika policy keygen --out keys-2027/` creates the new pair.
+2. Add the new public key (the hex in `keys-2027/policy.pub`) as a line of
+   `policy.keys` on every machine. Leave `policy.pub` (the old key) and
+   `company.policy` as they are. Machines now trust both keys.
+3. Once every machine has the new `policy.keys` **and a Ferrika build that
+   reads it** (older builds ignore `policy.keys` and trust only
+   `policy.pub`, so a policy signed with the new key puts them in strictest
+   mode), sign the policy with the new key and install the new
+   `company.policy`.
+4. Retire the old key: replace `policy.pub` with the new key and remove its
+   line from `policy.keys` (or delete `policy.keys`).
+
+If the old private key leaked, skip the waiting: install the new
+`policy.pub`, remove the old key from both files and install a policy
+signed with the new key at once. Machines that still have the old files
+then run in strictest mode until they get the new ones, which is the safe
+direction.
+
+## What is enforced where
+
+- **CLI**: every changing command is checked before it runs (the same list
+  that read-only profiles use). Refusals name the policy and are logged as
+  `policy.blocked`. `consume --group` commits the group's offsets, so it is
+  the `offsets.commit` change: on a read-only target, or when
+  `offsets.commit` (or `*`) is forbidden, it is refused before connecting;
+  `consume` without `--group` reads without committing and is never refused.
+  `consume` masks keys, payloads and headers (`--mask-pii`
+  without a policy; `--hex` is ignored while masking). Under enforced masking
+  `dlq inspect`/`export`, `diff`, `trace inspect` and `compact
+  snapshot`/`tombstones` mask the keys, payload previews, exception texts and
+  header values they print or write (JSON included; previews are cut after
+  masking). `diff` still compares the real values and `dlq redrive --execute`
+  re-produces the real records, which is a change the policy checks like any
+  other. `dump` and `mirror` (it would copy unmasked records to another
+  cluster) are refused under enforced masking. `mirror` is also checked
+  against its destination cluster (`--dst-profile`/`--dst-bootstrap-servers`)
+  as a `produce`, so a read-only destination or `forbid: produce` refuses it.
+  Under `export: forbidden`/`audited` the commands that write record data to
+  a file, to redirected stdout or to another cluster are refused or recorded
+  before they connect (see [Record export and watermark](#record-export-and-watermark-format-2)).
+- **Desktop app**: every changing action (create/delete/purge topics, produce, offset
+  resets, ACL, config, schema, connect, user and quota changes) is refused by
+  the worker, in live and mock mode, and logged as `policy.blocked`. Under
+  `audit: required` a change is also refused before it runs when the audit
+  log cannot be opened for appending; the outcome entry is still written
+  after a change that runs. The title
+  bar shows the badge (click it for the rules) and "read-only (policy)" when
+  the connected profile matches. Message Studio starts masked and masks
+  again on every topic change. Its filter autocomplete never suggests record
+  values under enforced masking (not even after an audited unmask) or while
+  the panel masks; schema field names and enum symbols are still offered.
+  Under `export: forbidden` Message Studio's
+  export, save, copy and Resend buttons are disabled, and `watermark: on`
+  draws the watermark over the window.
+- **`lint --fix` and the desktop app's config check**: each fix is checked as the
+  category of the change it makes, not as one `lint` command:
+  config changes (topic overrides, broker and cluster-default configs) are
+  `config.change`; replication changes and preferred-leader elections are
+  `topics.alter`; deleting an orphaned group is `groups.delete`. So
+  `forbid: ["config.change"]` blocks most auto fixes while replication fixes
+  still run, and a read-only target refuses them all. The CLI leaves refused
+  fixes out of the plan (nothing is logged until a fix is tried), then logs
+  each attempt as `lint fix <rule>` with its outcome on a second line; under
+  `audit: required` an unwritable log stops the run before any change.
+  `--dry-run` changes nothing and is not checked, like `topics config
+  --dry-run`. The desktop app sends each fix as the ordinary command, so its gate
+  applies, and greys out buttons the policy or profile would refuse.
+- **Undo** (`ferrika undo`, the desktop app's History tab and Undo toast): undo is a
+  change like any other. It is checked under the category of each change it
+  makes (undoing a topic creation is `topics.delete`, undoing a config change
+  `config.change`); there is no separate `history.undo` category. It is
+  refused on read-only targets, and under `audit: required` like other
+  changes. It is also refused when the history entry no longer matches the
+  audit log's `op_digest` (recorded as `history.tampered`), and, with a
+  policy installed, when the audit log has no entry for the operation.
+- **MCP**: `mask_pii: false` is ignored under enforced masking. The read
+  tools never change the cluster. With `ferrika mcp --allow-write`, every
+  write tool call (`produce_messages`, `create_topic`, `alter_topic_config`,
+  `reset_consumer_group_offsets`) is checked like a CLI command
+  (`produce`, `topics.create`, `config.change`, `offsets.reset`): `forbid`,
+  `read_only`, `read_only_brokers`, strictest mode and a read-only profile
+  refuse it, at the plan and again right before it runs, and tools refused
+  outright are not offered. Under `audit: required` a write is refused when
+  the audit log cannot be appended to. Refusals are `policy.blocked`;
+  results are `mcp <tool>` entries with source `mcp` and an `actor` naming
+  the MCP client and session (self-reported by the client, so the OS `user`
+  stays the identity). There is no policy rule yet that allows CLI and desktop app
+  writes but refuses MCP writes; until then use `forbid`/`read_only`, or do
+  not start the server with `--allow-write`. Under `export: forbidden`
+  `peek_messages` is hidden and refused. `config_lint` only reads; lint
+  fixes are not offered as a tool.
+
+## Tamper-evident audit log
+
+Each line of `~/.ferrika/audit.log` now records the OS user and two hashes:
+`prev` (the previous line's `hash`, or SHA-256 of an older unchained line,
+or 64 zeros for the first line) and `hash` (SHA-256 of the line's JSON
+without `hash`). Older unchained lines at the start stay readable.
+
+```bash
+ferrika audit verify      # ✔ OK, or ✖ the first edited/inserted/removed line (exit code 2)
+ferrika audit verify --anchor   # also compare with the OS log anchor (truncated/rewritten → exit code 2)
+ferrika audit             # now with a USER column
+```
+
+Entries written by the policy: `policy.blocked`, `policy.invalid`,
+`policy.override_ignored`, `record.unmask` (user, time, profile, topic, partition/offset, reason),
+`record.export` (`export: audited`; source `cli`, `gui` or `mcp`, target
+`export:<channel> <command> <topic>`, outcome `requested` before the export and `records: N` after it where known;
+no file paths). A refused export is a `policy.blocked` entry with an
+`export:` target.
+
+Changes recorded for undo carry two optional fields: `op` (the operation id
+in `history.jsonl`) and `op_digest` (SHA-256 of its recorded before- and
+after-state). In the CLI the request line (outcome `requested`) already
+names the `op`, and a second line with the same action and `op` gives the
+result and adds `op_digest` once the change has run; a command that changes
+several resources (`offset delete-group a b`) names its first operation on
+the request line, and each operation has its own result line. The desktop app
+writes both fields on its one outcome line. Lines are matched by `op`, so
+lines written before this layout (a separate `<command> recorded` result
+line) still verify. Lines without an operation leave the fields out, so
+older lines and `audit verify` are unaffected. A refused undo of an edited
+history entry writes `history.tampered`. The history file itself (it holds
+config values) is not forwarded to a SIEM.
+
+### Truncation detection: `seq` and the OS log anchor
+
+Every chained line also carries `seq`, its 1-based position among the
+chained lines (inside the hashed JSON). Lines written by older versions have
+no `seq` but still count, so the first line written after upgrading gets
+`seq` = number of existing chained lines + 1 (the appender reads the file
+once to count them; afterwards it continues from the last line). Torn
+fragments do not count. `audit verify` reports a line whose `seq` is not its
+position.
+
+With `"audit_anchor": "os_log"` each append (inside the log's file lock)
+also writes `ferrika-audit-anchor seq=<n> hash=<hex> log=<path>`:
+
+- Windows: Application log, source `Ferrika`, event ID 1000
+  (`ReportEventW`). `ferrika audit verify --anchor` reads the log backwards
+  for the newest anchor of this audit log and compares: log shorter than the
+  anchored `seq` or a different hash at that `seq` → "truncated or
+  rewritten", exit code 2. A log longer than its anchor is fine (later anchor
+  writes may have failed).
+- Linux / macOS: syslog (ident `ferrika`, facility auth). Not read back;
+  `--anchor` says so and the check is manual (`journalctl -t ferrika`; see
+  [packaging/README.md](../packaging/README.md#audit-anchor-on-linux-journald--syslog)
+  for persistent journald and forwarding).
+
+Writing events needs no administrator rights, but without a registered
+source Event Viewer shows "The description for Event ID 1000 from source
+Ferrika cannot be found" (the message is stored and read back anyway).
+Register the source once per machine in the installer or deployment script
+(`packaging/windows/Install-FerrikaPolicy.ps1` and the WiX fragment do it;
+by hand, administrator PowerShell):
+
+```powershell
+New-EventLog -LogName Application -Source Ferrika
+```
+
+`New-EventLog` creates the registry key
+`HKLM\SYSTEM\CurrentControlSet\Services\EventLog\Application\Ferrika`
+(with the .NET `EventLogMessages.dll` as `EventMessageFile`); an MSI can
+create the same key directly. Remove it with `Remove-EventLog -Source Ferrika`.
+
+The real-OS round trip is an ignored test:
+`cargo test os_log_anchor_round_trip -- --ignored`.
+
+A failed anchor write prints a warning and the change goes ahead, unless
+`anchor_required: true`. Limits: any process of the same user can write a
+forged `Ferrika` event, and an administrator can clear the Application log;
+the anchor makes a quiet truncation leave a trace, it does not make one
+impossible. Older Ferrika binaries refuse a policy with these fields
+(unknown rule → strictest mode), so roll out the binary first.
+
+## Korean PII
+
+Masking and `ferrika crypto audit` also recognise 주민등록번호/외국인등록번호
+(`YYMMDD-GXXXXXX` with a real birth date; bare 13 digits must also pass the
+pre-2020 checksum or have a 2020+ birth year), 휴대전화 (`01[016789]-…`),
+사업자등록번호 (`XXX-XX-XXXXX` with checksum) and 계좌번호 (values under
+`account`/`acct`/`account_no`/`계좌` keys, or 11–14 digit hyphenated formats
+that are not phone-shaped).
+
+Names have no pattern, so they are recognised by their JSON key
+(case-insensitive; `_`, `-`, `.` and spaces ignored, so `firstName` and
+`first_name` match): `name`, `full_name`, `first_name`, `last_name`,
+`surname`, `customer`, `customer_name`, `holder`, `holder_name`,
+`card_holder`, `recipient(s)`, `sender_name`, `payer`, `payee`,
+`beneficiary`, `이름`, `성명`, `성함`, `고객`, `고객명`, `예금주`, `수취인`,
+`수령인`, `받는사람`, `보내는사람` and a few more (`NAME_KEYS` in
+`crates/ferrika-core/src/codec/pii.rs`). Only exact keys count: `topic_name`,
+`connector_name`, `file_name`, `schema_name`, `host_name`, `display_name`
+and `username` are left alone. String values (and the strings of an array)
+are masked partially: `김민준` → `김*준`, `남궁민수` → `남**수`, `김민` → `김*`,
+`John Smith` → `J*** S****`. `crypto audit` reports them as `Person Name`.
+Names inside free text (non-JSON payloads) are not detected.
+
+## Limits (what this is and is not)
+
+- The trust anchor is the machine-wide directory. A local administrator can
+  replace `policy.pub` (or add to `policy.keys`) and `company.policy` with
+  their own pair, or delete them all (Ferrika then runs without a policy). The policy protects against
+  honest-but-careless users and makes deviation detectable; it is not DRM.
+  Pair it with broker-side ACLs for hard guarantees.
+- The audit chain detects edits, insertions and deletions **inside** the log.
+  Truncating the end, or deleting the whole file, leaves a valid shorter
+  chain; ship the log off the machine with `audit_forward` (or anchor the
+  last hash) for that.
+  `audit_anchor: os_log` plus `audit verify --anchor` detects that on
+  Windows (see above), or ship the log off the machine. Two Ferrika
+  processes appending at the same instant can fork the chain.
+- `export: forbidden` and the watermark do not stop screen photos, terminal
+  scrollback, remote-desktop clipboards, memory dumps or a local
+  administrator. They stop the obvious paths (files, clipboard, pipes,
+  another cluster, AI tools) and make the rest traceable.
+- The policy is read once at start-up; restart Ferrika after installing a new one.
+
+## Threat model and what open source changes
+
+Ferrika's source is public under Apache-2.0. That has one consequence for this
+feature that you should plan for:
+
+- **Anyone can build a Ferrika without the policy checks.** The signature
+  verification, the read-only and masking gates and the audit log are ordinary
+  code in this repository. A user who can compile Rust, or who can download a
+  modified binary, can run a build that skips them, trusts a different
+  `policy.pub`, or writes no audit entries. Debug builds also honour
+  `FERRIKA_POLICY_DIR`, and a build with the `dev-policy-dir` feature does too.
+  Open source did not create this risk (a closed binary can be patched as
+  well) but it makes it cheaper.
+- **The cryptography does not depend on secrecy.** Ed25519 verification needs
+  only the public key. Knowing the code does not let anyone forge a policy
+  signed by your private key; it lets them run code that does not ask for one.
+- **So enforcement comes from controlling which binary runs, not from the
+  binary alone.** To make the policy binding, allow only the signed official
+  Ferrika binary on managed machines and block everything else that a user
+  could build or download:
+  - Windows: AppLocker or Windows Defender Application Control (WDAC) rules
+    that allow the official executable by publisher or file hash, deployed with
+    Intune or Group Policy; no rule for user-writable folders (home directory,
+    `target\`, Downloads).
+  - macOS: an MDM that allows only the notarized official app and the CLI by
+    signing identity; Gatekeeper alone is not enough for command-line tools
+    that a user compiles on the machine.
+  - Linux: install the official package from an internal repository and use
+    an allow-list mechanism such as fapolicyd or IMA so that binaries from home
+    directories do not run.
+  - Do not give users local administrator rights or a compiler toolchain on
+    machines where the policy must hold.
+- **Release binaries are not code-signed yet** (see [SECURITY.md](../SECURITY.md)).
+  Until they are, an allow rule can pin the SHA-256 hash of a release you
+  have reviewed instead of a publisher. Check the hash against a build you
+  made yourself from a tagged source tree.
+- **Official builds must not enable `dev-policy-dir` or `test-util`.** The
+  first lets a user point Ferrika at a policy they signed themselves; the
+  second builds policies without a signature, and a build without debug
+  assertions refuses to compile it.
+- **Detection and hard limits still apply.** Forward audit entries off the
+  machine (`audit_forward`) and anchor them (`audit_anchor`) so that a
+  modified or missing log is visible. Use broker-side ACLs, quotas and network
+  rules for guarantees that must not depend on the client at all.
+
+In short: the policy is a control for honest-but-careless users on managed
+machines. It is not a defence against a user who can run software of their own
+choosing.
