@@ -36,7 +36,7 @@ jobs:
       matrix:
         include:
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-apple-darwin
             os: macos-15-intel
           # The oldest supported Ubuntu keeps the glibc requirement low.
@@ -168,7 +168,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15-intel, ubuntu-latest]
+        os: [macos-15, macos-15-intel, ubuntu-latest]
     steps:
       - name: Put Homebrew on PATH (Linux)
         if: runner.os == 'Linux'
@@ -185,7 +185,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15-intel, ubuntu-22.04, ubuntu-22.04-arm, windows-latest]
+        os: [macos-15, macos-15-intel, ubuntu-22.04, ubuntu-22.04-arm, windows-latest]
     env:
       FERRIKA_VERSION: ${{ github.ref_name }}
     steps:
