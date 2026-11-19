@@ -23,7 +23,7 @@ and a C compiler:
 
 ```bash
 git clone https://github.com/Jangmyun/ferrika.git
-cd Ferrika
+cd ferrika
 cargo build --release -p ferrika-cli
 ./target/release/ferrika --version
 ```

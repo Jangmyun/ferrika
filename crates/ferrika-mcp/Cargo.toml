@@ -6,6 +6,9 @@ description = "Ferrika MCP server: Kafka cluster tools for AI agents, read-only 
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords = ["kafka", "mcp", "ai-agents", "llm", "model-context"]
+categories = ["development-tools", "network-programming"]
 
 [dependencies]
 ferrika-core.workspace = true
