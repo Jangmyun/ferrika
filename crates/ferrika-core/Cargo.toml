@@ -6,6 +6,9 @@ description = "Ferrika engine: Kafka clients, record formats and domain model"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords = ["kafka", "schema-registry", "avro", "protobuf", "kafka-connect"]
+categories = ["api-bindings", "encoding", "network-programming"]
 
 [dependencies]
 tokio.workspace = true

@@ -6,6 +6,9 @@ description = "Ferrika governance: signed company policy, hash-chained audit log
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords = ["kafka", "policy", "audit-log", "compliance", "siem"]
+categories = ["cryptography", "development-tools"]
 
 [dependencies]
 ferrika-core.workspace = true

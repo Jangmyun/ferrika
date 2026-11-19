@@ -6,6 +6,9 @@ description = "Ferrika operations: backup, mirror, DLQ, diff, lint, health, repo
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords = ["kafka", "backup", "mirror", "dead-letter-queue", "lint"]
+categories = ["development-tools", "network-programming"]
 
 [dependencies]
 ferrika-core.workspace = true

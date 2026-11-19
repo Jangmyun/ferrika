@@ -6,6 +6,9 @@ description.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+readme = "README.md"
+keywords = ["kafka", "cli", "schema-registry", "kafka-connect", "devops"]
+categories = ["command-line-utilities", "development-tools"]
 
 [lib]
 name = "ferrika_cli"
