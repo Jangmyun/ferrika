@@ -290,8 +290,9 @@ async fn message_histogram(context: &ResolvedContext, args: &Value) -> KafkaResu
 
 fn histogram_json(hist: &ferrika_ops::time_histogram::TimeHistogram) -> Value {
     let iso = |ms: i64| {
-        chrono::DateTime::from_timestamp_millis(ms)
-            .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        jiff::Timestamp::from_millisecond(ms)
+            .ok()
+            .map(|t| t.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
             .unwrap_or_default()
     };
     json!({
@@ -747,7 +748,7 @@ async fn peek_messages(context: &ResolvedContext, args: &Value) -> KafkaResult<V
             let mut record = json!({
                 "partition": m.partition,
                 "offset": m.offset,
-                "timestamp": m.timestamp_ms.and_then(chrono::DateTime::from_timestamp_millis).map(|t| t.to_rfc3339()),
+                "timestamp": m.timestamp_ms.and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok()).map(ferrika_core::model::time::rfc3339),
                 "key": match &key_text {
                     Some(k) => record_text(Some(k.as_bytes()), mask),
                     None => record_text(m.key.as_deref(), mask),

@@ -126,8 +126,11 @@ fn seconds_nanos(bytes: &[u8]) -> KafkaResult<(i64, i32)> {
 }
 
 fn timestamp_text(seconds: i64, nanos: i32) -> Option<String> {
-    let t = chrono::DateTime::from_timestamp(seconds, u32::try_from(nanos).ok()?)?;
-    Some(t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+    if !(0..1_000_000_000).contains(&nanos) {
+        return None;
+    }
+    let t = jiff::Timestamp::new(seconds, nanos).ok()?;
+    Some(crate::model::time::rfc3339_z(t))
 }
 
 fn duration_text(seconds: i64, nanos: i32) -> String {
@@ -1205,22 +1208,23 @@ impl ProtoSchema {
                 match known {
                     WellKnown::Timestamp => {
                         let text = value.as_str().ok_or_else(|| bad("an RFC 3339 time"))?;
-                        let t = chrono::DateTime::parse_from_rfc3339(text)
+                        let t = text
+                            .parse::<jiff::Timestamp>()
                             .map_err(|_| bad("an RFC 3339 time"))?;
                         self.write_field(
                             &mut nested,
                             1,
                             &FieldType::Scalar(Scalar::Int64),
-                            &Value::from(t.timestamp()),
+                            &Value::from(t.as_second()),
                             path,
                             depth,
                         )?;
-                        if t.timestamp_subsec_nanos() > 0 {
+                        if t.subsec_nanosecond() > 0 {
                             self.write_field(
                                 &mut nested,
                                 2,
                                 &FieldType::Scalar(Scalar::Int32),
-                                &Value::from(t.timestamp_subsec_nanos()),
+                                &Value::from(t.subsec_nanosecond()),
                                 path,
                                 depth,
                             )?;

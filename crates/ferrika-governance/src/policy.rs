@@ -17,7 +17,7 @@ use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use crate::audit::AuditEntry;
 use ferrika_core::kafka::config::KafkaClientConfig;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use ferrika_core::model::policy::{
     ExpiryRule, ExportRule, MaskingRule, PolicyAction, PolicyPayload, PolicyRules, SignedPolicy,
@@ -302,7 +302,7 @@ pub fn trusted_keys(dir: &Path) -> Result<Vec<TrustedKey>, PolicyError> {
 /// When a policy expires and what happens then.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyExpiry {
-    pub at: DateTime<Utc>,
+    pub at: Timestamp,
     /// `expires_at` as written in the policy, for messages.
     pub text: String,
     pub on_expiry: ExpiryRule,
@@ -315,13 +315,11 @@ pub fn parse_expiry(payload: &PolicyPayload) -> Result<Option<PolicyExpiry>, Pol
         return Ok(None);
     };
     let text = text.trim();
-    let at = DateTime::parse_from_rfc3339(text)
-        .map_err(|e| {
-            PolicyError::Rules(format!(
-                "expires_at \"{text}\" is not an RFC 3339 time such as 2027-06-30T23:59:59+09:00 ({e})"
-            ))
-        })?
-        .with_timezone(&Utc);
+    let at = text.parse::<Timestamp>().map_err(|e| {
+        PolicyError::Rules(format!(
+            "expires_at \"{text}\" is not an RFC 3339 time such as 2027-06-30T23:59:59+09:00 ({e})"
+        ))
+    })?;
     Ok(Some(PolicyExpiry {
         at,
         text: text.to_string(),
@@ -343,18 +341,18 @@ pub enum ExpiryState {
 }
 
 impl PolicyExpiry {
-    pub fn state_at(&self, now: DateTime<Utc>) -> ExpiryState {
+    pub fn state_at(&self, now: Timestamp) -> ExpiryState {
         if now >= self.at {
             return match self.on_expiry {
                 ExpiryRule::Warn => ExpiryState::ExpiredWarn,
                 ExpiryRule::Strictest => ExpiryState::ExpiredStrictest,
             };
         }
-        let left = self.at - now;
-        if left > chrono::Duration::days(EXPIRY_WARNING_DAYS) {
+        let left = self.at.duration_since(now);
+        if left > jiff::SignedDuration::from_hours(EXPIRY_WARNING_DAYS * 24) {
             return ExpiryState::Current;
         }
-        let secs = left.num_seconds().max(1);
+        let secs = left.as_secs().max(1);
         ExpiryState::ExpiresSoon {
             days_left: (secs + 86_399) / 86_400,
         }
@@ -536,7 +534,7 @@ impl EffectivePolicy {
     }
 
     /// Where the policy stands against its expiry at `now`.
-    pub fn expiry_state_at(&self, now: DateTime<Utc>) -> ExpiryState {
+    pub fn expiry_state_at(&self, now: Timestamp) -> ExpiryState {
         match (&self.status, &self.expiry) {
             (PolicyStatus::Verified { .. }, Some(expiry)) => expiry.state_at(now),
             _ => ExpiryState::Current,
@@ -545,19 +543,19 @@ impl EffectivePolicy {
 
     /// Whether the strictest rules apply at `now`: the policy cannot be
     /// verified, or it expired with `on_expiry: strictest`.
-    pub fn is_strictest_at(&self, now: DateTime<Utc>) -> bool {
+    pub fn is_strictest_at(&self, now: Timestamp) -> bool {
         self.is_invalid() || self.expiry_state_at(now) == ExpiryState::ExpiredStrictest
     }
 
     pub fn is_strictest(&self) -> bool {
-        self.is_strictest_at(Utc::now())
+        self.is_strictest_at(Timestamp::now())
     }
 
     /// Whether a write is judged by broker addresses (`read_only_brokers`),
     /// so the brokers named by cluster metadata matter too. False when no
     /// policy is installed or it sets no such rule: nothing to fetch then.
     pub fn write_needs_broker_metadata(&self) -> bool {
-        self.is_active() && !self.rules_at(Utc::now()).read_only_brokers.is_empty()
+        self.is_active() && !self.rules_at(Timestamp::now()).read_only_brokers.is_empty()
     }
 
     /// Whether an export is judged by broker addresses (`export_clusters`
@@ -566,13 +564,13 @@ impl EffectivePolicy {
         if !self.is_active() {
             return false;
         }
-        let rules = self.rules_at(Utc::now());
+        let rules = self.rules_at(Timestamp::now());
         !rules.export.is_allowed() && !rules.export_clusters.is_empty()
     }
 
     /// The rules in force at `now`: the strictest ones once a policy with
     /// `on_expiry: strictest` has expired.
-    pub fn rules_at(&self, now: DateTime<Utc>) -> std::borrow::Cow<'_, PolicyRules> {
+    pub fn rules_at(&self, now: Timestamp) -> std::borrow::Cow<'_, PolicyRules> {
         if self.expiry_state_at(now) == ExpiryState::ExpiredStrictest {
             std::borrow::Cow::Owned(PolicyRules::strictest())
         } else {
@@ -582,7 +580,7 @@ impl EffectivePolicy {
 
     /// A short note on the expiry for labels and badges (`expires in 3
     /// days`, `expired 2026-11-01T00:00:00Z`), or `None` when none is due.
-    pub fn expiry_note_at(&self, now: DateTime<Utc>) -> Option<String> {
+    pub fn expiry_note_at(&self, now: Timestamp) -> Option<String> {
         let expiry = self.expiry.as_ref()?;
         match self.expiry_state_at(now) {
             ExpiryState::Current => None,
@@ -596,7 +594,7 @@ impl EffectivePolicy {
     }
 
     /// The expiry warning the CLI prints on stderr, if one is due at `now`.
-    pub fn expiry_warning_at(&self, now: DateTime<Utc>) -> Option<String> {
+    pub fn expiry_warning_at(&self, now: Timestamp) -> Option<String> {
         let expiry = self.expiry.as_ref()?;
         let name = self.name();
         match self.expiry_state_at(now) {
@@ -620,11 +618,11 @@ impl EffectivePolicy {
     /// Who the policy names, for messages; with the expiry note once one is
     /// due (`company policy by 보안팀, key …, expires in 3 days`).
     pub fn label(&self) -> String {
-        self.label_at(Utc::now())
+        self.label_at(Timestamp::now())
     }
 
     /// [`Self::label`] at `now`.
-    pub fn label_at(&self, now: DateTime<Utc>) -> String {
+    pub fn label_at(&self, now: Timestamp) -> String {
         let name = self.name();
         match self.expiry_note_at(now) {
             Some(note) => format!("{name} ({note})"),
@@ -655,13 +653,13 @@ impl EffectivePolicy {
         profile: &str,
         bootstrap: &str,
     ) -> Result<(), PolicyRefusal> {
-        self.check_at(Utc::now(), action, profile, bootstrap)
+        self.check_at(Timestamp::now(), action, profile, bootstrap)
     }
 
     /// [`Self::check`] at `now`.
     pub fn check_at(
         &self,
-        now: DateTime<Utc>,
+        now: Timestamp,
         action: PolicyAction,
         profile: &str,
         bootstrap: &str,
@@ -711,13 +709,13 @@ impl EffectivePolicy {
     /// brokers (`read_only`), or one of its brokers (`read_only_brokers`).
     /// `bootstrap` is a comma-separated list of broker addresses.
     pub fn read_only_match(&self, profile: &str, bootstrap: &str) -> Option<String> {
-        self.read_only_match_at(Utc::now(), profile, bootstrap)
+        self.read_only_match_at(Timestamp::now(), profile, bootstrap)
     }
 
     /// [`Self::read_only_match`] at `now`.
     pub fn read_only_match_at(
         &self,
-        now: DateTime<Utc>,
+        now: Timestamp,
         profile: &str,
         bootstrap: &str,
     ) -> Option<String> {
@@ -728,7 +726,7 @@ impl EffectivePolicy {
     /// The matching read-only rule and what it matched, for messages.
     fn read_only_hit_at(
         &self,
-        now: DateTime<Utc>,
+        now: Timestamp,
         profile: &str,
         bootstrap: &str,
     ) -> Option<ReadOnlyHit> {
@@ -759,19 +757,19 @@ impl EffectivePolicy {
     }
 
     pub fn masking_enforced(&self) -> bool {
-        self.masking_enforced_at(Utc::now())
+        self.masking_enforced_at(Timestamp::now())
     }
 
-    pub fn masking_enforced_at(&self, now: DateTime<Utc>) -> bool {
+    pub fn masking_enforced_at(&self, now: Timestamp) -> bool {
         self.is_active() && self.rules_at(now).masking == MaskingRule::Enforced
     }
 
     /// How unmasking is handled when masking is enforced.
     pub fn unmask(&self) -> UnmaskRule {
-        self.unmask_at(Utc::now())
+        self.unmask_at(Timestamp::now())
     }
 
-    pub fn unmask_at(&self, now: DateTime<Utc>) -> UnmaskRule {
+    pub fn unmask_at(&self, now: Timestamp) -> UnmaskRule {
         if self.masking_enforced_at(now) {
             self.rules_at(now).unmask
         } else {
@@ -780,10 +778,10 @@ impl EffectivePolicy {
     }
 
     pub fn audit_required(&self) -> bool {
-        self.audit_required_at(Utc::now())
+        self.audit_required_at(Timestamp::now())
     }
 
-    pub fn audit_required_at(&self, now: DateTime<Utc>) -> bool {
+    pub fn audit_required_at(&self, now: Timestamp) -> bool {
         self.is_active()
             && self.rules_at(now).audit == ferrika_core::model::policy::AuditRule::Required
     }
@@ -792,14 +790,14 @@ impl EffectivePolicy {
     /// comma-separated broker list) is handled now; see
     /// [`Self::export_rule_at`].
     pub fn export_rule(&self, bootstrap: &str) -> ExportRule {
-        self.export_rule_at(Utc::now(), bootstrap)
+        self.export_rule_at(Timestamp::now(), bootstrap)
     }
 
     /// The `export` rule at `now`, for the cluster at `bootstrap`: `allowed`
     /// when no policy is installed or `export_clusters` names none of its
     /// brokers. Like `read_only_brokers`, `export_clusters` matches broker
     /// addresses only, never the (user-chosen) profile name.
-    pub fn export_rule_at(&self, now: DateTime<Utc>, bootstrap: &str) -> ExportRule {
+    pub fn export_rule_at(&self, now: Timestamp, bootstrap: &str) -> ExportRule {
         if !self.is_active() {
             return ExportRule::Allowed;
         }
@@ -822,7 +820,7 @@ impl EffectivePolicy {
     }
 
     /// The watermark the GUI draws at `now`, if the rules turn it on.
-    pub fn watermark_at(&self, now: DateTime<Utc>) -> Option<WatermarkSpec> {
+    pub fn watermark_at(&self, now: Timestamp) -> Option<WatermarkSpec> {
         if !self.is_active() {
             return None;
         }
@@ -1066,7 +1064,7 @@ pub fn current() -> &'static EffectivePolicy {
         }
         // The CLI warns once per run; the GUI shows it in the badge, which
         // re-checks the time on every render.
-        if let Some(warning) = policy.expiry_warning_at(Utc::now()) {
+        if let Some(warning) = policy.expiry_warning_at(Timestamp::now()) {
             ferrika_core::notice::warn(&warning);
         }
         policy
@@ -1271,7 +1269,7 @@ pub fn authorize_write_with(
     mode: AuditMode,
     profile_check: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), WriteRefusal> {
-    authorize_write_at(policy, sink, request, mode, Utc::now(), profile_check)
+    authorize_write_at(policy, sink, request, mode, Timestamp::now(), profile_check)
 }
 
 /// [`authorize_write_with`] at `now` (the policy's expiry is judged then).
@@ -1280,7 +1278,7 @@ pub fn authorize_write_at(
     sink: &impl AuditSink,
     request: &WriteRequest<'_>,
     mode: AuditMode,
-    now: DateTime<Utc>,
+    now: Timestamp,
     profile_check: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), WriteRefusal> {
     if let Err(reason) = policy.check_at(now, request.action, request.profile, request.bootstrap) {
@@ -1439,7 +1437,7 @@ pub fn authorize_export_with(
     sink: &impl AuditSink,
     request: &ExportRequest<'_>,
 ) -> Result<(), WriteRefusal> {
-    let now = Utc::now();
+    let now = Timestamp::now();
     match policy.export_rule_at(now, request.bootstrap) {
         ExportRule::Allowed => Ok(()),
         ExportRule::Forbidden => {
@@ -2483,11 +2481,11 @@ mod tests {
         let invalid = EffectivePolicy::invalid(PathBuf::new(), "bad".into());
         assert_eq!(invalid.export_rule("localhost:9092"), ExportRule::Forbidden);
         assert_eq!(
-            invalid.watermark_at(Utc::now()),
+            invalid.watermark_at(Timestamp::now()),
             Some(WatermarkSpec { text: None })
         );
         let absent = EffectivePolicy::absent(PathBuf::new());
-        assert_eq!(absent.watermark_at(Utc::now()), None);
+        assert_eq!(absent.watermark_at(Timestamp::now()), None);
 
         let mut policy = export_policy(ExportRule::Audited, &["*.prod.corp"]);
         policy.rules.watermark = WatermarkRule::On;
@@ -2545,10 +2543,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    fn at(text: &str) -> DateTime<Utc> {
-        DateTime::parse_from_rfc3339(text)
-            .unwrap()
-            .with_timezone(&Utc)
+    fn at(text: &str) -> Timestamp {
+        text.parse().unwrap()
     }
 
     fn payload_with(extra: &str) -> String {

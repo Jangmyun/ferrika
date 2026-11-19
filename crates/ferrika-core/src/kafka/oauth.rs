@@ -11,7 +11,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::aws_sigv4::{self, AwsCredentials};
@@ -241,7 +241,7 @@ impl MskIamSource {
             .clone();
         let expiring = stored
             .expiration
-            .is_some_and(|exp| exp.timestamp_millis() - now_ms() < CREDENTIALS_EARLY_MS);
+            .is_some_and(|exp| exp.as_millisecond() - now_ms() < CREDENTIALS_EARLY_MS);
         if !expiring {
             return Ok(stored);
         }
@@ -253,11 +253,11 @@ impl MskIamSource {
     }
 
     /// A token signed at `now` with `credentials`.
-    pub fn token_at(credentials: &AwsCredentials, region: &str, now: DateTime<Utc>) -> OAuthToken {
-        let issued = now.timestamp_millis();
+    pub fn token_at(credentials: &AwsCredentials, region: &str, now: Timestamp) -> OAuthToken {
+        let issued = now.as_millisecond();
         let mut expires = issued + aws_sigv4::MSK_TOKEN_EXPIRES_SECS as i64 * 1000;
         if let Some(exp) = credentials.expiration {
-            expires = expires.min(exp.timestamp_millis());
+            expires = expires.min(exp.as_millisecond());
         }
         OAuthToken {
             value: aws_sigv4::msk_token(credentials, region, now),
@@ -282,7 +282,7 @@ impl TokenSource for MskIamSource {
     fn fetch(&self) -> BoxFuture<'_, KafkaResult<OAuthToken>> {
         Box::pin(async move {
             let credentials = self.current_credentials()?;
-            let token = Self::token_at(&credentials, &self.region, Utc::now());
+            let token = Self::token_at(&credentials, &self.region, Timestamp::now());
             if token.expires_at_ms <= now_ms() {
                 return Err(KafkaError::config(
                     "The AWS credentials have expired; refresh them (aws sso login, ...)",
@@ -594,7 +594,6 @@ pub fn blocking_token(source: &dyn TokenSource) -> KafkaResult<OAuthToken> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     /// A one-shot token endpoint: reads one request (headers and
     /// Content-Length body), answers `reply`, and hands the request back.
@@ -867,7 +866,7 @@ mod tests {
 
     #[test]
     fn msk_token_lifetime_is_capped_by_the_credentials() {
-        let now = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let now: Timestamp = "2024-01-01T00:00:00Z".parse().unwrap();
         let mut credentials = AwsCredentials::new("AKIDX", "secret");
         let t = MskIamSource::token_at(&credentials, "us-east-1", now);
         assert_eq!(t.expires_at_ms - t.issued_at_ms, 900_000);
@@ -875,7 +874,7 @@ mod tests {
         let url = String::from_utf8(base64url_decode(&t.value).unwrap()).unwrap();
         assert!(url.starts_with("https://kafka.us-east-1.amazonaws.com/?Action="));
 
-        credentials.expiration = Some(now + chrono::Duration::seconds(300));
+        credentials.expiration = Some(now + jiff::SignedDuration::from_secs(300));
         let t = MskIamSource::token_at(&credentials, "us-east-1", now);
         assert_eq!(t.expires_at_ms - t.issued_at_ms, 300_000);
     }

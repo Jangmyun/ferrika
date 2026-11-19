@@ -3,7 +3,7 @@
 #   cargo deny check
 #
 # The license list below was derived from Cargo.lock of the public crates
-# (`ferrika-core`, `ferrika-cli`; 285 third-party crates) with
+# (`ferrika-core`, `ferrika-cli`; 257 third-party crates) with
 # `python3 tools/sbom.py --package ferrika-cli`; see docs/sbom/LICENSES-ferrika-cli.md.
 # Many crates carry an "A OR B" expression: it is enough that one alternative
 # is allowed, so a copyleft alternative such as the LGPL option of one crate
@@ -50,12 +50,6 @@ wildcards = "allow"
 [advisories]
 # Uses the RustSec advisory database (needs network access in CI).
 yanked = "warn"
-ignore = [
-    # Unmaintained notice (not a vulnerability, no patched version), added to
-    # the database on 2026-11-17. Replacing chrono with jiff or time is planned
-    # before the first crates.io release.
-    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; migration to jiff/time planned before 0.1" },
-]
 
 [sources]
 unknown-registry = "deny"

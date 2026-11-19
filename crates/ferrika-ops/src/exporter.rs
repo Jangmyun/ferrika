@@ -278,7 +278,7 @@ pub async fn scrape_cluster_metrics(
         .map(|l| (l.topic.clone(), l.partition, l.current_offset.max(-1)))
         .collect();
     if !positions.is_empty() {
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = jiff::Timestamp::now().as_millisecond();
         let times = timestamps_at(config, &positions).await;
         metrics.lag_seconds = metrics
             .consumer_lags

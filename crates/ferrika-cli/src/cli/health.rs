@@ -195,7 +195,7 @@ async fn watch(args: &HealthArgs, global: &GlobalOpts, every: Duration) -> Kafka
             }
         };
         let (appeared, cleared) = diff_findings(&before, &now);
-        let stamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        let stamp = jiff::ZonedDateTime::now().strftime("%Y-%m-%d %H:%M:%S");
         for issue in &appeared {
             println!("{stamp} {} {}", severity_tag(issue.severity), issue.message);
         }

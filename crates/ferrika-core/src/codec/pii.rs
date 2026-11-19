@@ -462,7 +462,13 @@ fn valid_rrn_date(yymmdd: &str, gender: u32) -> bool {
         _ => return false,
     };
     // Nobody is born in the future.
-    if i64::from(year) > i64::from(chrono::Datelike::year(&chrono::Utc::now())) {
+    if i64::from(year)
+        > i64::from(
+            jiff::Timestamp::now()
+                .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+                .year(),
+        )
+    {
         return false;
     }
     let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;

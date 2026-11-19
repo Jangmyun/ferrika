@@ -121,7 +121,7 @@ impl WriteTools {
             config,
             ferrika_governance::policy::current(),
             Box::new(ferrika_governance::policy::AuditLog),
-            Box::new(chrono::Utc::now),
+            Box::new(jiff::Timestamp::now),
         );
         let backend = Box::new(KafkaBackend {
             config: context.config.clone(),
@@ -1265,8 +1265,8 @@ fn reset_strategy(to: Option<&Value>) -> Result<ResetStrategy, ToolError> {
                 "shift" => value.as_i64().map(ResetStrategy::Shift).ok_or_else(bad),
                 "timestamp" => value
                     .as_str()
-                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                    .map(|t| ResetStrategy::Timestamp(t.timestamp_millis()))
+                    .and_then(|t| t.parse::<jiff::Timestamp>().ok())
+                    .map(|t| ResetStrategy::Timestamp(t.as_millisecond()))
                     .ok_or_else(bad),
                 _ => Err(bad()),
             }
@@ -1459,7 +1459,7 @@ fn plan_result(
     tool: &str,
     planned: &Planned,
     token: &str,
-    expires: chrono::DateTime<chrono::Utc>,
+    expires: jiff::Timestamp,
     asks_person: bool,
 ) -> Value {
     let next = if asks_person {
@@ -1471,14 +1471,14 @@ fn plan_result(
         format!(
             "To run it, call {tool} again with the same arguments, mode \"execute\" and \
              confirmation \"{token}\" (valid until {}, once).",
-            expires.to_rfc3339()
+            ferrika_core::model::time::rfc3339(expires)
         )
     };
     let structured = json!({
         "plan": planned.plan,
         "confirmation": {
             "token": token,
-            "expires_at": expires.to_rfc3339(),
+            "expires_at": ferrika_core::model::time::rfc3339(expires),
             "summary": planned.summary,
             "destructive": planned.destructive,
             "by": if asks_person { "user" } else { "token" },

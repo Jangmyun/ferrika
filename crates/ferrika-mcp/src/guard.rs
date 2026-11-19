@@ -9,7 +9,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 
-use chrono::{DateTime, Duration, Utc};
+use jiff::{SignedDuration, Timestamp};
 use serde_json::{json, Value};
 
 use ferrika_core::model::policy::PolicyAction;
@@ -147,16 +147,16 @@ pub(super) struct WriteGuard {
     config: GuardConfig,
     policy: &'static EffectivePolicy,
     sink: DedupSink,
-    clock: Box<dyn Fn() -> DateTime<Utc>>,
+    clock: Box<dyn Fn() -> Timestamp>,
     actor: String,
     session: String,
     tokens: VecDeque<Token>,
-    plans: VecDeque<DateTime<Utc>>,
-    executes: VecDeque<DateTime<Utc>>,
+    plans: VecDeque<Timestamp>,
+    executes: VecDeque<Timestamp>,
     produced: u64,
     /// The last refusal and how many times in a row it came.
     streak: Option<(String, u32)>,
-    cooldown_until: Option<DateTime<Utc>>,
+    cooldown_until: Option<Timestamp>,
     writes: u64,
     refused: u64,
 }
@@ -166,7 +166,7 @@ struct Token {
     tool: &'static str,
     args_digest: String,
     plan_digest: String,
-    created: DateTime<Utc>,
+    created: Timestamp,
 }
 
 impl WriteGuard {
@@ -174,7 +174,7 @@ impl WriteGuard {
         config: GuardConfig,
         policy: &'static EffectivePolicy,
         sink: Box<dyn AuditSink>,
-        clock: Box<dyn Fn() -> DateTime<Utc>>,
+        clock: Box<dyn Fn() -> Timestamp>,
     ) -> Self {
         let session = random_hex(4);
         Self {
@@ -195,7 +195,7 @@ impl WriteGuard {
         }
     }
 
-    pub(super) fn now(&self) -> DateTime<Utc> {
+    pub(super) fn now(&self) -> Timestamp {
         (self.clock)()
     }
 
@@ -275,7 +275,7 @@ impl WriteGuard {
     pub(super) fn check_cooldown(&self) -> Result<(), ToolError> {
         match self.cooldown_until {
             Some(until) if self.now() < until => {
-                let left = (until - self.now()).num_seconds().max(1);
+                let left = until.duration_since(self.now()).as_secs().max(1);
                 Err(ToolError::new(
                     "cooldown",
                     format!(
@@ -319,14 +319,14 @@ impl WriteGuard {
         };
         while window
             .front()
-            .is_some_and(|t| now - *t >= Duration::seconds(60))
+            .is_some_and(|t| now.duration_since(*t) >= SignedDuration::from_secs(60))
         {
             window.pop_front();
         }
         if window.len() >= limit as usize {
             let wait = window
                 .front()
-                .map(|t| 60 - (now - *t).num_seconds())
+                .map(|t| 60 - now.duration_since(*t).as_secs())
                 .unwrap_or(60)
                 .max(1);
             return Err(ToolError::new(
@@ -424,7 +424,7 @@ impl WriteGuard {
         tool: &'static str,
         args_digest: String,
         plan_digest: String,
-    ) -> (String, DateTime<Utc>) {
+    ) -> (String, Timestamp) {
         let now = self.now();
         self.drop_expired(now);
         if self.tokens.len() >= TOKENS_MAX {
@@ -438,7 +438,7 @@ impl WriteGuard {
             plan_digest,
             created: now,
         });
-        (id, now + Duration::seconds(TOKEN_TTL_SECS))
+        (id, now + SignedDuration::from_secs(TOKEN_TTL_SECS))
     }
 
     /// Uses up `token` for `tool` with these arguments, returning the
@@ -457,7 +457,7 @@ impl WriteGuard {
                 "Unknown or already used confirmation token; run the tool with mode \"plan\" again.",
             ));
         };
-        if now - found.created > Duration::seconds(TOKEN_TTL_SECS) {
+        if now.duration_since(found.created) > SignedDuration::from_secs(TOKEN_TTL_SECS) {
             return Err(ToolError::new(
                 "confirmation_expired",
                 format!(
@@ -483,9 +483,9 @@ impl WriteGuard {
         Ok(found.plan_digest)
     }
 
-    fn drop_expired(&mut self, now: DateTime<Utc>) {
+    fn drop_expired(&mut self, now: Timestamp) {
         self.tokens
-            .retain(|t| now - t.created <= Duration::seconds(TOKEN_TTL_SECS));
+            .retain(|t| now.duration_since(t.created) <= SignedDuration::from_secs(TOKEN_TTL_SECS));
     }
 
     /// Notes a call that ended in `error`; the same refusal
@@ -502,7 +502,7 @@ impl WriteGuard {
             _ => 1,
         };
         if count >= REPEATS_FOR_COOLDOWN {
-            self.cooldown_until = Some(self.now() + Duration::seconds(COOLDOWN_SECS));
+            self.cooldown_until = Some(self.now() + SignedDuration::from_secs(COOLDOWN_SECS));
             self.streak = None;
         } else {
             self.streak = Some((key, count));
@@ -519,7 +519,7 @@ impl WriteGuard {
 
     fn entry(&self, action: String, target: &str, outcome: &str, ok: bool) -> AuditEntry {
         AuditEntry {
-            time_ms: self.now().timestamp_millis(),
+            time_ms: self.now().as_millisecond(),
             source: "mcp".to_string(),
             profile: if self.config.profile.is_empty() {
                 self.config.bootstrap.clone()
@@ -735,22 +735,18 @@ pub(super) mod tests {
 
     /// A clock tests move by hand.
     #[derive(Clone)]
-    pub struct TestClock(pub Rc<Cell<DateTime<Utc>>>);
+    pub struct TestClock(pub Rc<Cell<Timestamp>>);
 
     impl TestClock {
         pub fn new() -> Self {
-            Self(Rc::new(Cell::new(
-                DateTime::parse_from_rfc3339("2026-11-03T09:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
-            )))
+            Self(Rc::new(Cell::new("2026-11-03T09:00:00Z".parse().unwrap())))
         }
 
         pub fn advance(&self, secs: i64) {
-            self.0.set(self.0.get() + Duration::seconds(secs));
+            self.0.set(self.0.get() + SignedDuration::from_secs(secs));
         }
 
-        pub fn boxed(&self) -> Box<dyn Fn() -> DateTime<Utc>> {
+        pub fn boxed(&self) -> Box<dyn Fn() -> Timestamp> {
             let cell = self.0.clone();
             Box::new(move || cell.get())
         }
@@ -904,9 +900,7 @@ pub(super) mod tests {
             key_id: "test".into(),
         };
         p.expiry = Some(PolicyExpiry {
-            at: DateTime::parse_from_rfc3339("2026-11-03T09:01:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            at: "2026-11-03T09:01:00Z".parse().unwrap(),
             text: "2026-11-03T09:01:00Z".into(),
             on_expiry: ExpiryRule::Strictest,
         });
@@ -924,7 +918,10 @@ pub(super) mod tests {
         let (mut guard, _, clock) = guard_with(config(), no_policy());
         let (token, expires) = guard.issue_token("create_topic", "a".into(), "p".into());
         assert_eq!(token.len(), 32);
-        assert_eq!(expires, guard.now() + Duration::seconds(TOKEN_TTL_SECS));
+        assert_eq!(
+            expires,
+            guard.now() + SignedDuration::from_secs(TOKEN_TTL_SECS)
+        );
         assert_eq!(
             guard.redeem_token("create_topic", &token, "a"),
             Ok("p".into())
