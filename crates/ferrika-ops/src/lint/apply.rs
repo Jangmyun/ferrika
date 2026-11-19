@@ -426,7 +426,7 @@ pub fn save_undo(profile: &str, undo: Vec<UndoChange>) -> std::io::Result<PathBu
     };
     let dir = undo_dir();
     std::fs::create_dir_all(&dir)?;
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    let stamp = jiff::ZonedDateTime::now().strftime("%Y%m%d-%H%M%S");
     let path = dir.join(format!("{stamp}.json"));
     let json = serde_json::to_string_pretty(&record).map_err(std::io::Error::other)?;
     std::fs::write(&path, json)?;

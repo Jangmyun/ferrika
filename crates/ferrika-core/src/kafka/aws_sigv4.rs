@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use ring::{digest, hmac};
 
 /// AWS access keys. `Debug` hides the secret and the session token.
@@ -19,7 +19,7 @@ pub struct AwsCredentials {
     pub secret_access_key: String,
     pub session_token: Option<String>,
     /// When temporary credentials stop working, if known.
-    pub expiration: Option<DateTime<Utc>>,
+    pub expiration: Option<Timestamp>,
 }
 
 impl AwsCredentials {
@@ -134,10 +134,10 @@ pub fn string_to_sign(amz_date: &str, scope: &str, canonical_request: &str) -> S
 pub fn presign_query(
     request: &PresignRequest<'_>,
     credentials: &AwsCredentials,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> String {
-    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
-    let date = now.format("%Y%m%d").to_string();
+    let amz_date = now.strftime("%Y%m%dT%H%M%SZ").to_string();
+    let date = now.strftime("%Y%m%d").to_string();
     let scope = format!("{date}/{}/{}/aws4_request", request.region, request.service);
 
     // Encoded key -> encoded value; BTreeMap sorts by encoded key, which is
@@ -178,7 +178,7 @@ pub fn presign_query(
 }
 
 /// The presigned MSK IAM URL for `region`, `User-Agent` parameter included.
-pub fn msk_presigned_url(credentials: &AwsCredentials, region: &str, now: DateTime<Utc>) -> String {
+pub fn msk_presigned_url(credentials: &AwsCredentials, region: &str, now: Timestamp) -> String {
     let host = format!("kafka.{region}.amazonaws.com");
     let request = PresignRequest {
         method: "GET",
@@ -210,17 +210,20 @@ pub fn base64url(data: &[u8]) -> String {
 
 /// The MSK IAM OAUTHBEARER token: the presigned URL, base64url-encoded
 /// without padding. It expires [`MSK_TOKEN_EXPIRES_SECS`] after `now`.
-pub fn msk_token(credentials: &AwsCredentials, region: &str, now: DateTime<Utc>) -> String {
+pub fn msk_token(credentials: &AwsCredentials, region: &str, now: Timestamp) -> String {
     base64url(msk_presigned_url(credentials, region, now).as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
-    fn at(s: &str) -> DateTime<Utc> {
-        Utc.from_utc_datetime(&chrono::NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%M%SZ").unwrap())
+    fn at(s: &str) -> Timestamp {
+        jiff::civil::DateTime::strptime("%Y%m%dT%H%M%SZ", s)
+            .unwrap()
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp()
     }
 
     /// AWS SigV4 test suite, `get-vanilla-query`: the signing key, canonical

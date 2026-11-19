@@ -331,8 +331,9 @@ pub fn rfc5424(
 
 /// RFC 3339 UTC with milliseconds, e.g. `2026-11-02T09:30:00.123Z`.
 fn timestamp(time_ms: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(time_ms)
-        .map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+    jiff::Timestamp::from_millisecond(time_ms)
+        .ok()
+        .map(|t| t.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
         .unwrap_or_else(|| "-".to_string())
 }
 

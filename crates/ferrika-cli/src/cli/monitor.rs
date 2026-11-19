@@ -281,7 +281,7 @@ async fn handle_lag(
             .filter(|p| p.lag > 0)
             .map(|p| (p.topic.clone(), p.partition, p.current_offset.max(-1)))
             .collect();
-        let now = chrono::Utc::now().timestamp_millis();
+        let now = jiff::Timestamp::now().as_millisecond();
         let behind: std::collections::HashMap<(String, i32), i64> =
             crate::kafka::consumer::record_timestamps(
                 &kafka_config,

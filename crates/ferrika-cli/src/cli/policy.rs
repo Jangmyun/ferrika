@@ -228,7 +228,7 @@ fn sign(key: &Path, input: &Path, out: &Path) -> anyhow::Result<()> {
         signed.format
     );
     if let Ok(Some(expiry)) = policy::parse_expiry(&parsed) {
-        println!("  {}", expiry_line(&expiry, chrono::Utc::now()));
+        println!("  {}", expiry_line(&expiry, jiff::Timestamp::now()));
     }
     Ok(())
 }
@@ -293,7 +293,7 @@ fn verify(
                     payload.issued_at
                 );
                 if let Ok(Some(expiry)) = policy::parse_expiry(&payload) {
-                    println!("  {}", expiry_line(&expiry, chrono::Utc::now()));
+                    println!("  {}", expiry_line(&expiry, jiff::Timestamp::now()));
                 }
             }
             Ok(())
@@ -304,7 +304,7 @@ fn verify(
 
 /// `expires 2027-06-30T23:59:59+09:00 (on expiry: warn)`, with how it stands
 /// at `now` once it is due.
-fn expiry_line(expiry: &PolicyExpiry, now: chrono::DateTime<chrono::Utc>) -> String {
+fn expiry_line(expiry: &PolicyExpiry, now: jiff::Timestamp) -> String {
     let rule = match expiry.on_expiry {
         ExpiryRule::Warn => "warn",
         ExpiryRule::Strictest => "strictest",
@@ -409,7 +409,7 @@ fn rules_json(rules: &PolicyRules) -> serde_json::Value {
 }
 
 fn show(policy: &EffectivePolicy, global: &GlobalOpts) {
-    let now = chrono::Utc::now();
+    let now = jiff::Timestamp::now();
     if global.wants_json(false) {
         let (status, issuer, key_id, error) = match &policy.status {
             PolicyStatus::Absent => ("absent", None, None, None),

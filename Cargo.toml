@@ -39,8 +39,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-native-certs = "0.8"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # Timestamps: policy and token expiry, audit entries, local time in health
-# output and lint backup names
-chrono = "0.4"
+# output and lint backup names. jiff reads the system time zone safely in a
+# multi-threaded process and handles DST with the IANA database.
+jiff = "1"
 # HMAC/PBKDF2 for SASL SCRAM in the native admin requests (same ring as rustls)
 ring = "0.17"
 

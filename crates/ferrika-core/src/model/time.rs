@@ -1,4 +1,6 @@
-//! Time input shared by the CLI and the GUI.
+//! Time input and output shared by the CLI and the GUI.
+
+use jiff::{tz::Offset, Timestamp};
 
 /// `30m` / `2h` / `1d` / `45s` ago, epoch milliseconds, or
 /// `YYYY-MM-DD[ HH:MM[:SS]]` in a zone `offset_ms` ahead of UTC (the CLI
@@ -60,9 +62,58 @@ fn days_in_month(year: i64, month: i64) -> i64 {
     }
 }
 
+/// Fraction digits of RFC 3339 output: none, 3, 6 or 9, the fewest that keep
+/// the value exact (the form the protobuf JSON mapping asks for).
+fn fraction_digits(t: Timestamp) -> usize {
+    match t.subsec_nanosecond() {
+        0 => 0,
+        n if n % 1_000_000 == 0 => 3,
+        n if n % 1_000 == 0 => 6,
+        _ => 9,
+    }
+}
+
+/// RFC 3339 in UTC with a `Z` suffix, e.g. `2024-01-01T00:00:00.120Z`.
+pub fn rfc3339_z(t: Timestamp) -> String {
+    format!("{t:.0$}", fraction_digits(t))
+}
+
+/// RFC 3339 in UTC with a `+00:00` offset, e.g. `2024-01-01T00:00:00.120+00:00`.
+pub fn rfc3339(t: Timestamp) -> String {
+    format!(
+        "{:.1$}",
+        t.display_with_offset(Offset::UTC),
+        fraction_digits(t)
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_time_ms_in;
+    use super::{parse_time_ms_in, rfc3339, rfc3339_z};
+    use jiff::Timestamp;
+
+    #[test]
+    fn rfc3339_uses_no_3_6_or_9_fraction_digits() {
+        let at = |s, n| Timestamp::new(s, n).unwrap();
+        assert_eq!(rfc3339_z(at(1_704_067_200, 0)), "2024-01-01T00:00:00Z");
+        assert_eq!(
+            rfc3339_z(at(1_704_067_200, 120_000_000)),
+            "2024-01-01T00:00:00.120Z"
+        );
+        assert_eq!(
+            rfc3339_z(at(1_704_067_200, 120_500_000)),
+            "2024-01-01T00:00:00.120500Z"
+        );
+        assert_eq!(
+            rfc3339_z(at(1_704_067_200, 1)),
+            "2024-01-01T00:00:00.000000001Z"
+        );
+        assert_eq!(rfc3339(at(1_704_067_200, 0)), "2024-01-01T00:00:00+00:00");
+        assert_eq!(
+            rfc3339(at(1_704_067_200, 5_000_000)),
+            "2024-01-01T00:00:00.005+00:00"
+        );
+    }
 
     #[test]
     fn local_times_shift_by_the_zone_offset() {

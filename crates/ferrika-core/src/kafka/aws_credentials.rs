@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::aws_sigv4::AwsCredentials;
@@ -229,9 +229,8 @@ pub fn parse_credential_process_output(text: &str) -> KafkaResult<AwsCredentials
     creds.session_token = field("SessionToken");
     creds.expiration = match field("Expiration") {
         Some(text) => Some(
-            DateTime::parse_from_rfc3339(&text)
-                .map_err(|_| bad("has an invalid Expiration"))?
-                .with_timezone(&Utc),
+            text.parse::<Timestamp>()
+                .map_err(|_| bad("has an invalid Expiration"))?,
         ),
         None => None,
     };
@@ -417,7 +416,7 @@ mod tests {
         assert_eq!(creds.access_key_id, "ASIAX");
         assert_eq!(creds.session_token.as_deref(), Some("t"));
         assert_eq!(
-            creds.expiration.map(|e| e.to_rfc3339()),
+            creds.expiration.map(crate::model::time::rfc3339),
             Some("2030-01-02T03:04:05+00:00".to_string())
         );
         assert!(parse_credential_process_output(r#"{"Version":2}"#).is_err());

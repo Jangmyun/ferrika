@@ -230,7 +230,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                 // has passed: the window is empty.
                 let window_closed = args
                     .to_timestamp
-                    .is_some_and(|to| to < chrono::Utc::now().timestamp_millis());
+                    .is_some_and(|to| to < jiff::Timestamp::now().as_millisecond());
                 for &(p, start) in &starts {
                     if window_closed && start == Offset::End {
                         time_stop.finish(p);
