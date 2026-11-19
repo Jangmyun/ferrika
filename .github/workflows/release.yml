@@ -13,6 +13,12 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # A pull request that changes the release files builds and packages
+  # everything (no release, no tap) so a broken build shows before a tag.
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - tools/release/**
 
 permissions:
   contents: read
@@ -43,6 +49,9 @@ jobs:
     defaults:
       run:
         shell: bash
+    env:
+      # Archive names carry the tag; a pull request build uses a stand-in.
+      PKG_TAG: ${{ github.event_name == 'push' && github.ref_name || 'v0.0.0-pr' }}
     steps:
       - uses: actions/checkout@v4
       - name: Install build tools (macOS)
@@ -60,6 +69,7 @@ jobs:
         shell: pwsh
         run: cargo build --release --locked -p ferrika-cli --features ssl
       - name: Check the version against the tag
+        if: github.event_name == 'push'
         run: |
           got=$(target/release/ferrika --version)
           want="ferrika ${GITHUB_REF_NAME#v}"
@@ -72,7 +82,7 @@ jobs:
       - name: Package (tar.gz)
         if: runner.os != 'Windows'
         run: |
-          name="ferrika-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          name="ferrika-${PKG_TAG}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp target/release/ferrika LICENSE README.md "dist/$name/"
           tar -czf "dist/$name.tar.gz" -C "dist/$name" ferrika LICENSE README.md
@@ -81,7 +91,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = "ferrika-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          $name = "ferrika-$env:PKG_TAG-${{ matrix.target }}"
           New-Item -ItemType Directory -Force "dist/$name" | Out-Null
           Copy-Item target/release/ferrika.exe, LICENSE, README.md "dist/$name/"
           Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
@@ -99,6 +109,7 @@ jobs:
   release:
     name: GitHub release
     needs: build
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
