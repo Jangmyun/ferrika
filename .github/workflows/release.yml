@@ -1,0 +1,203 @@
+name: Release
+
+# Pushing a tag v<version> (the workspace version) builds the CLI for macOS,
+# Linux and Windows, publishes a GitHub release with the archives and the
+# install scripts (tools/release/install.sh, install.ps1) and updates the
+# Homebrew formula in Jangmyun/homebrew-tap. Publishing the crates to
+# crates.io stays a manual `cargo publish --workspace`.
+#
+# The tap is written with a deploy key: its public half is a write deploy key
+# of Jangmyun/homebrew-tap, its private half the HOMEBREW_TAP_DEPLOY_KEY
+# secret of this repository.
+
+on:
+  push:
+    tags: ["v*"]
+  # A pull request that changes the release files builds and packages
+  # everything (no release, no tap) so a broken build shows before a tag.
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - tools/release/**
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          # The oldest supported Ubuntu keeps the glibc requirement low.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Archive names carry the tag; a pull request build uses a stand-in.
+      PKG_TAG: ${{ github.event_name == 'push' && github.ref_name || 'v0.0.0-pr' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew list cmake >/dev/null 2>&1 || brew install cmake
+      - name: Install build tools (Linux)
+        # rdkafka builds librdkafka with CMake; the ssl feature builds OpenSSL
+        # from source with Perl.
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake build-essential pkg-config perl
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        # PowerShell, so that on Windows OpenSSL's build finds the runner's
+        # Strawberry Perl and not the MSYS perl that Git Bash puts first.
+        shell: pwsh
+        run: cargo build --release --locked -p ferrika-cli --features ssl
+      - name: Check the version against the tag
+        if: github.event_name == 'push'
+        run: |
+          got=$(target/release/ferrika --version)
+          want="ferrika ${GITHUB_REF_NAME#v}"
+          if [ "$got" != "$want" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match the binary: '$got' (expected '$want')"
+            exit 1
+          fi
+      # The archives hold ferrika (ferrika.exe), LICENSE and README.md at the
+      # top level; install.sh, install.ps1 and the formula rely on that.
+      - name: Package (tar.gz)
+        if: runner.os != 'Windows'
+        run: |
+          name="ferrika-${PKG_TAG}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/release/ferrika LICENSE README.md "dist/$name/"
+          tar -czf "dist/$name.tar.gz" -C "dist/$name" ferrika LICENSE README.md
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+      - name: Package (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "ferrika-$env:PKG_TAG-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          Copy-Item target/release/ferrika.exe, LICENSE, README.md "dist/$name/"
+          Compress-Archive -Path "dist/$name/*" -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/$name.zip").Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$PWD/dist/$name.zip.sha256", "$hash  $name.zip`n")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferrika-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Add the install scripts
+        run: cp tools/release/install.sh tools/release/install.ps1 dist/
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
+
+  homebrew:
+    name: Update the Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ferrika
+      - uses: actions/checkout@v4
+        with:
+          repository: Jangmyun/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Write the formula
+        run: |
+          mkdir -p tap/Formula
+          bash ferrika/tools/release/homebrew-formula.sh "${GITHUB_REF_NAME#v}" dist > tap/Formula/ferrika.rb
+      - name: Commit and push
+        working-directory: tap
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/ferrika.rb
+          git commit -m "ferrika ${GITHUB_REF_NAME#v}"
+          git push
+
+  # Installs from the tap the way a user does.
+  verify:
+    name: brew install (${{ matrix.os }})
+    needs: homebrew
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, ubuntu-latest]
+    steps:
+      - name: Put Homebrew on PATH (Linux)
+        if: runner.os == 'Linux'
+        run: echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+      - run: brew install jangmyun/tap/ferrika
+      - run: brew test jangmyun/tap/ferrika
+      - run: ferrika --version
+
+  # Runs the install scripts from the release the way a user does.
+  verify-scripts:
+    name: install script (${{ matrix.os }})
+    needs: release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, ubuntu-22.04, ubuntu-22.04-arm, windows-latest]
+    env:
+      FERRIKA_VERSION: ${{ github.ref_name }}
+    steps:
+      - name: install.sh
+        if: runner.os != 'Windows'
+        run: |
+          curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/install.sh" | sh
+          test "$("$HOME/.local/bin/ferrika" --version)" = "ferrika ${GITHUB_REF_NAME#v}"
+      - name: install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          irm "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:GITHUB_REF_NAME/install.ps1" | iex
+          $got = & (Join-Path $env:LOCALAPPDATA "Programs/ferrika/bin/ferrika.exe") --version
+          if ($got -ne "ferrika $($env:GITHUB_REF_NAME.TrimStart('v'))") { throw "unexpected version: $got" }

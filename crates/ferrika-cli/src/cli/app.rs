@@ -8,7 +8,7 @@ use crate::{cli, governance, kafka, model};
 #[derive(Parser, Debug)]
 #[command(name = "ferrika")]
 #[command(author = "Ferrika Contributors")]
-#[command(version = "0.1.0")]
+#[command(version)]
 #[command(about = "Ultra-lightweight & high-performance native Kafka client in Rust", long_about = None)]
 pub struct Cli {
     #[command(flatten)]

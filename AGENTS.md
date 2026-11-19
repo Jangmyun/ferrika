@@ -79,3 +79,18 @@ in both functions and add a test for the decision.
   into `tools/e2e/smoke.py`.
 - Documentation is in English. Examples must run against the current CLI;
   check them with `ferrika <command> --help`.
+
+## Releasing
+
+1. Bump `version` in the root `Cargo.toml` (the `[workspace.package]` value
+   and the five `ferrika-*` entries under `[workspace.dependencies]`) and run
+   `cargo check` so `Cargo.lock` follows; merge that.
+2. `cargo publish --workspace` from the merged commit (crates.io).
+3. Tag the same commit `v<version>` and push the tag. The release workflow
+   (`.github/workflows/release.yml`) builds the CLI for macOS, Linux and
+   Windows, creates the GitHub release with the install scripts
+   (`tools/release/install.sh`, `install.ps1`), updates the formula in
+   [Jangmyun/homebrew-tap](https://github.com/Jangmyun/homebrew-tap)
+   (`tools/release/homebrew-formula.sh`) and installs the result with the
+   scripts and with brew. The scripts and the formula expect the archive
+   layout the workflow builds; change them together.

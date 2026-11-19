@@ -10,16 +10,49 @@ runtime.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-> Status: pre-1.0 (`0.x`). There are no prebuilt release binaries yet; build
-> from source (below). Command names and flags can still change.
+> Status: pre-1.0 (`0.x`). Command names and flags can still change.
 
 A commercial desktop app is available separately; it is not part of this
 repository.
 
 ## Install
 
-Build from source with a recent stable Rust toolchain (1.85 or newer), CMake
-and a C compiler:
+Linux and macOS (x86_64 and arm64), into `~/.local/bin`:
+
+```bash
+curl -fsSL https://github.com/Jangmyun/ferrika/releases/latest/download/install.sh | sh
+```
+
+Windows (PowerShell), into `%LOCALAPPDATA%\Programs\ferrika\bin`, added to
+the user `PATH`:
+
+```powershell
+irm https://github.com/Jangmyun/ferrika/releases/latest/download/install.ps1 | iex
+```
+
+The scripts check the archive's sha256 before installing. Set
+`FERRIKA_VERSION` (for example `v0.1.0`) to pin a release,
+`FERRIKA_INSTALL_DIR` to install elsewhere, and on Windows
+`FERRIKA_NO_MODIFY_PATH=1` to leave `PATH` alone.
+
+Homebrew (macOS, Linux):
+
+```bash
+brew install jangmyun/tap/ferrika
+```
+
+The archives the scripts and Homebrew install are on the
+[releases page](https://github.com/Jangmyun/ferrika/releases). They are built
+with the `ssl` feature (TLS and SCRAM, see [Building](#building)).
+
+From crates.io, with a recent stable Rust toolchain (1.85 or newer), CMake and
+a C compiler:
+
+```bash
+cargo install ferrika-cli
+```
+
+Or build from source:
 
 ```bash
 git clone https://github.com/Jangmyun/ferrika.git
@@ -103,7 +136,7 @@ the crate with `-p`:
 | `crates/ferrika-mcp` | The MCP server behind `ferrika mcp`. |
 | `crates/ferrika-cli` | The `ferrika` command line. |
 
-The library crates are not on crates.io yet; until 1.0 their API can change.
+The crates are published on [crates.io](https://crates.io/crates/ferrika-core); until 1.0 their API can change.
 
 Requirements:
 
