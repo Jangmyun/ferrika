@@ -4,7 +4,7 @@
 #   curl -fsSL https://github.com/Jangmyun/ferrika/releases/latest/download/install.sh | sh
 #
 # Environment:
-#   FERRIKA_VERSION       release tag to install, for example v0.1.0 (default: latest)
+#   FERRIKA_VERSION       release tag to install, for example v0.1.1 (default: latest)
 #   FERRIKA_INSTALL_DIR   target folder (default: ~/.local/bin)
 #
 # The archive is checked against its published sha256 before anything is

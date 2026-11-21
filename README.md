@@ -30,12 +30,9 @@ the user `PATH`:
 irm https://github.com/Jangmyun/ferrika/releases/latest/download/install.ps1 | iex
 ```
 
-Shell completion: `ferrika completions bash|zsh|fish|powershell` prints the
-script (`ferrika completions --help` says where to put it); Homebrew installs
-it for you.
-
 The scripts check the archive's sha256 before installing. Set
-`FERRIKA_VERSION` (for example `v0.1.0`) to pin a release,
+`FERRIKA_VERSION` (for example `v0.1.1`, the first release with binaries) to
+pin a release,
 `FERRIKA_INSTALL_DIR` to install elsewhere, and on Windows
 `FERRIKA_NO_MODIFY_PATH=1` to leave `PATH` alone.
 
@@ -44,6 +41,10 @@ Homebrew (macOS, Linux):
 ```bash
 brew install jangmyun/tap/ferrika
 ```
+
+Shell completion: `ferrika completions bash|zsh|fish|powershell` prints the
+script (`ferrika completions --help` says where to put it); Homebrew installs
+it for you.
 
 The archives the scripts and Homebrew install are on the
 [releases page](https://github.com/Jangmyun/ferrika/releases). They are built
