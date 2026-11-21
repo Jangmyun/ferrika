@@ -287,6 +287,10 @@ The password is salted locally (PBKDF2); only the salted form reaches the cluste
 
 Every operation that changes a cluster — commands as requested — is appended to `~/.ferrika/audit.log` (JSON Lines,
 next to `profiles.json`). Targets are recorded, never payloads or config values.
+A second line records the result: the outcome of changes `ferrika undo` can
+revert, and `finished without error` or `failed` for commands that write records
+(`produce`, `generate`, `restore`, ...; the error itself is not logged, as it
+can quote a record).
 
 ```bash
 ferrika audit            # last 30 entries
