@@ -13,7 +13,9 @@ use crate::kafka::admin::KafkaAdminClient;
 use crate::model::cluster::ClusterSnapshot;
 use crate::ops::health::{health_checks, HealthIssue, Severity};
 
-#[derive(Args, Debug, Clone)]
+/// `Debug` is written by hand: an incoming-webhook URL carries its secret in
+/// the path.
+#[derive(Args, Clone)]
 pub struct HealthArgs {
     /// Exit with an error when a finding is at least this severe
     #[arg(long, value_enum, default_value_t = FailOn::Critical)]
@@ -29,6 +31,17 @@ pub struct HealthArgs {
     /// Lowest severity to report with --watch or --webhook
     #[arg(long, value_enum, default_value_t = MinSeverity::Warning)]
     pub min_severity: MinSeverity,
+}
+
+impl std::fmt::Debug for HealthArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HealthArgs")
+            .field("fail_on", &self.fail_on)
+            .field("watch", &self.watch)
+            .field("webhook", &self.webhook.as_ref().map(|_| "<redacted>"))
+            .field("min_severity", &self.min_severity)
+            .finish()
+    }
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +320,20 @@ pub(crate) async fn snapshot(global: &GlobalOpts) -> KafkaResult<ClusterSnapshot
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_redacts_the_webhook_url() {
+        let cli = <crate::cli::app::Cli as clap::Parser>::try_parse_from([
+            "ferrika",
+            "health",
+            "--webhook",
+            "https://hooks.slack.com/services/T0/B0/xoxsecret",
+        ])
+        .unwrap();
+        let shown = format!("{cli:?}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(!shown.contains("xoxsecret"), "{shown}");
+    }
 
     fn issue(severity: Severity, message: &str) -> HealthIssue {
         HealthIssue {

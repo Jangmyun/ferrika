@@ -17,7 +17,8 @@ pub struct UserArgs {
     pub command: UserSubcommands,
 }
 
-#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+/// `Debug` is written by hand to redact the password.
+#[derive(Subcommand, Clone, PartialEq, Eq)]
 pub enum UserSubcommands {
     /// List users with SCRAM credentials and their mechanisms
     List,
@@ -51,6 +52,33 @@ pub enum UserSubcommands {
         #[arg(long, default_value = "SCRAM-SHA-256")]
         mechanism: String,
     },
+}
+
+impl std::fmt::Debug for UserSubcommands {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::List => f.write_str("List"),
+            Self::Create {
+                name,
+                password,
+                password_stdin,
+                mechanism,
+                iterations,
+            } => f
+                .debug_struct("Create")
+                .field("name", name)
+                .field("password", &password.as_ref().map(|_| "<redacted>"))
+                .field("password_stdin", password_stdin)
+                .field("mechanism", mechanism)
+                .field("iterations", iterations)
+                .finish(),
+            Self::Delete { name, mechanism } => f
+                .debug_struct("Delete")
+                .field("name", name)
+                .field("mechanism", mechanism)
+                .finish(),
+        }
+    }
 }
 
 fn mechanism(name: &str) -> KafkaResult<ScramHash> {
@@ -210,6 +238,18 @@ mod tests {
     struct TestCli {
         #[command(subcommand)]
         command: UserSubcommands,
+    }
+
+    #[test]
+    fn debug_output_redacts_the_password() {
+        let cli =
+            TestCli::try_parse_from(["user", "create", "bob", "--password", "hunter2-pw"]).unwrap();
+        let shown = format!("{:?}", cli.command);
+        assert!(
+            shown.contains("bob") && shown.contains("<redacted>"),
+            "{shown}"
+        );
+        assert!(!shown.contains("hunter2-pw"), "{shown}");
     }
 
     #[test]
