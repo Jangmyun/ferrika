@@ -364,6 +364,20 @@ pub fn run(mut cli: Cli) {
     {
         cli::set_hint_config(global.to_kafka_config());
     }
+    // Only for a person at a terminal: a script may start the broker and
+    // the command together (`docker compose up -d && ferrika ...`) and rely
+    // on the client waiting for it.
+    if std::io::IsTerminal::is_terminal(&std::io::stderr())
+        && cli.command.as_ref().is_some_and(fails_fast_without_broker)
+    {
+        let config = global.to_kafka_config();
+        if let Some(reason) =
+            cli::unreachable_bootstrap(&config.bootstrap_servers, std::time::Duration::from_secs(3))
+        {
+            cli::print_connection_hint(&config, &crate::error::KafkaError::io(reason.clone()));
+            cli::exit_with_error(&reason);
+        }
+    }
     match cli.command {
         Some(Commands::Topics(args)) => run_async(cli::topics::run(args, global)),
         Some(Commands::Produce(args)) => run_async(cli::produce::run(args, global)),
@@ -466,6 +480,36 @@ fn needs_profiles(command: Option<&Commands>) -> bool {
                 | Commands::Completions { .. }
         )
     )
+}
+
+/// Commands that need the global cluster's brokers from the start and fail
+/// without them anyway: they stop at once when nothing listens at the
+/// bootstrap servers (see `cli::unreachable_bootstrap`). Left out: commands
+/// meant to keep watching or to run without a broker (`health --watch`,
+/// `monitor`, `top`, `probe`, `report`, `mcp`), ones that talk to other
+/// clusters or services (`mirror`, `cluster`, `diff`, `schema`, `connect`)
+/// or to local files (`acl --local`, `lint rules`, `history`), ones with
+/// offline modes (`reassign plan --partitions`, `trace inject`), and `undo`.
+fn fails_fast_without_broker(command: &Commands) -> bool {
+    match command {
+        Commands::Topics(_)
+        | Commands::Produce(_)
+        | Commands::Consume(_)
+        | Commands::Offset(_)
+        | Commands::Dump(_)
+        | Commands::Restore(_)
+        | Commands::Generate(_)
+        | Commands::Compact(_)
+        | Commands::Dlq(_)
+        | Commands::Topology(_)
+        | Commands::Quota(_)
+        | Commands::User(_)
+        | Commands::Bench(_) => true,
+        Commands::Health(args) => args.watch.is_none(),
+        Commands::Lint(args) => args.command.is_none(),
+        Commands::Acl(args) => !args.local,
+        _ => false,
+    }
 }
 
 /// The write the gate in `main` checks and records for `command`: its
@@ -998,6 +1042,43 @@ mod tests {
             assert!(may_write(&cmd), "{args:?}");
             assert_eq!(write_action(&cmd), Some(action), "{args:?}");
             assert_eq!(write_target(&cmd), target, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn only_broker_first_commands_fail_fast() {
+        use super::fails_fast_without_broker;
+        for args in [
+            &["topics", "list"][..],
+            &["produce", "t", "-m", "x"][..],
+            &["consume", "t"][..],
+            &["health"][..],
+            &["lint"][..],
+            &["acl", "list"][..],
+        ] {
+            assert!(fails_fast_without_broker(&command(args)), "{args:?}");
+        }
+        for args in [
+            &["health", "--watch", "60"][..],
+            &["lint", "rules"][..],
+            &["acl", "--local", "list"][..],
+            &["mirror", "a", "b"][..],
+            &["report"][..],
+            &["mcp"][..],
+            &["schema", "list"][..],
+            &[
+                "reassign",
+                "plan",
+                "-t",
+                "orders",
+                "--brokers",
+                "1,2",
+                "--partitions",
+                "3",
+            ][..],
+            &["trace", "inject"][..],
+        ] {
+            assert!(!fails_fast_without_broker(&command(args)), "{args:?}");
         }
     }
 
