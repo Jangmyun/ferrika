@@ -17,6 +17,34 @@ Producing, consuming and metadata go through librdkafka (the
 `ferrika_core::rdkafka`); admin requests, Schema Registry and Connect are
 native Rust over rustls.
 
+## Example
+
+```rust
+use ferrika_core::kafka::admin::KafkaAdminClient;
+use ferrika_core::kafka::config::KafkaClientConfig;
+use ferrika_core::kafka::producer::{KafkaProducerClient, OwnedProducerRecord};
+
+async fn run() -> ferrika_core::error::KafkaResult<()> {
+    let config = KafkaClientConfig::new("localhost:9092");
+
+    let admin = KafkaAdminClient::new(&config)?;
+    for topic in admin.list_topics(None)? {
+        println!("{topic}");
+    }
+
+    let producer = KafkaProducerClient::new(&config)?;
+    let mut record = OwnedProducerRecord::new("orders");
+    record.key = Some(b"order-1".to_vec());
+    record.payload = Some(br#"{"amount": 42}"#.to_vec());
+    let receipt = producer.send(&record, None).await?;
+    println!("partition {} offset {}", receipt.partition, receipt.offset);
+    Ok(())
+}
+```
+
+The crate documentation on [docs.rs](https://docs.rs/ferrika-core) has the
+same example, compiled with the crate.
+
 ## Building
 
 librdkafka is built from source, so a C compiler and CMake are needed. The
