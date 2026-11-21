@@ -1564,7 +1564,7 @@ pub fn brokers_for(config: &KafkaClientConfig, needed: bool) -> Result<String, S
 }
 
 /// [`brokers_for`] with the metadata lookup given.
-pub(crate) fn brokers_for_with(
+pub fn brokers_for_with(
     config: &KafkaClientConfig,
     needed: bool,
     fetch: impl FnOnce(&KafkaClientConfig) -> Result<Vec<String>, String>,
@@ -1582,7 +1582,7 @@ pub fn export_brokers(
 }
 
 /// [`export_brokers`] with the metadata lookup given.
-pub(crate) fn export_brokers_with(
+pub fn export_brokers_with(
     policy: &EffectivePolicy,
     config: &KafkaClientConfig,
     fetch: impl FnOnce(&KafkaClientConfig) -> Result<Vec<String>, String>,
