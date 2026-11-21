@@ -96,6 +96,17 @@ pub struct WriteContext {
 }
 
 impl GlobalOpts {
+    /// An empty `FERRIKA_PROFILE` or `KAFKA_BOOTSTRAP_SERVERS` (`export
+    /// FERRIKA_PROFILE=` to unset it) means "not set", not a profile named
+    /// "" or a cluster at "".
+    pub fn ignore_empty_values(&mut self) {
+        for value in [&mut self.profile, &mut self.bootstrap_servers] {
+            if value.as_deref().is_some_and(|v| v.trim().is_empty()) {
+                *value = None;
+            }
+        }
+    }
+
     /// `--timeout` for HTTP requests (Schema Registry, Connect, webhooks).
     pub fn http_timeout(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.timeout)
