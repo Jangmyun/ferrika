@@ -60,6 +60,16 @@ committed() {
     | grep -o '"partition":[0-9]*,"current_offset":-\{0,1\}[0-9]*' \
     | sed 's/"partition":\([0-9]*\),"current_offset":\(.*\)/\1:\2/' | sort
 }
+# Topic deletion finishes on the brokers after the request returns, so a
+# list taken at once may still show the topic: wait up to 10 s for it to go.
+topic_gone() {
+  for _ in $(seq 1 10); do
+    # Not `f ... | grep -q`: with pipefail an early grep exit fails the pipe.
+    grep -q "$1" <<< "$(f topics list)" || return 0
+    sleep 1
+  done
+  return 1
+}
 
 echo "config dir: $FERRIKA_CONFIG_DIR"
 
@@ -94,7 +104,7 @@ pass "drift refused (also by --dry-run), --force recorded as forced"
 # 4. Topic creation: undone while empty, refused once it has a record.
 f topics create "$TOPIC-b" -p 1 -r 1 >/dev/null
 f undo -y >/dev/null
-f topics list | grep -q "$TOPIC-b" && fail "empty topic not deleted by undo"
+topic_gone "$TOPIC-b" || fail "empty topic not deleted by undo"
 f topics create "$TOPIC-c" -p 1 -r 1 >/dev/null
 OP=$(latest)
 f produce "$TOPIC-c" -m hello >/dev/null

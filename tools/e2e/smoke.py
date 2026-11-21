@@ -358,7 +358,13 @@ def cleanup():
     names = [n for n in topic_names() if n.startswith(RUN)]
     for name in names:
         run(["topics", "delete", name, "-y"])
-    left = [n for n in topic_names() if n.startswith(RUN)]
+    # Deletion finishes on the brokers after the request returns, so a list
+    # taken at once may still show some topics: give them up to 10 s.
+    for _ in range(10):
+        left = [n for n in topic_names() if n.startswith(RUN)]
+        if not left:
+            break
+        time.sleep(1)
     print(f"\ncleanup: deleted {len(names)} topics and {len(groups)} consumer groups, topics left: {left}")
     return not left
 
