@@ -289,6 +289,9 @@ next to `profiles.json`). Targets are recorded, never payloads or config values.
 ```bash
 ferrika audit            # last 30 entries
 ferrika -f json audit -n 100
+ferrika audit --source mcp            # what AI assistants did (also gui, cli)
+ferrika audit --actor claude-code -n 100
+ferrika audit --failed                # failed and refused operations only
 ferrika audit verify     # check the hash chain; names the first edited line
 ```
 

@@ -85,6 +85,8 @@ pub enum Commands {
         /// Number of entries to show
         #[arg(short = 'n', long, default_value_t = 30)]
         limit: usize,
+        #[command(flatten)]
+        filter: cli::audit::AuditFilter,
         #[command(subcommand)]
         command: Option<cli::audit::AuditCommand>,
     },
@@ -328,7 +330,11 @@ pub fn run(mut cli: Cli) {
         }
         Some(Commands::Crypto(args)) => run_async(cli::crypto::handle_crypto_command(args, global)),
         Some(Commands::Topology(args)) => run_async(cli::topology::run(args, global)),
-        Some(Commands::Audit { limit, command }) => cli::audit::run(limit, command, global),
+        Some(Commands::Audit {
+            limit,
+            filter,
+            command,
+        }) => cli::audit::run(limit, &filter, command, global),
         Some(Commands::Policy(args)) => exit_on_error(cli::policy::run(args, global)),
         Some(Commands::Health(args)) => run_async(cli::health::run(args, global)),
         Some(Commands::Lint(args)) => run_async(cli::lint::run(args, global)),
