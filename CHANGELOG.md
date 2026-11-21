@@ -45,6 +45,8 @@ and 0.2.0 makes it crate-internal.
   clusters. Only the destination is checked now, and its `read_only_brokers`
   and the source's `export_clusters` match the brokers the clusters report
   (a tunnel or an IP address no longer gets around them).
+- `produce` from stdin kept a UTF-8 byte order mark (Windows files) in the
+  first record's key or value; it is now removed.
 - `dump -b` stopped with Ctrl+C before every partition reached its end
   reported success; it now fails as incomplete. After failed records,
   `restore` no longer suggests a `--skip` resume that would pass over them.
