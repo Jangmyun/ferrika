@@ -528,6 +528,11 @@ ferrika mirror orders-v1 orders-v1 --src-profile prod --dst-profile staging -b -
 
 # Replicate specific partition with key filtering and limit to 10,000 messages
 ferrika mirror telemetry telemetry-staging -p 0 -k "sensor-temp" -n 10000
+
+# Resumable: a later run with the same group continues where this one stopped.
+# An offset is committed only after its record reached the destination, so a
+# failed or interrupted run copies records again instead of skipping them.
+ferrika mirror orders-v1 orders-v1 --src-profile prod --dst-profile staging -g orders-mirror -b
 ```
 
 ### 10. Consumer Group Offset Reset & Replay (`ferrika offset reset`)

@@ -959,6 +959,19 @@ impl KafkaConsumerClient {
         Ok(())
     }
 
+    /// Like [`Self::store_processed`] for the record at `offset` of a
+    /// partition, for callers that no longer hold the message.
+    pub fn store_processed_offset(
+        &self,
+        topic: &str,
+        partition: i32,
+        offset: i64,
+    ) -> KafkaResult<()> {
+        self.pin();
+        self.consumer.store_offset(topic, partition, offset)?;
+        Ok(())
+    }
+
     /// Commits the offsets stored with [`Self::store_processed`].
     pub fn commit_stored(&self, mode: CommitMode) -> KafkaResult<()> {
         self.pin();

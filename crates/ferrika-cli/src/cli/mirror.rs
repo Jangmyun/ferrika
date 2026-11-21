@@ -42,9 +42,17 @@ pub struct MirrorArgs {
     #[arg(long)]
     pub dst_bootstrap_servers: Option<String>,
 
-    /// Start mirroring from the earliest available offset
+    /// Start mirroring from the earliest available offset (with --group:
+    /// only when the group has no committed offset yet)
     #[arg(short = 'b', long)]
     pub from_beginning: bool,
+
+    /// Consumer group on the source cluster: a later run with the same group
+    /// resumes where this one stopped. An offset is committed only after its
+    /// record was delivered to the destination, so a failed or interrupted
+    /// run copies records again rather than skipping them.
+    #[arg(short = 'g', long, value_name = "GROUP")]
+    pub group: Option<String>,
 
     /// Specific partition to mirror (mirrors all partitions if omitted)
     #[arg(short = 'p', long)]
@@ -284,11 +292,14 @@ fn authorize_cross_cluster(
 
 /// Main entry point for `ferrika mirror`.
 pub async fn run(args: MirrorArgs, global: &GlobalOpts) -> KafkaResult<()> {
-    let src_cfg = resolve_cluster_config(
+    let mut src_cfg = resolve_cluster_config(
         args.src_profile.as_deref(),
         args.src_bootstrap_servers.as_deref(),
         global,
     );
+    if let Some(group) = &args.group {
+        src_cfg = src_cfg.with_group_id(group);
+    }
 
     let dst_profile = args.dst_profile.as_deref().or(args.src_profile.as_deref());
     let dst_cfg =
@@ -350,6 +361,12 @@ pub async fn run(args: MirrorArgs, global: &GlobalOpts) -> KafkaResult<()> {
         }
         if let Some(p) = args.partition {
             println!("  Partition:          {}", p.to_string().yellow());
+        }
+        if let Some(group) = &args.group {
+            println!(
+                "  Consumer Group:     {} (resumes from its committed offsets)",
+                group.yellow()
+            );
         }
         if let Some(max) = args.max_messages {
             println!(

@@ -193,6 +193,20 @@ def scenarios():
     rc, out = run(["mirror", t, t, "-n", "1"], timeout=20)
     check("mirror to the same topic is refused", rc == 1 and "same topic" in out, f"rc={rc} {tail(out)}")
 
+    # --- mirror --group resumes after its committed offset ----------------
+    src, dst = topic("msrc"), topic("mdst")
+    for i in range(3):
+        run(["produce", src, "-m", f"rec{i}"])
+    rc, out = run(["mirror", src, dst, "-g", f"{src}-g", "-b", "-n", "3"], timeout=60)
+    check("mirror --group copies the records", rc == 0, f"rc={rc} {tail(out)}")
+    run(["produce", src, "-m", "rec3"])
+    # -b again: the committed offset wins, so only the new record is copied.
+    rc, out = run(["mirror", src, dst, "-g", f"{src}-g", "-b", "-n", "1"], timeout=60)
+    _, copied = consume(dst, n=10, timeout_ms=5000)
+    got = sorted(re.findall(r"\brec\d\b", copied))
+    check("mirror --group resumes after the committed offset",
+          rc == 0 and got == ["rec0", "rec1", "rec2", "rec3"], f"rc={rc} got={got} {tail(out)}")
+
     # --- consume --offset beyond the end --------------------------------
     t = topic("off")
     run(["produce", t, "-m", "a"])
