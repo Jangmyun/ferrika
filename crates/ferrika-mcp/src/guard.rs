@@ -411,7 +411,7 @@ impl WriteGuard {
             Err(WriteRefusal::Policy(m)) => Err(ToolError::new("policy_refused", m)),
             Err(WriteRefusal::AuditUnavailable(m)) => Err(ToolError::new("audit_unavailable", m)),
             Err(WriteRefusal::Profile(m)) => {
-                let _ = self.record_result(tool, target, &m, false);
+                let _ = self.record_result(tool, target, &m, false, None);
                 Err(ToolError::new("read_only_profile", m))
             }
         }
@@ -537,16 +537,27 @@ impl WriteGuard {
         }
     }
 
-    /// Records what an executed tool did. Returns a warning when the audit
-    /// log could not be written (the change has already happened).
+    /// The profile and bootstrap servers the session writes to.
+    pub(super) fn profile_and_bootstrap(&self) -> (String, String) {
+        (self.config.profile.clone(), self.config.bootstrap.clone())
+    }
+
+    /// Records what an executed tool did, with the operation id and digest
+    /// of its history record when it has one. Returns a warning when the
+    /// audit log could not be written (the change has already happened).
     pub(super) fn record_result(
         &self,
         tool: &str,
         target: &str,
         outcome: &str,
         ok: bool,
+        op: Option<(String, String)>,
     ) -> Option<String> {
-        let entry = self.entry(format!("mcp {tool}"), target, outcome, ok);
+        let mut entry = self.entry(format!("mcp {tool}"), target, outcome, ok);
+        if let Some((id, digest)) = op {
+            entry.op = id;
+            entry.op_digest = digest;
+        }
         self.sink.record(&entry).err().map(|e| {
             let warning = format!("The change ran, but the audit log could not be written: {e}");
             eprintln!("ferrika mcp: {warning}");

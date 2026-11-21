@@ -117,7 +117,8 @@ Examples for each are in the [command reference](docs/CLI.md).
 - **MCP server.** `ferrika mcp` serves read-only cluster tools to AI assistants
   over stdin/stdout. `--allow-write` adds a small set of write tools that
   are planned, confirmed and audited, and still pass the same policy and
-  read-only checks.
+  read-only checks. Their changes land in the operation history, so
+  `ferrika undo` reverts what an assistant changed.
 
 ```bash
 claude mcp add ferrika-prod -- ferrika -p prod mcp

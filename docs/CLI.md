@@ -234,6 +234,14 @@ for confirmations the user refused. Plans are not audited, and record
 values and secret config values never are. `ferrika audit` shows an ACTOR
 column.
 
+Executed `create_topic`, `alter_topic_config` and
+`reset_consumer_group_offsets` are also recorded in the operation history
+with the state before them, like the same changes made in the CLI or the
+desktop app: `ferrika history` lists them (FROM `mcp`) and `ferrika undo
+<id>` reverts one after checking nothing changed since. Produced records are
+not recorded (they cannot be taken back), and there is no undo tool: a
+person reverts a change.
+
 Deleting or purging topics, ACLs, SCRAM users and quotas are not, and will
 not be, MCP tools: do those in the CLI. Keep in mind that an
 assistant that reads records and configs may be steered by text inside them
