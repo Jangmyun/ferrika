@@ -201,7 +201,8 @@ impl WriteBackend for KafkaBackend {
         Box::pin(async move {
             let url = self.config.schema_registry_url.as_deref().ok_or_else(|| {
                 KafkaError::config(
-                    "value_subject needs a Schema Registry URL on the profile".to_string(),
+                    "value_subject and key_subject need a Schema Registry URL on the profile"
+                        .to_string(),
                 )
             })?;
             let client = ferrika_core::kafka::schema::SchemaRegistryClient::new(url)

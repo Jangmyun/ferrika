@@ -599,9 +599,15 @@ impl WriteTools {
                 topic,
                 records,
                 value_subject,
+                key_subject,
             } => {
-                self.plan_produce(topic, records, value_subject.as_deref())
-                    .await
+                self.plan_produce(
+                    topic,
+                    records,
+                    value_subject.as_deref(),
+                    key_subject.as_deref(),
+                )
+                .await
             }
         }
     }
@@ -723,6 +729,7 @@ impl WriteTools {
         topic: &str,
         records: &[RecordArg],
         value_subject: Option<&str>,
+        key_subject: Option<&str>,
     ) -> Result<Planned, ToolError> {
         self.guard.check_produce(records.len() as u64)?;
         let Some(shape) = self.backend.topic(topic).await.map_err(ToolError::kafka)? else {
@@ -772,7 +779,23 @@ impl WriteTools {
                 ),
                 (Some(text), None) => Some(text.as_bytes().to_vec()),
             };
-            let size = record.key.as_ref().map_or(0, String::len)
+            // An encoded key is what the partitioner hashes, as with a
+            // producer that uses the key's schema serializer.
+            let key = match (&record.key, key_subject) {
+                (None, _) => None,
+                (Some(text), Some(subject)) => Some(
+                    self.backend
+                        .encode_value(subject, text)
+                        .await
+                        .map_err(|e| {
+                            ToolError::invalid(format!(
+                                "records[{i}].key does not fit schema subject '{subject}': {e}"
+                            ))
+                        })?,
+                ),
+                (Some(text), None) => Some(text.as_bytes().to_vec()),
+            };
+            let size = key.as_ref().map_or(0, Vec::len)
                 + value.as_ref().map_or(0, Vec::len)
                 + record
                     .headers
@@ -799,7 +822,7 @@ impl WriteTools {
                 "headers": record.headers.len(),
             }));
             let mut out = OwnedProducerRecord::new(topic);
-            out.key = record.key.as_ref().map(|k| k.as_bytes().to_vec());
+            out.key = key;
             out.payload = value;
             out.partition = record.partition;
             out.headers = record
@@ -830,6 +853,7 @@ impl WriteTools {
                 "total_bytes": total,
                 "tombstones": tombstones,
                 "value_subject": value_subject,
+                "key_subject": key_subject,
                 "warnings": warnings,
             }),
             summary: format!(
@@ -1162,6 +1186,7 @@ enum Request {
         topic: String,
         records: Vec<RecordArg>,
         value_subject: Option<String>,
+        key_subject: Option<String>,
     },
 }
 
@@ -1258,7 +1283,14 @@ fn parse(tool: &str, args: &Value) -> Result<Request, ToolError> {
             })
         }
         "produce_messages" => {
-            fields.only(&["topic", "records", "value_subject", "mode", "confirmation"])?;
+            fields.only(&[
+                "topic",
+                "records",
+                "value_subject",
+                "key_subject",
+                "mode",
+                "confirmation",
+            ])?;
             let topic = fields.string("topic")?;
             let Some(Value::Array(items)) = fields.0.get("records") else {
                 return Err(ToolError::invalid("'records' must be an array of records"));
@@ -1273,14 +1305,17 @@ fn parse(tool: &str, args: &Value) -> Result<Request, ToolError> {
                 .enumerate()
                 .map(|(i, item)| record_arg(i, item))
                 .collect::<Result<Vec<_>, _>>()?;
-            let value_subject = match fields.0.get("value_subject") {
-                None | Some(Value::Null) => None,
-                Some(_) => Some(fields.string("value_subject")?),
+            let subject = |name: &str| match fields.0.get(name) {
+                None | Some(Value::Null) => Ok(None),
+                Some(_) => fields.string(name).map(Some),
             };
+            let value_subject = subject("value_subject")?;
+            let key_subject = subject("key_subject")?;
             Ok(Request::Produce {
                 topic,
                 records,
                 value_subject,
+                key_subject,
             })
         }
         _ => Err(ToolError::new(
@@ -1652,7 +1687,8 @@ fn definitions() -> Vec<Value> {
                             "required": ["value"]
                         }
                     },
-                    "value_subject": { "type": "string", "description": "Schema Registry subject to encode values with (Avro/Protobuf/JSON Schema); values are then JSON" }
+                    "value_subject": { "type": "string", "description": "Schema Registry subject to encode values with (Avro/Protobuf/JSON Schema); values are then JSON" },
+                    "key_subject": { "type": "string", "description": "Schema Registry subject to encode keys with (e.g. <topic>-key); keys are then JSON" }
                 })),
                 "required": ["topic", "records"]
             },
@@ -2445,6 +2481,24 @@ pub(super) mod tests {
             encoded["structuredContent"]["plan"]["records"][0]["bytes"],
             7
         );
+        // Keys too: the encoded key (5-byte header + "{}") and the raw value.
+        let keyed = tools
+            .call_token(
+                "produce_messages",
+                &json!({ "topic": "orders", "key_subject": "orders-key", "records": [{ "key": "{}", "value": "x" }] }),
+            )
+            .await;
+        let plan = &keyed["structuredContent"]["plan"];
+        assert_eq!(plan["records"][0]["bytes"], 8, "{keyed}");
+        assert_eq!(plan["key_subject"], "orders-key");
+        let bad_key = tools
+            .call_token(
+                "produce_messages",
+                &json!({ "topic": "orders", "key_subject": "missing-value", "records": [{ "key": "{}", "value": "x" }] }),
+            )
+            .await;
+        assert_eq!(code(&bad_key), "invalid_argument");
+        assert!(bad_key.to_string().contains("records[0].key"), "{bad_key}");
 
         let three = json!({ "topic": "orders", "records": [{ "value": "a" }, { "value": "b" }, { "value": "c" }] });
         let plan = tools.call_token("produce_messages", &three).await;
