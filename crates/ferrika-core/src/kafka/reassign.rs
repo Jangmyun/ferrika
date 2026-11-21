@@ -277,17 +277,28 @@ pub fn generate_minimal_move_plan(
     }
     let wanted: Vec<usize> = current
         .iter()
-        .map(|p| replication_factor.unwrap_or(p.replicas.len()))
+        .map(|p| replication_factor.unwrap_or(dedup_preserving_order(&p.replicas).len()))
         .collect();
-    if let Some(&rf) = wanted.iter().find(|&&rf| rf == 0 || rf > brokers.len()) {
-        return Err(KafkaError::admin(if rf == 0 {
-            "Replication factor must be greater than 0".to_string()
-        } else {
-            format!(
+    if let Some((i, &rf)) = wanted
+        .iter()
+        .enumerate()
+        .find(|(_, &rf)| rf == 0 || rf > brokers.len())
+    {
+        return Err(KafkaError::admin(
+            if rf == 0 && replication_factor.is_none() {
+                format!(
+                    "Partition {}-{} has no replicas; pass the replication factor",
+                    current[i].topic, current[i].partition
+                )
+            } else if rf == 0 {
+                "Replication factor must be greater than 0".to_string()
+            } else {
+                format!(
                 "Replication factor ({rf}) cannot exceed the number of distinct target brokers ({})",
                 brokers.len()
             )
-        }));
+            },
+        ));
     }
 
     let mut assigned: Vec<Vec<i32>> = current
@@ -346,6 +357,43 @@ pub fn generate_minimal_move_plan(
         }
     }
 
+    // A partition that needs several replicas can run out of brokers below
+    // their share (the others are in it already) and take one at its share.
+    // Swap replicas from brokers over their share to brokers under it,
+    // preferring a replica the plan just added (no extra copy) and a follower.
+    loop {
+        let over = |b: &&i32| loads[*b] > share(**b);
+        let under = |b: &&i32| loads[*b] < share(**b);
+        let mut swap = None;
+        'search: for &from in brokers.iter().filter(over) {
+            for &to in brokers.iter().filter(under) {
+                let best = assigned
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.contains(&from) && !r.contains(&to))
+                    .min_by_key(|(i, r)| {
+                        (
+                            current[*i].replicas.contains(&from),
+                            r.first() == Some(&from),
+                        )
+                    })
+                    .map(|(i, _)| i);
+                if let Some(i) = best {
+                    swap = Some((i, from, to));
+                    break 'search;
+                }
+            }
+        }
+        let Some((i, from, to)) = swap else {
+            break;
+        };
+        if let Some(slot) = assigned[i].iter_mut().find(|b| **b == from) {
+            *slot = to;
+            *loads.entry(from).or_default() -= 1;
+            *loads.entry(to).or_default() += 1;
+        }
+    }
+
     // Preferred leaders: keep the current one while it is within its share.
     let leader_share = current.len().div_ceil(brokers.len());
     let mut leads: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
@@ -393,14 +441,18 @@ pub fn generate_minimal_move_plan(
 
 /// Replicas a move from `current` to `planned` copies onto new brokers.
 pub fn replicas_to_move(current: &[PartitionAssignment], planned: &ReassignmentPlan) -> usize {
+    let before: std::collections::HashMap<(&str, i32), &[i32]> = current
+        .iter()
+        .map(|c| ((c.topic.as_str(), c.partition), c.replicas.as_slice()))
+        .collect();
     planned
         .partitions
         .iter()
         .map(|p| {
-            let before = current
-                .iter()
-                .find(|c| c.topic == p.topic && c.partition == p.partition)
-                .map_or(&[][..], |c| c.replicas.as_slice());
+            let before = before
+                .get(&(p.topic.as_str(), p.partition))
+                .copied()
+                .unwrap_or_default();
             p.replicas.iter().filter(|b| !before.contains(b)).count()
         })
         .sum()
@@ -643,6 +695,78 @@ mod tests {
         // Greedy leader choice: within one of even.
         assert!(leader_counts(&plan, &[1, 2, 3, 4]).iter().all(|&n| n <= 2));
         assert_eq!(replicas_to_move(&now, &plan), 4);
+    }
+
+    #[test]
+    fn minimal_plan_stays_balanced_when_a_partition_needs_several_replicas() {
+        // Brokers 4 and 5 are replaced by 3: p0 needs two new replicas.
+        let now = layout(&[&[4, 5], &[1, 2], &[1, 2]]);
+        let plan = generate_minimal_move_plan(&now, &[1, 2, 3], None).unwrap();
+        plan.validate().unwrap();
+        assert_eq!(replica_counts(&plan, &[1, 2, 3]), vec![2, 2, 2], "{plan:?}");
+        // Two for p0 and one more so broker 3 gets its share.
+        assert_eq!(replicas_to_move(&now, &plan), 3);
+
+        // The same at scale.
+        let mut rows: Vec<&[i32]> = vec![&[4, 5]; 10];
+        rows.extend(vec![&[1, 2][..]; 20]);
+        let now = layout(&rows);
+        let plan = generate_minimal_move_plan(&now, &[1, 2, 3], None).unwrap();
+        plan.validate().unwrap();
+        assert_eq!(replica_counts(&plan, &[1, 2, 3]), vec![20, 20, 20]);
+    }
+
+    #[test]
+    fn minimal_plan_is_valid_and_even_for_random_layouts() {
+        // Small LCG: deterministic, no extra dependency.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+        for _ in 0..500 {
+            let old_brokers = 1 + next(6);
+            let new: Vec<i32> = (1..=(1 + next(6) as i32)).collect();
+            let rf = 1 + next(new.len().min(old_brokers));
+            let now: Vec<PartitionAssignment> = (0..1 + next(40))
+                .map(|p| {
+                    let mut replicas: Vec<i32> = Vec::new();
+                    while replicas.len() < rf {
+                        let b = 1 + next(old_brokers) as i32;
+                        if !replicas.contains(&b) {
+                            replicas.push(b);
+                        }
+                    }
+                    PartitionAssignment::new("t", p as i32, replicas)
+                })
+                .collect();
+            let plan = generate_minimal_move_plan(&now, &new, None).unwrap();
+            plan.validate().unwrap();
+            let total = now.len() * rf;
+            let (lo, hi) = (total / new.len(), total.div_ceil(new.len()));
+            for (b, n) in new.iter().zip(replica_counts(&plan, &new)) {
+                assert!(
+                    (lo..=hi).contains(&n),
+                    "broker {b}: {n} not in {lo}..={hi}: {now:?} -> {plan:?}"
+                );
+            }
+            for after in &plan.partitions {
+                assert_eq!(after.replicas.len(), rf);
+                assert!(after.replicas.iter().all(|b| new.contains(b)));
+            }
+        }
+    }
+
+    #[test]
+    fn minimal_plan_counts_a_repeated_replica_once() {
+        let now = vec![PartitionAssignment::new("t", 0, vec![1, 1])];
+        let plan = generate_minimal_move_plan(&now, &[1, 2], None).unwrap();
+        assert_eq!(plan.partitions[0].replicas, vec![1]);
+        let empty = vec![PartitionAssignment::new("t", 0, vec![])];
+        let err = generate_minimal_move_plan(&empty, &[1, 2], None).unwrap_err();
+        assert!(err.to_string().contains("t-0 has no replicas"), "{err}");
     }
 
     #[test]

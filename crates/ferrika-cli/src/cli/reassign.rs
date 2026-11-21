@@ -48,8 +48,9 @@ pub struct ReassignPlanArgs {
     #[arg(short = 'b', long, value_delimiter = ',', required = true)]
     pub brokers: Vec<i32>,
 
-    /// Desired replication factor (defaults to the topic's current one; with
-    /// --partitions, to 2 or the broker count if smaller)
+    /// Desired replication factor (defaults to each partition's current one,
+    /// with --from-scratch the topic's first partition's; with --partitions,
+    /// to 2 or the broker count if smaller)
     #[arg(long)]
     pub rf: Option<usize>,
 
@@ -217,13 +218,16 @@ fn run_plan(mut args: ReassignPlanArgs, global: &GlobalOpts) -> KafkaResult<()> 
                 generate_minimal_move_plan(&current, &args.brokers, args.rf)?.partitions;
         }
         let planned = ReassignmentPlan::new(all_partitions.clone());
+        let after: std::collections::HashMap<(&str, i32), &PartitionAssignment> = planned
+            .partitions
+            .iter()
+            .map(|p| ((p.topic.as_str(), p.partition), p))
+            .collect();
         let kept: usize = current
             .iter()
             .map(|before| {
-                planned
-                    .partitions
-                    .iter()
-                    .find(|p| p.topic == before.topic && p.partition == before.partition)
+                after
+                    .get(&(before.topic.as_str(), before.partition))
                     .map_or(0, |after| {
                         before
                             .replicas
