@@ -57,6 +57,9 @@ API; a patch version (0.x.y) does not.
 ### Changed
 
 - `ferrika --help`: one accurate line per command, no "(CLI mode)" suffix.
+- `ferrika-core` docs, README and `examples/quickstart.rs` show how to use it
+  as a library; CONTRIBUTING describes the five crates; issue and pull request
+  templates.
 
 ## 0.1.0
 
