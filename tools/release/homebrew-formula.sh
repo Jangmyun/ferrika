@@ -65,6 +65,7 @@ class Ferrika < Formula
 
   def install
     bin.install "ferrika"
+    generate_completions_from_executable(bin/"ferrika", "completions")
   end
 
   test do
