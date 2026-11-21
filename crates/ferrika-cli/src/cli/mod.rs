@@ -315,6 +315,43 @@ fn fallback_hint_applies(error: &KafkaError) -> bool {
         )
 }
 
+/// The audit result entry still owed for the running write command, when
+/// its handler does not write one itself (changes outside the operation
+/// history: produce, generate, probe, ...). Its request entry was written
+/// before the command ran; the result is written once, at the end.
+static PENDING_RESULT: std::sync::Mutex<Option<crate::governance::audit::AuditEntry>> =
+    std::sync::Mutex::new(None);
+
+/// Owes the audit log the result of the write `request` describes.
+pub fn expect_audit_result(request: crate::governance::audit::AuditEntry) {
+    if let Ok(mut pending) = PENDING_RESULT.lock() {
+        *pending = Some(request);
+    }
+}
+
+/// Writes the owed result entry, if any. The outcome is a fixed word, not
+/// the error message: these commands write records, and an encoding error
+/// can quote a record's value, which the audit log must never hold.
+pub fn record_audit_result(ok: bool, outcome: &str) {
+    let owed = PENDING_RESULT.lock().ok().and_then(|mut p| p.take());
+    if let Some(request) = owed {
+        crate::governance::audit::record(&result_entry(request, ok, outcome));
+    }
+}
+
+fn result_entry(
+    request: crate::governance::audit::AuditEntry,
+    ok: bool,
+    outcome: &str,
+) -> crate::governance::audit::AuditEntry {
+    crate::governance::audit::AuditEntry {
+        time_ms: crate::governance::audit::now_ms(),
+        outcome: outcome.to_string(),
+        ok,
+        ..request
+    }
+}
+
 /// Ends the process after a failed command. The error is printed unless
 /// [`print_connection_hint`] already showed it.
 pub fn exit_with_error(err: &dyn std::fmt::Display) -> ! {
@@ -326,8 +363,10 @@ pub fn exit_with_error(err: &dyn std::fmt::Display) -> ! {
         .iter()
         .any(|code| message.contains(code))
     {
+        record_audit_result(true, "completed (output closed early)");
         std::process::exit(0);
     }
+    record_audit_result(false, "failed (see the command's output)");
     if !ERROR_REPORTED.load(std::sync::atomic::Ordering::Relaxed) {
         eprintln!("{} {message}", "Error:".red().bold());
     }
@@ -445,6 +484,33 @@ fn hint_kind(error: &KafkaError) -> HintKind {
 #[cfg(test)]
 mod tests {
     use super::{connection_hints, hint_kind, read_password_line, HintKind, KERBEROS_HINT};
+
+    #[test]
+    fn audit_results_keep_the_request_and_set_the_outcome() {
+        use crate::governance::audit::AuditEntry;
+        let request = AuditEntry {
+            time_ms: 1,
+            source: "cli".into(),
+            profile: "prod".into(),
+            action: "produce".into(),
+            target: "orders".into(),
+            outcome: "requested".into(),
+            ok: true,
+            user: String::new(),
+            actor: None,
+            op: String::new(),
+            op_digest: String::new(),
+        };
+        let result = super::result_entry(request, false, "Message size too large");
+        assert_eq!(
+            (result.action.as_str(), result.target.as_str()),
+            ("produce", "orders")
+        );
+        assert_eq!(result.profile, "prod");
+        assert!(!result.ok);
+        assert_eq!(result.outcome, "Message size too large");
+        assert!(result.time_ms > 1);
+    }
 
     #[test]
     fn fallback_hints_only_for_kafka_client_failures() {
