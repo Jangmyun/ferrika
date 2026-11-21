@@ -175,6 +175,7 @@ pub async fn run_dump(args: DumpArgs, global: &GlobalOpts) -> KafkaResult<()> {
     // The next offset to read per partition, as far as this loop has seen.
     let mut next_offsets: HashMap<i32, i64> = HashMap::new();
     let mut stopped_idle = false;
+    let mut interrupted = false;
 
     // Prepare output file
     let path = Path::new(&args.output);
@@ -252,6 +253,7 @@ pub async fn run_dump(args: DumpArgs, global: &GlobalOpts) -> KafkaResult<()> {
                 if global.format != OutputFormat::Json {
                     println!("\n{}", "Dump interrupted by user (Ctrl+C).".yellow());
                 }
+                interrupted = true;
                 break;
             }
             msg_res = consumer.recv() => {
@@ -317,8 +319,10 @@ pub async fn run_dump(args: DumpArgs, global: &GlobalOpts) -> KafkaResult<()> {
 
     // An idle stop is only complete when the remaining partitions' read
     // positions already reached their end offsets (their last offsets were
-    // transaction markers or compacted away); otherwise the backup is cut short.
-    if stopped_idle && !end_offsets.is_empty() {
+    // transaction markers or compacted away); otherwise the backup is cut
+    // short. So is a dump to the end (`-b`) that Ctrl+C stopped early: a
+    // script must not take the file for a complete backup.
+    if must_check_completeness(stopped_idle, interrupted, !end_offsets.is_empty()) {
         let mut positions = next_offsets.clone();
         if let Ok(tpl) = consumer.inner().position() {
             for elem in tpl.elements_for_topic(&args.topic) {
@@ -333,10 +337,14 @@ pub async fn run_dump(args: DumpArgs, global: &GlobalOpts) -> KafkaResult<()> {
             if global.format != OutputFormat::Json {
                 println!();
             }
+            let why = if interrupted {
+                "it was interrupted".to_string()
+            } else {
+                format!("no record arrived for {}s", args.idle_timeout)
+            };
             eprintln!(
-                "{} Dump incomplete: no record arrived for {}s before these partitions reached their end offsets:",
+                "{} Dump incomplete: {why} before these partitions reached their end offsets:",
                 "✖".red().bold(),
-                args.idle_timeout
             );
             for (p, pos, end) in &incomplete {
                 let pos =
@@ -650,10 +658,17 @@ pub async fn run_restore(args: RestoreArgs, global: &GlobalOpts) -> KafkaResult<
                     stats.records_restored,
                     next_skip
                 );
-                println!(
-                    "  Resume with: ferrika restore {} -i {} --skip {}",
-                    args.topic, args.input, next_skip
-                );
+                if !can_resume_with_skip(failed) {
+                    // `--skip` would pass over the records that failed too.
+                    println!(
+                        "  {failed} record(s) failed before that point: resuming with --skip {next_skip} would skip them. Fix the cause, then restore those records again."
+                    );
+                } else {
+                    println!(
+                        "  Resume with: ferrika restore {} -i {} --skip {}",
+                        args.topic, args.input, next_skip
+                    );
+                }
             }
         }
     }
@@ -753,9 +768,33 @@ fn print_restore_progress(stats: &RestoreStats, start_time: Instant) {
     let _ = std::io::stdout().flush();
 }
 
+/// Whether a dump must prove it reached every partition's end before it
+/// reports success: when it read to the end (`-b`, end offsets known) and
+/// stopped on the idle timeout or on Ctrl+C rather than at those ends.
+fn must_check_completeness(stopped_idle: bool, interrupted: bool, reads_to_end: bool) -> bool {
+    reads_to_end && (stopped_idle || interrupted)
+}
+
+/// Whether `--skip N` (records read so far) is a safe resume point: not
+/// when some of those records failed, as it would pass over them.
+fn can_resume_with_skip(failed: u64) -> bool {
+    failed == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupted_dumps_to_the_end_are_checked_and_failed_restores_not_resumed() {
+        assert!(must_check_completeness(false, true, true));
+        assert!(must_check_completeness(true, false, true));
+        assert!(!must_check_completeness(false, false, true));
+        // A dump without -b has no end to reach.
+        assert!(!must_check_completeness(false, true, false));
+        assert!(can_resume_with_skip(0));
+        assert!(!can_resume_with_skip(2));
+    }
 
     #[test]
     fn restore_producer_is_idempotent_and_keeps_order() {
