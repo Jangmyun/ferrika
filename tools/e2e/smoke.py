@@ -207,6 +207,36 @@ def scenarios():
     check("mirror --group resumes after the committed offset",
           rc == 0 and got == ["rec0", "rec1", "rec2", "rec3"], f"rc={rc} got={got} {tail(out)}")
 
+    # --- dlq redrive continues where the last run stopped ----------------
+    dlq, out_t = topic("dlq"), topic("dlqout")
+    for i in range(5):
+        run(["produce", dlq, "-m", f"bad{i}"])
+    rc, out = run(["dlq", "redrive", dlq, "-t", out_t, "-n", "3", "--execute", "--json"], timeout=60)
+    try:
+        first = json.loads(out[out.index("{"):])
+    except ValueError:
+        first = {}
+    nxt = first.get("next_from_offset") or []
+    check("dlq redrive sends the first 3 and says where to continue",
+          rc == 0 and first.get("published") == 3 and nxt, f"rc={rc} {tail(out)}")
+    args = [a for o in nxt for a in ("--from-offset", o)]
+    rc, out = run(["dlq", "redrive", dlq, "-t", out_t, "-n", "10", *args, "--execute", "--json"], timeout=60)
+    _, copied = consume(out_t, n=10, timeout_ms=5000)
+    got = sorted(re.findall(r"\bbad\d\b", copied))
+    check("dlq redrive --from-offset sends the rest, nothing twice",
+          rc == 0 and got == [f"bad{i}" for i in range(5)], f"rc={rc} got={got} {tail(out)}")
+
+    # --- audit filters ----------------------------------------------------
+    rc, out = run(["-f", "json", "audit", "--source", "cli", "-n", "200"], broker=False)
+    check("audit --source cli lists this run's changes", rc == 0 and RUN in out, f"rc={rc} {tail(out)}")
+    rc, out = run(["-f", "json", "audit", "--source", "gui", "-n", "200"], broker=False)
+    check("audit --source gui leaves out CLI entries", rc == 0 and RUN not in out, f"rc={rc} {tail(out)}")
+
+    # --- shell completion -------------------------------------------------
+    rc, out = run(["completions", "bash"], broker=False)
+    check("completions bash names the commands and new options",
+          rc == 0 and "mirror" in out and "--from-scratch" in out, f"rc={rc} {tail(out)}")
+
     # --- consume --offset beyond the end --------------------------------
     t = topic("off")
     run(["produce", t, "-m", "a"])
