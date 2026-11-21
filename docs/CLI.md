@@ -188,8 +188,8 @@ claude mcp add ferrika-prod -- ferrika -p prod mcp
 #### Write tools (`--allow-write`)
 
 `--allow-write` adds four write tools: `produce_messages` (up to 100 UTF-8
-records to an existing topic, optionally encoded with a Schema Registry
-subject), `create_topic`, `alter_topic_config` (set or reset keys; others
+records to an existing topic, values and keys optionally encoded with Schema Registry
+subjects: `value_subject`, `key_subject`), `create_topic`, `alter_topic_config` (set or reset keys; others
 stay) and `reset_consumer_group_offsets` (the group must be Empty).
 
 ```bash
