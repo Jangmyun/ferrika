@@ -45,6 +45,14 @@ and 0.2.0 makes it crate-internal.
   clusters. Only the destination is checked now, and its `read_only_brokers`
   and the source's `export_clusters` match the brokers the clusters report
   (a tunnel or an IP address no longer gets around them).
+- PII masking: an undecoded Schema Registry record (Avro, Protobuf, JSON
+  Schema wire format) that happened to be valid UTF-8 was scanned as free
+  text, so names and passwords in it were shown; it is now hidden whole
+  (`consume` without a registry or with `--format json`/`--save`, MCP
+  `peek_messages`, `compact`, `crypto mask`). JSON with a byte order mark or
+  several JSON lines is masked field by field; `crypto audit` samples of
+  passwords and tokens no longer keep the last four characters;
+  `Set-Cookie` and `Proxy-Authorization` headers are hidden.
 - Audit log: a correctly chained line appended later could replace an
   operation's `op_digest` and let an edited history pass `undo`'s check;
   two different digests for one operation now refuse it. `audit verify`
