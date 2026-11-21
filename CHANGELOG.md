@@ -45,6 +45,11 @@ and 0.2.0 makes it crate-internal.
   clusters. Only the destination is checked now, and its `read_only_brokers`
   and the source's `export_clusters` match the brokers the clusters report
   (a tunnel or an IP address no longer gets around them).
+- MCP: `--topics` patterns ignored case, so `dev-*` also allowed writes to
+  `DEV-payments`; they are now case-sensitive like topic names.
+  `alter_topic_config` now marks deleting a retention override, any
+  `cleanup.policy` change and lower `local.retention.*` as destructive
+  (stronger confirmation), like a lower `retention.ms`.
 - `consume --group` exited 0 when the final offset commit failed (it only
   printed it), so a script took the run as done and the next run read the
   records again. It now fails after the summary.
