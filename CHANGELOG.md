@@ -25,6 +25,11 @@ API; a patch version (0.x.y) does not.
   `ferrika undo` reverts what an assistant changed.
 - MCP: `schema_fields` read tool (field paths of a topic's schema, usable in
   `peek_messages`' `where`).
+- MCP: `produce_messages` encodes keys with `key_subject`, like values with
+  `value_subject`.
+- MCP: read tool results also come as `structuredContent`.
+- `ferrika completions bash|zsh|fish|powershell|elvish`; Homebrew installs the
+  bash, zsh and fish scripts.
 - Library: `TaggedDeliveryPipeline`, `KafkaConsumerClient::store_processed_offset`,
   `generate_minimal_move_plan`, `replicas_to_move`, `Endpoint::with_timeout`,
   `SchemaRegistryClient::with_timeout`, `ConnectClient::with_timeout`,
