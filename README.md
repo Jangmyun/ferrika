@@ -87,6 +87,11 @@ profile, `-b/--bootstrap-servers` overrides it, `-f json` switches the output
 to JSON, `--timeout <s>` sets the request timeout. `ferrika <command> --help`
 lists every option.
 
+At a terminal, a command that needs the cluster stops within seconds when
+nothing listens at the bootstrap servers (connection refused). In scripts
+(stderr redirected) it waits up to `--timeout` instead, so a broker that is
+still starting can answer.
+
 ## Main commands
 
 | Task | Commands |
