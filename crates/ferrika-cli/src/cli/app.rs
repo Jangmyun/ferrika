@@ -327,7 +327,13 @@ pub fn run(mut cli: Cli) {
             cli::expect_audit_result(governance::audit::AuditEntry {
                 time_ms: 0,
                 source: "cli".to_string(),
-                profile: profile.clone(),
+                // As the request entry names it (the brokers without a
+                // profile), so the two lines pair up.
+                profile: if profile.is_empty() {
+                    bootstrap.clone()
+                } else {
+                    profile.clone()
+                },
                 action: action.to_string(),
                 target: target.clone(),
                 outcome: String::new(),
@@ -401,7 +407,8 @@ pub fn run(mut cli: Cli) {
         Some(Commands::Mcp(args)) => run_async(cli::mcp::run(args, global)),
         None => print!("{}", no_command_help()),
     }
-    cli::record_audit_result(true, "completed");
+    // The handler returned without an error (an interrupted batch too).
+    cli::record_audit_result(true, "finished without error");
 }
 
 /// Runs an async CLI command on a fresh tokio runtime, exiting with the

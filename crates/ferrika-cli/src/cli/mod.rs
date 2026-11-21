@@ -363,7 +363,7 @@ pub fn exit_with_error(err: &dyn std::fmt::Display) -> ! {
         .iter()
         .any(|code| message.contains(code))
     {
-        record_audit_result(true, "completed (output closed early)");
+        record_audit_result(true, "ended with a pipe error (output closed?)");
         std::process::exit(0);
     }
     record_audit_result(false, "failed (see the command's output)");
@@ -501,14 +501,14 @@ mod tests {
             op: String::new(),
             op_digest: String::new(),
         };
-        let result = super::result_entry(request, false, "Message size too large");
+        let result = super::result_entry(request, false, "failed (see the command's output)");
         assert_eq!(
             (result.action.as_str(), result.target.as_str()),
             ("produce", "orders")
         );
         assert_eq!(result.profile, "prod");
         assert!(!result.ok);
-        assert_eq!(result.outcome, "Message size too large");
+        assert_eq!(result.outcome, "failed (see the command's output)");
         assert!(result.time_ms > 1);
     }
 
