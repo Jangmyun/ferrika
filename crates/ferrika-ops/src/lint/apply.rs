@@ -522,6 +522,21 @@ impl<'a> ClusterRunner<'a> {
                     .find(|g| &g.name == group);
                 match listing {
                     Some(g) => {
+                        // Read the committed offsets again: a group whose
+                        // OffsetFetch failed during the scan (a coordinator
+                        // loading after a restart) looked like one that
+                        // committed nothing, and its delete cannot be undone.
+                        let offsets = ferrika_core::kafka::wire::fetch_group_offsets(
+                            self.config,
+                            std::slice::from_ref(group),
+                        )?;
+                        let Some(positions) = offsets.get(group) else {
+                            return Err(KafkaError::admin(format!(
+                                "cannot read the committed offsets of group '{group}'"
+                            )));
+                        };
+                        let partitions =
+                            crate::group_lag::group_partition_lags(positions, &input.data.topics);
                         if let Some(summary) = input
                             .data
                             .consumers
@@ -530,6 +545,7 @@ impl<'a> ClusterRunner<'a> {
                         {
                             summary.active_members = g.members.len();
                             summary.state = ConsumerState::from_broker_state(&g.state);
+                            summary.partitions = partitions;
                         }
                     }
                     None => input.data.consumers.retain(|c| &c.group_id != group),
