@@ -389,7 +389,11 @@ fn export_lines(rules: &PolicyRules) -> Vec<String> {
     if let (WatermarkRule::On, Some(text)) = (rules.watermark, &rules.watermark_text) {
         watermark.push_str(&format!(" (\"{text}\")"));
     }
-    vec![export, watermark]
+    let capture = format!(
+        "screen capture:    {}",
+        name(serde_json::json!(rules.screen_capture))
+    );
+    vec![export, watermark, capture]
 }
 
 /// `rules` for `-f json policy show`: as signed, plus `export`,
@@ -404,6 +408,8 @@ fn rules_json(rules: &PolicyRules) -> serde_json::Value {
             .or_insert_with(|| serde_json::json!(rules.export_clusters));
         map.entry("watermark")
             .or_insert_with(|| serde_json::json!(rules.watermark));
+        map.entry("screen_capture")
+            .or_insert_with(|| serde_json::json!(rules.screen_capture));
     }
     value
 }
@@ -638,13 +644,18 @@ mod tests {
         let v1 = PolicyRules::default();
         assert_eq!(
             export_lines(&v1),
-            vec!["record export:     allowed", "watermark:         off"]
+            vec![
+                "record export:     allowed",
+                "watermark:         off",
+                "screen capture:    allowed"
+            ]
         );
         let v2 = PolicyRules {
             export: crate::model::policy::ExportRule::Forbidden,
             export_clusters: vec!["*.prod.corp".into(), "10.20.*".into()],
             watermark: WatermarkRule::On,
             watermark_text: Some("대외비".into()),
+            screen_capture: crate::model::policy::ScreenCaptureRule::Blocked,
             ..PolicyRules::default()
         };
         assert_eq!(
@@ -652,6 +663,7 @@ mod tests {
             vec![
                 "record export:     forbidden on brokers *.prod.corp, 10.20.*",
                 "watermark:         on (\"대외비\")",
+                "screen capture:    blocked",
             ]
         );
 
@@ -660,7 +672,9 @@ mod tests {
         assert_eq!(json["export"], "allowed");
         assert_eq!(json["export_clusters"], serde_json::json!([]));
         assert_eq!(json["watermark"], "off");
+        assert_eq!(json["screen_capture"], "allowed");
         let json = rules_json(&v2);
+        assert_eq!(json["screen_capture"], "blocked");
         assert_eq!(json["export"], "forbidden");
         assert_eq!(json["watermark_text"], "대외비");
     }
