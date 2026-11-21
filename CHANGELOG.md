@@ -57,6 +57,8 @@ and 0.2.0 makes it crate-internal.
 - `ferrika --version` follows the crate version.
 - `ferrika.exe` carries Windows version information (product, version, file
   description) for Explorer, AppLocker and inventory tools.
+- The hint for a GSSAPI (Kerberos) profile that fails to connect had runs of
+  spaces in the middle of its sentence.
 
 ### Changed
 
