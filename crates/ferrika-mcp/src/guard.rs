@@ -15,8 +15,7 @@ use serde_json::{json, Value};
 use ferrika_core::model::policy::PolicyAction;
 use ferrika_governance::audit::AuditEntry;
 use ferrika_governance::policy::{
-    authorize_write_at, glob_match, AuditMode, AuditSink, EffectivePolicy, WriteRefusal,
-    WriteRequest,
+    authorize_write_at, AuditMode, AuditSink, EffectivePolicy, WriteRefusal, WriteRequest,
 };
 
 /// The write tools, in the order `tools/list` shows them.
@@ -258,7 +257,11 @@ impl WriteGuard {
             ));
         }
         if !self.config.topics.is_empty()
-            && !self.config.topics.iter().any(|g| glob_match(g, topic))
+            && !self
+                .config
+                .topics
+                .iter()
+                .any(|g| topic_glob_match(g, topic))
         {
             return Err(ToolError::new(
                 "target_not_allowed",
@@ -712,9 +715,48 @@ pub(super) fn args_digest(args: &Value) -> String {
     digest(&args)
 }
 
+/// `--topics` patterns: `*` any run, `?` one character, and case-sensitive
+/// like Kafka topic names (`dev-*` must not reach `DEV-payments`). The
+/// policy's `glob_match` ignores case, which suits profile names and hosts.
+fn topic_glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0, 0);
+    let (mut star, mut mark) = (None, 0);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    #[test]
+    fn topic_patterns_are_case_sensitive() {
+        assert!(topic_glob_match("dev-*", "dev-orders"));
+        assert!(!topic_glob_match("dev-*", "DEV-payments"));
+        assert!(!topic_glob_match("dev-*", "Dev-Orders"));
+        assert!(topic_glob_match("orders.v?", "orders.v1"));
+        assert!(!topic_glob_match("orders.v?", "orders.v10"));
+        assert!(topic_glob_match("*", "anything"));
+        assert!(topic_glob_match("a*b*", "aXbY"));
+        assert!(!topic_glob_match("", "x"));
+    }
     use ferrika_core::model::policy::{ExpiryRule, PolicyRules};
     use ferrika_governance::policy::{PolicyExpiry, PolicyStatus};
     use std::rc::Rc;

@@ -1098,6 +1098,8 @@ impl WriteTools {
                     "cleanup.policy changes to '{value}': with 'compact' old values of a key are \
                      removed, with 'delete' records expire by retention."
                 ));
+                // Either way records the topic keeps today can go.
+                destructive = true;
             }
             if key == "min.insync.replicas"
                 && value
@@ -1125,6 +1127,14 @@ impl WriteTools {
                 warnings.push(format!(
                     "'{key}' is not set on the topic; deleting it changes nothing."
                 ));
+            } else if now.is_some() && is_retention_key(key) {
+                // The broker default takes over, and it may be shorter (an
+                // override of -1, keep forever, is common on archives).
+                warnings.push(format!(
+                    "Deleting '{key}' falls back to the broker default, which may be shorter: \
+                     the broker then deletes older records, which cannot be undone."
+                ));
+                destructive = true;
             }
             rows.push(json!({
                 "key": key,
@@ -1517,8 +1527,16 @@ fn shown_value(key: &str, value: &str, sensitive: bool) -> String {
 
 /// A warning when setting `key` from `old` to `new` lets the broker delete
 /// data sooner (`retention.ms` / `retention.bytes` lowered; -1 = unlimited).
+/// Keys whose smaller value makes the broker delete records.
+fn is_retention_key(key: &str) -> bool {
+    matches!(
+        key,
+        "retention.ms" | "retention.bytes" | "local.retention.ms" | "local.retention.bytes"
+    )
+}
+
 fn shrink_warning(key: &str, old: &str, new: &str) -> Option<String> {
-    if !matches!(key, "retention.ms" | "retention.bytes") {
+    if !is_retention_key(key) {
         return None;
     }
     let (old, new) = (
@@ -2729,5 +2747,7 @@ pub(super) mod tests {
         assert!(shrink_warning("retention.ms", "86400000", "-1").is_none());
         assert!(shrink_warning("retention.ms", "1", "2").is_none());
         assert!(shrink_warning("segment.ms", "2", "1").is_none());
+        // Tiered storage's local retention deletes too.
+        assert!(shrink_warning("local.retention.ms", "-2", "3600000").is_some());
     }
 }
