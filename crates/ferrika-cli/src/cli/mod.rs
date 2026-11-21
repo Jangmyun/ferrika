@@ -282,6 +282,30 @@ pub fn read_password_stdin() -> Result<String, String> {
 /// Set once an error has been reported in full, so it is not printed again.
 static ERROR_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The client configuration of the cluster command being run, for
+/// [`hint_unreported`]; set by `main` before the command starts.
+static HINT_CONFIG: std::sync::OnceLock<KafkaClientConfig> = std::sync::OnceLock::new();
+
+/// Remembers the cluster the command talks to, so a failure its handler
+/// returns as is still gets the troubleshooting hints.
+pub fn set_hint_config(config: KafkaClientConfig) {
+    let _ = HINT_CONFIG.set(config);
+}
+
+/// Shows the troubleshooting hints for a failed cluster command, unless its
+/// handler already did or the error needs none (the broker's own message
+/// says what to fix). Most handlers return the error without hints.
+pub fn hint_unreported(error: &KafkaError) {
+    if ERROR_REPORTED.load(std::sync::atomic::Ordering::Relaxed)
+        || hint_kind(error) == HintKind::None
+    {
+        return;
+    }
+    if let Some(config) = HINT_CONFIG.get() {
+        print_connection_hint(config, error);
+    }
+}
+
 /// Ends the process after a failed command. The error is printed unless
 /// [`print_connection_hint`] already showed it.
 pub fn exit_with_error(err: &dyn std::fmt::Display) -> ! {

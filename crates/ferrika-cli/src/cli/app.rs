@@ -328,6 +328,9 @@ pub fn run(mut cli: Cli) {
     }
 
     let global = &cli.global_opts;
+    if needs_profiles(cli.command.as_ref()) {
+        cli::set_hint_config(global.to_kafka_config());
+    }
     match cli.command {
         Some(Commands::Topics(args)) => run_async(cli::topics::run(args, global)),
         Some(Commands::Produce(args)) => run_async(cli::produce::run(args, global)),
@@ -381,7 +384,7 @@ pub fn run(mut cli: Cli) {
 fn run_async<F, E>(command: F)
 where
     F: std::future::Future<Output = Result<(), E>>,
-    E: std::fmt::Display,
+    E: std::fmt::Display + 'static,
 {
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -393,11 +396,24 @@ where
     exit_on_error(rt.block_on(command));
 }
 
-/// Exits with the command's error (see [`cli::exit_with_error`]) if it failed.
-fn exit_on_error<E: std::fmt::Display>(result: Result<(), E>) {
+/// Exits with the command's error (see [`cli::exit_with_error`]) if it
+/// failed, after the troubleshooting hints a Kafka error calls for.
+fn exit_on_error<E: std::fmt::Display + 'static>(result: Result<(), E>) {
     if let Err(err) = result {
+        if let Some(kafka) = kafka_error_of(&err) {
+            cli::hint_unreported(kafka);
+        }
         cli::exit_with_error(&err);
     }
+}
+
+/// The Kafka error a command failed with, directly or inside an
+/// `anyhow::Error`.
+fn kafka_error_of(err: &dyn std::any::Any) -> Option<&crate::error::KafkaError> {
+    err.downcast_ref::<crate::error::KafkaError>().or_else(|| {
+        err.downcast_ref::<anyhow::Error>()
+            .and_then(|e| e.downcast_ref::<crate::error::KafkaError>())
+    })
 }
 
 /// Whether `command` uses the cluster profiles, so `main` resolves a
@@ -823,6 +839,17 @@ fn write_target(command: &Commands) -> String {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn kafka_errors_are_found_directly_or_in_anyhow() {
+        use super::kafka_error_of;
+        use crate::error::KafkaError;
+        let direct = KafkaError::io("refused");
+        assert!(kafka_error_of(&direct).is_some());
+        let wrapped = anyhow::Error::new(KafkaError::io("refused"));
+        assert!(kafka_error_of(&wrapped).is_some());
+        assert!(kafka_error_of(&anyhow::anyhow!("plain")).is_none());
+        assert!(kafka_error_of(&"text".to_string()).is_none());
+    }
     use super::*;
 
     #[test]
