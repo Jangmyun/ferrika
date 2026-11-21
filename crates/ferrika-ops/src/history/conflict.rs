@@ -100,21 +100,29 @@ fn drift_rows(before: &State, recorded: Option<&State>, current: &State) -> Vec<
         .collect()
 }
 
-/// Later operations that touched something `op` touched and are still in
-/// effect (not failed, not undone, not an undo of `op`). Undoing `op` first
-/// would silently drop their changes, so undo asks for them to be undone
-/// first (or `--force`).
+/// Later operations on the same cluster that touched something `op` touched
+/// and are still in effect (not failed, not undone, not an undo of `op`,
+/// not the undo of another later operation: that pair cancels out). Undoing
+/// `op` first would silently drop their changes, so undo asks for them to
+/// be undone first (or `--force`).
 pub fn later_overlaps<'a>(op: &Operation, all: &'a [Operation]) -> Vec<&'a Operation> {
     let keys: BTreeSet<String> = op.resource_keys().into_iter().collect();
     let Some(position) = all.iter().position(|o| o.id == op.id) else {
         return Vec::new();
     };
+    let later_ids: BTreeSet<&str> = all[position + 1..].iter().map(|o| o.id.as_str()).collect();
     all[position + 1..]
         .iter()
         .filter(|later| {
             later.ok() != Some(false)
                 && later.undone_by.is_none()
+                && later.begin.scope.same_cluster(&op.begin.scope)
                 && later.begin.undoes.as_deref() != Some(op.id.as_str())
+                && !later
+                    .begin
+                    .undoes
+                    .as_deref()
+                    .is_some_and(|undone| later_ids.contains(undone))
                 && later.begin.reversibility
                     != ferrika_core::model::history::Reversibility::NotApplicable
                 && later.resource_keys().iter().any(|k| keys.contains(k))
@@ -226,5 +234,27 @@ mod tests {
         let mut undone = all.clone();
         undone[1].undone_by = Some("U".into());
         assert!(later_overlaps(&first, &undone).is_empty());
+    }
+
+    #[test]
+    fn a_later_change_and_its_undo_do_not_block() {
+        // A sets 1->2, B sets 2->3, C undoes B (3->2): A can be undone.
+        let first = op("A", Some("1"), Some("2"));
+        let mut second = op("B", Some("2"), Some("3"));
+        let mut undo = op("C", Some("3"), Some("2"));
+        undo.begin.undoes = Some("B".into());
+        second.undone_by = Some("C".into());
+        let all = vec![first.clone(), second, undo];
+        assert!(later_overlaps(&first, &all).is_empty());
+    }
+
+    #[test]
+    fn later_changes_on_another_cluster_do_not_block() {
+        let first = op("A", Some("1"), Some("2"));
+        let mut elsewhere = op("B", Some("2"), Some("3"));
+        elsewhere.begin.scope.bootstrap = "other.cluster:9092".into();
+        elsewhere.begin.scope.cluster_id = "other-id".into();
+        let all = vec![first.clone(), elsewhere];
+        assert!(later_overlaps(&first, &all).is_empty());
     }
 }
