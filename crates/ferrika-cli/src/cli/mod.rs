@@ -363,6 +363,91 @@ fn result_entry(
     }
 }
 
+/// What a quick TCP connect to one address of a bootstrap server (or
+/// resolving the server's name) found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Reach {
+    /// The address accepted the connection.
+    Open,
+    /// Refused, or the name did not resolve: nothing listens there.
+    Closed(String),
+    /// No answer in time: a firewall may drop packets, or a slow network
+    /// may answer later. The Kafka client decides, as before.
+    Unclear,
+}
+
+fn connect(addr: std::net::SocketAddr, server: &str, timeout: std::time::Duration) -> Reach {
+    match std::net::TcpStream::connect_timeout(&addr, timeout) {
+        Ok(_) => Reach::Open,
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            Reach::Closed(format!("{server}: connection refused"))
+        }
+        Err(_) => Reach::Unclear,
+    }
+}
+
+/// Why nothing can be reached, when every address of every server is
+/// certainly closed; `None` once one is open or unclear.
+fn closed_reason(results: &[Reach]) -> Option<String> {
+    let mut reasons: Vec<&str> = Vec::new();
+    for result in results {
+        match result {
+            Reach::Closed(reason) => {
+                if !reasons.contains(&reason.as_str()) {
+                    reasons.push(reason);
+                }
+            }
+            Reach::Open | Reach::Unclear => return None,
+        }
+    }
+    (!reasons.is_empty()).then(|| format!("Nothing accepts connections at {}", reasons.join("; ")))
+}
+
+/// Why no bootstrap server can be reached, when that is certain (see
+/// [`closed_reason`]), so a command can fail at once instead of waiting
+/// `--timeout` (30 s) for a broker that is not running. Every address is
+/// tried in parallel, and the first open or unclear one ends the wait: a
+/// refused IPv6 `localhost` (about 2 s on Windows) must not slow down a
+/// broker that listens on IPv4.
+pub fn unreachable_bootstrap(bootstrap: &str, timeout: std::time::Duration) -> Option<String> {
+    use std::net::ToSocketAddrs as _;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut results = Vec::new();
+    let mut pending = 0usize;
+    for server in bootstrap
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let addrs: Vec<_> = match server.to_socket_addrs() {
+            Ok(addrs) => addrs.collect(),
+            Err(e) => {
+                results.push(Reach::Closed(format!("{server}: {e}")));
+                continue;
+            }
+        };
+        if addrs.is_empty() {
+            results.push(Reach::Closed(format!("{server}: no address")));
+        }
+        for addr in addrs {
+            let (tx, server) = (tx.clone(), server.to_string());
+            std::thread::spawn(move || {
+                let _ = tx.send(connect(addr, &server, timeout));
+            });
+            pending += 1;
+        }
+    }
+    drop(tx);
+    for _ in 0..pending {
+        match rx.recv() {
+            Ok(Reach::Closed(reason)) => results.push(Reach::Closed(reason)),
+            // Open, unclear, or a check that died: let the client decide.
+            Ok(Reach::Open | Reach::Unclear) | Err(_) => return None,
+        }
+    }
+    closed_reason(&results)
+}
+
 /// Ends the process after a failed command. The error is printed unless
 /// [`print_connection_hint`] already showed it.
 pub fn exit_with_error(err: &dyn std::fmt::Display) -> ! {
@@ -495,6 +580,45 @@ fn hint_kind(error: &KafkaError) -> HintKind {
 #[cfg(test)]
 mod tests {
     use super::{connection_hints, hint_kind, read_password_line, HintKind, KERBEROS_HINT};
+
+    #[test]
+    fn only_certain_failures_stop_a_command_early() {
+        use super::{closed_reason, Reach};
+        let closed = || Reach::Closed("h:1: connection refused".into());
+        // The same server's addresses (IPv6 and IPv4) are named once.
+        assert_eq!(
+            closed_reason(&[closed(), closed()]).as_deref(),
+            Some("Nothing accepts connections at h:1: connection refused")
+        );
+        // One open or unclear server: the client decides.
+        assert_eq!(closed_reason(&[closed(), Reach::Open]), None);
+        assert_eq!(closed_reason(&[closed(), Reach::Unclear]), None);
+        assert_eq!(closed_reason(&[]), None);
+    }
+
+    #[test]
+    fn a_listening_port_is_reachable_and_a_closed_one_is_not() {
+        use super::unreachable_bootstrap;
+        use std::time::Duration;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let open = listener.local_addr().unwrap().to_string();
+        assert_eq!(unreachable_bootstrap(&open, Duration::from_secs(3)), None);
+        // A closed server next to an open one: reachable.
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        assert_eq!(
+            unreachable_bootstrap(&format!("{closed},{open}"), Duration::from_secs(3)),
+            None
+        );
+        drop(listener);
+        // Nothing listens on either now (or the check is unclear).
+        let reason = unreachable_bootstrap(&format!("{closed},{open}"), Duration::from_secs(3));
+        if let Some(reason) = reason {
+            assert!(reason.contains("connection refused"), "{reason}");
+        }
+    }
 
     #[test]
     fn audit_results_keep_the_request_and_set_the_outcome() {
