@@ -282,7 +282,7 @@ pub fn mentioned_paths(text: &str) -> Vec<String> {
 
 /// How good a match `candidate` is for what was typed; `None` for no match.
 /// Prefix beats word-boundary prefix beats substring beats in-order letters.
-pub fn match_score(candidate: &str, typed: &str) -> Option<i32> {
+pub(crate) fn match_score(candidate: &str, typed: &str) -> Option<i32> {
     if typed.is_empty() {
         return Some(0);
     }

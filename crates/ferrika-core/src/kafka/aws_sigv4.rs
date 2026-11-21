@@ -48,7 +48,7 @@ impl std::fmt::Debug for AwsCredentials {
 }
 
 /// The SigV4 service name MSK IAM signs for.
-pub const MSK_SERVICE: &str = "kafka-cluster";
+pub(crate) const MSK_SERVICE: &str = "kafka-cluster";
 
 /// How long a presigned MSK token is valid, in seconds (the signer's default).
 pub const MSK_TOKEN_EXPIRES_SECS: u64 = 900;
@@ -60,7 +60,7 @@ const EMPTY_PAYLOAD_SHA256: &str =
 /// A request to presign with query parameters (`X-Amz-*`), signing only the
 /// `host` header.
 #[derive(Debug, Clone)]
-pub struct PresignRequest<'a> {
+pub(crate) struct PresignRequest<'a> {
     pub method: &'a str,
     pub host: &'a str,
     /// Absolute path, already URI-encoded (`/` for the root).
@@ -76,7 +76,7 @@ pub struct PresignRequest<'a> {
 
 /// Percent-encodes `text` the way SigV4 wants: everything but the RFC 3986
 /// unreserved characters, upper-case hex.
-pub fn uri_encode(text: &str) -> String {
+pub(crate) fn uri_encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for b in text.bytes() {
         match b {
@@ -105,7 +105,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 }
 
 /// The SigV4 signing key for one day, region and service.
-pub fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+pub(crate) fn signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
     let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
@@ -122,7 +122,7 @@ fn canonical_query(params: &BTreeMap<String, String>) -> String {
 }
 
 /// The string to sign for a canonical request.
-pub fn string_to_sign(amz_date: &str, scope: &str, canonical_request: &str) -> String {
+pub(crate) fn string_to_sign(amz_date: &str, scope: &str, canonical_request: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         sha256_hex(canonical_request.as_bytes())
@@ -131,7 +131,7 @@ pub fn string_to_sign(amz_date: &str, scope: &str, canonical_request: &str) -> S
 
 /// Presigns `request`, returning the query string with the signature
 /// (`...&X-Amz-Signature=<hex>`), parameters sorted.
-pub fn presign_query(
+pub(crate) fn presign_query(
     request: &PresignRequest<'_>,
     credentials: &AwsCredentials,
     now: Timestamp,
@@ -178,7 +178,11 @@ pub fn presign_query(
 }
 
 /// The presigned MSK IAM URL for `region`, `User-Agent` parameter included.
-pub fn msk_presigned_url(credentials: &AwsCredentials, region: &str, now: Timestamp) -> String {
+pub(crate) fn msk_presigned_url(
+    credentials: &AwsCredentials,
+    region: &str,
+    now: Timestamp,
+) -> String {
     let host = format!("kafka.{region}.amazonaws.com");
     let request = PresignRequest {
         method: "GET",

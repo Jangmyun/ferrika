@@ -764,7 +764,7 @@ impl ProfileStore {
 /// Parses Java-style `.properties` text: `key=value` or `key: value`
 /// lines, `#`/`!` comments, `\` line continuations and escapes
 /// (`\\`, `\=`, `\:`, `\t`, `\n`, `\uXXXX`).
-pub fn parse_properties(text: &str) -> BTreeMap<String, String> {
+pub(crate) fn parse_properties(text: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let mut pending = String::new();
     for raw in text.lines() {

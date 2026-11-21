@@ -456,7 +456,7 @@ impl<'a> AvroWalk<'a> {
 
 /// The fields of a JSON Schema whose external `$ref`s may point at
 /// `references` (reference name, document).
-pub fn json_catalog(
+pub(crate) fn json_catalog(
     schema: &Value,
     references: &[(String, Value)],
     limits: &Limits,

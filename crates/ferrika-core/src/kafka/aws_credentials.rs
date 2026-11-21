@@ -72,7 +72,7 @@ type Ini = BTreeMap<String, BTreeMap<String, String>>;
 
 /// Parses the INI dialect of the AWS shared files: `[section]`,
 /// `key = value`, `#`/`;` comments. Keys are lower-cased.
-pub fn parse_ini(text: &str) -> Ini {
+pub(crate) fn parse_ini(text: &str) -> Ini {
     let mut out = Ini::new();
     let mut section: Option<String> = None;
     for line in text.lines() {
@@ -125,7 +125,7 @@ fn profile_settings(lookup: &Lookup<'_>, name: &str) -> Option<BTreeMap<String, 
 /// `AWS_SECRET_ACCESS_KEY` (/ `AWS_SESSION_TOKEN`) variables first; then
 /// the profile (explicit, else `AWS_PROFILE`, else `default`) from the
 /// shared files, static keys or `credential_process`.
-pub fn resolve_credentials(
+pub(crate) fn resolve_credentials(
     lookup: &Lookup<'_>,
     profile: Option<&str>,
 ) -> KafkaResult<AwsCredentials> {
@@ -185,7 +185,7 @@ fn show(path: Option<PathBuf>) -> String {
 
 /// Runs a `credential_process` command (through the shell) and parses its
 /// JSON output (`Version` 1).
-pub fn run_credential_process(command: &str) -> KafkaResult<AwsCredentials> {
+pub(crate) fn run_credential_process(command: &str) -> KafkaResult<AwsCredentials> {
     // Passed verbatim: Rust's argument quoting (\") means nothing to cmd and
     // would break JSON or quoted paths. `/S /C "..."` strips exactly the
     // outer quotes.
@@ -214,7 +214,7 @@ pub fn run_credential_process(command: &str) -> KafkaResult<AwsCredentials> {
 
 /// Parses `{"Version":1,"AccessKeyId":..,"SecretAccessKey":..,
 /// "SessionToken":..,"Expiration":"<RFC 3339>"}`.
-pub fn parse_credential_process_output(text: &str) -> KafkaResult<AwsCredentials> {
+pub(crate) fn parse_credential_process_output(text: &str) -> KafkaResult<AwsCredentials> {
     let bad = |why: &str| KafkaError::config(format!("AWS credential_process output {why}"));
     let json: serde_json::Value =
         serde_json::from_str(text.trim()).map_err(|_| bad("is not JSON"))?;
@@ -240,7 +240,7 @@ pub fn parse_credential_process_output(text: &str) -> KafkaResult<AwsCredentials
 /// The region in an MSK bootstrap host name
 /// (`b-1.c.abc.c2.kafka.us-east-1.amazonaws.com`,
 /// `boot-x.c1.kafka-serverless.eu-west-1.amazonaws.com`).
-pub fn region_from_bootstrap(bootstrap: &str) -> Option<String> {
+pub(crate) fn region_from_bootstrap(bootstrap: &str) -> Option<String> {
     bootstrap.split(',').find_map(|server| {
         let host = server
             .trim()
