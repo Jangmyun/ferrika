@@ -134,17 +134,43 @@ fn cluster_profile_name(
         .unwrap_or_default()
 }
 
+/// Whether `args` name the clusters to copy between; then [`authorize`]
+/// checks the destination, and the gate in `main` stays out (see
+/// `main_gate_action`).
+pub fn names_clusters(args: &MirrorArgs) -> bool {
+    args.dst_profile.is_some() || args.src_profile.is_some() || args.dst_bootstrap_servers.is_some()
+}
+
 /// The write gate in `main` checks the cluster the global options name, but
 /// `mirror` writes to its destination cluster; see [`authorize_with`].
 pub fn authorize(args: &MirrorArgs, global: &GlobalOpts) -> Result<(), String> {
     let store = global.profile_store();
-    authorize_with(
+    let requested = authorize_checking_brokers(
         crate::governance::policy::current(),
         &crate::governance::policy::AuditLog,
         &store,
         args,
         global,
-    )
+        crate::kafka::admin::known_brokers,
+    )?;
+    // The destination's request entry was written here, not in `main`: owe
+    // its result line too (see `cli::record_audit_result`).
+    if let Some(profile) = requested {
+        crate::cli::expect_audit_result(crate::governance::audit::AuditEntry {
+            time_ms: 0,
+            source: "cli".to_string(),
+            profile,
+            action: "mirror".to_string(),
+            target: format!("{} -> {}", args.src_topic, args.dst_topic),
+            outcome: String::new(),
+            ok: true,
+            user: String::new(),
+            actor: None,
+            op: String::new(),
+            op_digest: String::new(),
+        });
+    }
+    Ok(())
 }
 
 /// Refuses `mirror` under enforced PII masking (it would copy unmasked
@@ -152,6 +178,9 @@ pub fn authorize(args: &MirrorArgs, global: &GlobalOpts) -> Result<(), String> {
 /// another cluster (see [`authorize_cross_cluster`]), then the write gate for the destination
 /// cluster as a `produce`: a read-only target or `forbid: produce` refuses it
 /// with a `policy.blocked` entry, and so does a read-only destination profile.
+/// [`authorize_checking_brokers`] without a cluster to ask: tests whose
+/// policies need no broker metadata.
+#[cfg(test)]
 fn authorize_with(
     policy: &EffectivePolicy,
     sink: &impl AuditSink,
@@ -159,6 +188,23 @@ fn authorize_with(
     args: &MirrorArgs,
     global: &GlobalOpts,
 ) -> Result<(), String> {
+    authorize_checking_brokers(policy, sink, store, args, global, |_| {
+        Err("no cluster in this test".to_string())
+    })
+    .map(|_| ())
+}
+
+/// `fetch` lists the brokers a cluster reports, for `read_only_brokers`:
+/// a tunnel or an IP address of the destination must not dodge it (the gate
+/// in `main` does the same for the global cluster).
+fn authorize_checking_brokers(
+    policy: &EffectivePolicy,
+    sink: &impl AuditSink,
+    store: &ProfileStore,
+    args: &MirrorArgs,
+    global: &GlobalOpts,
+    fetch: impl Fn(&KafkaClientConfig) -> Result<Vec<String>, String>,
+) -> Result<Option<String>, String> {
     // An unknown profile would silently fall back to localhost.
     for name in [args.src_profile.as_deref(), args.dst_profile.as_deref()]
         .into_iter()
@@ -194,15 +240,12 @@ fn authorize_with(
         }
         return Err(reason);
     }
-    authorize_cross_cluster(policy, sink, store, args, global, &target)?;
+    authorize_cross_cluster(policy, sink, store, args, global, &target, &fetch)?;
 
     // Without any cluster option the destination is the cluster the gate in
     // `main` already checked and recorded.
-    if args.dst_profile.is_none()
-        && args.src_profile.is_none()
-        && args.dst_bootstrap_servers.is_none()
-    {
-        return Ok(());
+    if !names_clusters(args) {
+        return Ok(None);
     }
     let dst_name = args.dst_profile.as_deref().or(args.src_profile.as_deref());
     let profile = cluster_profile_name(store, dst_name, global);
@@ -212,13 +255,30 @@ fn authorize_with(
         args.dst_bootstrap_servers.as_deref(),
         global,
     );
+    let brokers =
+        match policy::brokers_for_with(&config, policy.write_needs_broker_metadata(), &fetch) {
+            Ok(brokers) => brokers,
+            Err(reason) => {
+                let named = if profile.is_empty() {
+                    config.bootstrap_servers.as_str()
+                } else {
+                    profile.as_str()
+                };
+                let entry =
+                    policy::blocked_entry("cli", named, &format!("mirror {target}"), &reason);
+                if let Err(e) = sink.record(&entry) {
+                    tracing::warn!(%e, "Could not write the audit log");
+                }
+                return Err(reason);
+            }
+        };
     let request = WriteRequest {
         source: "cli",
         action: PolicyAction::Produce,
         label: "mirror",
         target: &target,
         profile: &profile,
-        bootstrap: &config.bootstrap_servers,
+        bootstrap: &brokers,
         actor: None,
         op: None,
     };
@@ -236,7 +296,10 @@ fn authorize_with(
              Turn it off with `ferrika profile read-only {name} --off`."
         ))
     })
-    .map_err(|refusal| refusal.to_string())
+    .map_err(|refusal| refusal.to_string())?;
+    // The profile the request entry names (its brokers without a name), for
+    // the result entry to pair with.
+    Ok(Some(if profile.is_empty() { brokers } else { profile }))
 }
 
 /// Copying records to another cluster takes them out of the source cluster:
@@ -251,6 +314,7 @@ fn authorize_cross_cluster(
     args: &MirrorArgs,
     global: &GlobalOpts,
     target: &str,
+    fetch: &impl Fn(&KafkaClientConfig) -> Result<Vec<String>, String>,
 ) -> Result<(), String> {
     let src_name = args.src_profile.as_deref();
     let dst_name = args.dst_profile.as_deref().or(src_name);
@@ -275,6 +339,23 @@ fn authorize_cross_cluster(
     }
     let target = format!("{target} (to {destination})");
     let profile = cluster_profile_name(store, src_name, global);
+    // `export_clusters` matches the brokers the source reports too, as the
+    // export gate in `main` does: a tunnel or an IP must not dodge it.
+    let src_brokers = match policy::export_brokers_with(policy, &src, fetch) {
+        Ok(brokers) => brokers,
+        Err(reason) => {
+            let named = if profile.is_empty() {
+                src.bootstrap_servers.as_str()
+            } else {
+                profile.as_str()
+            };
+            let entry = policy::blocked_entry("cli", named, &format!("mirror {target}"), &reason);
+            if let Err(e) = sink.record(&entry) {
+                tracing::warn!(%e, "Could not write the audit log");
+            }
+            return Err(reason);
+        }
+    };
     let request = ExportRequest {
         source: "cli",
         channel: ExportChannel::Cluster,
@@ -282,7 +363,7 @@ fn authorize_cross_cluster(
         target: &target,
         records: None,
         profile: &profile,
-        bootstrap: &src.bootstrap_servers,
+        bootstrap: &src_brokers,
         actor: None,
     };
     policy::authorize_export_with(policy, sink, &request).map_err(|refusal| refusal.to_string())?;
@@ -651,6 +732,64 @@ mod tests {
     }
 
     #[test]
+    fn read_only_brokers_match_the_destinations_reported_brokers() {
+        let mut policy = verified(&[], &[]);
+        policy.rules.read_only_brokers = vec!["*.prod.corp:*".to_string()];
+        let args = mirror_args(&["--dst-profile", "prod-eu"]);
+        // Reached through a tunnel: the bootstrap does not match, the
+        // brokers the cluster reports do.
+        let log = FakeLog::default();
+        let reason = authorize_checking_brokers(&policy, &log, &store(), &args, &global(), |_| {
+            Ok(vec!["b1.prod.corp:9092".to_string()])
+        })
+        .unwrap_err();
+        assert!(reason.contains("read-only"), "{reason}");
+        assert_eq!(log.entries.borrow()[0].action, "policy.blocked");
+        // Other brokers: allowed; the result line pairs with the request's profile.
+        let log = FakeLog::default();
+        assert_eq!(
+            authorize_checking_brokers(&policy, &log, &store(), &args, &global(), |_| {
+                Ok(vec!["b1.dev.corp:9092".to_string()])
+            }),
+            Ok(Some("prod-eu".to_string()))
+        );
+        // The brokers cannot be read: refused, not let through.
+        let log = FakeLog::default();
+        assert!(
+            authorize_checking_brokers(&policy, &log, &store(), &args, &global(), |_| {
+                Err("unreachable".to_string())
+            })
+            .is_err()
+        );
+        assert_eq!(log.entries.borrow()[0].action, "policy.blocked");
+    }
+
+    #[test]
+    fn export_clusters_match_the_sources_reported_brokers() {
+        let mut policy = verified(&[], &[]);
+        policy.rules.export = crate::model::policy::ExportRule::Forbidden;
+        policy.rules.export_clusters = vec!["*.prod.corp:*".to_string()];
+        let args = mirror_args(&["--src-profile", "dev", "--dst-profile", "prod-eu"]);
+        let dev = store().get("dev").unwrap().bootstrap_servers.clone();
+        // The source is reached through an alias; it reports prod's brokers.
+        let log = FakeLog::default();
+        let refused = authorize_checking_brokers(&policy, &log, &store(), &args, &global(), |c| {
+            Ok(if c.bootstrap_servers == dev {
+                vec!["b1.prod.corp:9092".to_string()]
+            } else {
+                vec!["b1.other:9092".to_string()]
+            })
+        });
+        assert!(refused.is_err(), "{refused:?}");
+        // A source that reports other brokers may copy.
+        let log = FakeLog::default();
+        let allowed = authorize_checking_brokers(&policy, &log, &store(), &args, &global(), |_| {
+            Ok(vec!["b1.other:9092".to_string()])
+        });
+        assert!(allowed.is_ok(), "{allowed:?}");
+    }
+
+    #[test]
     fn forbidden_produce_refuses_the_destination() {
         let policy = verified(&[], &["produce"]);
         let log = FakeLog::default();
@@ -792,9 +931,13 @@ mod tests {
         dev_only.rules.export_clusters = vec!["kafka.prod".into()];
         let log = FakeLog::default();
         let args = mirror_args(&["--src-profile", "dev", "--dst-profile", "prod-eu"]);
-        assert_eq!(
-            authorize_with(&dev_only, &log, &store(), &args, &global()),
-            Ok(())
+        // The source's brokers are read for the rule: here, what it is
+        // configured with.
+        assert!(
+            authorize_checking_brokers(&dev_only, &log, &store(), &args, &global(), |c| {
+                Ok(vec![c.bootstrap_servers.clone()])
+            })
+            .is_ok()
         );
 
         // Audited: recorded, then the destination's write gate.

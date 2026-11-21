@@ -280,7 +280,7 @@ pub fn run(mut cli: Cli) {
         }
     }
 
-    if let Some(action) = cli.command.as_ref().and_then(write_action) {
+    if let Some(action) = cli.command.as_ref().and_then(main_gate_action) {
         let profile = cli.global_opts.resolved_profile_name().unwrap_or_default();
         // The brokers the cluster reports too (a tunnel or IP address must
         // not dodge `read_only_brokers`), only when the policy has such a rule.
@@ -472,6 +472,18 @@ fn needs_profiles(command: Option<&Commands>) -> bool {
 /// There is no wildcard arm, at any level, on purpose: a new command or
 /// subcommand stops this from compiling until its author decides whether it
 /// writes, so a policy check cannot be skipped by forgetting to register it.
+/// The write the gate in `main` checks and records for `command`: its
+/// [`write_action`], except a `mirror` that names its clusters
+/// (`--src-profile`, `--dst-profile`, `--dst-bootstrap-servers`), whose
+/// destination `mirror::authorize` checks and records; the global profile
+/// may then be a cluster it never writes to (and refuse it when read-only).
+fn main_gate_action(command: &Commands) -> Option<&'static str> {
+    match command {
+        Commands::Mirror(args) if cli::mirror::names_clusters(args) => None,
+        _ => write_action(command),
+    }
+}
+
 fn write_action(command: &Commands) -> Option<&'static str> {
     use cli::acl::AclSubcommands;
     use cli::offset::OffsetSubcommands;
@@ -985,6 +997,26 @@ mod tests {
             assert_eq!(write_action(&cmd), Some(action), "{args:?}");
             assert_eq!(write_target(&cmd), target, "{args:?}");
         }
+    }
+
+    #[test]
+    fn mirror_between_named_clusters_skips_the_global_gate() {
+        use super::main_gate_action;
+        assert_eq!(
+            main_gate_action(&command(&["mirror", "a", "b"])),
+            Some("mirror")
+        );
+        for args in [
+            &["mirror", "a", "b", "--src-profile", "prod"][..],
+            &["mirror", "a", "b", "--dst-profile", "staging"][..],
+            &["mirror", "a", "b", "--dst-bootstrap-servers", "h:9092"][..],
+        ] {
+            assert_eq!(main_gate_action(&command(args)), None, "{args:?}");
+        }
+        assert_eq!(
+            main_gate_action(&command(&["produce", "t", "-m", "x"])),
+            Some("produce")
+        );
     }
 
     #[test]
