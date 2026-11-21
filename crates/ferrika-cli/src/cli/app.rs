@@ -364,7 +364,12 @@ pub fn run(mut cli: Cli) {
     {
         cli::set_hint_config(global.to_kafka_config());
     }
-    if cli.command.as_ref().is_some_and(fails_fast_without_broker) {
+    // Only for a person at a terminal: a script may start the broker and
+    // the command together (`docker compose up -d && ferrika ...`) and rely
+    // on the client waiting for it.
+    if std::io::IsTerminal::is_terminal(&std::io::stderr())
+        && cli.command.as_ref().is_some_and(fails_fast_without_broker)
+    {
         let config = global.to_kafka_config();
         if let Some(reason) =
             cli::unreachable_bootstrap(&config.bootstrap_servers, std::time::Duration::from_secs(3))
