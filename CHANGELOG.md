@@ -2,7 +2,10 @@
 
 All notable changes to the Ferrika crates and the `ferrika` CLI. The crates
 share one version. Before 1.0, a minor version (0.x) may break the library
-API; a patch version (0.x.y) does not.
+API; a patch version (0.x.y) does not. Exception: `ferrika-cli`'s Rust `cli`
+module is the command line's own code (argument structs, the command enum),
+not a library API; options added to commands change it in patch versions,
+and 0.2.0 makes it crate-internal.
 
 ## 0.1.1
 
@@ -15,10 +18,6 @@ API; a patch version (0.x.y) does not.
   the archive's sha256.
 - `ferrika mirror -g/--group`: resumable mirroring. A later run with the same
   group continues where the last one stopped.
-- `ferrika reassign plan` keeps replicas that are already well placed and
-  moves as few as possible (adding a broker moves only its share, removing one
-  moves only its replicas); it prints how many replicas move.
-  `--from-scratch` gives the previous round-robin layout.
 - `ferrika audit --source cli|gui|mcp`, `--actor TEXT`, `--failed`.
 - MCP: changes made by the write tools (`create_topic`, `alter_topic_config`,
   `reset_consumer_group_offsets`) are recorded in the operation history, so
@@ -45,17 +44,25 @@ API; a patch version (0.x.y) does not.
 - `dlq redrive` and `dlq export` stopped at the first 800 ms gap, so a slow
   first fetch looked like an empty DLQ. They now read up to the high
   watermark and warn when the result is partial.
-- `schema check -m *_transitive` reported the mode without `_TRANSITIVE` and
-  said "incompatible with latest registered schema".
+- `schema check -m *_transitive` showed the mode without `_TRANSITIVE` and
+  said "incompatible with latest registered schema". The table shows
+  `BACKWARD_TRANSITIVE (N versions)`; JSON keeps `mode` as before and adds
+  `transitive: true` and `versions_checked`.
 - `ferrika lint` printed the target name twice on every line.
 - The Linux binary no longer needs `libz.so.1` (zlib is linked statically);
   release builds check that only glibc / system libraries are linked.
-- Secrets (SASL password, OIDC client secret, SCRAM password, webhook URL)
-  no longer appear in the `Debug` output of parsed command-line arguments.
+- Secrets (SASL password, OIDC client secret, SCRAM password, webhook URL,
+  credentials in Schema Registry and Connect URLs) no longer appear in the
+  `Debug` output of parsed command-line arguments.
 - `ferrika --version` follows the crate version.
 
 ### Changed
 
+- **`ferrika reassign plan` (with a cluster) now keeps replicas that are
+  already well placed and moves as few as possible** (adding a broker moves
+  only its share, removing one moves only its replicas) and prints how many
+  replicas move. The JSON shape is the same; `--from-scratch` gives the
+  previous round-robin layout. The offline plan (`--partitions`) is unchanged.
 - `ferrika --help`: one accurate line per command, no "(CLI mode)" suffix.
 - `ferrika-core` docs, README and `examples/quickstart.rs` show how to use it
   as a library; CONTRIBUTING describes the five crates; issue and pull request
