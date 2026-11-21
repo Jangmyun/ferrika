@@ -1,4 +1,3 @@
-use rdkafka::Offset;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -7,8 +6,9 @@ use comfy_table::{Cell, CellAlignment, Color};
 
 use crate::cli::{output, GlobalOpts};
 use crate::error::{KafkaError, KafkaResult};
-use crate::kafka::bounded_read::{read_topic, BoundedReadOptions};
-use crate::kafka::consumer::KafkaConsumerClient;
+use crate::kafka::bounded_read::{
+    read_ranges, read_topic, topic_watermarks, BoundedReadOptions, PartitionRange, TopicMarks,
+};
 use crate::kafka::producer::{KafkaProducerClient, OwnedProducerRecord};
 use crate::ops::dlq::{
     build_redrive_plan_from, DlqAnalysis, DlqMessage, RedrivePlanItem, RedriveStart,
@@ -114,30 +114,6 @@ pub async fn handle_dlq(args: DlqArgs, global: &GlobalOpts) -> KafkaResult<()> {
         DlqSubcommands::Redrive(redrive_args) => run_redrive(redrive_args, global).await,
         DlqSubcommands::Export(export_args) => run_export(export_args, global).await,
     }
-}
-
-/// Fetches DLQ messages from the configured cluster.
-async fn fetch_dlq_messages(
-    topic: &str,
-    limit: usize,
-    global: &GlobalOpts,
-) -> KafkaResult<Vec<DlqMessage>> {
-    let mut messages = Vec::new();
-    let config = global.to_kafka_config();
-    let client = KafkaConsumerClient::scanner(&config)?;
-    client.assign_topic(topic, Offset::Beginning)?;
-    let timeout = Duration::from_millis(800);
-    for _ in 0..limit {
-        match tokio::time::timeout(timeout, client.recv()).await {
-            Ok(Ok(msg)) => {
-                messages.push(DlqMessage::from_consumed_message(&msg, topic));
-            }
-            Ok(Err(error)) => return Err(error),
-            Err(_) => break,
-        }
-    }
-
-    Ok(messages)
 }
 
 /// Samples up to `limit` DLQ messages of `topic` (or of one `partition`),
@@ -304,35 +280,50 @@ async fn fetch_redrive_messages(
     global: &GlobalOpts,
 ) -> KafkaResult<Vec<DlqMessage>> {
     let config = global.to_kafka_config();
-    let client = KafkaConsumerClient::scanner(&config)?;
-    let partitions = client.topic_partitions(topic, None)?;
-    if let Some(missing) = start.partitions.keys().find(|p| !partitions.contains(p)) {
+    let marks = topic_watermarks(&config, topic, None)?;
+    let known = |p: &i32| marks.marks.contains_key(p) || marks.unavailable.contains(p);
+    if let Some(missing) = start.partitions.keys().find(|p| !known(p)) {
         return Err(KafkaError::PartitionNotFound {
             topic: topic.to_string(),
             partition: *missing,
         });
     }
-    let assignments: Vec<(&str, i32, Offset)> = partitions
-        .iter()
-        .map(|&p| {
-            let offset = start
-                .offset_for(p)
-                .map_or(Offset::Beginning, Offset::Offset);
-            (topic, p, offset)
-        })
-        .collect();
-    client.assign_with_offsets(&assignments)?;
-
-    let mut messages = Vec::new();
-    let timeout = Duration::from_millis(800);
-    for _ in 0..limit {
-        match tokio::time::timeout(timeout, client.recv()).await {
-            Ok(Ok(msg)) => messages.push(DlqMessage::from_consumed_message(&msg, topic)),
-            Ok(Err(error)) => return Err(error),
-            Err(_) => break,
-        }
+    // Up to the high watermarks captured now: records that land in the DLQ
+    // while this runs (or that the redrive itself sends back) wait for the
+    // next run.
+    let ranges = redrive_ranges(&marks, start);
+    let mut read = read_ranges(
+        &config,
+        &ranges,
+        &BoundedReadOptions::with_max_records(limit),
+        |_| true,
+    )
+    .await?;
+    read.unavailable = marks.unavailable;
+    if let Some(warning) = read.partial_warning(topic, false) {
+        eprintln!("⚠ {warning}");
     }
-    Ok(messages)
+    Ok(read
+        .records
+        .iter()
+        .map(|msg| DlqMessage::from_consumed_message(msg, topic))
+        .collect())
+}
+
+/// Per partition: from the `--from-offset` start (not below the low
+/// watermark) up to the high watermark.
+fn redrive_ranges(marks: &TopicMarks, start: &RedriveStart) -> Vec<PartitionRange> {
+    marks
+        .marks
+        .iter()
+        .map(|(&partition, &(low, high))| PartitionRange {
+            topic: marks.topic.clone(),
+            partition,
+            start: start.offset_for(partition).map_or(low, |o| o.max(low)),
+            end: high,
+        })
+        .filter(|r| r.start < r.end)
+        .collect()
 }
 
 async fn run_redrive(args: RedriveDlqArgs, global: &GlobalOpts) -> KafkaResult<()> {
@@ -526,7 +517,7 @@ async fn publish_redrive(
 }
 
 async fn run_export(args: ExportDlqArgs, global: &GlobalOpts) -> KafkaResult<()> {
-    let messages = fetch_dlq_messages(&args.topic, args.limit, global).await?;
+    let messages = sample_dlq_messages(&args.topic, None, args.limit, global).await?;
     let policy = crate::governance::policy::current();
     crate::cli::note_masking(policy);
     let messages = shown(messages, policy);
@@ -604,6 +595,30 @@ mod tests {
     struct Wrapper {
         #[command(subcommand)]
         cmd: DlqSubcommands,
+    }
+
+    #[test]
+    fn redrive_reads_from_the_start_offset_up_to_the_high_watermark() {
+        let marks = TopicMarks {
+            topic: "dlq".into(),
+            marks: [(0, (0, 10)), (1, (5, 8)), (2, (0, 4)), (3, (2, 2))]
+                .into_iter()
+                .collect(),
+            unavailable: vec![],
+        };
+        let start = RedriveStart::parse(&["3".into(), "1:2".into(), "2:9".into()]).unwrap();
+        let ranges: Vec<(i32, i64, i64)> = redrive_ranges(&marks, &start)
+            .iter()
+            .map(|r| (r.partition, r.start, r.end))
+            .collect();
+        // p0 from the default 3; p1 from its low watermark (2 is gone);
+        // p2 starts past its end and p3 is empty, so neither is read.
+        assert_eq!(ranges, vec![(0, 3, 10), (1, 5, 8)]);
+        let from_beginning: Vec<i64> = redrive_ranges(&marks, &RedriveStart::default())
+            .iter()
+            .map(|r| r.start)
+            .collect();
+        assert_eq!(from_beginning, vec![0, 5, 0]);
     }
 
     #[test]
