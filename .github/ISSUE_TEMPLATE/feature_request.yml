@@ -1,0 +1,21 @@
+name: Feature request
+description: A command, option or library API you need
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you are trying to do
+      description: The task and where Ferrika falls short today (what you do instead)
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help
+      description: A command line, an option or an API sketch
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Cluster setup (managed service, authentication, size) if it matters

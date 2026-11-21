@@ -1,0 +1,57 @@
+name: Bug report
+description: Something in the `ferrika` CLI or the crates does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problems (credentials, policy bypass, audit log tampering): please do not open an issue; report them privately as described in SECURITY.md.
+        Remove passwords, tokens and record contents from anything you paste.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran, what it printed, and what you expected instead.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Ferrika version
+      description: Output of `ferrika --version`, or the crate version
+      placeholder: ferrika 0.1.1
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How it was installed
+      options:
+        - Homebrew
+        - install.sh / install.ps1
+        - Release archive
+        - cargo install
+        - Built from source
+        - As a library (crates.io)
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Windows 11 / macOS 15 (Apple silicon) / Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: kafka
+    attributes:
+      label: Kafka
+      description: Broker version or service, and how the client connects
+      placeholder: Apache Kafka 3.9 (KRaft), SASL_SSL + SCRAM-SHA-512
+  - type: textarea
+    id: details
+    attributes:
+      label: Anything else
+      description: "`FERRIKA_LOG=ferrika=debug` output, the profile settings (without secrets), a company policy if one is installed"
+      render: text
