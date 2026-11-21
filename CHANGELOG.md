@@ -36,6 +36,13 @@ and 0.2.0 makes it crate-internal.
 
 ### Fixed
 
+- The audit log recorded only the request of commands that write records
+  (`produce`, `generate`, `restore`, `probe`, `consume --group`, ...). A
+  second line now says whether the command finished without error or failed
+  (`audit --failed` finds it); the error text is not logged.
+- An empty `FERRIKA_PROFILE` or `KAFKA_BOOTSTRAP_SERVERS` (`export
+  FERRIKA_PROFILE=`) made every command fail with "Profile '' does not
+  exist"; it now means not set.
 - `mirror` with a consumer group could commit offsets of records whose copy
   was still in flight or had failed, so a restart skipped them. Offsets are
   now committed only after delivery (at least once).
