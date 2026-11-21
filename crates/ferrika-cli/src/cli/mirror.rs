@@ -145,12 +145,13 @@ pub fn names_clusters(args: &MirrorArgs) -> bool {
 /// `mirror` writes to its destination cluster; see [`authorize_with`].
 pub fn authorize(args: &MirrorArgs, global: &GlobalOpts) -> Result<(), String> {
     let store = global.profile_store();
-    authorize_with(
+    authorize_checking_brokers(
         crate::governance::policy::current(),
         &crate::governance::policy::AuditLog,
         &store,
         args,
         global,
+        crate::kafka::admin::known_brokers,
     )?;
     // The destination's request entry was written here, not in `main`: owe
     // its result line too (see `cli::record_audit_result`).
@@ -188,12 +189,31 @@ pub fn authorize(args: &MirrorArgs, global: &GlobalOpts) -> Result<(), String> {
 /// another cluster (see [`authorize_cross_cluster`]), then the write gate for the destination
 /// cluster as a `produce`: a read-only target or `forbid: produce` refuses it
 /// with a `policy.blocked` entry, and so does a read-only destination profile.
+/// [`authorize_checking_brokers`] without a cluster to ask: tests whose
+/// policies need no broker metadata.
+#[cfg(test)]
 fn authorize_with(
     policy: &EffectivePolicy,
     sink: &impl AuditSink,
     store: &ProfileStore,
     args: &MirrorArgs,
     global: &GlobalOpts,
+) -> Result<(), String> {
+    authorize_checking_brokers(policy, sink, store, args, global, |_| {
+        Err("no cluster in this test".to_string())
+    })
+}
+
+/// `fetch` lists the brokers a cluster reports, for `read_only_brokers`:
+/// a tunnel or an IP address of the destination must not dodge it (the gate
+/// in `main` does the same for the global cluster).
+fn authorize_checking_brokers(
+    policy: &EffectivePolicy,
+    sink: &impl AuditSink,
+    store: &ProfileStore,
+    args: &MirrorArgs,
+    global: &GlobalOpts,
+    fetch: impl FnOnce(&KafkaClientConfig) -> Result<Vec<String>, String>,
 ) -> Result<(), String> {
     // An unknown profile would silently fall back to localhost.
     for name in [args.src_profile.as_deref(), args.dst_profile.as_deref()]
@@ -245,13 +265,30 @@ fn authorize_with(
         args.dst_bootstrap_servers.as_deref(),
         global,
     );
+    let brokers =
+        match policy::brokers_for_with(&config, policy.write_needs_broker_metadata(), fetch) {
+            Ok(brokers) => brokers,
+            Err(reason) => {
+                let named = if profile.is_empty() {
+                    config.bootstrap_servers.as_str()
+                } else {
+                    profile.as_str()
+                };
+                let entry =
+                    policy::blocked_entry("cli", named, &format!("mirror {target}"), &reason);
+                if let Err(e) = sink.record(&entry) {
+                    tracing::warn!(%e, "Could not write the audit log");
+                }
+                return Err(reason);
+            }
+        };
     let request = WriteRequest {
         source: "cli",
         action: PolicyAction::Produce,
         label: "mirror",
         target: &target,
         profile: &profile,
-        bootstrap: &config.bootstrap_servers,
+        bootstrap: &brokers,
         actor: None,
         op: None,
     };
@@ -681,6 +718,39 @@ mod tests {
         let log = FakeLog::default();
         let args = mirror_args(&["--src-profile", "prod-eu"]);
         assert!(authorize_with(&policy, &log, &store(), &args, &global()).is_err());
+    }
+
+    #[test]
+    fn read_only_brokers_match_the_destinations_reported_brokers() {
+        let mut policy = verified(&[], &[]);
+        policy.rules.read_only_brokers = vec!["*.prod.corp:*".to_string()];
+        let args = mirror_args(&["--dst-profile", "prod-eu"]);
+        // Reached through a tunnel: the bootstrap does not match, the
+        // brokers the cluster reports do.
+        let log = FakeLog::default();
+        let reason = authorize_checking_brokers(&policy, &log, &store(), &args, &global(), |_| {
+            Ok(vec!["b1.prod.corp:9092".to_string()])
+        })
+        .unwrap_err();
+        assert!(reason.contains("read-only"), "{reason}");
+        assert_eq!(log.entries.borrow()[0].action, "policy.blocked");
+        // Other brokers: allowed.
+        let log = FakeLog::default();
+        assert!(
+            authorize_checking_brokers(&policy, &log, &store(), &args, &global(), |_| {
+                Ok(vec!["b1.dev.corp:9092".to_string()])
+            })
+            .is_ok()
+        );
+        // The brokers cannot be read: refused, not let through.
+        let log = FakeLog::default();
+        assert!(
+            authorize_checking_brokers(&policy, &log, &store(), &args, &global(), |_| {
+                Err("unreachable".to_string())
+            })
+            .is_err()
+        );
+        assert_eq!(log.entries.borrow()[0].action, "policy.blocked");
     }
 
     #[test]
