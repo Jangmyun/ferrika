@@ -232,7 +232,10 @@ Each write call passes the same gate as the CLI commands: the company
 policy (`forbid`, `read_only`, `read_only_brokers`, `audit: required`,
 strictest mode) and a read-only profile refuse it, and when they refuse a
 tool outright it is left out of `tools/list` (with one stderr line at
-start). Internal topics (names starting with `_`) are never written; `--topics <glob>`
+start). The policy rule `mcp_write` applies to assistants only:
+`forbidden` removes the write tools, `confirm_human` makes every write wait
+for a person's confirmation in the client whatever `--confirm` says (see
+docs/POLICY.md). Internal topics (names starting with `_`) are never written; `--topics <glob>`
 (repeatable) narrows the writable topics further. Limits per session:
 `--max-writes-per-minute` (10), `--max-produce-records` (1,000), plans at 60
 per minute, and the same refusal 5 times in a row pauses writes for 30 s.
