@@ -55,6 +55,8 @@ and 0.2.0 makes it crate-internal.
   credentials in Schema Registry and Connect URLs) no longer appear in the
   `Debug` output of parsed command-line arguments.
 - `ferrika --version` follows the crate version.
+- `ferrika.exe` carries Windows version information (product, version, file
+  description) for Explorer, AppLocker and inventory tools.
 
 ### Changed
 
