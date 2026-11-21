@@ -45,6 +45,11 @@ and 0.2.0 makes it crate-internal.
   clusters. Only the destination is checked now, and its `read_only_brokers`
   and the source's `export_clusters` match the brokers the clusters report
   (a tunnel or an IP address no longer gets around them).
+- `undo` of an undo could put a Kafka Connect connector back with empty
+  passwords (the undo had stored the blanked secrets); it is now refused for
+  want of the secret. Undoing a change is no longer refused because a later
+  change to the same thing was itself undone, or because of changes on
+  another cluster.
 - MCP: `--topics` patterns ignored case, so `dev-*` also allowed writes to
   `DEV-payments`; they are now case-sensitive like topic names.
   `alter_topic_config` now marks deleting a retention override, any
