@@ -29,7 +29,7 @@ pub fn registry(config: &KafkaClientConfig) -> KafkaResult<SchemaRegistryClient>
         .schema_registry_url
         .as_deref()
         .filter(|u| !u.trim().is_empty())
-        .map(SchemaRegistryClient::new)
+        .map(|url| SchemaRegistryClient::new(url).with_timeout(config.request_timeout))
         .ok_or_else(|| KafkaError::config("This profile has no Schema Registry URL."))
 }
 
@@ -40,7 +40,7 @@ pub fn connect(config: &KafkaClientConfig) -> KafkaResult<ConnectClient> {
         .as_deref()
         .filter(|u| !u.trim().is_empty())
         .ok_or_else(|| KafkaError::config("This profile has no Kafka Connect URL."))?;
-    ConnectClient::new(url)
+    Ok(ConnectClient::new(url)?.with_timeout(config.request_timeout))
 }
 
 /// `keys` of `entries` as recorded: the value set on the resource itself

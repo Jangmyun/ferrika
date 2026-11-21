@@ -105,7 +105,14 @@ pub async fn run(args: HealthArgs, global: &GlobalOpts) -> KafkaResult<()> {
             .cloned()
             .collect();
         if !shown.is_empty() {
-            post_webhook(url, &cluster_name(global), &shown, &[]).await?;
+            post_webhook(
+                url,
+                global.http_timeout(),
+                &cluster_name(global),
+                &shown,
+                &[],
+            )
+            .await?;
         }
     }
 
@@ -217,7 +224,9 @@ async fn watch(args: &HealthArgs, global: &GlobalOpts, every: Duration) -> Kafka
         }
         if let Some(url) = &args.webhook {
             if !appeared.is_empty() || !cleared.is_empty() {
-                if let Err(e) = post_webhook(url, &cluster, &appeared, &cleared).await {
+                if let Err(e) =
+                    post_webhook(url, global.http_timeout(), &cluster, &appeared, &cleared).await
+                {
                     eprintln!("{stamp} {} {e}", "Webhook failed:".yellow());
                 }
             }
@@ -269,12 +278,13 @@ fn with_path(url: &str) -> String {
 
 async fn post_webhook(
     url: &str,
+    timeout: Duration,
     cluster: &str,
     appeared: &[HealthIssue],
     cleared: &[HealthIssue],
 ) -> KafkaResult<()> {
     let url = with_path(url);
-    let endpoint = crate::kafka::http::Endpoint::parse(&url, 80)?;
+    let endpoint = crate::kafka::http::Endpoint::parse(&url, 80)?.with_timeout(timeout);
     let path = if url
         .trim_end_matches('/')
         .split("://")

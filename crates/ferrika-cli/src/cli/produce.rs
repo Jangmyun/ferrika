@@ -59,6 +59,7 @@ type SchemaDef = crate::codec::schema::SchemaDefinition;
 async fn value_schema(
     args: &ProduceArgs,
     registry_url: Option<String>,
+    timeout: std::time::Duration,
 ) -> anyhow::Result<Option<(SchemaDef, Option<SchemaDef>)>> {
     if !args.schema && args.subject.is_none() {
         return Ok(None);
@@ -76,7 +77,7 @@ async fn value_schema(
                 "--schema needs a Schema Registry: pass -S <url> or set one on the profile",
             )
         })?;
-    let client = crate::kafka::schema::SchemaRegistryClient::new(&url);
+    let client = crate::kafka::schema::SchemaRegistryClient::new(&url).with_timeout(timeout);
     let def = client.get_latest_subject_schema(&subject).await?;
     let key_subject = format!("{}-key", subject.strip_suffix("-value").unwrap_or(&subject));
     let key_def = match client.get_latest_subject_schema(&key_subject).await {
@@ -144,7 +145,12 @@ pub async fn run(args: ProduceArgs, global: &GlobalOpts) -> anyhow::Result<()> {
     };
 
     let parsed_headers = parse_headers(&args.headers)?;
-    let schemas = value_schema(&args, kafka_config.schema_registry_url.clone()).await?;
+    let schemas = value_schema(
+        &args,
+        kafka_config.schema_registry_url.clone(),
+        kafka_config.request_timeout,
+    )
+    .await?;
     let (schema, key_schema) = match schemas {
         Some((value, key)) => (Some(value), key),
         None => (None, None),

@@ -14,6 +14,8 @@ use crate::model::schema::SchemaRef;
 pub struct SchemaRegistryClient {
     base_url: String,
     cache: Arc<RwLock<HashMap<u32, SchemaDefinition>>>,
+    /// Per-request limit; `None` keeps the HTTP client's default (30 s).
+    timeout: Option<std::time::Duration>,
 }
 
 impl SchemaRegistryClient {
@@ -22,7 +24,15 @@ impl SchemaRegistryClient {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             cache: Arc::new(RwLock::new(HashMap::new())),
+            timeout: None,
         }
+    }
+
+    /// Sets the time each request may take (see
+    /// [`crate::kafka::http::Endpoint::with_timeout`]).
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
     }
 
     /// Pre-populates the schema cache with a known schema definition.
@@ -32,6 +42,7 @@ impl SchemaRegistryClient {
         Self {
             base_url: self.base_url,
             cache: Arc::new(RwLock::new(map)),
+            timeout: self.timeout,
         }
     }
 
@@ -408,8 +419,11 @@ impl SchemaRegistryClient {
         path: &str,
         body: Option<&str>,
     ) -> KafkaResult<crate::kafka::http::Response> {
-        let endpoint = crate::kafka::http::Endpoint::parse(&self.base_url, 8081)
+        let mut endpoint = crate::kafka::http::Endpoint::parse(&self.base_url, 8081)
             .map_err(|e| KafkaError::schema(format!("Schema Registry URL: {e}")))?;
+        if let Some(timeout) = self.timeout {
+            endpoint = endpoint.with_timeout(timeout);
+        }
         endpoint
             .send(method, path, "application/vnd.schemaregistry.v1+json", body)
             .await

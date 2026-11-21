@@ -163,7 +163,7 @@ async fn handle_register(
 ) -> KafkaResult<()> {
     let schema = std::fs::read_to_string(schema_file)
         .map_err(|e| KafkaError::File(format!("Cannot read '{schema_file}': {e}")))?;
-    let client = SchemaRegistryClient::new(registry_url);
+    let client = SchemaRegistryClient::new(registry_url).with_timeout(global.http_timeout());
     let captured = capture::subject_versions(&client, subject, false)
         .await
         .map(|before| (vec![before], Vec::new()));
@@ -201,7 +201,7 @@ async fn handle_compat(
     registry_url: &str,
     global: &GlobalOpts,
 ) -> KafkaResult<()> {
-    let client = SchemaRegistryClient::new(registry_url);
+    let client = SchemaRegistryClient::new(registry_url).with_timeout(global.http_timeout());
     if let Some(level) = set {
         let level = level.to_uppercase();
         let after = State::SubjectCompat {
@@ -253,7 +253,7 @@ async fn handle_delete_subject(
             return Ok(());
         }
     }
-    let client = SchemaRegistryClient::new(registry_url);
+    let client = SchemaRegistryClient::new(registry_url).with_timeout(global.http_timeout());
     let captured = capture::subject_versions(&client, subject, true)
         .await
         .map(|before| {
@@ -452,7 +452,7 @@ async fn handle_fields(
     global: &GlobalOpts,
 ) -> KafkaResult<()> {
     use crate::codec::schema_fields::{from_definition, Limits};
-    let client = SchemaRegistryClient::new(registry_url);
+    let client = SchemaRegistryClient::new(registry_url).with_timeout(global.http_timeout());
     let def = client
         .subject_schema_resolved(request.subject, request.version)
         .await?;
@@ -545,7 +545,7 @@ fn shown_url(url: &str) -> String {
 }
 
 async fn handle_list_subjects(registry_url: &str, global: &GlobalOpts) -> KafkaResult<()> {
-    let client = SchemaRegistryClient::new(registry_url);
+    let client = SchemaRegistryClient::new(registry_url).with_timeout(global.http_timeout());
 
     if global.format != OutputFormat::Json {
         println!(
@@ -601,7 +601,7 @@ async fn handle_list_subjects(registry_url: &str, global: &GlobalOpts) -> KafkaR
 }
 
 async fn handle_get_schema(id: u32, registry_url: &str, global: &GlobalOpts) -> KafkaResult<()> {
-    let client = SchemaRegistryClient::new(registry_url);
+    let client = SchemaRegistryClient::new(registry_url).with_timeout(global.http_timeout());
 
     if global.format != OutputFormat::Json {
         println!(
@@ -623,7 +623,7 @@ async fn handle_get_subject(
     registry_url: &str,
     global: &GlobalOpts,
 ) -> KafkaResult<()> {
-    let client = SchemaRegistryClient::new(registry_url);
+    let client = SchemaRegistryClient::new(registry_url).with_timeout(global.http_timeout());
 
     if global.format != OutputFormat::Json {
         println!(
@@ -858,7 +858,7 @@ async fn handle_check_schema(
         ))
     })?;
 
-    let client = SchemaRegistryClient::new(registry_url);
+    let client = SchemaRegistryClient::new(registry_url).with_timeout(global.http_timeout());
     let report = if transitive {
         let mut reports = Vec::new();
         for version in client.list_versions(subject).await? {
