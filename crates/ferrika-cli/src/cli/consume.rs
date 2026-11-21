@@ -319,6 +319,8 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
     }
 
     let mut stats = FilterStats::default();
+    // Offsets of processed records that could not be stored (`--group`).
+    let mut store_failures = 0usize;
     let idle_timeout = args.timeout.map(Duration::from_millis);
     // Buffer terminal output: println! issues one write per message, which dominates
     // the cost of consuming large topics. Buffers are flushed whenever the stream pauses.
@@ -364,6 +366,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                         if use_group {
                             if let Err(e) = consumer.store_processed(&msg) {
                                 eprintln!("{} Could not store offset: {e}", "✖".red());
+                                store_failures += 1;
                             }
                         }
                         let masked = mask.then(|| msg.masked());
@@ -483,10 +486,13 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
     }
     // Every matched record went to the file or the (redirected) stdout.
     crate::cli::export_finished(stats.matched);
-    if use_group {
-        if let Err(e) = consumer.commit_stored(CommitMode::Sync) {
-            eprintln!("{} Final offset commit failed: {e}", "✖".red());
-        }
+    let commit = if use_group {
+        consumer.commit_stored(CommitMode::Sync)
+    } else {
+        Ok(())
+    };
+    if let Err(e) = &commit {
+        eprintln!("{} Final offset commit failed: {e}", "✖".red());
     }
 
     eprintln!(
@@ -508,6 +514,24 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
         );
     }
 
+    // The group's position did not (fully) move: say so in the exit code,
+    // so a script does not take the run as done and skip the re-read.
+    group_outcome(commit.is_ok(), store_failures)
+}
+
+/// `Err` when `consume --group` could not commit where it got to: the next
+/// run with the group reads (some of) these records again.
+fn group_outcome(committed: bool, store_failures: usize) -> anyhow::Result<()> {
+    if !committed {
+        anyhow::bail!(
+            "the group's offsets were not committed; the next run with this group reads these records again"
+        );
+    }
+    if store_failures > 0 {
+        anyhow::bail!(
+            "{store_failures} record offset(s) could not be stored; the next run with this group may read them again"
+        );
+    }
     Ok(())
 }
 
@@ -764,6 +788,15 @@ pub fn format_message_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_runs_fail_when_their_position_was_not_saved() {
+        assert!(group_outcome(true, 0).is_ok());
+        let not_committed = group_outcome(false, 0).unwrap_err().to_string();
+        assert!(not_committed.contains("not committed"), "{not_committed}");
+        let not_stored = group_outcome(true, 2).unwrap_err().to_string();
+        assert!(not_stored.starts_with("2 record offset(s)"), "{not_stored}");
+    }
 
     #[test]
     fn clamp_offset_past_high_watermark_starts_at_high() {
