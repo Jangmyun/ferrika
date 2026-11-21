@@ -155,6 +155,7 @@ pub fn exit_quietly_on_broken_pipe() {
             .or_else(|| info.payload().downcast_ref::<&str>().copied())
             .unwrap_or("");
         if is_closed_pipe_panic(message) {
+            cli::record_audit_result(true, "ended with a pipe error (output closed?)");
             std::process::exit(0);
         }
         default_hook(info);
@@ -424,6 +425,7 @@ where
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("Failed to initialize async runtime: {e}");
+            cli::record_audit_result(false, "failed (see the command's output)");
             std::process::exit(1);
         }
     };
@@ -466,12 +468,6 @@ fn needs_profiles(command: Option<&Commands>) -> bool {
     )
 }
 
-/// The command line a read-only profile refuses, or `None` for commands that
-/// only read the cluster (or only preview a change).
-///
-/// There is no wildcard arm, at any level, on purpose: a new command or
-/// subcommand stops this from compiling until its author decides whether it
-/// writes, so a policy check cannot be skipped by forgetting to register it.
 /// The write the gate in `main` checks and records for `command`: its
 /// [`write_action`], except a `mirror` that names its clusters
 /// (`--src-profile`, `--dst-profile`, `--dst-bootstrap-servers`), whose
@@ -484,6 +480,12 @@ fn main_gate_action(command: &Commands) -> Option<&'static str> {
     }
 }
 
+/// The command line a read-only profile refuses, or `None` for commands that
+/// only read the cluster (or only preview a change).
+///
+/// There is no wildcard arm, at any level, on purpose: a new command or
+/// subcommand stops this from compiling until its author decides whether it
+/// writes, so a policy check cannot be skipped by forgetting to register it.
 fn write_action(command: &Commands) -> Option<&'static str> {
     use cli::acl::AclSubcommands;
     use cli::offset::OffsetSubcommands;
