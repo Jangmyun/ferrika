@@ -212,7 +212,7 @@ pub fn verify_with(
         return Err(PolicyError::Rules(
             "format 2 fields (expires_at, on_expiry, audit_forward, audit_anchor, \
              anchor_required, read_only_brokers, export, export_clusters, watermark, \
-             watermark_text) need format 2"
+             watermark_text, screen_capture) need format 2"
                 .to_string(),
         ));
     }
@@ -828,6 +828,14 @@ impl EffectivePolicy {
         (rules.watermark == WatermarkRule::On).then(|| WatermarkSpec {
             text: rules.watermark_text.clone(),
         })
+    }
+}
+
+impl EffectivePolicy {
+    /// Whether the GUI keeps its window out of screen capture at `now`
+    /// (`screen_capture: blocked`).
+    pub fn screen_capture_blocked_at(&self, now: Timestamp) -> bool {
+        self.is_active() && !self.rules_at(now).screen_capture.is_allowed()
     }
 }
 
@@ -2543,6 +2551,22 @@ mod tests {
             ExportRule::Audited
         );
         assert_eq!(everywhere.export_rule(""), ExportRule::Audited);
+    }
+
+    #[test]
+    fn screen_capture_is_blocked_only_by_an_active_rule() {
+        use ferrika_core::model::policy::ScreenCaptureRule;
+        let now = Timestamp::now();
+        assert!(!EffectivePolicy::absent(PathBuf::new()).screen_capture_blocked_at(now));
+        // An untrusted policy falls back to the strictest mode, which does
+        // not block (see PolicyRules::strictest).
+        assert!(
+            !EffectivePolicy::invalid(PathBuf::new(), "bad".into()).screen_capture_blocked_at(now)
+        );
+        let mut policy = export_policy(ExportRule::Allowed, &[]);
+        assert!(!policy.screen_capture_blocked_at(now));
+        policy.rules.screen_capture = ScreenCaptureRule::Blocked;
+        assert!(policy.screen_capture_blocked_at(now));
     }
 
     #[test]
