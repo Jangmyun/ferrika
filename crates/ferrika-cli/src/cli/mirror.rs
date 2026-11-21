@@ -142,7 +142,7 @@ pub fn names_clusters(args: &MirrorArgs) -> bool {
 }
 
 /// The write gate in `main` checks the cluster the global options name, but
-/// `mirror` writes to its destination cluster; see [`authorize_with`].
+/// `mirror` writes to its destination cluster; see `authorize_checking_brokers`.
 pub fn authorize(args: &MirrorArgs, global: &GlobalOpts) -> Result<(), String> {
     let store = global.profile_store();
     let requested = authorize_checking_brokers(
@@ -173,11 +173,6 @@ pub fn authorize(args: &MirrorArgs, global: &GlobalOpts) -> Result<(), String> {
     Ok(())
 }
 
-/// Refuses `mirror` under enforced PII masking (it would copy unmasked
-/// records to another cluster), then the export gate when the destination is
-/// another cluster (see [`authorize_cross_cluster`]), then the write gate for the destination
-/// cluster as a `produce`: a read-only target or `forbid: produce` refuses it
-/// with a `policy.blocked` entry, and so does a read-only destination profile.
 /// [`authorize_checking_brokers`] without a cluster to ask: tests whose
 /// policies need no broker metadata.
 #[cfg(test)]
@@ -194,6 +189,12 @@ fn authorize_with(
     .map(|_| ())
 }
 
+/// Refuses `mirror` under enforced PII masking (it would copy unmasked
+/// records to another cluster), then the export gate when the destination is
+/// another cluster (see [`authorize_cross_cluster`]), then the write gate for the destination
+/// cluster as a `produce`: a read-only target or `forbid: produce` refuses it
+/// with a `policy.blocked` entry, and so does a read-only destination profile.
+///
 /// `fetch` lists the brokers a cluster reports, for `read_only_brokers`:
 /// a tunnel or an IP address of the destination must not dodge it (the gate
 /// in `main` does the same for the global cluster).
