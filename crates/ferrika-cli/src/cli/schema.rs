@@ -859,9 +859,13 @@ async fn handle_check_schema(
     })?;
 
     let client = SchemaRegistryClient::new(registry_url).with_timeout(global.http_timeout());
+    // Transitive: the number of registered versions checked.
+    let mut checked: Option<usize> = None;
     let report = if transitive {
         let mut reports = Vec::new();
-        for version in client.list_versions(subject).await? {
+        let versions = client.list_versions(subject).await?;
+        checked = Some(versions.len());
+        for version in versions {
             let def = client.get_subject_version(subject, version).await?;
             let report =
                 evaluate_compatibility(Some(subject), &def.schema, &candidate_schema, mode)
@@ -879,11 +883,15 @@ async fn handle_check_schema(
             .map_err(|e| KafkaError::schema(format!("Compatibility evaluation failed: {e}")))?
     };
 
-    render_compatibility_report(&report, global)?;
+    render_compatibility_report(&report, checked, global)?;
 
     if fail_on_incompatible && !report.is_compatible {
+        let against = match checked {
+            Some(n) => format!("{n} registered version(s)"),
+            None => "the latest registered schema".to_string(),
+        };
         return Err(KafkaError::Check(format!(
-            "Schema Compatibility Failure: Candidate schema for subject '{subject}' is incompatible with latest registered schema ({} violations)",
+            "Schema Compatibility Failure: Candidate schema for subject '{subject}' is incompatible with {against} ({} violations)",
             report.violations.len()
         )));
     }
@@ -912,7 +920,7 @@ fn handle_diff_schema(
     let report = evaluate_compatibility(None, &old_schema, &new_schema, mode)
         .map_err(|e| KafkaError::schema(format!("Compatibility evaluation failed: {e}")))?;
 
-    render_compatibility_report(&report, global)?;
+    render_compatibility_report(&report, None, global)?;
 
     if fail_on_incompatible && !report.is_compatible {
         return Err(KafkaError::Check(format!(
@@ -924,12 +932,34 @@ fn handle_diff_schema(
     Ok(())
 }
 
+/// The mode as the registry names it: `BACKWARD`, or `BACKWARD_TRANSITIVE`
+/// when `transitive_versions` (the versions checked) is set.
+fn mode_label(mode: CompatibilityMode, transitive_versions: Option<usize>) -> String {
+    match transitive_versions {
+        Some(_) if mode != CompatibilityMode::None => format!("{}_TRANSITIVE", mode.as_str()),
+        _ => mode.as_str().to_string(),
+    }
+}
+
+/// Prints `report`; `transitive_versions` is the number of registered
+/// versions a transitive check compared against.
 fn render_compatibility_report(
     report: &CompatibilityReport,
+    transitive_versions: Option<usize>,
     global: &GlobalOpts,
 ) -> KafkaResult<()> {
     if global.format == OutputFormat::Json {
-        output::print_json(report)?;
+        let mut json = serde_json::to_value(report).map_err(|e| {
+            KafkaError::Serialization(format!("Failed to serialize the report: {e}"))
+        })?;
+        if let (Some(obj), Some(n)) = (json.as_object_mut(), transitive_versions) {
+            obj.insert(
+                "mode".into(),
+                mode_label(report.mode, transitive_versions).into(),
+            );
+            obj.insert("versions_checked".into(), n.into());
+        }
+        output::print_json(&json)?;
         return Ok(());
     }
 
@@ -959,7 +989,14 @@ fn render_compatibility_report(
 
     summary_table.add_row(vec![
         Cell::new(report.subject.as_deref().unwrap_or("[offline file diff]")).fg(Color::White),
-        Cell::new(report.mode.as_str()).fg(Color::Yellow),
+        Cell::new(match transitive_versions {
+            Some(n) => format!(
+                "{} ({n} versions)",
+                mode_label(report.mode, transitive_versions)
+            ),
+            None => mode_label(report.mode, None),
+        })
+        .fg(Color::Yellow),
         verdict_badge,
         Cell::new(report.added_fields.len().to_string()).set_alignment(CellAlignment::Right),
         Cell::new(report.deleted_fields.len().to_string()).set_alignment(CellAlignment::Right),
@@ -1009,6 +1046,17 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn transitive_checks_are_labelled_as_such() {
+        use super::{mode_label, CompatibilityMode};
+        assert_eq!(mode_label(CompatibilityMode::Backward, None), "BACKWARD");
+        assert_eq!(
+            mode_label(CompatibilityMode::Full, Some(3)),
+            "FULL_TRANSITIVE"
+        );
+        assert_eq!(mode_label(CompatibilityMode::None, Some(3)), "NONE");
+    }
 
     #[test]
     fn test_parse_compat_mode_rejects_unknown_and_reads_transitive() {
