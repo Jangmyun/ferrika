@@ -232,6 +232,25 @@ def scenarios():
     rc, out = run(["-f", "json", "audit", "--source", "gui", "-n", "200"], broker=False)
     check("audit --source gui leaves out CLI entries", rc == 0 and RUN not in out, f"rc={rc} {tail(out)}")
 
+    # --- audit result lines of record writes ------------------------------
+    t = topic("audit-result")
+    run(["produce", t, "-m", "x"])
+    # A broker that is not there: the produce fails after --timeout.
+    run(["-b", "127.0.0.1:1", "--timeout", "3", "produce", t, "-m", "y"], broker=False, timeout=60)
+    rc, out = run(["-f", "json", "audit", "--source", "cli", "-n", "200"], broker=False)
+    try:
+        mine = [(e["outcome"], e["ok"]) for e in json.loads(out) if e.get("target") == t]
+    except ValueError:
+        mine = []
+    check("audit: produce writes a result line after its request",
+          ("finished without error", True) in mine and ("requested", True) in mine, f"rc={rc} {mine}")
+    check("audit: a failed produce is recorded as failed, without the error text",
+          ("failed (see the command's output)", False) in mine, f"{mine}")
+
+    # --- empty environment variables mean not set --------------------------
+    rc, out = run(["topics", "list"], env={"FERRIKA_PROFILE": ""})
+    check("FERRIKA_PROFILE= (empty) is ignored", rc == 0 and "does not exist" not in out, f"rc={rc} {tail(out)}")
+
     # --- shell completion -------------------------------------------------
     rc, out = run(["completions", "bash"], broker=False)
     check("completions bash names the commands and new options",
