@@ -238,9 +238,13 @@ Executed `create_topic`, `alter_topic_config` and
 `reset_consumer_group_offsets` are also recorded in the operation history
 with the state before them, like the same changes made in the CLI or the
 desktop app: `ferrika history` lists them (FROM `mcp`) and `ferrika undo
-<id>` reverts one after checking nothing changed since. Produced records are
+<id>` reverts one after checking nothing changed since. They run as your OS
+user, so a bare `ferrika undo` (your latest change) may pick an assistant's
+change; it shows what it will revert and asks first. Produced records are
 not recorded (they cannot be taken back), and there is no undo tool: a
-person reverts a change.
+person reverts a change. When the topic's config cannot be read just before
+a config change, the change still runs but cannot be undone; the result says
+so (`history_warning`).
 
 Deleting or purging topics, ACLs, SCRAM users and quotas are not, and will
 not be, MCP tools: do those in the CLI. Keep in mind that an

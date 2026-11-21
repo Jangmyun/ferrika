@@ -147,12 +147,37 @@ impl WriteTools {
         }
     }
 
+    /// Checks that must pass just before `work` runs, before anything is
+    /// recorded: a group must still be idle, since members that joined since
+    /// the plan would overwrite the reset with their own commits.
+    async fn precheck(&self, work: &Work) -> Result<(), ToolError> {
+        if let Work::ResetOffsets { group, .. } = work {
+            let state = self
+                .backend
+                .group_state(group)
+                .await
+                .map_err(ToolError::kafka)?;
+            check_group_idle(group, state.as_ref().map(|(s, m)| (s.as_str(), *m)))
+                .map_err(|e| ToolError::new("group_active", e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Starts the history record of `work` (the `begin` line, with the
     /// state it changes read now). `None` without a journal and for
     /// produce, which, as in the CLI, is not recorded (records cannot be
-    /// taken back).
-    async fn start_record(&self, tool: &str, target: &str, work: &Work) -> Option<Recorder> {
-        let journal = self.history.clone()?;
+    /// taken back). The warning says when the change will not be undoable
+    /// because its before-state could not be read.
+    async fn start_record(
+        &self,
+        tool: &str,
+        target: &str,
+        work: &Work,
+    ) -> (Option<Recorder>, Option<String>) {
+        let Some(journal) = self.history.clone() else {
+            return (None, None);
+        };
+        let mut warning = None;
         let change = match work {
             Work::CreateTopic { topic, .. } => Change::topic_created(topic),
             Work::AlterConfig { topic, changes } => {
@@ -162,10 +187,16 @@ impl WriteTools {
                     let after = capture::config_after(&before, changes);
                     (vec![before], vec![after])
                 });
+                if let Err(e) = &captured {
+                    warning = Some(format!(
+                        "The change ran, but `ferrika undo` cannot revert it: the topic's \
+                         config could not be read first ({e})."
+                    ));
+                }
                 Change::captured(Reversibility::Reversible, captured).sensitive_limits()
             }
             Work::ResetOffsets { group, plans, .. } => Change::offset_reset(group, plans),
-            Work::Produce { .. } => return None,
+            Work::Produce { .. } => return (None, None),
         };
         let (profile, bootstrap) = self.guard.profile_and_bootstrap();
         let scope = Scope {
@@ -181,7 +212,7 @@ impl WriteTools {
             target.to_string(),
             None,
         );
-        Some(Recorder::start(journal, begin))
+        (Some(Recorder::start(journal, begin)), warning)
     }
 
     /// One stderr line per reason some enabled write tools are hidden.
@@ -327,7 +358,14 @@ impl WriteTools {
             self.guard.charge_produce(records.len() as u64)?;
         }
         let target = planned.target.clone();
-        let recorder = self.start_record(tool, &target, &planned.work).await;
+        // Refused here as it was inside the run: audited, not recorded.
+        if let Err(error) = self.precheck(&planned.work).await {
+            let _ = self
+                .guard
+                .record_result(tool, &target, &error.message, false, None);
+            return Err(error);
+        }
+        let (recorder, history_warning) = self.start_record(tool, &target, &planned.work).await;
         // The journal's `end` line, and the id and digest the audit entry names.
         let finish = |ok: bool, outcome: &str| {
             let recorder = recorder.as_ref()?;
@@ -340,7 +378,12 @@ impl WriteTools {
                 let warning = self
                     .guard
                     .record_result(tool, &target, &done.outcome, done.ok, op);
-                Ok((execute_result(&done, warning), true))
+                let mut result = execute_result(&done, warning);
+                if let Some(text) = history_warning {
+                    eprintln!("ferrika mcp: {text}");
+                    result["structuredContent"]["history_warning"] = json!(text);
+                }
+                Ok((result, true))
             }
             Err(error) => {
                 let op = finish(false, &error.message);
@@ -605,15 +648,6 @@ impl WriteTools {
                 strategy,
                 plans,
             } => {
-                // Members that joined since the plan would overwrite the
-                // reset with their own commits.
-                let state = self
-                    .backend
-                    .group_state(&group)
-                    .await
-                    .map_err(ToolError::kafka)?;
-                check_group_idle(&group, state.as_ref().map(|(s, m)| (s.as_str(), *m)))
-                    .map_err(|e| ToolError::new("group_active", e.to_string()))?;
                 self.backend
                     .commit_reset(&group, &plans)
                     .await
@@ -2162,7 +2196,9 @@ pub(super) mod tests {
         c.group_states
             .borrow_mut()
             .insert("billing".into(), ("Stable".into(), 2));
-        let (mut tools, cluster, _, _) = tools_with(c, config());
+        let (mut tools, cluster, log, _) = tools_with(c, config());
+        let journal = temp_journal("active");
+        tools.history = Some(journal.clone());
         let args = json!({ "group": "billing", "topic": "orders", "to": { "shift": -10 } });
         let plan = tools
             .call_token("reset_consumer_group_offsets", &args)
@@ -2178,6 +2214,13 @@ pub(super) mod tests {
             )
             .await;
         assert_eq!(code(&result), "group_active");
+        // Refused before it ran: audited, but nothing for undo to see.
+        assert!(journal.load().is_empty());
+        assert!(log
+            .entries
+            .borrow()
+            .iter()
+            .any(|e| !e.ok && e.op.is_empty()));
 
         // A consumer joins after an idle plan: the plan no longer matches.
         cluster
