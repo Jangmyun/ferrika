@@ -35,6 +35,11 @@ pub(super) trait WriteBackend {
     fn known_brokers(&self) -> BoxFuture<'_, Vec<String>> {
         Box::pin(async { Ok(Vec::new()) })
     }
+    /// The cluster id, for the operation history's scope; empty when it
+    /// cannot be read. Fakes have none.
+    fn cluster_id(&self) -> BoxFuture<'_, String> {
+        Box::pin(async { Ok(String::new()) })
+    }
     /// CreateTopics; a replication factor of -1 is the broker default.
     fn create_topic<'a>(
         &'a self,
@@ -91,6 +96,10 @@ impl KafkaBackend {
 }
 
 impl WriteBackend for KafkaBackend {
+    fn cluster_id(&self) -> BoxFuture<'_, String> {
+        Box::pin(async move { Ok(self.admin()?.cluster_id(timeout()).unwrap_or_default()) })
+    }
+
     fn topic<'a>(&'a self, topic: &'a str) -> BoxFuture<'a, Option<TopicShape>> {
         Box::pin(async move {
             match self.admin()?.describe_topic(topic, timeout()) {

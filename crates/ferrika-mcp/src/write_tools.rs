@@ -19,6 +19,8 @@ use super::{ConfirmMode, WriteOptions};
 use ferrika_core::kafka::context::ResolvedContext;
 use ferrika_core::kafka::offset_reset::{check_group_idle, OffsetResetPlan, ResetStrategy};
 use ferrika_core::kafka::producer::OwnedProducerRecord;
+use ferrika_core::model::history::{Reversibility, Scope};
+use ferrika_ops::history::{capture, Change, Journal, Recorder};
 
 /// Most records one produce_messages call sends.
 const PRODUCE_MAX_RECORDS: usize = 100;
@@ -37,6 +39,9 @@ pub(super) struct WriteTools {
     backend: Box<dyn WriteBackend>,
     confirm: ConfirmMode,
     elicit_timeout: Duration,
+    /// Where executed changes are recorded for `ferrika history` / `undo`;
+    /// `None` records nothing (tests).
+    history: Option<Journal>,
 }
 
 /// The client request a tool call answers, and how to ask the client.
@@ -128,6 +133,7 @@ impl WriteTools {
         });
         let mut tools = Self::new(guard, backend);
         tools.confirm = args.confirm;
+        tools.history = Some(Journal::default());
         tools
     }
 
@@ -137,7 +143,76 @@ impl WriteTools {
             backend,
             confirm: ConfirmMode::Auto,
             elicit_timeout: ELICIT_TIMEOUT,
+            history: None,
         }
+    }
+
+    /// Checks that must pass just before `work` runs, before anything is
+    /// recorded: a group must still be idle, since members that joined since
+    /// the plan would overwrite the reset with their own commits.
+    async fn precheck(&self, work: &Work) -> Result<(), ToolError> {
+        if let Work::ResetOffsets { group, .. } = work {
+            let state = self
+                .backend
+                .group_state(group)
+                .await
+                .map_err(ToolError::kafka)?;
+            check_group_idle(group, state.as_ref().map(|(s, m)| (s.as_str(), *m)))
+                .map_err(|e| ToolError::new("group_active", e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Starts the history record of `work` (the `begin` line, with the
+    /// state it changes read now). `None` without a journal and for
+    /// produce, which, as in the CLI, is not recorded (records cannot be
+    /// taken back). The warning says when the change will not be undoable
+    /// because its before-state could not be read.
+    async fn start_record(
+        &self,
+        tool: &str,
+        target: &str,
+        work: &Work,
+    ) -> (Option<Recorder>, Option<String>) {
+        let Some(journal) = self.history.clone() else {
+            return (None, None);
+        };
+        let mut warning = None;
+        let change = match work {
+            Work::CreateTopic { topic, .. } => Change::topic_created(topic),
+            Work::AlterConfig { topic, changes } => {
+                let keys = capture::change_keys(changes);
+                let captured = self.backend.topic_configs(topic).await.map(|entries| {
+                    let before = capture::topic_config_of(topic, &entries, &keys);
+                    let after = capture::config_after(&before, changes);
+                    (vec![before], vec![after])
+                });
+                if let Err(e) = &captured {
+                    warning = Some(format!(
+                        "The change ran, but `ferrika undo` cannot revert it: the topic's \
+                         config could not be read first ({e})."
+                    ));
+                }
+                Change::captured(Reversibility::Reversible, captured).sensitive_limits()
+            }
+            Work::ResetOffsets { group, plans, .. } => Change::offset_reset(group, plans),
+            Work::Produce { .. } => return (None, None),
+        };
+        let (profile, bootstrap) = self.guard.profile_and_bootstrap();
+        let scope = Scope {
+            profile,
+            bootstrap,
+            cluster_id: self.backend.cluster_id().await.unwrap_or_default(),
+            ..Scope::default()
+        };
+        let begin = change.into_begin(
+            "mcp",
+            scope,
+            format!("mcp {tool}"),
+            target.to_string(),
+            None,
+        );
+        (Some(Recorder::start(journal, begin)), warning)
     }
 
     /// One stderr line per reason some enabled write tools are hidden.
@@ -283,17 +358,38 @@ impl WriteTools {
             self.guard.charge_produce(records.len() as u64)?;
         }
         let target = planned.target.clone();
+        // Refused here as it was inside the run: audited, not recorded.
+        if let Err(error) = self.precheck(&planned.work).await {
+            let _ = self
+                .guard
+                .record_result(tool, &target, &error.message, false, None);
+            return Err(error);
+        }
+        let (recorder, history_warning) = self.start_record(tool, &target, &planned.work).await;
+        // The journal's `end` line, and the id and digest the audit entry names.
+        let finish = |ok: bool, outcome: &str| {
+            let recorder = recorder.as_ref()?;
+            let digest = recorder.finish(ok, outcome, None)?;
+            Some((recorder.id().to_string(), digest))
+        };
         match self.execute(planned.work).await {
             Ok(done) => {
+                let op = finish(done.ok, &done.outcome);
                 let warning = self
                     .guard
-                    .record_result(tool, &target, &done.outcome, done.ok);
-                Ok((execute_result(&done, warning), true))
+                    .record_result(tool, &target, &done.outcome, done.ok, op);
+                let mut result = execute_result(&done, warning);
+                if let Some(text) = history_warning {
+                    eprintln!("ferrika mcp: {text}");
+                    result["structuredContent"]["history_warning"] = json!(text);
+                }
+                Ok((result, true))
             }
             Err(error) => {
+                let op = finish(false, &error.message);
                 let _ = self
                     .guard
-                    .record_result(tool, &target, &error.message, false);
+                    .record_result(tool, &target, &error.message, false, op);
                 Err(error)
             }
         }
@@ -552,15 +648,6 @@ impl WriteTools {
                 strategy,
                 plans,
             } => {
-                // Members that joined since the plan would overwrite the
-                // reset with their own commits.
-                let state = self
-                    .backend
-                    .group_state(&group)
-                    .await
-                    .map_err(ToolError::kafka)?;
-                check_group_idle(&group, state.as_ref().map(|(s, m)| (s.as_str(), *m)))
-                    .map_err(|e| ToolError::new("group_active", e.to_string()))?;
                 self.backend
                     .commit_reset(&group, &plans)
                     .await
@@ -1901,6 +1988,81 @@ pub(super) mod tests {
         assert!(result.to_string().contains("retention.nope"));
     }
 
+    /// A journal in a fresh temporary directory.
+    fn temp_journal(name: &str) -> Journal {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrika-mcp-{name}-{}-{}",
+            std::process::id(),
+            ferrika_core::kafka::clock::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Journal::at(dir.join("history.jsonl"))
+    }
+
+    #[tokio::test]
+    async fn executed_changes_are_recorded_for_undo_and_named_in_the_audit_log() {
+        use ferrika_core::model::history::State;
+        let c = reset_cluster();
+        c.group_states
+            .borrow_mut()
+            .insert("billing".into(), ("Empty".into(), 0));
+        c.set_config("orders", "retention.ms", "604800000", true);
+        let (mut tools, _, log, _) = tools_with(c, config());
+        let journal = temp_journal("history");
+        tools.history = Some(journal.clone());
+
+        let alter = json!({ "topic": "orders", "set": { "retention.ms": "86400000" } });
+        let plan = tools.call_token("alter_topic_config", &alter).await;
+        let done = tools
+            .call_token("alter_topic_config", &execute(&alter, &token(&plan)))
+            .await;
+        assert_eq!(done["structuredContent"]["executed"], true, "{done}");
+        let reset = json!({ "group": "billing", "topic": "orders", "to": "earliest" });
+        let plan = tools
+            .call_token("reset_consumer_group_offsets", &reset)
+            .await;
+        tools
+            .call_token(
+                "reset_consumer_group_offsets",
+                &execute(&reset, &token(&plan)),
+            )
+            .await;
+        // A plan alone records nothing.
+        tools
+            .call_token(
+                "create_topic",
+                &json!({ "topic": "audit-only", "partitions": 1 }),
+            )
+            .await;
+
+        let ops = journal.load();
+        assert_eq!(ops.len(), 2, "{ops:?}");
+        let config = &ops[0];
+        assert_eq!(config.begin.source, "mcp");
+        assert_eq!(config.begin.action, "mcp alter_topic_config");
+        assert_eq!(config.begin.reversibility, Reversibility::Reversible);
+        let own = |states: &[State]| match &states[0] {
+            State::TopicConfig { keys, .. } => keys["retention.ms"].own.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(own(&config.begin.before).as_deref(), Some("604800000"));
+        assert_eq!(own(&config.begin.after).as_deref(), Some("86400000"));
+        assert!(config.end.as_ref().is_some_and(|e| e.ok));
+        assert!(matches!(config.begin.before[0], State::TopicConfig { .. }));
+        assert!(matches!(ops[1].begin.before[0], State::GroupOffsets { .. }));
+
+        // Each result entry names its operation, as the CLI's do.
+        let entries = log.entries.borrow();
+        let results: Vec<&ferrika_governance::audit::AuditEntry> = entries
+            .iter()
+            .filter(|e| e.action.starts_with("mcp ") && !e.op.is_empty())
+            .collect();
+        assert_eq!(results.len(), 2, "{entries:?}");
+        assert_eq!(results[0].op, ops[0].id);
+        assert_eq!(results[1].op, ops[1].id);
+        assert!(results.iter().all(|e| !e.op_digest.is_empty()));
+    }
+
     #[tokio::test]
     async fn tools_outside_allow_tools_are_disabled_and_hidden() {
         let only_create = GuardConfig {
@@ -2034,7 +2196,9 @@ pub(super) mod tests {
         c.group_states
             .borrow_mut()
             .insert("billing".into(), ("Stable".into(), 2));
-        let (mut tools, cluster, _, _) = tools_with(c, config());
+        let (mut tools, cluster, log, _) = tools_with(c, config());
+        let journal = temp_journal("active");
+        tools.history = Some(journal.clone());
         let args = json!({ "group": "billing", "topic": "orders", "to": { "shift": -10 } });
         let plan = tools
             .call_token("reset_consumer_group_offsets", &args)
@@ -2050,6 +2214,13 @@ pub(super) mod tests {
             )
             .await;
         assert_eq!(code(&result), "group_active");
+        // Refused before it ran: audited, but nothing for undo to see.
+        assert!(journal.load().is_empty());
+        assert!(log
+            .entries
+            .borrow()
+            .iter()
+            .any(|e| !e.ok && e.op.is_empty()));
 
         // A consumer joins after an idle plan: the plan no longer matches.
         cluster
