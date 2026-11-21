@@ -80,6 +80,10 @@ and 0.2.0 makes it crate-internal.
 
 ### Changed
 
+- At a terminal, commands that need the cluster (`topics`, `consume`,
+  `produce`, `health`, ...) stop within seconds when nothing listens at the
+  bootstrap servers (connection refused) instead of waiting `--timeout`
+  (30 s). Scripts (stderr not a terminal) wait as before.
 - **`ferrika reassign plan` (with a cluster) now keeps replicas that are
   already well placed and moves as few as possible** (adding a broker moves
   only its share, removing one moves only its replicas) and prints how many
