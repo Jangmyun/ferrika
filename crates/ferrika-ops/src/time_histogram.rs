@@ -26,7 +26,7 @@ use ferrika_core::kafka::config::KafkaClientConfig;
 use ferrika_core::kafka::consumer::{ConsumedMessage, KafkaConsumerClient, Lookup, LookupFailure};
 
 /// Bucket sizes to pick from, in milliseconds.
-pub const BUCKET_CANDIDATES_MS: [i64; 19] = [
+pub(crate) const BUCKET_CANDIDATES_MS: [i64; 19] = [
     1_000,
     5_000,
     10_000,
@@ -48,7 +48,7 @@ pub const BUCKET_CANDIDATES_MS: [i64; 19] = [
     604_800_000,
 ];
 /// More buckets than this are refused.
-pub const MAX_BUCKETS: usize = 500;
+pub(crate) const MAX_BUCKETS: usize = 500;
 /// Partition lookups (`partitions × boundaries`) above this need consent
 /// ([`CostPolicy`]).
 pub const COST_LIMIT: usize = 200_000;
@@ -57,9 +57,9 @@ pub const MIN_COARSE_BUCKETS: usize = 24;
 /// Above this many partitions the per-partition numbers are left out.
 pub const MAX_PER_PARTITION: usize = 256;
 /// Timeout of one boundary lookup.
-pub const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// After this long the result is reported at the resolution reached.
-pub const OVERALL_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const OVERALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub const NOTE_TRANSACTIONS: &str =
     "offset-based counts include transaction markers and aborted records";
@@ -360,13 +360,13 @@ pub fn plan_boundaries(
 }
 
 /// Partition lookups a chart needs.
-pub fn lookup_cost(partitions: usize, boundaries: usize) -> usize {
+pub(crate) fn lookup_cost(partitions: usize, boundaries: usize) -> usize {
     partitions.saturating_mul(boundaries)
 }
 
 /// Boundaries for `[from, to]` within the cost policy; `true` when buckets
 /// were widened to fit.
-pub fn plan_within_cost(
+pub(crate) fn plan_within_cost(
     from_ms: i64,
     to_ms: i64,
     spec: &BucketSpec,
@@ -406,7 +406,7 @@ pub trait TimeLookup {
 }
 
 /// [`TimeLookup`] through a group-less consumer.
-pub struct ClientLookup<'a> {
+pub(crate) struct ClientLookup<'a> {
     pub client: &'a KafkaConsumerClient,
     pub topic: &'a str,
     pub timeout: Duration,
@@ -654,7 +654,7 @@ pub fn assemble(
 /// known. The offsets between the low watermark and it were removed by
 /// compaction: they are counted as [`TimeHistogram::removed_by_compaction`],
 /// not as before the range.
-pub fn assemble_retained(
+pub(crate) fn assemble_retained(
     topic: &str,
     boundaries: &[i64],
     partitions: &[i32],
@@ -814,7 +814,7 @@ impl TopicFacts {
 
 /// Reads the timestamp type and cleanup policy (best effort) and, when
 /// `with_earliest`, the oldest retained record's time per partition.
-pub async fn topic_facts(
+pub(crate) async fn topic_facts(
     config: &KafkaClientConfig,
     topic: &str,
     partitions: &[i32],
@@ -839,7 +839,7 @@ pub async fn topic_facts(
 }
 
 /// The partitions to chart: all of `topic`'s, or the requested ones.
-pub fn selected_partitions(
+pub(crate) fn selected_partitions(
     client: &KafkaConsumerClient,
     topic: &str,
     only: Option<&[i32]>,
@@ -1057,7 +1057,7 @@ pub const EXACT_LIMIT: u64 = 1_000_000;
 
 /// Records per bucket from their own timestamps, for an exact count.
 #[derive(Debug, Clone, Default)]
-pub struct ExactBins {
+pub(crate) struct ExactBins {
     boundaries: Vec<i64>,
     /// Partition id -> column.
     columns: HashMap<i32, usize>,
@@ -1376,7 +1376,7 @@ async fn mark_trimmed_inside(config: &KafkaClientConfig, hist: &mut TimeHistogra
 
 /// The oldest retained record's time per partition (reads one record of
 /// each; needs READ). Partitions that could not be read are left out.
-pub async fn earliest_timestamps(
+pub(crate) async fn earliest_timestamps(
     config: &KafkaClientConfig,
     topic: &str,
     partitions: &[i32],

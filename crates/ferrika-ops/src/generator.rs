@@ -7,7 +7,7 @@ use ferrika_core::codec::schema::encode_confluent_wire_format;
 
 /// Minimal, zero-dependency fast pseudo-random number generator (xorshift64star).
 #[derive(Debug, Clone)]
-pub struct FastRng {
+pub(crate) struct FastRng {
     state: u64,
 }
 

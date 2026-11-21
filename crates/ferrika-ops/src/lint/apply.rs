@@ -42,7 +42,7 @@ pub enum ApplyMode {
     Validate,
 }
 
-pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
+pub(crate) type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 /// Reads and changes the cluster for [`apply_fixes`]; a trait so the loop
 /// can be tested without a cluster.
@@ -123,7 +123,7 @@ pub struct UndoChange {
 
 /// The undo record of one `lint --fix` run.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct UndoRecord {
+pub(crate) struct UndoRecord {
     pub time_ms: i64,
     pub profile: String,
     pub changes: Vec<UndoChange>,
@@ -147,7 +147,7 @@ fn current_finding(
 }
 
 /// The config values `fix` replaces, read from `input` before it runs.
-pub fn undo_changes(input: &LintInput, fix: &Fix) -> Vec<UndoChange> {
+pub(crate) fn undo_changes(input: &LintInput, fix: &Fix) -> Vec<UndoChange> {
     let (resource, entries, origin) = match fix {
         Fix::TopicConfig { topic, .. } => (
             format!("topic {topic}"),
@@ -355,7 +355,7 @@ async fn apply_one<S: AuditSink>(
 /// it, for the fixes whose before-state `input` holds; `None` for the ones
 /// that need a read of their own (the replication plan, a group's
 /// offsets). Mirrors what the GUI records for the same change.
-pub fn change_from_input(input: &LintInput, fix: &Fix) -> Option<Change> {
+pub(crate) fn change_from_input(input: &LintInput, fix: &Fix) -> Option<Change> {
     let config = |state: KafkaResult<State>, changes: &[ConfigChange]| {
         let captured = state.map(|before| {
             let after = capture::config_after(&before, changes);
@@ -434,7 +434,7 @@ pub fn save_undo(profile: &str, undo: Vec<UndoChange>) -> std::io::Result<PathBu
 }
 
 /// Where `lint --fix` keeps its undo records.
-pub fn undo_dir() -> PathBuf {
+pub(crate) fn undo_dir() -> PathBuf {
     ferrika_core::kafka::profile::ProfileStore::default_path().with_file_name("lint")
 }
 
