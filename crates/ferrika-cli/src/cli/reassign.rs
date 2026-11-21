@@ -10,7 +10,8 @@ use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::admin::KafkaAdminClient;
 use crate::kafka::reassign::{
     dedup_preserving_order, evaluate_partition_status, generate_balanced_plan,
-    generate_rollback_plan, PartitionAssignment, ReassignmentPlan, ReassignmentStatus,
+    generate_minimal_move_plan, generate_rollback_plan, replicas_to_move, PartitionAssignment,
+    ReassignmentPlan, ReassignmentStatus,
 };
 use crate::kafka::wire::alter_partition_reassignments;
 
@@ -47,8 +48,9 @@ pub struct ReassignPlanArgs {
     #[arg(short = 'b', long, value_delimiter = ',', required = true)]
     pub brokers: Vec<i32>,
 
-    /// Desired replication factor (defaults to the topic's current one; with
-    /// --partitions, to 2 or the broker count if smaller)
+    /// Desired replication factor (defaults to each partition's current one,
+    /// with --from-scratch the topic's first partition's; with --partitions,
+    /// to 2 or the broker count if smaller)
     #[arg(long)]
     pub rf: Option<usize>,
 
@@ -56,6 +58,12 @@ pub struct ReassignPlanArgs {
     /// cluster. Otherwise topics and broker ids are checked against the cluster
     #[arg(short = 'p', long)]
     pub partitions: Option<usize>,
+
+    /// Lay every partition out afresh (leader rotation over the brokers)
+    /// instead of keeping the replicas that are already well placed. Moves
+    /// much more data; the offline plan (--partitions) always does this
+    #[arg(long)]
+    pub from_scratch: bool,
 
     /// Save generated reassignment plan to file (e.g. 'reassignment.json')
     #[arg(short = 'o', long)]
@@ -147,6 +155,9 @@ fn run_plan(mut args: ReassignPlanArgs, global: &GlobalOpts) -> KafkaResult<()> 
     let mut all_partitions = Vec::new();
     // Each topic continues the leader rotation where the previous one ended.
     let mut placed = 0usize;
+    // Online: replicas the plan copies to new brokers, current replicas it
+    // keeps, and current replicas in all.
+    let mut moved: Option<(usize, usize, usize)> = None;
 
     if let Some(part_count) = args.partitions {
         // Offline planning: nothing to check the topics and brokers against.
@@ -180,16 +191,57 @@ fn run_plan(mut args: ReassignPlanArgs, global: &GlobalOpts) -> KafkaResult<()> 
             )));
         }
 
+        let mut current = Vec::new();
         for topic in &args.topics {
             // A missing topic is an error rather than a made-up plan.
             let detail = admin.describe_topic(topic, timeout)?;
             let current_rf = detail.partitions.first().map_or(1, |p| p.replicas.len());
             let rf = args.rf.unwrap_or(current_rf);
-            let topic_plan =
-                generate_balanced_plan(topic, detail.partitions.len(), &args.brokers, rf, placed)?;
-            placed += topic_plan.partitions.len();
-            all_partitions.extend(topic_plan.partitions);
+            current.extend(detail.partitions.iter().map(|p| {
+                PartitionAssignment::new(topic.clone(), p.partition_id, p.replicas.clone())
+            }));
+            if args.from_scratch {
+                let topic_plan = generate_balanced_plan(
+                    topic,
+                    detail.partitions.len(),
+                    &args.brokers,
+                    rf,
+                    placed,
+                )?;
+                placed += topic_plan.partitions.len();
+                all_partitions.extend(topic_plan.partitions);
+            }
         }
+        if !args.from_scratch {
+            // All topics at once, so the brokers' shares count every topic.
+            all_partitions =
+                generate_minimal_move_plan(&current, &args.brokers, args.rf)?.partitions;
+        }
+        let planned = ReassignmentPlan::new(all_partitions.clone());
+        let after: std::collections::HashMap<(&str, i32), &PartitionAssignment> = planned
+            .partitions
+            .iter()
+            .map(|p| ((p.topic.as_str(), p.partition), p))
+            .collect();
+        let kept: usize = current
+            .iter()
+            .map(|before| {
+                after
+                    .get(&(before.topic.as_str(), before.partition))
+                    .map_or(0, |after| {
+                        before
+                            .replicas
+                            .iter()
+                            .filter(|b| after.replicas.contains(b))
+                            .count()
+                    })
+            })
+            .sum();
+        moved = Some((
+            replicas_to_move(&current, &planned),
+            kept,
+            current.iter().map(|p| p.replicas.len()).sum::<usize>(),
+        ));
     }
 
     let plan = ReassignmentPlan::new(all_partitions);
@@ -204,6 +256,12 @@ fn run_plan(mut args: ReassignPlanArgs, global: &GlobalOpts) -> KafkaResult<()> 
     }
 
     render_plan_table(&plan, &args.brokers);
+    if let Some((moving, kept, existing)) = moved {
+        println!(
+            "\n{} replica(s) to copy onto other brokers; {kept} of {existing} current replica(s) stay where they are.",
+            moving.to_string().yellow().bold(),
+        );
+    }
 
     if let Some(ref path) = args.output {
         plan.save_to_file(path)?;
