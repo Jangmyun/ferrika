@@ -483,7 +483,8 @@ fn needs_profiles(command: Option<&Commands>) -> bool {
 /// meant to keep watching or to run without a broker (`health --watch`,
 /// `monitor`, `top`, `probe`, `report`, `mcp`), ones that talk to other
 /// clusters or services (`mirror`, `cluster`, `diff`, `schema`, `connect`)
-/// or to local files (`acl --local`, `lint rules`, `history`), and `undo`.
+/// or to local files (`acl --local`, `lint rules`, `history`), ones with
+/// offline modes (`reassign plan --partitions`, `trace inject`), and `undo`.
 fn fails_fast_without_broker(command: &Commands) -> bool {
     match command {
         Commands::Topics(_)
@@ -495,9 +496,7 @@ fn fails_fast_without_broker(command: &Commands) -> bool {
         | Commands::Generate(_)
         | Commands::Compact(_)
         | Commands::Dlq(_)
-        | Commands::Trace(_)
         | Commands::Topology(_)
-        | Commands::Reassign(_)
         | Commands::Quota(_)
         | Commands::User(_)
         | Commands::Bench(_) => true,
@@ -1062,6 +1061,17 @@ mod tests {
             &["report"][..],
             &["mcp"][..],
             &["schema", "list"][..],
+            &[
+                "reassign",
+                "plan",
+                "-t",
+                "orders",
+                "--brokers",
+                "1,2",
+                "--partitions",
+                "3",
+            ][..],
+            &["trace", "inject"][..],
         ] {
             assert!(!fails_fast_without_broker(&command(args)), "{args:?}");
         }

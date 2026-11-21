@@ -363,16 +363,15 @@ fn result_entry(
     }
 }
 
-/// What a quick TCP connect to one address of a bootstrap server (or
-/// resolving the server's name) found.
+/// What a quick TCP connect to a bootstrap server found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Reach {
-    /// The address accepted the connection.
+    /// An address accepted the connection.
     Open,
-    /// Refused, or the name did not resolve: nothing listens there.
+    /// Every address refused it: nothing listens there.
     Closed(String),
-    /// No answer in time: a firewall may drop packets, or a slow network
-    /// may answer later. The Kafka client decides, as before.
+    /// No answer in time, the name did not resolve (DNS may recover), or
+    /// the entry could not be read: the Kafka client decides, as before.
     Unclear,
 }
 
@@ -386,8 +385,58 @@ fn connect(addr: std::net::SocketAddr, server: &str, timeout: std::time::Duratio
     }
 }
 
-/// Why nothing can be reached, when every address of every server is
-/// certainly closed; `None` once one is open or unclear.
+/// `host:port` of one bootstrap entry as librdkafka reads it: a
+/// `scheme://` prefix (`SASL_SSL://`) is dropped and a missing port is
+/// 9092. `None` when it cannot be told apart (a bare IPv6 address).
+fn socket_target(entry: &str) -> Option<String> {
+    let entry = entry.rsplit("://").next()?.trim().trim_end_matches('/');
+    if entry.is_empty() {
+        return None;
+    }
+    if let Some(rest) = entry.strip_prefix('[') {
+        let (_, after) = rest.split_once(']')?;
+        return match after {
+            "" => Some(format!("{entry}:9092")),
+            port if port.starts_with(':') => Some(entry.to_string()),
+            _ => None,
+        };
+    }
+    match entry.matches(':').count() {
+        0 => Some(format!("{entry}:9092")),
+        1 => Some(entry.to_string()),
+        _ => None,
+    }
+}
+
+/// Resolves `target` and connects to all its addresses at once; the first
+/// open or unclear one decides, refused ones only when all are.
+fn reach(target: &str, timeout: std::time::Duration) -> Reach {
+    use std::net::ToSocketAddrs as _;
+    let addrs: Vec<_> = match target.to_socket_addrs() {
+        Ok(addrs) => addrs.collect(),
+        Err(_) => return Reach::Unclear,
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    for &addr in &addrs {
+        let (tx, target) = (tx.clone(), target.to_string());
+        std::thread::spawn(move || {
+            let _ = tx.send(connect(addr, &target, timeout));
+        });
+    }
+    drop(tx);
+    let mut refused = None;
+    for _ in 0..addrs.len() {
+        match rx.recv() {
+            Ok(Reach::Closed(reason)) => refused = Some(reason),
+            Ok(other) => return other,
+            Err(_) => return Reach::Unclear,
+        }
+    }
+    refused.map_or(Reach::Unclear, Reach::Closed)
+}
+
+/// Why nothing can be reached, when every server is certainly closed;
+/// `None` once one is open or unclear.
 fn closed_reason(results: &[Reach]) -> Option<String> {
     let mut reasons: Vec<&str> = Vec::new();
     for result in results {
@@ -403,46 +452,36 @@ fn closed_reason(results: &[Reach]) -> Option<String> {
     (!reasons.is_empty()).then(|| format!("Nothing accepts connections at {}", reasons.join("; ")))
 }
 
-/// Why no bootstrap server can be reached, when that is certain (see
-/// [`closed_reason`]), so a command can fail at once instead of waiting
-/// `--timeout` (30 s) for a broker that is not running. Every address is
-/// tried in parallel, and the first open or unclear one ends the wait: a
-/// refused IPv6 `localhost` (about 2 s on Windows) must not slow down a
-/// broker that listens on IPv4.
+/// Why no bootstrap server can be reached, when that is certain (every
+/// address refused the connection), so a command can fail at once instead
+/// of waiting `--timeout` (30 s) for a broker that is not running. Servers
+/// and their addresses are tried in parallel, and the first open or
+/// unclear one ends the wait: a refused IPv6 `localhost` (about 2 s on
+/// Windows) must not slow down a broker that listens on IPv4. A slow name
+/// lookup is not waited for past `timeout`.
 pub fn unreachable_bootstrap(bootstrap: &str, timeout: std::time::Duration) -> Option<String> {
-    use std::net::ToSocketAddrs as _;
+    let deadline = std::time::Instant::now() + timeout + std::time::Duration::from_millis(500);
     let (tx, rx) = std::sync::mpsc::channel();
-    let mut results = Vec::new();
-    let mut pending = 0usize;
-    for server in bootstrap
-        .split(',')
-        .map(str::trim)
+    let mut servers = 0usize;
+    for entry in bootstrap
+        .split(|c: char| c == ',' || c.is_whitespace())
         .filter(|s| !s.is_empty())
     {
-        let addrs: Vec<_> = match server.to_socket_addrs() {
-            Ok(addrs) => addrs.collect(),
-            Err(e) => {
-                results.push(Reach::Closed(format!("{server}: {e}")));
-                continue;
-            }
-        };
-        if addrs.is_empty() {
-            results.push(Reach::Closed(format!("{server}: no address")));
-        }
-        for addr in addrs {
-            let (tx, server) = (tx.clone(), server.to_string());
-            std::thread::spawn(move || {
-                let _ = tx.send(connect(addr, &server, timeout));
-            });
-            pending += 1;
-        }
+        let target = socket_target(entry)?;
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(reach(&target, timeout));
+        });
+        servers += 1;
     }
     drop(tx);
-    for _ in 0..pending {
-        match rx.recv() {
+    let mut results = Vec::new();
+    for _ in 0..servers {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
             Ok(Reach::Closed(reason)) => results.push(Reach::Closed(reason)),
-            // Open, unclear, or a check that died: let the client decide.
-            Ok(Reach::Open | Reach::Unclear) | Err(_) => return None,
+            // Open, unclear, too slow, or a check that died.
+            _ => return None,
         }
     }
     closed_reason(&results)
@@ -594,6 +633,33 @@ mod tests {
         assert_eq!(closed_reason(&[closed(), Reach::Open]), None);
         assert_eq!(closed_reason(&[closed(), Reach::Unclear]), None);
         assert_eq!(closed_reason(&[]), None);
+    }
+
+    #[test]
+    fn bootstrap_entries_are_read_like_librdkafka() {
+        use super::socket_target;
+        assert_eq!(socket_target("kafka1").as_deref(), Some("kafka1:9092"));
+        assert_eq!(socket_target("h:9093").as_deref(), Some("h:9093"));
+        assert_eq!(
+            socket_target("SASL_SSL://b1.prod.corp:9094").as_deref(),
+            Some("b1.prod.corp:9094")
+        );
+        assert_eq!(socket_target("PLAINTEXT://h").as_deref(), Some("h:9092"));
+        assert_eq!(socket_target("[::1]:9092").as_deref(), Some("[::1]:9092"));
+        assert_eq!(socket_target("[::1]").as_deref(), Some("[::1]:9092"));
+        // A bare IPv6 address cannot be split into host and port.
+        assert_eq!(socket_target("::1"), None);
+    }
+
+    #[test]
+    fn unreadable_or_unresolved_entries_never_stop_a_command() {
+        use super::unreachable_bootstrap;
+        use std::time::Duration;
+        assert_eq!(unreachable_bootstrap("::1", Duration::from_secs(1)), None);
+        assert_eq!(
+            unreachable_bootstrap("no-such-host.invalid:9092", Duration::from_secs(1)),
+            None
+        );
     }
 
     #[test]
