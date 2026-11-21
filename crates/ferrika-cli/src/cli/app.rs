@@ -80,7 +80,7 @@ pub enum Commands {
     Connect(cli::connect::ConnectArgs),
     /// Serve cluster tools to AI assistants over MCP (stdin/stdout); read-only unless --allow-write
     Mcp(cli::mcp::McpArgs),
-    /// Show the local audit log of cluster changes (GUI and CLI)
+    /// Show the local audit log of cluster changes (GUI, CLI and MCP)
     Audit {
         /// Number of entries to show
         #[arg(short = 'n', long, default_value_t = 30)]
