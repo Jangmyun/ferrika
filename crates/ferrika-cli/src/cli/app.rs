@@ -182,6 +182,7 @@ pub fn run(mut cli: Cli) {
         print!("{}", no_command_help());
         return;
     }
+    cli.global_opts.ignore_empty_values();
     // Reads nothing and changes nothing: no policy, profile or audit.
     if let Some(Commands::Completions { shell }) = &cli.command {
         let mut command = <Cli as clap::CommandFactory>::command();
@@ -320,6 +321,30 @@ pub fn run(mut cli: Cli) {
         ) {
             cli::exit_with_error(&refusal_message(&refusal, cli.command.as_ref()));
         }
+        // Changes recorded in the history write their result entry when the
+        // record finishes; for the others it is written at the end of `main`
+        // (or on the way out after an error).
+        if op.is_none() {
+            cli::expect_audit_result(governance::audit::AuditEntry {
+                time_ms: 0,
+                source: "cli".to_string(),
+                // As the request entry names it (the brokers without a
+                // profile), so the two lines pair up.
+                profile: if profile.is_empty() {
+                    bootstrap.clone()
+                } else {
+                    profile.clone()
+                },
+                action: action.to_string(),
+                target: target.clone(),
+                outcome: String::new(),
+                ok: true,
+                user: String::new(),
+                actor: None,
+                op: String::new(),
+                op_digest: String::new(),
+            });
+        }
         cli.global_opts.write = Some(cli::WriteContext {
             label: action.to_string(),
             target,
@@ -383,6 +408,8 @@ pub fn run(mut cli: Cli) {
         Some(Commands::Mcp(args)) => run_async(cli::mcp::run(args, global)),
         None => print!("{}", no_command_help()),
     }
+    // The handler returned without an error (an interrupted batch too).
+    cli::record_audit_result(true, "finished without error");
 }
 
 /// Runs an async CLI command on a fresh tokio runtime, exiting with the
@@ -846,6 +873,20 @@ fn write_target(command: &Commands) -> String {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_profile_and_brokers_mean_not_set() {
+        use clap::Parser as _;
+        let mut cli =
+            super::Cli::try_parse_from(["ferrika", "-p", "", "-b", " ", "topics", "list"]).unwrap();
+        cli.global_opts.ignore_empty_values();
+        assert_eq!(cli.global_opts.profile, None);
+        assert_eq!(cli.global_opts.bootstrap_servers, None);
+        let mut cli =
+            super::Cli::try_parse_from(["ferrika", "-p", "prod", "topics", "list"]).unwrap();
+        cli.global_opts.ignore_empty_values();
+        assert_eq!(cli.global_opts.profile.as_deref(), Some("prod"));
+    }
+
     #[test]
     fn kafka_errors_are_found_directly_or_in_anyhow() {
         use super::kafka_error_of;
