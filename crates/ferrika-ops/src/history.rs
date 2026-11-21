@@ -444,6 +444,7 @@ type SecretStore<'a> = dyn Fn(&str, &str, &str) -> bool + 'a;
 fn keep_secrets(op: &str, states: &mut [State], store: &SecretStore<'_>) -> Option<String> {
     let profile = secret_store_profile(op);
     let mut lost = Vec::new();
+    let mut unknown = Vec::new();
     for state in states.iter_mut() {
         if let State::Connector {
             name,
@@ -456,6 +457,15 @@ fn keep_secrets(op: &str, states: &mut [State], store: &SecretStore<'_>) -> Opti
                 let Some(value) = config.get_mut(key) else {
                     continue;
                 };
+                // An empty value is a secret that was not known when the
+                // state was read (an undo reads the connector back with its
+                // secrets blanked). Keeping "" would later put the connector
+                // back with empty passwords; leave it out so undoing this
+                // operation is refused for want of the secret instead.
+                if value.is_empty() {
+                    unknown.push(format!("{name}: {key}"));
+                    continue;
+                }
                 if !store(&profile, key, value) {
                     lost.push(format!("{name}: {key}"));
                 }
@@ -463,12 +473,20 @@ fn keep_secrets(op: &str, states: &mut [State], store: &SecretStore<'_>) -> Opti
             }
         }
     }
-    (!lost.is_empty()).then(|| {
-        format!(
+    let mut reasons = Vec::new();
+    if !lost.is_empty() {
+        reasons.push(format!(
             "connector secrets were not kept (no OS credential store): {}",
             lost.join(", ")
-        )
-    })
+        ));
+    }
+    if !unknown.is_empty() {
+        reasons.push(format!(
+            "connector secrets were not known when the state was read: {}",
+            unknown.join(", ")
+        ));
+    }
+    (!reasons.is_empty()).then(|| reasons.join("; "))
 }
 
 /// Blanks the secret values of a connector state.
@@ -706,6 +724,31 @@ mod tests {
             "{text}"
         );
         assert_eq!(ops[0].begin.reversibility, Reversibility::Reversible);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn blanked_secrets_are_not_stored_as_empty_passwords() {
+        let (dir, journal) = temp_journal("blanked");
+        let kept = std::cell::RefCell::new(Vec::new());
+        // An undo records the connector as read back: its secret blanked.
+        let _recorder = Recorder::start_with(
+            journal.clone(),
+            "01JBX3K8Q2MA".to_string(),
+            begin_with(vec![connector("")], vec![]),
+            &|_, key, value| {
+                kept.borrow_mut().push((key.to_string(), value.to_string()));
+                true
+            },
+        );
+        assert!(kept.borrow().is_empty(), "{:?}", kept.borrow());
+        let op = &journal.load()[0];
+        assert_eq!(op.begin.reversibility, Reversibility::Partial);
+        assert!(
+            op.begin.limits[0].contains("not known"),
+            "{:?}",
+            op.begin.limits
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
