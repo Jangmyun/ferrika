@@ -32,8 +32,8 @@ cargo test -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -
 ```
 
 Changes that touch a command's behaviour against a real broker should also
-pass the end-to-end smoke test (it needs Docker and Python 3; use a throw-away
-broker, never a real cluster):
+pass the end-to-end smoke test (it needs Docker and Python 3 on Linux, macOS
+or WSL; use a throw-away broker, never a real cluster):
 
 ```bash
 docker run -d --name ferrika-kafka-test -p 9092:9092 apache/kafka:3.9.0
@@ -41,11 +41,15 @@ cargo build --release -p ferrika-cli
 python3 tools/e2e/smoke.py
 ```
 
-The repository contains two crates: `ferrika-core` (the engine) and
-`ferrika-cli` (the `ferrika` command line). `ferrika-core` is the CLI's
-engine, not a stable library API. Read [AGENTS.md](AGENTS.md) for the layout and
-for one rule you must keep: the policy gate in `crates/ferrika-cli/src/cli/app.rs`
-has no wildcard `match` arms, so a new command must be classified there.
+The workspace has five crates, published together on crates.io with one
+version: `ferrika-core` (clients, record formats, data model),
+`ferrika-governance` (company policy and audit), `ferrika-ops` (operations),
+`ferrika-mcp` (the MCP server) and `ferrika-cli` (the `ferrika` command
+line). Before 1.0 their API can change in a minor version; a patch version
+must not break it, so say in the pull request when a change does. Read
+[AGENTS.md](AGENTS.md) for the layout and for one rule you must keep: the policy
+gate in `crates/ferrika-cli/src/cli/app.rs` has no wildcard `match` arms, so a
+new command must be classified there.
 
 ### Build requirements
 
