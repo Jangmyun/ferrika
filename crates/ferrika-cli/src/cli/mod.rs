@@ -96,6 +96,11 @@ pub struct WriteContext {
 }
 
 impl GlobalOpts {
+    /// `--timeout` for HTTP requests (Schema Registry, Connect, webhooks).
+    pub fn http_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout)
+    }
+
     /// Whether to print JSON: a command's own `--json` flag or the global
     /// `--format json`.
     pub fn wants_json(&self, flag: bool) -> bool {

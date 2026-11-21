@@ -29,6 +29,8 @@ pub struct Endpoint {
     pub base_path: String,
     /// `Basic ...` header value when the URL carries credentials.
     authorization: Option<String>,
+    /// Limit for connecting, the TLS handshake and the exchange, each.
+    timeout: Duration,
 }
 
 /// A response's status code and body (chunked encoding already removed).
@@ -127,7 +129,15 @@ impl Endpoint {
             port,
             base_path,
             authorization,
+            timeout: HTTP_TIMEOUT,
         })
+    }
+
+    /// Sets the time allowed to connect, for the TLS handshake and for the
+    /// request and response (each; at least one second). Default 30 s.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout.max(Duration::from_secs(1));
+        self
     }
 
     /// `host:port` (credentials left out), for messages.
@@ -162,10 +172,10 @@ impl Endpoint {
         let timed_out = || {
             KafkaError::Io(format!(
                 "Timed out after {}s reaching {target}",
-                HTTP_TIMEOUT.as_secs()
+                self.timeout.as_secs()
             ))
         };
-        let tcp = tokio::time::timeout(HTTP_TIMEOUT, TcpStream::connect(&target))
+        let tcp = tokio::time::timeout(self.timeout, TcpStream::connect(&target))
             .await
             .map_err(|_| timed_out())?
             .map_err(|e| KafkaError::Io(format!("Cannot reach {target}: {e}")))?;
@@ -174,13 +184,13 @@ impl Endpoint {
                 KafkaError::config(format!("Invalid TLS host '{}': {e}", self.host))
             })?;
             let handshake = tokio_rustls::TlsConnector::from(tls_config()?).connect(name, tcp);
-            let stream = tokio::time::timeout(HTTP_TIMEOUT, handshake)
+            let stream = tokio::time::timeout(self.timeout, handshake)
                 .await
                 .map_err(|_| timed_out())?
                 .map_err(|e| KafkaError::Io(format!("TLS handshake with {target} failed: {e}")))?;
-            exchange(stream, &request, HTTP_TIMEOUT, MAX_RESPONSE_BYTES).await?
+            exchange(stream, &request, self.timeout, MAX_RESPONSE_BYTES).await?
         } else {
-            exchange(tcp, &request, HTTP_TIMEOUT, MAX_RESPONSE_BYTES).await?
+            exchange(tcp, &request, self.timeout, MAX_RESPONSE_BYTES).await?
         };
         parse_response(&raw)
     }
@@ -554,6 +564,34 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn send_uses_the_endpoint_timeout() {
+        // Accepts and reads, never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = sock.read(&mut req).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let endpoint = Endpoint::parse(&format!("http://127.0.0.1:{port}"), 80)
+            .unwrap()
+            .with_timeout(Duration::from_secs(1));
+        let started = std::time::Instant::now();
+        let err = endpoint
+            .send("GET", "/", "text/plain", None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out after 1s"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // Below one second is raised to one.
+        let e = Endpoint::parse("http://x", 80)
+            .unwrap()
+            .with_timeout(Duration::ZERO);
+        assert_eq!(e.timeout, Duration::from_secs(1));
     }
 
     #[test]

@@ -195,7 +195,8 @@ impl WriteBackend for KafkaBackend {
                     "value_subject needs a Schema Registry URL on the profile".to_string(),
                 )
             })?;
-            let client = ferrika_core::kafka::schema::SchemaRegistryClient::new(url);
+            let client = ferrika_core::kafka::schema::SchemaRegistryClient::new(url)
+                .with_timeout(self.config.request_timeout);
             Ok(client.encode_latest(subject, json_text).await?.0)
         })
     }

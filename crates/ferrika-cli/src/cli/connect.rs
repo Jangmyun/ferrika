@@ -72,7 +72,7 @@ pub async fn run(args: ConnectArgs, global: &GlobalOpts) -> KafkaResult<()> {
                  (ferrika profile add <name> -b <servers> --connect http://host:8083)",
             )
         })?;
-    let client = ConnectClient::new(&url)?;
+    let client = ConnectClient::new(&url)?.with_timeout(global.http_timeout());
     let action = match &args.command {
         ConnectSubcommands::Pause { name } => Some((name, ConnectorAction::Pause)),
         ConnectSubcommands::Resume { name } => Some((name, ConnectorAction::Resume)),

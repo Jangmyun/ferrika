@@ -98,6 +98,13 @@ impl ConnectClient {
         })
     }
 
+    /// Sets the time each request may take (see
+    /// [`crate::kafka::http::Endpoint::with_timeout`]).
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.endpoint = self.endpoint.with_timeout(timeout);
+        self
+    }
+
     /// Every connector with status and config (`?expand=status&expand=info`).
     pub async fn list(&self) -> KafkaResult<Vec<ConnectorView>> {
         let body = self
