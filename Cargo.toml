@@ -23,7 +23,7 @@ tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "time", "ne
 # and links it statically; without it librdkafka is configured with
 # WITH_ZSTD=0 and `-c zstd` fails with "libzstd not available at build time".
 # Do not use zstd-pkg-config: it needs a system libzstd (not standalone).
-rdkafka = { version = "0.39", features = ["cmake-build", "zstd"] }
+rdkafka = { version = "0.39", features = ["cmake-build", "zstd", "libz-static"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
