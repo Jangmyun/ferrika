@@ -96,7 +96,20 @@ pub enum Commands {
     History(cli::history::HistoryArgs),
     /// Revert a recorded change; refuses if the state drifted, unless --force
     Undo(cli::history::UndoArgs),
+    /// Print a shell completion script (bash, zsh, fish, powershell, elvish)
+    #[command(after_help = COMPLETIONS_HELP)]
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
+
+const COMPLETIONS_HELP: &str = "Install, for example:
+  bash:        ferrika completions bash > ~/.local/share/bash-completion/completions/ferrika
+  zsh:         ferrika completions zsh > \"${fpath[1]}/_ferrika\"
+  fish:        ferrika completions fish > ~/.config/fish/completions/ferrika.fish
+  PowerShell:  ferrika completions powershell | Out-String | Invoke-Expression   (add to $PROFILE)
+Homebrew installs them for you.";
 
 /// Sends `tracing` output and the library's notices (`warning: ...`) to
 /// stderr. The `tracing` filter comes from `FERRIKA_LOG`, then
@@ -167,6 +180,19 @@ pub fn main_cli() {
 pub fn run(mut cli: Cli) {
     if cli.command.is_none() {
         print!("{}", no_command_help());
+        return;
+    }
+    // Reads nothing and changes nothing: no policy, profile or audit.
+    if let Some(Commands::Completions { shell }) = &cli.command {
+        let mut command = <Cli as clap::CommandFactory>::command();
+        let mut script = Vec::new();
+        clap_complete::generate(*shell, &mut command, "ferrika", &mut script);
+        // `| head` closing the pipe early is not an error.
+        if let Err(e) = std::io::Write::write_all(&mut std::io::stdout(), &script) {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                cli::exit_with_error(&format!("could not write the completion script: {e}"));
+            }
+        }
         return;
     }
     // `health --watch` turns an unreachable broker into a finding; the
@@ -336,6 +362,8 @@ pub fn run(mut cli: Cli) {
             command,
         }) => cli::audit::run(limit, &filter, command, global),
         Some(Commands::Policy(args)) => exit_on_error(cli::policy::run(args, global)),
+        // Printed at the start of `run`.
+        Some(Commands::Completions { .. }) => {}
         Some(Commands::Health(args)) => run_async(cli::health::run(args, global)),
         Some(Commands::Lint(args)) => run_async(cli::lint::run(args, global)),
         Some(Commands::Report(args)) => run_async(cli::report::run(args, global)),
@@ -379,7 +407,12 @@ fn exit_on_error<E: std::fmt::Display>(result: Result<(), E>) {
 fn needs_profiles(command: Option<&Commands>) -> bool {
     !matches!(
         command,
-        None | Some(Commands::Profile(_) | Commands::Policy(_) | Commands::Audit { .. })
+        None | Some(
+            Commands::Profile(_)
+                | Commands::Policy(_)
+                | Commands::Audit { .. }
+                | Commands::Completions { .. }
+        )
     )
 }
 
@@ -495,6 +528,7 @@ fn write_action(command: &Commands) -> Option<&'static str> {
         Commands::Lint(_) => None,
         // Each MCP write tool call passes the gate itself.
         Commands::Mcp(_) => None,
+        Commands::Completions { .. } => None,
         Commands::Connect(args) => match &args.command {
             cli::connect::ConnectSubcommands::Pause { .. } => Some("connect pause"),
             cli::connect::ConnectSubcommands::Resume { .. } => Some("connect resume"),
@@ -605,7 +639,7 @@ fn export_gate(command: &Commands) -> Option<ExportGate> {
             cli::crypto::CryptoCommands::Mask(_) | cli::crypto::CryptoCommands::Audit(_) => None,
         },
         // Metadata or counts only, records read in, or checked elsewhere.
-        Commands::Mirror(_) | Commands::Mcp(_) => None,
+        Commands::Mirror(_) | Commands::Mcp(_) | Commands::Completions { .. } => None,
         Commands::Topics(_)
         | Commands::Produce(_)
         | Commands::Monitor(_)
@@ -844,6 +878,7 @@ mod tests {
             // Each MCP write tool call passes the gate itself.
             | Commands::Mcp(_)
             | Commands::Audit { .. }
+            | Commands::Completions { .. }
             | Commands::Policy(_) => false,
         }
     }
@@ -1003,6 +1038,7 @@ mod tests {
             | Commands::History(_)
             | Commands::Undo(_)
             | Commands::Audit { .. }
+            | Commands::Completions { .. }
             | Commands::Policy(_) => false,
         }
     }
