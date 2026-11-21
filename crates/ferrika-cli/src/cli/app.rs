@@ -182,6 +182,7 @@ pub fn run(mut cli: Cli) {
         print!("{}", no_command_help());
         return;
     }
+    cli.global_opts.ignore_empty_values();
     // Reads nothing and changes nothing: no policy, profile or audit.
     if let Some(Commands::Completions { shell }) = &cli.command {
         let mut command = <Cli as clap::CommandFactory>::command();
@@ -872,6 +873,20 @@ fn write_target(command: &Commands) -> String {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn empty_profile_and_brokers_mean_not_set() {
+        use clap::Parser as _;
+        let mut cli =
+            super::Cli::try_parse_from(["ferrika", "-p", "", "-b", " ", "topics", "list"]).unwrap();
+        cli.global_opts.ignore_empty_values();
+        assert_eq!(cli.global_opts.profile, None);
+        assert_eq!(cli.global_opts.bootstrap_servers, None);
+        let mut cli =
+            super::Cli::try_parse_from(["ferrika", "-p", "prod", "topics", "list"]).unwrap();
+        cli.global_opts.ignore_empty_values();
+        assert_eq!(cli.global_opts.profile.as_deref(), Some("prod"));
+    }
+
     #[test]
     fn kafka_errors_are_found_directly_or_in_anyhow() {
         use super::kafka_error_of;
