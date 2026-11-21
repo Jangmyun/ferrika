@@ -305,7 +305,7 @@ pub fn set_hint_config(config: KafkaClientConfig) {
 
 /// Shows the troubleshooting hints for a failed cluster command whose
 /// handler returned the error as is, when the error came from the Kafka
-/// client itself (see [`fallback_hint_applies`]).
+/// client itself (see `fallback_hint_applies`).
 pub fn hint_unreported(error: &KafkaError) {
     if ERROR_REPORTED.load(std::sync::atomic::Ordering::Relaxed) || !fallback_hint_applies(error) {
         return;
