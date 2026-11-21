@@ -257,7 +257,7 @@ pub async fn run(args: ProduceArgs, global: &GlobalOpts) -> anyhow::Result<()> {
                 }
             }
 
-            let line = strip_line_ending(&line_buf);
+            let line = strip_bom(strip_line_ending(&line_buf));
             // A blank line is almost always a stray newline, not an intended
             // empty message (and an empty value is rejected by compacted topics,
             // failing the whole batch).
@@ -385,9 +385,23 @@ pub fn parse_input_line<'a>(
     (None, line)
 }
 
+/// Drops a UTF-8 byte order mark at the start of a line: Windows tools
+/// write one at the start of a file (`type orders.txt | ferrika produce`),
+/// and kept, it would become part of the first record's key or value.
+fn strip_bom(line: &[u8]) -> &[u8] {
+    line.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_byte_order_mark_does_not_reach_the_record() {
+        assert_eq!(strip_bom(b"\xEF\xBB\xBFu1:{}"), b"u1:{}");
+        assert_eq!(strip_bom(b"u1:{}"), b"u1:{}");
+        assert_eq!(strip_bom(strip_line_ending(b"\xEF\xBB\xBFk:v\r\n")), b"k:v");
+    }
 
     #[test]
     fn test_parse_headers_valid() {
