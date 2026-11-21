@@ -393,7 +393,11 @@ fn export_lines(rules: &PolicyRules) -> Vec<String> {
         "screen capture:    {}",
         name(serde_json::json!(rules.screen_capture))
     );
-    vec![export, watermark, capture]
+    let mcp = format!(
+        "AI (MCP) writes:   {}",
+        name(serde_json::json!(rules.mcp_write))
+    );
+    vec![export, watermark, capture, mcp]
 }
 
 /// `rules` for `-f json policy show`: as signed, plus `export`,
@@ -410,6 +414,8 @@ fn rules_json(rules: &PolicyRules) -> serde_json::Value {
             .or_insert_with(|| serde_json::json!(rules.watermark));
         map.entry("screen_capture")
             .or_insert_with(|| serde_json::json!(rules.screen_capture));
+        map.entry("mcp_write")
+            .or_insert_with(|| serde_json::json!(rules.mcp_write));
     }
     value
 }
@@ -647,7 +653,8 @@ mod tests {
             vec![
                 "record export:     allowed",
                 "watermark:         off",
-                "screen capture:    allowed"
+                "screen capture:    allowed",
+                "AI (MCP) writes:   allowed"
             ]
         );
         let v2 = PolicyRules {
@@ -664,6 +671,7 @@ mod tests {
                 "record export:     forbidden on brokers *.prod.corp, 10.20.*",
                 "watermark:         on (\"대외비\")",
                 "screen capture:    blocked",
+                "AI (MCP) writes:   allowed",
             ]
         );
 
