@@ -77,7 +77,7 @@ pub const RULES: &[RuleSpec] = &[
         "Replication factor 1 with two or more brokers online: one broker loss loses data. Fix: raise replication (copies data)."),
     rule("T002", "min-isr-unreachable", Topic, Critical, Critical, Auto,
         "min.insync.replicas is above the replication factor: every acks=all write fails. Fix: min.insync.replicas = max(1, RF-1)."),
-    rule("T003", "min-isr-equals-rf", Topic, Warning, Info, Auto,
+    rule("T003", "min-isr-equals-rf", Topic, Warning, Info, Guided,
         "min.insync.replicas equals the replication factor: one broker down stops acks=all writes. Fix: min.insync.replicas = RF-1."),
     rule("T004", "min-isr-weak", Topic, Warning, Info, Guided,
         "Replication 3+ with min.insync.replicas 1: acks=all accepts writes held by one replica. Fix: min.insync.replicas = 2 (acks=all producers may start failing)."),
@@ -108,7 +108,7 @@ pub const RULES: &[RuleSpec] = &[
     rule("B003", "default-rf-1", Broker, Warning, Info, Manual,
         "default.replication.factor=1 with three or more brokers: new topics get no redundancy."),
     rule("B004", "default-min-isr-vs-rf", Broker, Warning, Info, Guided,
-        "The default min.insync.replicas is not below default.replication.factor. Fix: the cluster default min.insync.replicas = default RF - 1."),
+        "The default min.insync.replicas is not below default.replication.factor. Fix: the cluster default min.insync.replicas = default RF - 1 (also lowers it for existing topics without an override)."),
     rule("B005", "auto-create-on", Broker, Warning, Info, Manual,
         "auto.create.topics.enable=true: a typo in a client creates a topic."),
     rule("B006", "broker-config-drift", Broker, Warning, Info, Guided,
@@ -967,6 +967,16 @@ fn duration(ms: i64) -> String {
 mod tests {
     use super::*;
     use crate::lint::lint;
+
+    #[test]
+    fn fixes_that_weaken_durability_are_never_automatic() {
+        // Lowering min.insync.replicas lets acks=all accept writes held by
+        // fewer replicas: only when the rule is named, confirmed one by one.
+        for id in ["T003", "B004"] {
+            let spec = RULES.iter().find(|r| r.id == id).unwrap();
+            assert_eq!(spec.fix_class, FixClass::Guided, "{id}");
+        }
+    }
     use ferrika_core::model::cluster::{
         BrokerInfo, ClusterSnapshot, ConsumerGroupSummary, ConsumerState, GroupPartitionLag,
         PartitionDetail,
