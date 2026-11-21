@@ -77,6 +77,24 @@ jobs:
             echo "Tag ${GITHUB_REF_NAME} does not match the binary: '$got' (expected '$want')"
             exit 1
           fi
+      # The binary must run on a bare system: on Linux it may need only
+      # glibc; on macOS only system libraries and frameworks.
+      - name: Check shared libraries
+        if: runner.os != 'Windows'
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            ldd target/release/ferrika
+            extra=$(ldd target/release/ferrika | awk '{print $1}' \
+              | grep -vE '^(linux-vdso\.so|linux-gate\.so|/lib.*/ld-linux.*|ld-linux.*|libc\.so|libm\.so|libgcc_s\.so|libpthread\.so|libdl\.so|librt\.so)' || true)
+          else
+            otool -L target/release/ferrika
+            extra=$(otool -L target/release/ferrika | tail -n +2 | awk '{print $1}' \
+              | grep -vE '^(/usr/lib/|/System/Library/Frameworks/)' || true)
+          fi
+          if [ -n "$extra" ]; then
+            echo "Unexpected shared libraries: $extra"
+            exit 1
+          fi
       # The archives hold ferrika (ferrika.exe), LICENSE and README.md at the
       # top level; install.sh, install.ps1 and the formula rely on that.
       - name: Package (tar.gz)
