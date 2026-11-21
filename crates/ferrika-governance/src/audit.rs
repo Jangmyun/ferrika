@@ -589,10 +589,15 @@ pub fn verify_chain(path: &Path) -> std::io::Result<ChainReport> {
 
 /// The last `limit` entries, oldest first. Unreadable lines are skipped.
 pub fn recent(limit: usize) -> Vec<AuditEntry> {
-    read_recent(&audit_path(), limit)
+    read_recent(&audit_path(), limit, |_| true)
 }
 
-fn read_recent(path: &Path, limit: usize) -> Vec<AuditEntry> {
+/// The last `limit` entries that `keep` accepts, oldest first.
+pub fn recent_matching(limit: usize, keep: impl Fn(&AuditEntry) -> bool) -> Vec<AuditEntry> {
+    read_recent(&audit_path(), limit, keep)
+}
+
+fn read_recent(path: &Path, limit: usize, keep: impl Fn(&AuditEntry) -> bool) -> Vec<AuditEntry> {
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
@@ -600,6 +605,7 @@ fn read_recent(path: &Path, limit: usize) -> Vec<AuditEntry> {
         .lines()
         .map_while(Result::ok)
         .filter_map(|line| serde_json::from_str(&line).ok())
+        .filter(|entry| keep(entry))
         .collect();
     let skip = entries.len().saturating_sub(limit);
     entries.drain(..skip);
@@ -655,7 +661,7 @@ mod tests {
             std::fs::read_to_string(&path).unwrap() + "not json\n",
         )
         .unwrap();
-        let last = read_recent(&path, 2);
+        let last = read_recent(&path, 2, |_| true);
         assert_eq!(last.len(), 2);
         assert_eq!(last[0].target, "t1");
         assert_eq!(last[1].target, "t2");
@@ -769,7 +775,7 @@ mod tests {
         append(&path, &mcp).unwrap();
         let report = verify_chain(&path).unwrap();
         assert_eq!((report.chained, report.broken), (2, None));
-        let back = read_recent(&path, 10);
+        let back = read_recent(&path, 10, |_| true);
         assert_eq!(back[0].actor, None);
         assert_eq!(
             back[1].actor.as_deref(),
@@ -806,7 +812,7 @@ mod tests {
         assert_eq!(report.legacy, 1);
         assert_eq!(report.chained, 3);
         assert_eq!(report.broken, None);
-        assert_eq!(read_recent(&path, 10).len(), 4);
+        assert_eq!(read_recent(&path, 10, |_| true).len(), 4);
 
         let original = std::fs::read_to_string(&path).unwrap();
 
@@ -920,7 +926,7 @@ mod tests {
         assert_eq!(report.torn, vec![3]);
         assert_eq!(report.lines, 5);
         assert_eq!(report.chained, 4);
-        let targets: Vec<String> = read_recent(&path, 10)
+        let targets: Vec<String> = read_recent(&path, 10, |_| true)
             .into_iter()
             .map(|e| e.target)
             .collect();

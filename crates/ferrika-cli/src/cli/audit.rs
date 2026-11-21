@@ -1,10 +1,11 @@
 //! `ferrika audit`: recent operations that changed a cluster.
 
+use clap::Args;
 use colored::Colorize;
 use comfy_table::{Cell, Color};
 
 use crate::cli::{output, GlobalOpts, OutputFormat};
-use crate::governance::audit::{audit_path, recent};
+use crate::governance::audit::{audit_path, AuditEntry};
 use crate::governance::audit_anchor::{self as anchor, AnchorCheck, AuditAnchor, OsLogAnchor};
 
 #[derive(clap::Subcommand, Debug, Clone)]
@@ -26,7 +27,37 @@ pub enum AuditCommand {
     },
 }
 
-pub fn run(limit: usize, command: Option<AuditCommand>, global: &GlobalOpts) {
+/// Which entries `ferrika audit` lists; the limit counts matching entries.
+#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuditFilter {
+    /// Only entries from this source: cli, gui or mcp
+    #[arg(long, value_name = "SOURCE")]
+    pub source: Option<String>,
+    /// Only entries whose actor contains this text (e.g. an MCP client name
+    /// or session id)
+    #[arg(long, value_name = "TEXT")]
+    pub actor: Option<String>,
+    /// Only failed or refused operations
+    #[arg(long)]
+    pub failed: bool,
+}
+
+impl AuditFilter {
+    fn keeps(&self, entry: &AuditEntry) -> bool {
+        self.source
+            .as_deref()
+            .is_none_or(|s| entry.source.eq_ignore_ascii_case(s))
+            && self.actor.as_deref().is_none_or(|text| {
+                entry
+                    .actor
+                    .as_deref()
+                    .is_some_and(|a| a.to_lowercase().contains(&text.to_lowercase()))
+            })
+            && (!self.failed || !entry.ok)
+    }
+}
+
+pub fn run(limit: usize, filter: &AuditFilter, command: Option<AuditCommand>, global: &GlobalOpts) {
     match command {
         Some(AuditCommand::Verify { anchor }) => {
             verify(global, anchor);
@@ -38,7 +69,7 @@ pub fn run(limit: usize, command: Option<AuditCommand>, global: &GlobalOpts) {
         }
         None => {}
     }
-    let entries = recent(limit);
+    let entries = crate::governance::audit::recent_matching(limit, |e| filter.keeps(e));
     if global.format == OutputFormat::Json {
         if let Err(e) = output::print_json(&entries) {
             crate::cli::exit_with_error(&e);
@@ -46,8 +77,13 @@ pub fn run(limit: usize, command: Option<AuditCommand>, global: &GlobalOpts) {
         return;
     }
     if entries.is_empty() {
+        let what = if *filter == AuditFilter::default() {
+            "No recorded operations yet"
+        } else {
+            "No matching entries"
+        };
         println!(
-            "No recorded operations yet ({}).",
+            "{what} ({}).",
             audit_path().display().to_string().bright_black()
         );
         return;
@@ -262,5 +298,52 @@ fn print_anchor_check(path: &std::path::Path, check: &AnchorCheck) {
                  compare with `journalctl -t ferrika` by hand"
             }
         ),
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    fn entry(source: &str, actor: Option<&str>, ok: bool) -> AuditEntry {
+        AuditEntry {
+            time_ms: 0,
+            source: source.into(),
+            profile: String::new(),
+            action: "topics create".into(),
+            target: "t".into(),
+            outcome: String::new(),
+            ok,
+            user: "me".into(),
+            actor: actor.map(str::to_string),
+            op: String::new(),
+            op_digest: String::new(),
+        }
+    }
+
+    #[test]
+    fn filters_by_source_actor_and_failure() {
+        let mcp = entry("mcp", Some("mcp:claude-code/2.1.4#a1b2c3d4"), true);
+        let cli_failed = entry("cli", None, false);
+        let all = AuditFilter::default();
+        assert!(all.keeps(&mcp) && all.keeps(&cli_failed));
+
+        let by_source = AuditFilter {
+            source: Some("MCP".into()),
+            ..AuditFilter::default()
+        };
+        assert!(by_source.keeps(&mcp) && !by_source.keeps(&cli_failed));
+
+        let by_actor = AuditFilter {
+            actor: Some("Claude-Code".into()),
+            ..AuditFilter::default()
+        };
+        assert!(by_actor.keeps(&mcp) && !by_actor.keeps(&cli_failed));
+
+        let failed = AuditFilter {
+            failed: true,
+            ..AuditFilter::default()
+        };
+        assert!(!failed.keeps(&mcp) && failed.keeps(&cli_failed));
     }
 }
