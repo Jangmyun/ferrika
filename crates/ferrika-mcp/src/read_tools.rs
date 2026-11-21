@@ -128,6 +128,21 @@ pub(super) fn tool_definitions(with_peek: bool) -> Value {
             "annotations": read_only
         },
         {
+            "name": "schema_fields",
+            "description": "The fields of a topic's Schema Registry schema (Avro, Protobuf or JSON Schema): path, type, optional, enum values. Each path works as-is in peek_messages' where (e.g. $.amount > 100). Needs a Schema Registry URL on the profile.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": { "type": "string", "description": "Read the topic's <topic>-value subject (<topic>-key with key)" },
+                    "subject": { "type": "string", "description": "A subject instead of topic" },
+                    "key": { "type": "boolean", "default": false, "description": "With topic: the key subject" },
+                    "version": { "type": "integer", "minimum": 1, "description": "Subject version (default: latest)" },
+                    "message": { "type": "string", "description": "Protobuf: the message type (default: the first)" }
+                }
+            },
+            "annotations": read_only
+        },
+        {
             "name": "peek_messages",
             "description": "Reads a few records without joining a consumer group. By default the newest records across all partitions.",
             "inputSchema": {
@@ -181,6 +196,7 @@ pub(super) async fn call_tool(
         "list_consumer_groups" => list_consumer_groups(context, &args).await,
         "consumer_group_lag" => consumer_group_lag(context, &args).await,
         "message_histogram" => message_histogram(context, &args).await,
+        "schema_fields" => schema_fields(context, &args).await,
         "peek_messages" => match authorize_peek(policy, sink, context, &args, actor) {
             Ok(()) => peek_messages(context, &args).await,
             Err(e) => Err(e),
@@ -461,6 +477,70 @@ fn list_topics(context: &ResolvedContext, args: &Value) -> KafkaResult<Value> {
         })
         .collect();
     Ok(json!({ "count": topics.len(), "topics": topics }))
+}
+
+/// The subject `schema_fields` reads: `subject`, or the topic's value (or
+/// key) subject.
+fn fields_subject(args: &Value) -> KafkaResult<String> {
+    let key = args.get("key").and_then(Value::as_bool).unwrap_or(false);
+    match (str_arg(args, "subject"), str_arg(args, "topic")) {
+        (Some(_), Some(_)) => Err(KafkaError::config("Give topic or subject, not both")),
+        (Some(_), None) if key => Err(KafkaError::config("key goes with topic")),
+        (Some(subject), None) => Ok(subject.to_string()),
+        (None, Some(topic)) => Ok(format!("{topic}-{}", if key { "key" } else { "value" })),
+        (None, None) => Err(KafkaError::config("Give topic or subject")),
+    }
+}
+
+async fn schema_fields(context: &ResolvedContext, args: &Value) -> KafkaResult<Value> {
+    use ferrika_core::codec::schema_fields::{from_definition, Limits};
+    let subject = fields_subject(args)?;
+    let url = context
+        .config
+        .schema_registry_url
+        .as_deref()
+        .filter(|u| !u.trim().is_empty())
+        .ok_or_else(|| KafkaError::config("This profile has no Schema Registry URL"))?;
+    let version = args
+        .get("version")
+        .and_then(Value::as_u64)
+        .map(|v| u32::try_from(v).map_err(|_| KafkaError::config("version is too large")))
+        .transpose()?;
+    let message = str_arg(args, "message");
+    let client = ferrika_core::kafka::schema::SchemaRegistryClient::new(url)
+        .with_timeout(context.config.request_timeout);
+    let def = client.subject_schema_resolved(&subject, version).await?;
+    let catalog = from_definition(&def, message, &Limits::default())?;
+    let fields: Vec<Value> = catalog
+        .entries
+        .iter()
+        .map(|e| {
+            let mut field = json!({
+                "path": e.path(),
+                "type": e.kind.label(),
+                "optional": e.optional,
+            });
+            if e.recursive {
+                field["recursive"] = json!(true);
+            }
+            if let Some(group) = &e.group {
+                field["oneof"] = json!(group);
+            }
+            if !e.enum_values.is_empty() {
+                field["values"] = json!(e.enum_values);
+            }
+            field
+        })
+        .collect();
+    Ok(json!({
+        "subject": subject,
+        "id": def.id,
+        "version": def.version,
+        "schema_type": def.schema_type,
+        "truncated": catalog.truncated,
+        "notes": catalog.notes,
+        "fields": fields,
+    }))
 }
 
 async fn describe_topic(context: &ResolvedContext, args: &Value) -> KafkaResult<Value> {
@@ -864,6 +944,22 @@ mod tests {
         let err = histogram_request(&json!({ "topic": "t", "since": "7d", "bucket": "1m" }), now)
             .unwrap_err();
         assert!(err.to_string().contains("200"), "{err}");
+    }
+
+    #[test]
+    fn schema_fields_reads_the_topic_value_or_key_subject() {
+        assert_eq!(
+            fields_subject(&json!({ "topic": "orders" })).unwrap(),
+            "orders-value"
+        );
+        assert_eq!(
+            fields_subject(&json!({ "topic": "orders", "key": true })).unwrap(),
+            "orders-key"
+        );
+        assert_eq!(fields_subject(&json!({ "subject": "s" })).unwrap(), "s");
+        assert!(fields_subject(&json!({})).is_err());
+        assert!(fields_subject(&json!({ "topic": "t", "subject": "s" })).is_err());
+        assert!(fields_subject(&json!({ "subject": "s", "key": true })).is_err());
     }
 
     #[tokio::test]

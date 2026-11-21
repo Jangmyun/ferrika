@@ -167,7 +167,9 @@ server on stdin/stdout. By default it gives an assistant read-only tools for
 the profile it starts with: `cluster_health`, `config_lint` (the `ferrika lint`
 findings, with the command for each fix), `list_brokers`, `list_topics`,
 `describe_topic`, `list_consumer_groups`, `consumer_group_lag`,
-`message_histogram` (records per time bucket from offsets) and
+`message_histogram` (records per time bucket from offsets), `schema_fields`
+(the field paths of a topic's Schema Registry schema, ready for a `where`
+filter; needs the profile's registry URL) and
 `peek_messages`. None of them changes the cluster, and `peek_messages` reads
 without a consumer group and masks emails, card numbers and tokens unless
 `mask_pii` is false. A broken `profiles.json` or an unknown `-p` profile
