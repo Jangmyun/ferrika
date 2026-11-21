@@ -323,7 +323,9 @@ pub fn print_connection_hint(config: &crate::kafka::config::KafkaClientConfig, e
 
 /// Shown when a GSSAPI profile fails to connect or authenticate: librdkafka
 /// reports a missing Kerberos ticket as a plain connection failure.
-const KERBEROS_HINT: &str = "The profile uses GSSAPI (Kerberos): check for a valid ticket     ('klist', 'kinit') or a keytab, and the sasl.kerberos.service.name,     sasl.kerberos.principal and sasl.kerberos.keytab properties of the profile.";
+const KERBEROS_HINT: &str = "The profile uses GSSAPI (Kerberos): check for a valid ticket \
+     ('klist', 'kinit') or a keytab, and the sasl.kerberos.service.name, \
+     sasl.kerberos.principal and sasl.kerberos.keytab properties of the profile.";
 
 /// The troubleshooting hints for `error` on a client configured as `config`.
 fn connection_hints(
@@ -425,6 +427,8 @@ mod tests {
             .any(|h| h == KERBEROS_HINT));
         let denied = KafkaError::acl("denied");
         assert_eq!(connection_hints(&config, &denied)[0], KERBEROS_HINT);
+        // One sentence: a lost line continuation once left runs of spaces in it.
+        assert!(!KERBEROS_HINT.contains("  "), "{KERBEROS_HINT}");
     }
 
     #[test]
