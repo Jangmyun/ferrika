@@ -566,6 +566,16 @@ pub fn verify_chain(path: &Path) -> std::io::Result<ChainReport> {
             ));
             return Ok(report);
         }
+        // A duplicated key keeps the hash above (the map holds one copy) but
+        // makes the readers skip the line (`recent`, `op_digest`): an edit
+        // that hides an entry.
+        if has_duplicate_keys(line) {
+            report.broken = Some((
+                number,
+                "the line is not a well-formed entry (a duplicated field)".to_string(),
+            ));
+            return Ok(report);
+        }
         // `seq` is the line's position among chained lines. Lines written
         // before `seq` existed have none and still count.
         if let Some(seq) = map.get("seq") {
@@ -612,21 +622,75 @@ fn read_recent(path: &Path, limit: usize, keep: impl Fn(&AuditEntry) -> bool) ->
     entries
 }
 
-/// The `op_digest` the audit log holds for history operation `op` (from the
-/// last entry naming it with a digest), or `None` when no entry does.
+/// Whether the JSON object `line` names a key twice. `serde_json::Value`
+/// keeps one copy, so the chain hash does not notice; the typed readers
+/// refuse the line.
+fn has_duplicate_keys(line: &str) -> bool {
+    struct Keys(Vec<String>);
+    impl<'de> serde::Deserialize<'de> for Keys {
+        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct Visit;
+            impl<'de> serde::de::Visitor<'de> for Visit {
+                type Value = Keys;
+                fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    f.write_str("a JSON object")
+                }
+                fn visit_map<A: serde::de::MapAccess<'de>>(
+                    self,
+                    mut map: A,
+                ) -> Result<Keys, A::Error> {
+                    let mut keys = Vec::new();
+                    while let Some((key, _)) = map.next_entry::<String, serde::de::IgnoredAny>()? {
+                        keys.push(key);
+                    }
+                    Ok(Keys(keys))
+                }
+            }
+            d.deserialize_map(Visit)
+        }
+    }
+    match serde_json::from_str::<Keys>(line) {
+        Ok(Keys(mut keys)) => {
+            let count = keys.len();
+            keys.sort_unstable();
+            keys.dedup();
+            keys.len() != count
+        }
+        Err(_) => false,
+    }
+}
+
+/// What [`op_digest`] returns when the log names two different digests for
+/// one operation: never a real digest, so the check fails.
+pub const CONFLICTING_OP_DIGESTS: &str = "conflicting op_digest entries";
+
+/// The `op_digest` the audit log holds for history operation `op`, or
+/// `None` when no entry names one. An operation is finished once, so a
+/// second, different digest for it means a line was added afterwards (the
+/// chain has no key, so one can be appended that verifies): that gives
+/// [`CONFLICTING_OP_DIGESTS`], which matches no journal entry.
 pub fn op_digest(op: &str) -> Option<String> {
     op_digest_in(&audit_path(), op)
 }
 
 fn op_digest_in(path: &Path, op: &str) -> Option<String> {
     let file = std::fs::File::open(path).ok()?;
-    std::io::BufReader::new(file)
+    let mut found: Option<String> = None;
+    for entry in std::io::BufReader::new(file)
         .lines()
         .map_while(Result::ok)
         .filter_map(|line| serde_json::from_str::<AuditEntry>(&line).ok())
         .filter(|entry| entry.op == op && !entry.op_digest.is_empty())
-        .last()
-        .map(|entry| entry.op_digest)
+    {
+        match &found {
+            Some(first) if *first != entry.op_digest => {
+                return Some(CONFLICTING_OP_DIGESTS.to_string());
+            }
+            Some(_) => {}
+            None => found = Some(entry.op_digest),
+        }
+    }
+    found
 }
 
 /// Current Unix time in milliseconds (kept here for existing callers).
@@ -735,6 +799,67 @@ mod tests {
         assert_eq!(op_digest_in(&path, "01JBX3K8Q2M7").as_deref(), Some("old"));
         assert_eq!(op_digest_in(&path, "01JBX3K8Q2M8").as_deref(), Some("new"));
         assert_eq!(verify_chain(&path).unwrap().broken, None);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_second_digest_for_an_operation_does_not_win() {
+        let (dir, path) = temp_log("second-digest");
+        let finished = AuditEntry {
+            op: "01JBX3K8Q2MB".into(),
+            op_digest: "original".into(),
+            ..entry(1)
+        };
+        append(&path, &finished).unwrap();
+        // The same digest again (a repeated line) is fine.
+        append(&path, &finished).unwrap();
+        assert_eq!(
+            op_digest_in(&path, "01JBX3K8Q2MB").as_deref(),
+            Some("original")
+        );
+        // A later line with another digest, chained correctly.
+        let forged = AuditEntry {
+            op_digest: "forged".into(),
+            ..finished.clone()
+        };
+        append(&path, &forged).unwrap();
+        assert_eq!(verify_chain(&path).unwrap().broken, None);
+        assert_eq!(
+            op_digest_in(&path, "01JBX3K8Q2MB").as_deref(),
+            Some(CONFLICTING_OP_DIGESTS)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_duplicated_key_breaks_the_chain() {
+        let (dir, path) = temp_log("duplicate-key");
+        let hidden = AuditEntry {
+            op: "01JBX3K8Q2MC".into(),
+            op_digest: "abc".into(),
+            ..entry(1)
+        };
+        append(&path, &hidden).unwrap();
+        assert_eq!(verify_chain(&path).unwrap().broken, None);
+        // Insert a duplicate of "op" before the real one: the parsed map (and
+        // so the hash) is unchanged, but readers would skip the line.
+        let text = std::fs::read_to_string(&path).unwrap();
+        let edited = text.replacen(
+            r#""op":"01JBX3K8Q2MC""#,
+            r#""op":"junk","op":"01JBX3K8Q2MC""#,
+            1,
+        );
+        assert_ne!(text, edited);
+        std::fs::write(&path, edited).unwrap();
+        let report = verify_chain(&path).unwrap();
+        assert!(
+            report
+                .broken
+                .as_ref()
+                .is_some_and(|(_, why)| why.contains("duplicated")),
+            "{:?}",
+            report.broken
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
