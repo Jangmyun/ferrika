@@ -61,6 +61,7 @@ impl PolicyPayload {
             || !self.rules.export_clusters.is_empty()
             || !self.rules.watermark.is_off()
             || self.rules.watermark_text.is_some()
+            || !self.rules.screen_capture.is_allowed()
     }
 
     /// The `format` a signed file with this payload carries.
@@ -143,6 +144,11 @@ pub struct PolicyRules {
     /// characters, no control characters).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watermark_text: Option<String>,
+    /// Policy pack v2: `blocked` keeps the desktop app's window out of
+    /// screenshots, screen recordings and screen shares (Windows). Left out
+    /// of the payload when `allowed`.
+    #[serde(default, skip_serializing_if = "ScreenCaptureRule::is_allowed")]
+    pub screen_capture: ScreenCaptureRule,
 }
 
 /// Longest `watermark_text`, in characters.
@@ -172,6 +178,10 @@ impl PolicyRules {
             export_clusters: Vec::new(),
             watermark: WatermarkRule::On,
             watermark_text: None,
+            // Not blocked: with an untrusted policy people need to show the
+            // badge to whoever fixes it, often over a screen share; the
+            // watermark still marks what they share.
+            screen_capture: ScreenCaptureRule::Allowed,
         }
     }
 
@@ -280,6 +290,22 @@ pub enum WatermarkRule {
 impl WatermarkRule {
     pub fn is_off(&self) -> bool {
         *self == Self::Off
+    }
+}
+
+/// Whether the desktop app's window may appear in screenshots, recordings
+/// and screen shares (policy pack v2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenCaptureRule {
+    #[default]
+    Allowed,
+    Blocked,
+}
+
+impl ScreenCaptureRule {
+    pub fn is_allowed(&self) -> bool {
+        *self == Self::Allowed
     }
 }
 
@@ -874,6 +900,28 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<PolicyRules>(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn screen_capture_rule_parses_needs_format_2_and_is_omitted_when_allowed() {
+        let parse = |json: &str| serde_json::from_str::<PolicyRules>(json);
+        assert_eq!(
+            parse("{}").unwrap().screen_capture,
+            ScreenCaptureRule::Allowed
+        );
+        let blocked = parse(r#"{"screen_capture":"blocked"}"#).unwrap();
+        assert_eq!(blocked.screen_capture, ScreenCaptureRule::Blocked);
+        assert!(parse(r#"{"screen_capture":"off"}"#).is_err());
+        let payload = |rules: PolicyRules| PolicyPayload {
+            rules,
+            ..serde_json::from_str("{}").unwrap()
+        };
+        assert_eq!(payload(blocked.clone()).format(), POLICY_FORMAT_V2);
+        assert_eq!(payload(PolicyRules::default()).format(), POLICY_FORMAT_V1);
+        let text = serde_json::to_string(&PolicyRules::default()).unwrap();
+        assert!(!text.contains("screen_capture"), "{text}");
+        // An untrusted policy does not block: people need to show it to support.
+        assert!(PolicyRules::strictest().screen_capture.is_allowed());
     }
 
     #[test]
