@@ -106,6 +106,10 @@ pub struct OffsetResetArgs {
     pub dry_run: bool,
 }
 
+/// The smallest `--to-timestamp` taken (1973-03-03): any smaller value is
+/// almost surely seconds, not milliseconds.
+const MIN_TIMESTAMP_MS: i64 = 100_000_000_000;
+
 impl OffsetResetArgs {
     /// Extracts the chosen ResetStrategy or returns an error if none was specified.
     pub fn strategy(&self) -> KafkaResult<ResetStrategy> {
@@ -118,6 +122,15 @@ impl OffsetResetArgs {
         } else if let Some(delta) = self.shift_by {
             Ok(ResetStrategy::Shift(delta))
         } else if let Some(ts) = self.to_timestamp {
+            // Seconds (1700000000) read as milliseconds are January 1970, and
+            // would rewind every partition to its oldest record.
+            if ts < MIN_TIMESTAMP_MS {
+                return Err(KafkaError::config(format!(
+                    "--to-timestamp {ts} is before 1973: it takes epoch milliseconds \
+                     (seconds × 1000, e.g. {})",
+                    ts.saturating_mul(1000)
+                )));
+            }
             Ok(ResetStrategy::Timestamp(ts))
         } else {
             Err(KafkaError::config(
@@ -507,6 +520,28 @@ fn render_plans_table(group_id: &str, topic: &str, plans: &[OffsetResetPlan], ex
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timestamp_in_seconds_is_refused() {
+        let args = |ts| OffsetResetArgs {
+            group_id: "g".into(),
+            topic: "orders".into(),
+            partition: None,
+            to_earliest: false,
+            to_latest: false,
+            to_offset: None,
+            shift_by: None,
+            to_timestamp: Some(ts),
+            execute: false,
+            dry_run: false,
+        };
+        let err = args(1_700_000_000).strategy().unwrap_err().to_string();
+        assert!(err.contains("1700000000000"), "{err}");
+        assert!(matches!(
+            args(1_700_000_000_000).strategy(),
+            Ok(ResetStrategy::Timestamp(1_700_000_000_000))
+        ));
+    }
 
     #[test]
     fn reset_records_uncommitted_partitions_as_none() {
