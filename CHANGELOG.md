@@ -40,6 +40,11 @@ and 0.2.0 makes it crate-internal.
   (`produce`, `generate`, `restore`, `probe`, `consume --group`, ...). A
   second line now says whether the command finished without error or failed
   (`audit --failed` finds it); the error text is not logged.
+- `mirror --src-profile/--dst-profile` was also checked against the global
+  profile, so a read-only `-p` profile refused a copy between two other
+  clusters. Only the destination is checked now, and its `read_only_brokers`
+  and the source's `export_clusters` match the brokers the clusters report
+  (a tunnel or an IP address no longer gets around them).
 - `consume --group` exited 0 when the final offset commit failed (it only
   printed it), so a script took the run as done and the next run read the
   records again. It now fails after the summary.
