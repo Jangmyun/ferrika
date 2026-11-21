@@ -282,6 +282,39 @@ pub fn read_password_stdin() -> Result<String, String> {
 /// Set once an error has been reported in full, so it is not printed again.
 static ERROR_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The client configuration of the cluster command being run, for
+/// [`hint_unreported`]; set by `main` before the command starts.
+static HINT_CONFIG: std::sync::OnceLock<KafkaClientConfig> = std::sync::OnceLock::new();
+
+/// Remembers the cluster the command talks to, so a failure its handler
+/// returns as is still gets the troubleshooting hints.
+pub fn set_hint_config(config: KafkaClientConfig) {
+    let _ = HINT_CONFIG.set(config);
+}
+
+/// Shows the troubleshooting hints for a failed cluster command whose
+/// handler returned the error as is, when the error came from the Kafka
+/// client itself (see [`fallback_hint_applies`]).
+pub fn hint_unreported(error: &KafkaError) {
+    if ERROR_REPORTED.load(std::sync::atomic::Ordering::Relaxed) || !fallback_hint_applies(error) {
+        return;
+    }
+    if let Some(config) = HINT_CONFIG.get() {
+        print_connection_hint(config, error);
+    }
+}
+
+/// Only librdkafka's own connection and authorization failures: `Io` and
+/// `Config` also carry Schema Registry / Connect HTTP failures, local file
+/// errors and usage errors, where broker hints would point the wrong way.
+fn fallback_hint_applies(error: &KafkaError) -> bool {
+    matches!(error, KafkaError::Driver(_))
+        && matches!(
+            hint_kind(error),
+            HintKind::Connectivity | HintKind::Authorization
+        )
+}
+
 /// Ends the process after a failed command. The error is printed unless
 /// [`print_connection_hint`] already showed it.
 pub fn exit_with_error(err: &dyn std::fmt::Display) -> ! {
@@ -412,6 +445,16 @@ fn hint_kind(error: &KafkaError) -> HintKind {
 #[cfg(test)]
 mod tests {
     use super::{connection_hints, hint_kind, read_password_line, HintKind, KERBEROS_HINT};
+
+    #[test]
+    fn fallback_hints_only_for_kafka_client_failures() {
+        use super::fallback_hint_applies;
+        assert!(!fallback_hint_applies(&KafkaError::io("registry down")));
+        assert!(!fallback_hint_applies(&KafkaError::config(
+            "Nothing to undo"
+        )));
+        assert!(!fallback_hint_applies(&KafkaError::acl("denied")));
+    }
 
     #[test]
     fn gssapi_profiles_get_a_kerberos_hint() {
