@@ -12,7 +12,7 @@
 # installed. The folder is added to the user PATH; no administrator rights.
 
 # Everything runs inside a function, so a download cut off half way through
-# `irm | iex` runs nothing and nothing leaks into the caller's session.
+# `irm | iex` runs nothing; only the two function names stay defined.
 function Install-Ferrika {
     $ErrorActionPreference = 'Stop'
     $ProgressPreference = 'SilentlyContinue'
@@ -50,17 +50,19 @@ function Install-Ferrika {
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
         $exe = Join-Path $dir 'ferrika.exe'
         # A running ferrika.exe cannot be overwritten, but it can be renamed.
+        $moved = $false
         if (Test-Path $exe) {
             $old = "$exe.old"
             Remove-Item -Force $old -ErrorAction SilentlyContinue
             Move-Item -Force $exe $old
+            $moved = $true
         }
         try {
             Copy-Item (Join-Path $tmp 'x\ferrika.exe') $exe
         }
         catch {
             # Put the previous version back rather than leave none.
-            if (Test-Path "$exe.old") { Move-Item -Force "$exe.old" $exe }
+            if ($moved) { Move-Item -Force "$exe.old" $exe }
             throw
         }
         Remove-Item -Force "$exe.old" -ErrorAction SilentlyContinue
