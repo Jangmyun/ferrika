@@ -292,18 +292,27 @@ pub fn set_hint_config(config: KafkaClientConfig) {
     let _ = HINT_CONFIG.set(config);
 }
 
-/// Shows the troubleshooting hints for a failed cluster command, unless its
-/// handler already did or the error needs none (the broker's own message
-/// says what to fix). Most handlers return the error without hints.
+/// Shows the troubleshooting hints for a failed cluster command whose
+/// handler returned the error as is, when the error came from the Kafka
+/// client itself (see [`fallback_hint_applies`]).
 pub fn hint_unreported(error: &KafkaError) {
-    if ERROR_REPORTED.load(std::sync::atomic::Ordering::Relaxed)
-        || hint_kind(error) == HintKind::None
-    {
+    if ERROR_REPORTED.load(std::sync::atomic::Ordering::Relaxed) || !fallback_hint_applies(error) {
         return;
     }
     if let Some(config) = HINT_CONFIG.get() {
         print_connection_hint(config, error);
     }
+}
+
+/// Only librdkafka's own connection and authorization failures: `Io` and
+/// `Config` also carry Schema Registry / Connect HTTP failures, local file
+/// errors and usage errors, where broker hints would point the wrong way.
+fn fallback_hint_applies(error: &KafkaError) -> bool {
+    matches!(error, KafkaError::Driver(_))
+        && matches!(
+            hint_kind(error),
+            HintKind::Connectivity | HintKind::Authorization
+        )
 }
 
 /// Ends the process after a failed command. The error is printed unless
@@ -436,6 +445,16 @@ fn hint_kind(error: &KafkaError) -> HintKind {
 #[cfg(test)]
 mod tests {
     use super::{connection_hints, hint_kind, read_password_line, HintKind, KERBEROS_HINT};
+
+    #[test]
+    fn fallback_hints_only_for_kafka_client_failures() {
+        use super::fallback_hint_applies;
+        assert!(!fallback_hint_applies(&KafkaError::io("registry down")));
+        assert!(!fallback_hint_applies(&KafkaError::config(
+            "Nothing to undo"
+        )));
+        assert!(!fallback_hint_applies(&KafkaError::acl("denied")));
+    }
 
     #[test]
     fn gssapi_profiles_get_a_kerberos_hint() {

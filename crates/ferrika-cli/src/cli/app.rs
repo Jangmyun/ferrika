@@ -328,7 +328,14 @@ pub fn run(mut cli: Cli) {
     }
 
     let global = &cli.global_opts;
-    if needs_profiles(cli.command.as_ref()) {
+    // `cluster` and `mirror` talk to other profiles' clusters too; hints
+    // naming the global bootstrap would point at the wrong one.
+    if needs_profiles(cli.command.as_ref())
+        && !matches!(
+            cli.command,
+            Some(Commands::Cluster(_) | Commands::Mirror(_))
+        )
+    {
         cli::set_hint_config(global.to_kafka_config());
     }
     match cli.command {
