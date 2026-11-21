@@ -5,7 +5,7 @@ use colored::Colorize;
 use comfy_table::{Cell, CellAlignment, Color};
 
 use crate::cli::{output, GlobalOpts};
-use crate::codec::pii::{ellipsize, mask_bytes, mask_payload, MaskStrategy};
+use crate::codec::pii::{ellipsize, mask_bytes, MaskStrategy};
 use crate::error::KafkaResult;
 use crate::kafka::bounded_read::{read_topic, BoundedReadOptions};
 use crate::kafka::config::{AutoOffsetReset, KafkaClientConfig};
@@ -175,7 +175,8 @@ fn to_record(msg: &ConsumedMessage, mask: bool) -> CompactedRecord {
 /// A record key as shown: masked when `mask` is set.
 fn masked_key(key: &str, mask: bool) -> String {
     if mask {
-        mask_payload(key, MaskStrategy::Partial)
+        // A Confluent-encoded key is hidden whole (see `mask_bytes`).
+        mask_bytes(key.as_bytes(), MaskStrategy::Partial)
     } else {
         key.to_string()
     }

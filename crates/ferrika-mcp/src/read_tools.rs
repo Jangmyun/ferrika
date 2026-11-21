@@ -652,9 +652,10 @@ fn record_text(bytes: Option<&[u8]>, mask: bool) -> Value {
         return Value::Null;
     };
     let mut text = match std::str::from_utf8(bytes) {
-        Ok(s) if mask => mask_payload(s, MaskStrategy::Partial),
+        // `mask_bytes` hides undecoded schema records whole, which are often
+        // valid UTF-8 but would pass a free-text scan.
+        _ if mask => mask_bytes(bytes, MaskStrategy::Partial),
         Ok(s) => s.to_string(),
-        Err(_) if mask => mask_bytes(bytes, MaskStrategy::Partial),
         Err(_) => {
             let hex =
                 ferrika_core::model::format::to_hex(&bytes[..bytes.len().min(PEEK_TEXT_MAX / 2)]);
@@ -869,6 +870,18 @@ async fn peek_messages(context: &ResolvedContext, args: &Value) -> KafkaResult<V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn undecoded_schema_records_are_hidden_when_masking() {
+        let mut avro = vec![0u8, 0, 0, 0, 1, 0x0e];
+        avro.extend_from_slice(b"hunter2");
+        let shown = super::record_text(Some(&avro), true);
+        assert!(!shown.to_string().contains("hunter2"), "{shown}");
+        // Unmasked, the text is passed through as before.
+        assert!(super::record_text(Some(b"plain"), false)
+            .to_string()
+            .contains("plain"));
+    }
 
     use crate::protocol::tests::context;
 

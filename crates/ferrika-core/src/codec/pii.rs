@@ -878,20 +878,46 @@ pub fn mask_text(input: &str, strategy: MaskStrategy) -> String {
 }
 
 /// Masks one payload: JSON is masked field by field (sensitive keys hidden
-/// whole), anything else as free text.
+/// whole), anything else as free text. A leading byte order mark and
+/// several JSON documents on separate lines still count as JSON: as free
+/// text, a `"password"` field would only be masked if its value looked
+/// like a known pattern.
 pub fn mask_payload(payload: &str, strategy: MaskStrategy) -> String {
-    match serde_json::from_str::<Value>(payload) {
-        Ok(mut json) => {
-            mask_json_value(&mut json, strategy);
-            json.to_string()
-        }
-        Err(_) => mask_text(payload, strategy),
+    let body = payload.strip_prefix('\u{FEFF}').unwrap_or(payload);
+    if let Ok(mut json) = serde_json::from_str::<Value>(body) {
+        mask_json_value(&mut json, strategy);
+        return json.to_string();
     }
+    let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.len() > 1 {
+        let parsed: Option<Vec<Value>> = lines
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).ok())
+            .collect();
+        if let Some(mut docs) = parsed {
+            for doc in &mut docs {
+                mask_json_value(doc, strategy);
+            }
+            return docs
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+    }
+    mask_text(payload, strategy)
 }
 
 /// Masks one record field for display: UTF-8 text through [`mask_payload`],
-/// anything else hidden whole, since it cannot be scanned.
+/// anything else hidden whole, since it cannot be scanned. That includes
+/// the Confluent wire format (magic byte 0, a schema id, then Avro,
+/// Protobuf or JSON Schema bytes) when it was not decoded: short records
+/// are often valid UTF-8, and scanned as text their names and passwords
+/// would pass, since only field names say what they are.
 pub fn mask_bytes(bytes: &[u8], strategy: MaskStrategy) -> String {
+    if bytes.len() >= 5 && bytes[0] == 0 {
+        return format!("[schema-encoded {} bytes hidden]", bytes.len());
+    }
     match std::str::from_utf8(bytes) {
         Ok(text) => mask_payload(text, strategy),
         Err(_) => format!("[binary {} bytes hidden]", bytes.len()),
@@ -909,7 +935,12 @@ pub fn mask_header_value(name: &str, value: &[u8], strategy: MaskStrategy) -> St
     // Header names are usually kebab-case: `x-api-key` should match `api_key`.
     let snake = name.replace('-', "_");
     let lower = snake.to_ascii_lowercase();
-    if is_sensitive_key(&snake) || matches!(lower.as_str(), "authorization" | "cookie") {
+    if is_sensitive_key(&snake)
+        || matches!(
+            lower.as_str(),
+            "authorization" | "proxy_authorization" | "cookie" | "set_cookie"
+        )
+    {
         return match strategy {
             MaskStrategy::Redact => "[REDACTED]".to_string(),
             MaskStrategy::Partial => "****".to_string(),
@@ -1003,8 +1034,10 @@ pub fn scan_json_for_pii(
                     continue;
                 }
                 if is_sensitive_key(key) {
+                    // Hidden whole, as in `mask_json_field`: even the last
+                    // four characters of a password or token leak.
                     let sample = match val {
-                        Value::String(s) => mask_credit_card(s, MaskStrategy::Partial),
+                        Value::String(_) => "[REDACTED_SECRET]".to_string(),
                         _ => "[NON_STRING_SECRET]".to_string(),
                     };
                     findings.push(PiiFinding {
@@ -1272,6 +1305,47 @@ mod tests {
             assert!(is_sensitive_key(k), "{k}");
         }
         assert!(!is_sensitive_key("connector.class"));
+    }
+
+    #[test]
+    fn schema_encoded_records_are_hidden_whole() {
+        // Avro: magic 0, schema id 1, then "Kim Minjun" and "hunter2".
+        let mut avro = vec![0u8, 0, 0, 0, 1, 0x14];
+        avro.extend_from_slice(b"Kim Minjun");
+        avro.push(0x0e);
+        avro.extend_from_slice(b"hunter2");
+        assert!(
+            std::str::from_utf8(&avro).is_ok(),
+            "the case is valid UTF-8"
+        );
+        let shown = mask_bytes(&avro, MaskStrategy::Redact);
+        assert!(
+            !shown.contains("hunter2") && !shown.contains("Minjun"),
+            "{shown}"
+        );
+        assert!(shown.contains("schema-encoded"), "{shown}");
+        // JSON Schema wire format too.
+        let json_schema = b"\0\0\0\0\x01{\"password\":\"hunter2\"}";
+        assert!(!mask_bytes(json_schema, MaskStrategy::Redact).contains("hunter2"));
+    }
+
+    #[test]
+    fn json_with_a_bom_or_several_lines_is_masked_by_field() {
+        let bom = "\u{FEFF}{\"password\":\"hunter2\"}";
+        assert!(!mask_payload(bom, MaskStrategy::Redact).contains("hunter2"));
+        let lines = "{\"password\":\"a1b2c3\"}\n{\"password\":\"d4e5f6\"}";
+        let masked = mask_payload(lines, MaskStrategy::Redact);
+        assert!(
+            !masked.contains("a1b2c3") && !masked.contains("d4e5f6"),
+            "{masked}"
+        );
+        assert_eq!(masked.lines().count(), 2);
+    }
+
+    #[test]
+    fn set_cookie_headers_are_hidden() {
+        let shown = mask_header_value("Set-Cookie", b"session=abc123", MaskStrategy::Redact);
+        assert!(!shown.contains("abc123"), "{shown}");
     }
 
     #[test]
