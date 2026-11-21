@@ -103,7 +103,7 @@ pub struct ProfileAddArgs {
     /// Refuse operations that change this cluster
     #[arg(long)]
     pub read_only: bool,
-    /// Confluent Schema Registry URL for decoding Avro payloads in the GUI
+    /// Schema Registry URL: `schema` commands, Avro/Protobuf/JSON Schema decoding (`consume -D`) and encoding (`produce --schema`), the GUI and MCP
     #[arg(long, value_name = "URL")]
     pub schema_registry: Option<String>,
     /// Kafka Connect REST URL for `ferrika connect` and the GUI
