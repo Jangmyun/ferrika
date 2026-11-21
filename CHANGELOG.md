@@ -57,9 +57,6 @@ and 0.2.0 makes it crate-internal.
 - `ferrika --version` follows the crate version.
 - `ferrika.exe` carries Windows version information (product, version, file
   description) for Explorer, AppLocker and inventory tools.
-- `install.ps1` rewrote the user PATH with variables expanded and as
-  `REG_SZ`, turning entries such as `%USERPROFILE%\AppData\Local\Microsoft\WindowsApps`
-  into fixed paths. It now keeps the value as stored.
 
 ### Changed
 
