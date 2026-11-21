@@ -45,6 +45,11 @@ and 0.2.0 makes it crate-internal.
   clusters. Only the destination is checked now, and its `read_only_brokers`
   and the source's `export_clusters` match the brokers the clusters report
   (a tunnel or an IP address no longer gets around them).
+- `offset reset --to-timestamp`: a partition whose time lookup failed (a
+  moving leader, a timeout) was planned at its end and, with `--execute`,
+  committed there, skipping its unread records; the plan is now refused.
+  A value in seconds (before 1973 as milliseconds) is refused instead of
+  rewinding every partition to its oldest record.
 - PII masking: an undecoded Schema Registry record (Avro, Protobuf, JSON
   Schema wire format) that happened to be valid UTF-8 was scanned as free
   text, so names and passwords in it were shown; it is now hidden whole
