@@ -61,7 +61,8 @@ pub enum ProfileSubcommands {
 }
 
 /// Command line arguments for adding or updating a cluster profile.
-#[derive(Args, Debug, Clone, PartialEq, Eq)]
+/// `Debug` is written by hand to redact the SASL password.
+#[derive(Args, Clone, PartialEq, Eq)]
 pub struct ProfileAddArgs {
     /// Unique nickname for this profile (e.g. "prod", "staging")
     pub name: String,
@@ -112,8 +113,9 @@ pub struct ProfileAddArgs {
     pub oauth: OAuthArgs,
 }
 
-/// SASL OAUTHBEARER options of `profile add`.
-#[derive(Args, Debug, Clone, PartialEq, Eq, Default)]
+/// SASL OAUTHBEARER options of `profile add`. `Debug` is written by hand
+/// to redact the client secret.
+#[derive(Args, Clone, PartialEq, Eq, Default)]
 pub struct OAuthArgs {
     /// OIDC token endpoint (OAUTHBEARER)
     #[arg(long, value_name = "URL")]
@@ -142,6 +144,50 @@ pub struct OAuthArgs {
     /// AWS shared-config profile for AWS-MSK-IAM (default: AWS_PROFILE or default)
     #[arg(long)]
     pub aws_profile: Option<String>,
+}
+
+/// What `Debug` shows in place of a secret that was given.
+fn redacted(secret: &Option<String>) -> Option<&'static str> {
+    secret.as_ref().map(|_| "<redacted>")
+}
+
+impl std::fmt::Debug for ProfileAddArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProfileAddArgs")
+            .field("name", &self.name)
+            .field("bootstrap_servers", &self.bootstrap_servers)
+            .field("description", &self.description)
+            .field("security_protocol", &self.security_protocol)
+            .field("sasl_mechanism", &self.sasl_mechanism)
+            .field("sasl_username", &self.sasl_username)
+            .field("sasl_password", &redacted(&self.sasl_password))
+            .field("sasl_password_stdin", &self.sasl_password_stdin)
+            .field("ssl_ca_location", &self.ssl_ca_location)
+            .field("ssl_certificate_location", &self.ssl_certificate_location)
+            .field("ssl_key_location", &self.ssl_key_location)
+            .field("set_active", &self.set_active)
+            .field("read_only", &self.read_only)
+            .field("schema_registry", &self.schema_registry)
+            .field("connect", &self.connect)
+            .field("oauth", &self.oauth)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for OAuthArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthArgs")
+            .field("oauth_token_endpoint", &self.oauth_token_endpoint)
+            .field("oauth_client_id", &self.oauth_client_id)
+            .field("oauth_client_secret", &redacted(&self.oauth_client_secret))
+            .field("oauth_client_secret_stdin", &self.oauth_client_secret_stdin)
+            .field("oauth_client_auth", &self.oauth_client_auth)
+            .field("oauth_scope", &self.oauth_scope)
+            .field("oauth_extensions", &self.oauth_extensions)
+            .field("aws_region", &self.aws_region)
+            .field("aws_profile", &self.aws_profile)
+            .finish()
+    }
 }
 
 /// Executes the profile command with the provided global options.
@@ -727,6 +773,30 @@ fn handle_remove(store: &mut ProfileStore, name: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_output_redacts_the_password_and_client_secret() {
+        let cli = <crate::cli::app::Cli as clap::Parser>::try_parse_from([
+            "ferrika",
+            "profile",
+            "add",
+            "prod",
+            "-b",
+            "kafka:9092",
+            "--sasl-username",
+            "alice",
+            "--sasl-password",
+            "hunter2-pw",
+            "--oauth-client-secret",
+            "s3cret-oauth",
+        ])
+        .unwrap();
+        let shown = format!("{cli:?}");
+        assert!(shown.contains("alice"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(!shown.contains("hunter2-pw"), "{shown}");
+        assert!(!shown.contains("s3cret-oauth"), "{shown}");
+    }
 
     #[test]
     fn test_parse_security_protocols() {
