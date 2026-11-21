@@ -9,7 +9,7 @@ use crate::{cli, governance, kafka, model};
 #[command(name = "ferrika")]
 #[command(author = "Ferrika Contributors")]
 #[command(version)]
-#[command(about = "Ultra-lightweight & high-performance native Kafka client in Rust", long_about = None)]
+#[command(about = "Kafka command-line client: topics, records, consumer groups, schemas, Connect and cluster checks", long_about = None)]
 pub struct Cli {
     #[command(flatten)]
     pub global_opts: cli::GlobalOpts,
@@ -20,67 +20,67 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Manage Kafka topics (CLI mode)
+    /// List, describe, create, configure, purge and delete topics
     Topics(cli::topics::TopicsArgs),
-    /// Produce messages to Kafka topics (CLI mode)
+    /// Send records to a topic
     Produce(cli::produce::ProduceArgs),
-    /// Consume messages from Kafka topics (CLI mode)
+    /// Read records from a topic, with key, header and field filters
     Consume(cli::consume::ConsumeArgs),
-    /// Real-time monitoring of Consumer Groups and Brokers (CLI mode)
+    /// Show consumer group lag and broker status; serve Prometheus metrics
     Monitor(cli::monitor::MonitorArgs),
-    /// Manage Kafka cluster connection profiles (CLI mode)
+    /// Manage saved cluster connection profiles
     Profile(cli::profile::ProfileArgs),
-    /// High-throughput performance benchmark suite (CLI mode)
+    /// Measure produce and consume throughput
     Bench(cli::bench::BenchArgs),
-    /// Confluent Schema Registry inspection and wire-format decoding (CLI mode)
+    /// Schema Registry: subjects, schemas, compatibility, decoding
     Schema(cli::schema::SchemaArgs),
-    /// Generate synthetic domain mock events (e.g. ecommerce, iot, web, financial) (CLI mode)
+    /// Produce synthetic sample events (ecommerce, iot, web, financial)
     Generate(cli::generator::GenerateArgs),
-    /// Replicate and pipe messages between topics or cross-cluster (CLI mode)
+    /// Copy records between topics, also across clusters
     Mirror(cli::mirror::MirrorArgs),
-    /// Inspect and reset consumer group offsets (CLI mode)
+    /// Show and reset consumer group offsets
     Offset(cli::offset::OffsetArgs),
-    /// Dump topic data to portable JSON Lines (.jsonl) file (CLI mode)
+    /// Back up topic records to a JSON Lines (.jsonl) file
     Dump(cli::backup::DumpArgs),
-    /// Restore topic data from portable JSON Lines (.jsonl) file (CLI mode)
+    /// Restore topic records from a JSON Lines (.jsonl) file
     Restore(cli::backup::RestoreArgs),
-    /// Manage and audit Kafka Access Control Lists (ACLs) and cluster security (CLI mode)
+    /// List, create and delete cluster ACLs
     Acl(cli::acl::AclArgs),
-    /// List, set and remove client quotas (byte rates, request share) (CLI mode)
+    /// List, set and remove client quotas (byte rates, request share)
     Quota(cli::quota::QuotaArgs),
-    /// List, create and delete SASL/SCRAM users (CLI mode)
+    /// List, create and delete SASL/SCRAM users
     User(cli::user::UserArgs),
-    /// Plan, execute, verify, and rollback partition reassignments across brokers (CLI mode)
+    /// Plan, run, verify and roll back partition reassignments
     Reassign(cli::reassign::ReassignArgs),
-    /// Inspect topic log compaction efficiency, dirty ratios, and snapshot key-value state (CLI mode)
+    /// Analyze log compaction and tombstones; snapshot the latest value per key
     Compact(cli::compact::CompactArgs),
-    /// Manage Dead Letter Queues (DLQ), inspect failures, and redrive poison pill records (CLI mode)
+    /// Inspect, export and redrive dead letter queue records
     Dlq(cli::dlq::DlqArgs),
-    /// Inspect distributed tracing headers (W3C/B3/Jaeger), audit coverage, and inject trace context (CLI mode)
+    /// Inspect, audit and inject tracing headers (W3C, B3, Jaeger)
     Trace(cli::trace::TraceArgs),
-    /// Compare records and schema parity between two Kafka topics (CLI mode)
+    /// Compare the records and schemas of two topics
     Diff(cli::diff::DiffArgs),
-    /// Measure end-to-end produce-to-consume latency, jitter, and packet loss with canary heartbeat probes (CLI mode)
+    /// Measure produce-to-consume latency with canary records
     Probe(cli::probe::ProbeArgs),
-    /// Real-time terminal cluster monitor with throughput deltas, lag leaderboards, and broker stats (CLI mode)
+    /// Live terminal view of throughput, lag and brokers
     Top(cli::top::TopArgs),
-    /// Manage, ping, and check synchronization across multiple Kafka clusters (CLI mode)
+    /// Ping several clusters, compare their topics and plan reconciliation
     Cluster(cli::cluster_sync::ClusterArgs),
-    /// Field-level PII masking and sensitive data security compliance auditor (CLI mode)
+    /// Scan records for personal data (PII) and mask fields
     Crypto(cli::crypto::CryptoArgs),
-    /// Inspect cluster topology, broker workload, rack distribution, and under-replicated partitions (CLI mode)
+    /// Show brokers, racks, partition placement and under-replication
     Topology(cli::topology::TopologyArgs),
-    /// Check cluster health (offline brokers, under-replication, leader skew, idle lag) for scripts and CI (CLI mode)
+    /// Check cluster health for scripts and CI (exit code on findings)
     Health(cli::health::HealthArgs),
-    /// Check topic, broker and consumer group configs for risky or inconsistent values, and fix them (CLI mode)
+    /// Check topic, broker and group configs for risky values, and fix them
     Lint(cli::lint::LintArgs),
-    /// Write one Markdown incident report: health, lag and its trend, audit timeline (CLI mode)
+    /// Write a Markdown incident report: health, lag trend, audit timeline
     Report(cli::report::ReportArgs),
-    /// List and control Kafka Connect connectors (CLI mode)
+    /// List and control Kafka Connect connectors
     Connect(cli::connect::ConnectArgs),
     /// Serve cluster tools to AI assistants over MCP (stdin/stdout); read-only unless --allow-write
     Mcp(cli::mcp::McpArgs),
-    /// Show recent operations that changed a cluster, from the GUI and the CLI (CLI mode)
+    /// Show the local audit log of cluster changes (GUI and CLI)
     Audit {
         /// Number of entries to show
         #[arg(short = 'n', long, default_value_t = 30)]
@@ -88,11 +88,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: Option<cli::audit::AuditCommand>,
     },
-    /// Signed company policy: keygen, sign, verify, show (CLI mode)
+    /// Signed company policy: keygen, sign, verify, show
     Policy(cli::policy::PolicyArgs),
-    /// Cluster changes recorded for undo, newest first; `history show <id>` for one (CLI mode)
+    /// List cluster changes recorded for undo, newest first
     History(cli::history::HistoryArgs),
-    /// Put a recorded change back: checks the state first, refuses on drift unless --force (CLI mode)
+    /// Revert a recorded change; refuses if the state drifted, unless --force
     Undo(cli::history::UndoArgs),
 }
 
