@@ -45,6 +45,10 @@ and 0.2.0 makes it crate-internal.
   clusters. Only the destination is checked now, and its `read_only_brokers`
   and the source's `export_clusters` match the brokers the clusters report
   (a tunnel or an IP address no longer gets around them).
+- `lint --fix`: G002 could delete a group whose committed offsets had not
+  been read (a coordinator loading after a restart); it now reads them
+  again before deleting. T003 (lower `min.insync.replicas` to RF-1) is no
+  longer an automatic fix: it runs only with `--rule T003`.
 - `offset reset --to-timestamp`: a partition whose time lookup failed (a
   moving leader, a timeout) was planned at its end and, with `--execute`,
   committed there, skipping its unread records; the plan is now refused.
