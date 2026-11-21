@@ -251,6 +251,161 @@ pub fn generate_balanced_plan(
     Ok(ReassignmentPlan::new(partitions))
 }
 
+/// Plans `current` partitions onto `target_brokers` moving as few replicas
+/// as possible, unlike [`generate_balanced_plan`], which lays every
+/// partition out afresh.
+///
+/// A replica already on a target broker stays unless that broker holds more
+/// than its share (`floor` or `ceil` of replicas / brokers); new replicas go
+/// to the least-loaded brokers. The current preferred leader stays first
+/// unless it leads more than its share. `replication_factor` `None` keeps
+/// each partition's current replica count.
+pub fn generate_minimal_move_plan(
+    current: &[PartitionAssignment],
+    target_brokers: &[i32],
+    replication_factor: Option<usize>,
+) -> KafkaResult<ReassignmentPlan> {
+    if target_brokers.is_empty() {
+        return Err(KafkaError::admin("Target broker list cannot be empty"));
+    }
+    let brokers = dedup_preserving_order(target_brokers);
+    if current.len() > MAX_PLAN_PARTITIONS {
+        return Err(KafkaError::admin(format!(
+            "Partition count {} exceeds the planning limit of {MAX_PLAN_PARTITIONS}",
+            current.len()
+        )));
+    }
+    let wanted: Vec<usize> = current
+        .iter()
+        .map(|p| replication_factor.unwrap_or(p.replicas.len()))
+        .collect();
+    if let Some(&rf) = wanted.iter().find(|&&rf| rf == 0 || rf > brokers.len()) {
+        return Err(KafkaError::admin(if rf == 0 {
+            "Replication factor must be greater than 0".to_string()
+        } else {
+            format!(
+                "Replication factor ({rf}) cannot exceed the number of distinct target brokers ({})",
+                brokers.len()
+            )
+        }));
+    }
+
+    let mut assigned: Vec<Vec<i32>> = current
+        .iter()
+        .zip(&wanted)
+        .map(|(p, &rf)| {
+            let mut kept = dedup_preserving_order(&p.replicas);
+            kept.retain(|b| brokers.contains(b));
+            kept.truncate(rf);
+            kept
+        })
+        .collect();
+
+    // Each broker's share: `base`, and `base + 1` for `extra` of them.
+    let total: usize = wanted.iter().sum();
+    let (base, extra) = (total / brokers.len(), total % brokers.len());
+    let load = |assigned: &[Vec<i32>], b: i32| assigned.iter().filter(|r| r.contains(&b)).count();
+    // Brokers that already hold the most get the `base + 1` shares, so the
+    // fewest replicas have to leave them.
+    let mut by_load: Vec<i32> = brokers.clone();
+    by_load.sort_by_key(|&b| std::cmp::Reverse(load(&assigned, b)));
+    let share = |b: i32| base + usize::from(by_load.iter().take(extra).any(|&x| x == b));
+    for &b in &brokers {
+        let mut over = load(&assigned, b).saturating_sub(share(b));
+        // Drop followers before leaders, from the last partitions first.
+        for followers_only in [true, false] {
+            for replicas in assigned.iter_mut().rev() {
+                if over == 0 {
+                    break;
+                }
+                if let Some(i) = replicas.iter().position(|&x| x == b) {
+                    if !followers_only || i > 0 {
+                        replicas.remove(i);
+                        over -= 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Fill up from the least-loaded brokers; ties go round the broker list
+    // from a different start per partition so they spread.
+    let mut loads: std::collections::HashMap<i32, usize> =
+        brokers.iter().map(|&b| (b, load(&assigned, b))).collect();
+    for (i, (replicas, &rf)) in assigned.iter_mut().zip(&wanted).enumerate() {
+        while replicas.len() < rf {
+            let pick = (0..brokers.len())
+                .map(|k| brokers[(i + k) % brokers.len()])
+                .filter(|b| !replicas.contains(b))
+                .min_by_key(|b| loads[b])
+                .ok_or_else(|| {
+                    KafkaError::admin("Not enough brokers for the replication factor")
+                })?;
+            replicas.push(pick);
+            *loads.entry(pick).or_default() += 1;
+        }
+    }
+
+    // Preferred leaders: keep the current one while it is within its share.
+    let leader_share = current.len().div_ceil(brokers.len());
+    let mut leads: std::collections::HashMap<i32, usize> = std::collections::HashMap::new();
+    let mut leader: Vec<Option<i32>> = vec![None; current.len()];
+    for (i, p) in current.iter().enumerate() {
+        if let Some(&b) = p.replicas.first() {
+            if assigned[i].contains(&b) && leads.get(&b).copied().unwrap_or(0) < leader_share {
+                leader[i] = Some(b);
+                *leads.entry(b).or_default() += 1;
+            }
+        }
+    }
+    for (i, replicas) in assigned.iter_mut().enumerate() {
+        let lead = match leader[i] {
+            Some(b) => b,
+            None => {
+                let b = replicas
+                    .iter()
+                    .copied()
+                    .min_by_key(|b| leads.get(b).copied().unwrap_or(0))
+                    .ok_or_else(|| KafkaError::admin("Partition without replicas"))?;
+                *leads.entry(b).or_default() += 1;
+                b
+            }
+        };
+        if let Some(pos) = replicas.iter().position(|&b| b == lead) {
+            let b = replicas.remove(pos);
+            replicas.insert(0, b);
+        }
+    }
+
+    Ok(ReassignmentPlan::new(
+        current
+            .iter()
+            .zip(assigned)
+            .map(|(p, replicas)| PartitionAssignment {
+                topic: p.topic.clone(),
+                partition: p.partition,
+                replicas,
+                log_dirs: None,
+            })
+            .collect(),
+    ))
+}
+
+/// Replicas a move from `current` to `planned` copies onto new brokers.
+pub fn replicas_to_move(current: &[PartitionAssignment], planned: &ReassignmentPlan) -> usize {
+    planned
+        .partitions
+        .iter()
+        .map(|p| {
+            let before = current
+                .iter()
+                .find(|c| c.topic == p.topic && c.partition == p.partition)
+                .map_or(&[][..], |c| c.replicas.as_slice());
+            p.replicas.iter().filter(|b| !before.contains(b)).count()
+        })
+        .sum()
+}
+
 /// Generates a rollback plan restoring current assignments
 pub fn generate_rollback_plan(current_assignments: &[PartitionAssignment]) -> ReassignmentPlan {
     ReassignmentPlan::new(current_assignments.to_vec())
@@ -396,6 +551,109 @@ pub fn plan_replication_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layout(rows: &[&[i32]]) -> Vec<PartitionAssignment> {
+        rows.iter()
+            .enumerate()
+            .map(|(i, r)| PartitionAssignment::new("t", i as i32, r.to_vec()))
+            .collect()
+    }
+
+    fn replica_counts(plan: &ReassignmentPlan, brokers: &[i32]) -> Vec<usize> {
+        brokers
+            .iter()
+            .map(|b| {
+                plan.partitions
+                    .iter()
+                    .filter(|p| p.replicas.contains(b))
+                    .count()
+            })
+            .collect()
+    }
+
+    fn leader_counts(plan: &ReassignmentPlan, brokers: &[i32]) -> Vec<usize> {
+        brokers
+            .iter()
+            .map(|b| {
+                plan.partitions
+                    .iter()
+                    .filter(|p| p.replicas[0] == *b)
+                    .count()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn minimal_plan_leaves_a_balanced_layout_alone() {
+        let now = layout(&[&[1, 2], &[2, 3], &[3, 1]]);
+        let plan = generate_minimal_move_plan(&now, &[1, 2, 3], None).unwrap();
+        assert_eq!(replicas_to_move(&now, &plan), 0);
+        let same: Vec<&Vec<i32>> = plan.partitions.iter().map(|p| &p.replicas).collect();
+        assert_eq!(same, now.iter().map(|p| &p.replicas).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn minimal_plan_moves_only_a_share_onto_a_new_broker() {
+        // 6 partitions x rf 2 on brokers 1-3 (4 replicas each); broker 4 joins.
+        let now = layout(&[&[1, 2], &[2, 3], &[3, 1], &[1, 2], &[2, 3], &[3, 1]]);
+        let plan = generate_minimal_move_plan(&now, &[1, 2, 3, 4], None).unwrap();
+        plan.validate().unwrap();
+        assert_eq!(replicas_to_move(&now, &plan), 3, "{plan:?}");
+        assert_eq!(replica_counts(&plan, &[1, 2, 3, 4]), vec![3, 3, 3, 3]);
+        let leaders = leader_counts(&plan, &[1, 2, 3, 4]);
+        assert!(leaders.iter().all(|&n| n <= 2), "{leaders:?}");
+        // The rotation planner would move far more.
+        let fresh = generate_balanced_plan("t", 6, &[1, 2, 3, 4], 2, 0).unwrap();
+        assert!(replicas_to_move(&now, &fresh) > 3);
+    }
+
+    #[test]
+    fn minimal_plan_moves_only_replicas_off_a_removed_broker() {
+        let now = layout(&[&[1, 2], &[2, 3], &[3, 4], &[4, 1]]);
+        let plan = generate_minimal_move_plan(&now, &[1, 2, 3], None).unwrap();
+        // Broker 4 held 2 replicas; nothing else moves.
+        assert_eq!(replicas_to_move(&now, &plan), 2);
+        assert!(plan.partitions.iter().all(|p| !p.replicas.contains(&4)));
+        let counts = replica_counts(&plan, &[1, 2, 3]);
+        assert!(counts.iter().all(|&n| n == 2 || n == 3), "{counts:?}");
+        // Partitions that did not touch broker 4 keep their leader.
+        assert_eq!(plan.partitions[0].replicas, vec![1, 2]);
+        assert_eq!(plan.partitions[1].replicas, vec![2, 3]);
+    }
+
+    #[test]
+    fn minimal_plan_raises_the_replication_factor_in_place() {
+        let now = layout(&[&[1], &[2], &[3]]);
+        let plan = generate_minimal_move_plan(&now, &[1, 2, 3], Some(2)).unwrap();
+        assert_eq!(replicas_to_move(&now, &plan), 3);
+        for (before, after) in now.iter().zip(&plan.partitions) {
+            assert_eq!(after.replicas.len(), 2);
+            assert_eq!(after.replicas[0], before.replicas[0], "leader kept");
+        }
+        assert_eq!(replica_counts(&plan, &[1, 2, 3]), vec![2, 2, 2]);
+    }
+
+    #[test]
+    fn minimal_plan_spreads_a_skewed_layout_and_its_leaders() {
+        // Everything on brokers 1 and 2, all led by 1.
+        let now = layout(&[&[1, 2], &[1, 2], &[1, 2], &[1, 2]]);
+        let plan = generate_minimal_move_plan(&now, &[1, 2, 3, 4], None).unwrap();
+        plan.validate().unwrap();
+        assert_eq!(replica_counts(&plan, &[1, 2, 3, 4]), vec![2, 2, 2, 2]);
+        // Greedy leader choice: within one of even.
+        assert!(leader_counts(&plan, &[1, 2, 3, 4]).iter().all(|&n| n <= 2));
+        assert_eq!(replicas_to_move(&now, &plan), 4);
+    }
+
+    #[test]
+    fn minimal_plan_checks_its_input() {
+        let now = layout(&[&[1, 2]]);
+        assert!(generate_minimal_move_plan(&now, &[], None).is_err());
+        assert!(generate_minimal_move_plan(&now, &[1], None).is_err());
+        assert!(generate_minimal_move_plan(&now, &[1, 2], Some(0)).is_err());
+        // A repeated broker id counts once.
+        assert!(generate_minimal_move_plan(&now, &[1, 1], None).is_err());
+    }
 
     #[test]
     fn pre_move_replicas_drops_only_adding() {

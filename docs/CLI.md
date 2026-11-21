@@ -615,10 +615,17 @@ ferrika acl --local list
 
 ### 13. Cluster Rebalance & Partition Reassignment Planner (`ferrika reassign`)
 ```bash
-# Generate an optimal partition rebalance plan spreading topics across target brokers
+# Spread topics evenly over brokers 1-4 (e.g. after adding broker 4). Replicas
+# already on a broker within its share stay; the plan says how many move.
 ferrika reassign plan -t orders-v1,payments -b 1,2,3,4 --rf 2 -o ./reassignment.json
 
-# Preview reassignment plan JSON directly to stdout
+# Decommission broker 4: only its replicas move to 1-3
+ferrika reassign plan -t orders-v1,payments -b 1,2,3
+
+# Lay every partition out afresh (leader rotation; moves much more data)
+ferrika reassign plan -t orders-v1 -b 1,2,3 --from-scratch
+
+# Offline plan for 6 partitions, without reading the cluster (always afresh)
 ferrika reassign plan -t orders-v1 -b 1,2,3 -p 6 --rf 2 --json
 
 # Dry-run simulation: Preview partition migration plan without touching the cluster
