@@ -203,11 +203,25 @@ pub(super) async fn call_tool(
         },
         _ => Err(KafkaError::config(format!("Unknown tool '{name}'"))),
     };
+    tool_reply(result)
+}
+
+/// A tool result: the value as text and, when it is an object, as
+/// structured content; an error as text with `isError`.
+fn tool_reply(result: KafkaResult<Value>) -> Value {
     match result {
-        Ok(value) => json!({
-            "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() }],
-            "isError": false
-        }),
+        Ok(value) => {
+            let mut reply = json!({
+                "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() }],
+                "isError": false
+            });
+            // The same result as structured content (MCP 2025-06-18), which
+            // must be an object; the text stays for older clients.
+            if value.is_object() {
+                reply["structuredContent"] = value;
+            }
+            reply
+        }
         Err(e) => json!({
             "content": [{ "type": "text", "text": e.to_string() }],
             "isError": true
@@ -960,6 +974,23 @@ mod tests {
         assert!(fields_subject(&json!({})).is_err());
         assert!(fields_subject(&json!({ "topic": "t", "subject": "s" })).is_err());
         assert!(fields_subject(&json!({ "subject": "s", "key": true })).is_err());
+    }
+
+    #[test]
+    fn results_carry_structured_content_when_they_are_objects() {
+        let reply = tool_reply(Ok(json!({ "count": 2, "topics": ["a", "b"] })));
+        assert_eq!(reply["isError"], false);
+        assert_eq!(reply["structuredContent"]["count"], 2);
+        let text: Value =
+            serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text, reply["structuredContent"]);
+        // Structured content must be an object: an array stays text only.
+        assert!(tool_reply(Ok(json!([1, 2])))
+            .get("structuredContent")
+            .is_none());
+        let failed = tool_reply(Err(KafkaError::config("nope")));
+        assert_eq!(failed["isError"], true);
+        assert!(failed.get("structuredContent").is_none());
     }
 
     #[tokio::test]
