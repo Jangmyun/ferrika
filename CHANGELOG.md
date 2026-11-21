@@ -57,9 +57,9 @@ and 0.2.0 makes it crate-internal.
 - `ferrika --version` follows the crate version.
 - `ferrika.exe` carries Windows version information (product, version, file
   description) for Explorer, AppLocker and inventory tools.
-- `health`, `report`, `acl`, `user`, `schema`, `reassign` and other commands
-  that failed to reach the cluster ended with a bare `Error:` line; they now
-  show the same troubleshooting hints as `topics` and `consume`.
+- Commands such as `health` that failed with a Kafka client connection or
+  authorization error ended with a bare `Error:` line; they now show the same
+  troubleshooting hints as `topics` and `consume`.
 - The hint for a GSSAPI (Kerberos) profile that fails to connect had runs of
   spaces in the middle of its sentence.
 
