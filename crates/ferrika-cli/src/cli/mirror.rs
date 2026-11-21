@@ -134,6 +134,13 @@ fn cluster_profile_name(
         .unwrap_or_default()
 }
 
+/// Whether `args` name the clusters to copy between; then [`authorize`]
+/// checks the destination, and the gate in `main` stays out (see
+/// `main_gate_action`).
+pub fn names_clusters(args: &MirrorArgs) -> bool {
+    args.dst_profile.is_some() || args.src_profile.is_some() || args.dst_bootstrap_servers.is_some()
+}
+
 /// The write gate in `main` checks the cluster the global options name, but
 /// `mirror` writes to its destination cluster; see [`authorize_with`].
 pub fn authorize(args: &MirrorArgs, global: &GlobalOpts) -> Result<(), String> {
@@ -144,7 +151,36 @@ pub fn authorize(args: &MirrorArgs, global: &GlobalOpts) -> Result<(), String> {
         &store,
         args,
         global,
-    )
+    )?;
+    // The destination's request entry was written here, not in `main`: owe
+    // its result line too (see `cli::record_audit_result`).
+    if names_clusters(args) {
+        let dst_name = args.dst_profile.as_deref().or(args.src_profile.as_deref());
+        let mut profile = cluster_profile_name(&store, dst_name, global);
+        if profile.is_empty() {
+            profile = cluster_config(
+                &store,
+                dst_name,
+                args.dst_bootstrap_servers.as_deref(),
+                global,
+            )
+            .bootstrap_servers;
+        }
+        crate::cli::expect_audit_result(crate::governance::audit::AuditEntry {
+            time_ms: 0,
+            source: "cli".to_string(),
+            profile,
+            action: "mirror".to_string(),
+            target: format!("{} -> {}", args.src_topic, args.dst_topic),
+            outcome: String::new(),
+            ok: true,
+            user: String::new(),
+            actor: None,
+            op: String::new(),
+            op_digest: String::new(),
+        });
+    }
+    Ok(())
 }
 
 /// Refuses `mirror` under enforced PII masking (it would copy unmasked
@@ -198,10 +234,7 @@ fn authorize_with(
 
     // Without any cluster option the destination is the cluster the gate in
     // `main` already checked and recorded.
-    if args.dst_profile.is_none()
-        && args.src_profile.is_none()
-        && args.dst_bootstrap_servers.is_none()
-    {
+    if !names_clusters(args) {
         return Ok(());
     }
     let dst_name = args.dst_profile.as_deref().or(args.src_profile.as_deref());
