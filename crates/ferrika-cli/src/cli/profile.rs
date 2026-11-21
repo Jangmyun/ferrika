@@ -151,6 +151,11 @@ fn redacted(secret: &Option<String>) -> Option<&'static str> {
     secret.as_ref().map(|_| "<redacted>")
 }
 
+/// A URL for `Debug` without its `user:password@` part.
+fn redacted_url(url: &Option<String>) -> Option<String> {
+    url.as_deref().map(crate::model::format::redact_url)
+}
+
 impl std::fmt::Debug for ProfileAddArgs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProfileAddArgs")
@@ -167,8 +172,9 @@ impl std::fmt::Debug for ProfileAddArgs {
             .field("ssl_key_location", &self.ssl_key_location)
             .field("set_active", &self.set_active)
             .field("read_only", &self.read_only)
-            .field("schema_registry", &self.schema_registry)
-            .field("connect", &self.connect)
+            // Their URLs may carry `user:password@`.
+            .field("schema_registry", &redacted_url(&self.schema_registry))
+            .field("connect", &redacted_url(&self.connect))
             .field("oauth", &self.oauth)
             .finish()
     }
@@ -789,6 +795,8 @@ mod tests {
             "hunter2-pw",
             "--oauth-client-secret",
             "s3cret-oauth",
+            "--schema-registry",
+            "https://KEY:url-secret@registry.example.com",
         ])
         .unwrap();
         let shown = format!("{cli:?}");
@@ -796,6 +804,8 @@ mod tests {
         assert!(shown.contains("<redacted>"), "{shown}");
         assert!(!shown.contains("hunter2-pw"), "{shown}");
         assert!(!shown.contains("s3cret-oauth"), "{shown}");
+        assert!(shown.contains("registry.example.com"), "{shown}");
+        assert!(!shown.contains("url-secret"), "{shown}");
     }
 
     #[test]

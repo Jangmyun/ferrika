@@ -952,11 +952,10 @@ fn render_compatibility_report(
         let mut json = serde_json::to_value(report).map_err(|e| {
             KafkaError::Serialization(format!("Failed to serialize the report: {e}"))
         })?;
+        // `mode` keeps its 0.1.0 values (a CompatibilityMode); transitive
+        // checks say so in fields of their own.
         if let (Some(obj), Some(n)) = (json.as_object_mut(), transitive_versions) {
-            obj.insert(
-                "mode".into(),
-                mode_label(report.mode, transitive_versions).into(),
-            );
+            obj.insert("transitive".into(), true.into());
             obj.insert("versions_checked".into(), n.into());
         }
         output::print_json(&json)?;
