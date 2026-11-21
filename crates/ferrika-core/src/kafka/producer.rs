@@ -143,12 +143,17 @@ impl DeliveryPipeline {
         producer: &KafkaProducerClient,
         record: &OwnedProducerRecord,
     ) -> KafkaResult<Option<DeliveryOutcome>> {
-        let completed = self.inner.make_room().await.map(|(_, outcome)| outcome);
+        let completed = if self.inner.is_full() {
+            self.next_outcome().await
+        } else {
+            None
+        };
         self.inner.push(producer, record, ()).await?;
         Ok(completed)
     }
 
-    /// Waits for the next delivery to complete. Returns `None` when nothing is in flight.
+    /// Waits for the next delivery to complete. Returns `None` when nothing is
+    /// in flight. A delivery task that panicked is reported as a failed delivery.
     pub async fn next_outcome(&mut self) -> Option<DeliveryOutcome> {
         let joined = self.inner.next_joined().await?;
         Some(match joined {
@@ -191,10 +196,14 @@ impl<T: Send + 'static> TaggedDeliveryPipeline<T> {
         self.in_flight.len()
     }
 
+    fn is_full(&self) -> bool {
+        self.in_flight.len() >= self.max_in_flight
+    }
+
     /// When the window is full, waits for one delivery to complete and
     /// returns it; otherwise returns `None` at once. Call before [`Self::push`].
     pub async fn make_room(&mut self) -> Option<(T, DeliveryOutcome)> {
-        if self.in_flight.len() >= self.max_in_flight {
+        if self.is_full() {
             self.next_outcome().await
         } else {
             None

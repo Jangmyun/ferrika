@@ -237,8 +237,9 @@ struct PartitionProgress {
     pending: BTreeSet<i64>,
     /// Highest offset delivered or skipped.
     highest_done: Option<i64>,
-    /// Lowest offset whose copy failed; nothing at or after it is committed.
-    first_failed: Option<i64>,
+    /// Offsets whose copy failed and was not delivered since (a rebalance
+    /// can deliver the record again); nothing from the lowest on is committed.
+    failed: BTreeSet<i64>,
     /// Last offset returned for storing.
     stored: Option<i64>,
 }
@@ -262,8 +263,9 @@ impl CommitTracker {
         progress.pending.remove(&offset);
         if done {
             progress.highest_done = progress.highest_done.max(Some(offset));
+            progress.failed.remove(&offset);
         } else {
-            progress.first_failed = Some(progress.first_failed.map_or(offset, |f| f.min(offset)));
+            progress.failed.insert(offset);
         }
         // Records arrive in offset order per partition, so everything below
         // the lowest pending offset has been seen and finished.
@@ -271,7 +273,7 @@ impl CommitTracker {
             Some(&lowest) => Some(lowest - 1),
             None => progress.highest_done,
         };
-        if let Some(failed) = progress.first_failed {
+        if let Some(&failed) = progress.failed.first() {
             safe = safe.map(|s| s.min(failed - 1));
         }
         match safe {
@@ -395,7 +397,9 @@ where
             if let Err(e) =
                 consumer.store_processed_offset(&mirror_config.src_topic, partition, last)
             {
-                tracing::warn!("Could not store mirror offset {partition}@{last}: {e}");
+                // Usually a partition this member lost in a rebalance; the
+                // new owner reads from the last commit, so nothing is skipped.
+                tracing::debug!("Could not store mirror offset {partition}@{last}: {e}");
             }
         }
     };
@@ -626,6 +630,18 @@ mod tests {
         // Later records stay behind the failure too.
         t.sent(3, 14);
         assert_eq!(t.finished(3, 14, true), None);
+    }
+
+    #[test]
+    fn commit_tracker_resumes_once_a_failed_record_is_delivered_again() {
+        let mut t = CommitTracker::default();
+        t.sent(0, 0);
+        t.sent(0, 1);
+        assert_eq!(t.finished(0, 0, false), None);
+        assert_eq!(t.finished(0, 1, true), None);
+        // After a rebalance the record is read and copied again.
+        t.sent(0, 0);
+        assert_eq!(t.finished(0, 0, true), Some(1));
     }
 
     #[test]
