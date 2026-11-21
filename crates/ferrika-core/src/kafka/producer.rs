@@ -4,7 +4,7 @@ use rdkafka::client::DefaultClientContext;
 use rdkafka::error::{KafkaError as RdKafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header, OwnedHeaders};
 use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer};
-use tokio::task::JoinSet;
+use tokio::task::{JoinError, JoinSet};
 
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::config::KafkaClientConfig;
@@ -120,11 +120,64 @@ pub struct DeliveryOutcome {
 /// Keeps up to `max_in_flight` messages in flight so librdkafka can batch them,
 /// instead of awaiting each delivery before sending the next message.
 pub struct DeliveryPipeline {
-    in_flight: JoinSet<DeliveryOutcome>,
-    max_in_flight: usize,
+    inner: TaggedDeliveryPipeline<()>,
 }
 
 impl DeliveryPipeline {
+    /// Creates a pipeline that allows at most `max_in_flight` unacknowledged messages.
+    pub fn new(max_in_flight: usize) -> Self {
+        Self {
+            inner: TaggedDeliveryPipeline::new(max_in_flight),
+        }
+    }
+
+    /// Number of messages enqueued but not yet acknowledged.
+    pub fn in_flight(&self) -> usize {
+        self.inner.in_flight()
+    }
+
+    /// Enqueues a record. When the window is full, first waits for one earlier
+    /// delivery to complete and returns its outcome.
+    pub async fn submit(
+        &mut self,
+        producer: &KafkaProducerClient,
+        record: &OwnedProducerRecord,
+    ) -> KafkaResult<Option<DeliveryOutcome>> {
+        let completed = self.inner.make_room().await.map(|(_, outcome)| outcome);
+        self.inner.push(producer, record, ()).await?;
+        Ok(completed)
+    }
+
+    /// Waits for the next delivery to complete. Returns `None` when nothing is in flight.
+    pub async fn next_outcome(&mut self) -> Option<DeliveryOutcome> {
+        let joined = self.inner.next_joined().await?;
+        Some(match joined {
+            Ok(((), outcome)) => outcome,
+            Err(err) => DeliveryOutcome {
+                result: Err(KafkaError::DeliveryFailed {
+                    topic: String::new(),
+                    partition: None,
+                    reason: format!("delivery task failed: {err}"),
+                }),
+                latency: Duration::ZERO,
+                payload_bytes: 0,
+            },
+        })
+    }
+}
+
+/// A [`DeliveryPipeline`] whose outcomes carry a caller-chosen tag, for
+/// callers that must know which record a delivery report belongs to (for
+/// example to commit a source offset only after its copy was delivered).
+///
+/// A delivery task that panics loses its tag: its outcome is never returned,
+/// so a caller tracking tags must treat a tag without an outcome as pending.
+pub struct TaggedDeliveryPipeline<T> {
+    in_flight: JoinSet<(T, DeliveryOutcome)>,
+    max_in_flight: usize,
+}
+
+impl<T: Send + 'static> TaggedDeliveryPipeline<T> {
     /// Creates a pipeline that allows at most `max_in_flight` unacknowledged messages.
     pub fn new(max_in_flight: usize) -> Self {
         Self {
@@ -138,19 +191,24 @@ impl DeliveryPipeline {
         self.in_flight.len()
     }
 
-    /// Enqueues a record. When the window is full, first waits for one earlier
-    /// delivery to complete and returns its outcome.
-    pub async fn submit(
-        &mut self,
-        producer: &KafkaProducerClient,
-        record: &OwnedProducerRecord,
-    ) -> KafkaResult<Option<DeliveryOutcome>> {
-        let completed = if self.in_flight.len() >= self.max_in_flight {
+    /// When the window is full, waits for one delivery to complete and
+    /// returns it; otherwise returns `None` at once. Call before [`Self::push`].
+    pub async fn make_room(&mut self) -> Option<(T, DeliveryOutcome)> {
+        if self.in_flight.len() >= self.max_in_flight {
             self.next_outcome().await
         } else {
             None
-        };
+        }
+    }
 
+    /// Hands a record to the producer. On an error the record was not
+    /// enqueued and `tag` comes back with no outcome.
+    pub async fn push(
+        &mut self,
+        producer: &KafkaProducerClient,
+        record: &OwnedProducerRecord,
+        tag: T,
+    ) -> KafkaResult<()> {
         let enqueued_at = Instant::now();
         let future = producer.enqueue(record).await?;
         let topic = record.topic.clone();
@@ -158,27 +216,29 @@ impl DeliveryPipeline {
         let payload_bytes = record.payload.as_ref().map_or(0, Vec::len);
         self.in_flight.spawn(async move {
             let result = map_delivery(future.await, topic, partition);
-            DeliveryOutcome {
+            let outcome = DeliveryOutcome {
                 result,
                 latency: enqueued_at.elapsed(),
                 payload_bytes,
-            }
+            };
+            (tag, outcome)
         });
-        Ok(completed)
+        Ok(())
     }
 
-    /// Waits for the next delivery to complete. Returns `None` when nothing is in flight.
-    pub async fn next_outcome(&mut self) -> Option<DeliveryOutcome> {
-        let joined = self.in_flight.join_next().await?;
-        Some(joined.unwrap_or_else(|err| DeliveryOutcome {
-            result: Err(KafkaError::DeliveryFailed {
-                topic: String::new(),
-                partition: None,
-                reason: format!("delivery task failed: {err}"),
-            }),
-            latency: Duration::ZERO,
-            payload_bytes: 0,
-        }))
+    /// Waits for the next delivery to complete. Returns `None` when nothing is
+    /// in flight. A delivery task that panicked is skipped (see the type docs).
+    pub async fn next_outcome(&mut self) -> Option<(T, DeliveryOutcome)> {
+        loop {
+            match self.next_joined().await? {
+                Ok(done) => return Some(done),
+                Err(err) => tracing::warn!("delivery task failed: {err}"),
+            }
+        }
+    }
+
+    async fn next_joined(&mut self) -> Option<Result<(T, DeliveryOutcome), JoinError>> {
+        self.in_flight.join_next().await
     }
 }
 

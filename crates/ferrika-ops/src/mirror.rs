@@ -1,4 +1,6 @@
+use rdkafka::consumer::CommitMode;
 use rdkafka::Offset;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -8,7 +10,7 @@ use ferrika_core::kafka::config::{AutoOffsetReset, KafkaClientConfig};
 use ferrika_core::kafka::consumer::{ConsumedMessage, KafkaConsumerClient};
 use ferrika_core::kafka::filter::MessageFilter;
 use ferrika_core::kafka::producer::{
-    DeliveryOutcome, DeliveryPipeline, KafkaProducerClient, OwnedProducerRecord,
+    DeliveryOutcome, KafkaProducerClient, OwnedProducerRecord, TaggedDeliveryPipeline,
 };
 
 /// Unacknowledged records allowed in flight while mirroring. librdkafka
@@ -212,8 +214,74 @@ impl MirrorStats {
 /// One event of the mirror loop.
 enum MirrorStep {
     Stop,
-    Delivered(DeliveryOutcome),
+    Delivered(SourcePosition, DeliveryOutcome),
     Received(KafkaResult<ConsumedMessage>),
+}
+
+/// Partition and offset of the source record a copy was made from.
+type SourcePosition = (i32, i64);
+
+/// Decides which source offsets a mirror with a consumer group may commit:
+/// only those whose copy was delivered (or that the filter skipped), and
+/// never past a record whose copy failed. The mirror thereby copies each
+/// record at least once across restarts; records after a failure may be
+/// copied again.
+#[derive(Debug, Default)]
+struct CommitTracker {
+    partitions: HashMap<i32, PartitionProgress>,
+}
+
+#[derive(Debug, Default)]
+struct PartitionProgress {
+    /// Records handed to the producer whose delivery is not reported yet.
+    pending: BTreeSet<i64>,
+    /// Highest offset delivered or skipped.
+    highest_done: Option<i64>,
+    /// Lowest offset whose copy failed; nothing at or after it is committed.
+    first_failed: Option<i64>,
+    /// Last offset returned for storing.
+    stored: Option<i64>,
+}
+
+impl CommitTracker {
+    /// A copy of the record at `offset` was handed to the producer.
+    fn sent(&mut self, partition: i32, offset: i64) {
+        self.partitions
+            .entry(partition)
+            .or_default()
+            .pending
+            .insert(offset);
+    }
+
+    /// The record at `offset` is finished: its copy was delivered (`done`),
+    /// it failed, or the filter skipped it (`done` without [`Self::sent`]).
+    /// Returns the offset of the last record that may now be marked
+    /// processed, when that moved forward.
+    fn finished(&mut self, partition: i32, offset: i64, done: bool) -> Option<i64> {
+        let progress = self.partitions.entry(partition).or_default();
+        progress.pending.remove(&offset);
+        if done {
+            progress.highest_done = progress.highest_done.max(Some(offset));
+        } else {
+            progress.first_failed = Some(progress.first_failed.map_or(offset, |f| f.min(offset)));
+        }
+        // Records arrive in offset order per partition, so everything below
+        // the lowest pending offset has been seen and finished.
+        let mut safe = match progress.pending.first() {
+            Some(&lowest) => Some(lowest - 1),
+            None => progress.highest_done,
+        };
+        if let Some(failed) = progress.first_failed {
+            safe = safe.map(|s| s.min(failed - 1));
+        }
+        match safe {
+            Some(s) if s >= 0 && progress.stored.is_none_or(|stored| s > stored) => {
+                progress.stored = Some(s);
+                Some(s)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Builds the destination record for a source message, keeping it byte-for-byte:
@@ -268,6 +336,12 @@ where
     // Without one it reads directly (no throwaway group is created) from the
     // beginning or the current end.
     let use_group = consumer_cfg.group_id.is_some();
+    if use_group {
+        // Offsets are stored by hand once the copy is delivered (see
+        // `CommitTracker`) and committed by the periodic auto-commit and at
+        // the end; storing them on receipt would commit records in flight.
+        consumer_cfg = consumer_cfg.with_property("enable.auto.offset.store", "false");
+    }
     let consumer = if use_group {
         KafkaConsumerClient::new(&consumer_cfg)?
     } else {
@@ -309,8 +383,22 @@ where
         .map(|r| Duration::from_secs_f64(1.0 / r));
 
     let mut last_tick = Instant::now();
-    let mut pipeline = DeliveryPipeline::new(MIRROR_MAX_IN_FLIGHT);
+    let mut pipeline = TaggedDeliveryPipeline::<SourcePosition>::new(MIRROR_MAX_IN_FLIGHT);
+    let mut tracker = CommitTracker::default();
     let mut forwarded: u64 = 0;
+    // With a group, marks a finished record and stores the offset it frees.
+    let store = |tracker: &mut CommitTracker, (partition, offset): SourcePosition, done: bool| {
+        if !use_group {
+            return;
+        }
+        if let Some(last) = tracker.finished(partition, offset, done) {
+            if let Err(e) =
+                consumer.store_processed_offset(&mirror_config.src_topic, partition, last)
+            {
+                tracing::warn!("Could not store mirror offset {partition}@{last}: {e}");
+            }
+        }
+    };
 
     loop {
         if let Some(max) = mirror_config.max_messages {
@@ -327,29 +415,40 @@ where
 
         let step = tokio::select! {
             _ = tokio::signal::ctrl_c() => MirrorStep::Stop,
-            Some(outcome) = pipeline.next_outcome(), if pipeline.in_flight() > 0 => {
-                MirrorStep::Delivered(outcome)
+            Some((source, outcome)) = pipeline.next_outcome(), if pipeline.in_flight() > 0 => {
+                MirrorStep::Delivered(source, outcome)
             }
             msg_res = consumer.recv() => MirrorStep::Received(msg_res),
         };
 
         match step {
             MirrorStep::Stop => break,
-            MirrorStep::Delivered(outcome) => stats.record_outcome(outcome),
+            MirrorStep::Delivered(source, outcome) => {
+                store(&mut tracker, source, outcome.result.is_ok());
+                stats.record_outcome(outcome);
+            }
             MirrorStep::Received(Ok(msg)) => {
                 stats.record_read();
+                let source = (msg.partition, msg.offset);
 
                 if !mirror_config.filter.matches(&msg) {
                     stats.record_filtered();
+                    store(&mut tracker, source, true);
                     continue;
                 }
 
                 let record = mirror_record(&msg, &mirror_config.dst_topic);
                 forwarded += 1;
-                match pipeline.submit(&producer, &record).await {
-                    Ok(Some(outcome)) => stats.record_outcome(outcome),
-                    Ok(None) => {}
-                    Err(e) => stats.record_failed(&e),
+                if let Some((done, outcome)) = pipeline.make_room().await {
+                    store(&mut tracker, done, outcome.result.is_ok());
+                    stats.record_outcome(outcome);
+                }
+                if use_group {
+                    tracker.sent(source.0, source.1);
+                }
+                if let Err(e) = pipeline.push(&producer, &record, source).await {
+                    store(&mut tracker, source, false);
+                    stats.record_failed(&e);
                 }
 
                 // Rate throttling
@@ -374,8 +473,14 @@ where
     }
 
     // Wait for every record already handed to the producer so the counts are final.
-    while let Some(outcome) = pipeline.next_outcome().await {
+    while let Some((source, outcome)) = pipeline.next_outcome().await {
+        store(&mut tracker, source, outcome.result.is_ok());
         stats.record_outcome(outcome);
+    }
+    if use_group {
+        if let Err(e) = consumer.commit_stored(CommitMode::Sync) {
+            tracing::warn!("Could not commit the mirror's consumer group offsets: {e}");
+        }
     }
 
     stats.update_rates();
@@ -492,6 +597,49 @@ mod tests {
         let err = stats.failure().map(|e| e.to_string()).unwrap_or_default();
         assert_eq!(err, "1 of 2 mirrored messages failed delivery");
         assert!(MirrorStats::new().failure().is_none());
+    }
+
+    #[test]
+    fn commit_tracker_waits_for_earlier_deliveries() {
+        let mut t = CommitTracker::default();
+        for offset in 0..3 {
+            t.sent(0, offset);
+        }
+        // Out of order: 1 and 2 are delivered before 0.
+        assert_eq!(t.finished(0, 2, true), None);
+        assert_eq!(t.finished(0, 1, true), None);
+        assert_eq!(t.finished(0, 0, true), Some(2));
+        // Nothing new: nothing to store.
+        assert_eq!(t.finished(0, 2, true), None);
+    }
+
+    #[test]
+    fn commit_tracker_never_passes_a_failed_copy() {
+        let mut t = CommitTracker::default();
+        for offset in 10..14 {
+            t.sent(3, offset);
+        }
+        assert_eq!(t.finished(3, 10, true), Some(10));
+        assert_eq!(t.finished(3, 11, false), None);
+        assert_eq!(t.finished(3, 12, true), None);
+        assert_eq!(t.finished(3, 13, true), None);
+        // Later records stay behind the failure too.
+        t.sent(3, 14);
+        assert_eq!(t.finished(3, 14, true), None);
+    }
+
+    #[test]
+    fn commit_tracker_counts_skipped_records_and_keeps_partitions_apart() {
+        let mut t = CommitTracker::default();
+        t.sent(0, 5);
+        // Partition 1 is not held back by partition 0.
+        assert_eq!(t.finished(1, 7, true), Some(7));
+        // A record the filter skipped (never sent) behind a pending one.
+        assert_eq!(t.finished(0, 6, true), Some(4));
+        assert_eq!(t.finished(0, 5, true), Some(6));
+        // A gap (compaction, transaction markers) is not waited for.
+        t.sent(0, 20);
+        assert_eq!(t.finished(0, 20, true), Some(20));
     }
 
     #[test]
