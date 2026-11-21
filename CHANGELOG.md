@@ -45,6 +45,10 @@ and 0.2.0 makes it crate-internal.
   clusters. Only the destination is checked now, and its `read_only_brokers`
   and the source's `export_clusters` match the brokers the clusters report
   (a tunnel or an IP address no longer gets around them).
+- Audit log: a correctly chained line appended later could replace an
+  operation's `op_digest` and let an edited history pass `undo`'s check;
+  two different digests for one operation now refuse it. `audit verify`
+  reports a line with a duplicated key (which hid the entry from readers).
 - `undo` of an undo could put a Kafka Connect connector back with empty
   passwords (the undo had stored the blanked secrets); it is now refused for
   want of the secret. Undoing a change is no longer refused because a later
