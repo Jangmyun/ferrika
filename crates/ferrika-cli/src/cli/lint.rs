@@ -409,13 +409,25 @@ fn print_findings(findings: &[LintFinding]) {
             severity_tag(f.severity),
             f.rule.bold(),
             target_label(&f.target).cyan(),
-            f.message,
+            message_body(f),
             format!("[{}]", f.fix_class.label()).bright_black()
         );
         if let Some(line) = fix_line(f) {
             println!("         {} {line}", "fix:".bright_black());
         }
     }
+}
+
+/// The message without the target name it starts with (`orders: ...`,
+/// `Broker 2: ...`); the table line already shows the target before it.
+fn message_body(f: &LintFinding) -> &str {
+    use crate::ops::health::HealthTarget;
+    let prefix = match &f.target {
+        HealthTarget::Topic(name) | HealthTarget::Group(name) => format!("{name}: "),
+        HealthTarget::Broker(id) => format!("Broker {id}: "),
+        HealthTarget::Brokers => return &f.message,
+    };
+    f.message.strip_prefix(&prefix).unwrap_or(&f.message)
 }
 
 /// One line on how to fix `f`: the change, the manual step or why there is
@@ -528,6 +540,25 @@ mod tests {
             fix,
             fix_class,
         }
+    }
+
+    #[test]
+    fn message_body_drops_the_target_name_the_line_already_shows() {
+        use crate::ops::health::HealthTarget;
+        let mut f = finding("G002", FixClass::Guided, Fix::Manual { steps: vec![] });
+        f.target = HealthTarget::Group("billing".into());
+        f.message = "billing: no members and no committed offsets".into();
+        assert_eq!(message_body(&f), "no members and no committed offsets");
+        f.target = HealthTarget::Broker(2);
+        f.message = "Broker 2: unclean leader election is on".into();
+        assert_eq!(message_body(&f), "unclean leader election is on");
+        // A message that does not start with the target stays whole.
+        f.target = HealthTarget::Topic("orders".into());
+        f.message = "orders-v2: something".into();
+        assert_eq!(message_body(&f), "orders-v2: something");
+        f.target = HealthTarget::Brokers;
+        f.message = "default.replication.factor is 1".into();
+        assert_eq!(message_body(&f), "default.replication.factor is 1");
     }
 
     #[test]
