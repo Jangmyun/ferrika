@@ -36,7 +36,7 @@ const STEP_HEADING: &str = "Steps (applied in the order given)";
 
 /// Command line arguments for `ferrika transform`.
 #[derive(Args, Debug, Clone, PartialEq)]
-pub struct TransformArgs {
+pub(crate) struct TransformArgs {
     /// Topic to read from, on the cluster the global options select
     pub src_topic: String,
 
@@ -114,7 +114,7 @@ pub struct TransformArgs {
 /// keeps each flag's values apart, so the order across flags is rebuilt
 /// from the argument indices.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct StepArgs(pub Vec<(StepKind, String)>);
+pub(crate) struct StepArgs(pub Vec<(StepKind, String)>);
 
 impl StepArgs {
     fn arg(kind: StepKind) -> Arg {
@@ -240,7 +240,7 @@ impl CopyRoute for TransformArgs {
 /// the command: enforced masking (unless `--mask` comes first), the export
 /// gate when the destination is another cluster, and the write gate for the
 /// destination cluster. See `mirror::authorize`.
-pub fn authorize(args: &TransformArgs, global: &GlobalOpts) -> Result<(), String> {
+pub(crate) fn authorize(args: &TransformArgs, global: &GlobalOpts) -> Result<(), String> {
     crate::cli::mirror::authorize(args, global)
 }
 
@@ -363,7 +363,7 @@ fn preview_line(record: &OwnedProducerRecord) -> Value {
 }
 
 /// Main entry point for `ferrika transform`.
-pub async fn run(args: TransformArgs, global: &GlobalOpts) -> KafkaResult<()> {
+pub(crate) async fn run(args: TransformArgs, global: &GlobalOpts) -> KafkaResult<()> {
     check_args(&args).map_err(KafkaError::config)?;
     let pipeline = Pipeline::parse(
         args.steps

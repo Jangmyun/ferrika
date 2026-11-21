@@ -28,7 +28,7 @@ use crate::rabbitmq::view::{
 };
 
 /// Environment variable with the RabbitMQ password.
-pub const PASSWORD_ENV: &str = "FERRIKA_RABBIT_PASSWORD";
+pub(crate) const PASSWORD_ENV: &str = "FERRIKA_RABBIT_PASSWORD";
 
 /// Request timeout when `--timeout` is not given. The Kafka profile's
 /// timeout does not apply: these commands do not use a Kafka profile.
@@ -443,7 +443,7 @@ fn redrive_target(to_exchange: Option<&str>, routing_key: Option<&str>) -> Strin
 }
 
 /// The record data `args` shows, for the export gate: `(label, target)`.
-pub fn export(args: &RabbitArgs) -> Option<(&'static str, String)> {
+pub(crate) fn export(args: &RabbitArgs) -> Option<(&'static str, String)> {
     use crate::cli::rabbit_profile::RabbitProfileSubcommands as P;
     let target = |queue: &str| format!("queue {queue} on vhost {}", vhost(args));
     match &args.command {
@@ -465,7 +465,7 @@ pub fn export(args: &RabbitArgs) -> Option<(&'static str, String)> {
     }
 }
 
-pub async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result<()> {
+pub(crate) async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result<()> {
     let json = global.format == OutputFormat::Json;
     if let RabbitSubcommands::Profile(profile) = &args.command {
         return crate::cli::rabbit_profile::run(profile, &args.connection, json);

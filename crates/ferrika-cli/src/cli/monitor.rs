@@ -516,7 +516,8 @@ pub fn render_broker_table(brokers: &[BrokerInfo]) -> String {
 }
 
 /// Formats partition lag details into a color-highlighted table.
-pub fn render_lag_table(lags: &[PartitionLag]) -> String {
+#[cfg(test)]
+fn render_lag_table(lags: &[PartitionLag]) -> String {
     render_lag_table_with(lags, &std::collections::HashMap::new())
 }
 

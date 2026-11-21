@@ -153,10 +153,6 @@ fn start_as(
 }
 
 impl Pending {
-    pub fn id(&self) -> &str {
-        self.recorder.id()
-    }
-
     /// Writes the outcome to the journal and the operation's result entry
     /// to the audit log: the request's action, the outcome, the operation
     /// id and its digest.

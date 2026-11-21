@@ -12,14 +12,14 @@ use crate::{cli, governance, kafka, model};
 #[command(about = "Kafka command-line client: topics, records, consumer groups, schemas, Connect and cluster checks", long_about = None)]
 pub struct Cli {
     #[command(flatten)]
-    pub global_opts: cli::GlobalOpts,
+    pub(crate) global_opts: cli::GlobalOpts,
 
     #[command(subcommand)]
-    pub command: Option<Commands>,
+    pub(crate) command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
-pub enum Commands {
+pub(crate) enum Commands {
     /// List, describe, create, configure, purge and delete topics
     Topics(cli::topics::TopicsArgs),
     /// Send records to a topic
