@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::cli::{output, GlobalOpts};
 use crate::codec::pii::{
-    build_audit_report, mask_payload, scan_json_for_pii, MaskStrategy, PiiAuditReport,
+    build_audit_report, mask_bytes, mask_payload, scan_json_for_pii, MaskStrategy, PiiAuditReport,
 };
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::consumer::KafkaConsumerClient;
@@ -275,8 +275,10 @@ async fn handle_mask(args: CryptoMaskArgs, global: &GlobalOpts) -> KafkaResult<(
             match tokio::time::timeout(timeout, consumer.recv()).await {
                 Ok(Ok(msg)) => {
                     count += 1;
-                    if let Some(payload_str) = msg.payload_str() {
-                        println!("{}", mask_payload(payload_str, strategy));
+                    // Through `mask_bytes`: an undecoded schema record is
+                    // hidden whole, not scanned as free text.
+                    if let Some(payload) = msg.payload.as_deref() {
+                        println!("{}", mask_bytes(payload, strategy));
                     }
                 }
                 Ok(Err(e)) => {
