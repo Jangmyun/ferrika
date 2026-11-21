@@ -55,7 +55,14 @@ function Install-Ferrika {
             Remove-Item -Force $old -ErrorAction SilentlyContinue
             Move-Item -Force $exe $old
         }
-        Copy-Item (Join-Path $tmp 'x\ferrika.exe') $exe
+        try {
+            Copy-Item (Join-Path $tmp 'x\ferrika.exe') $exe
+        }
+        catch {
+            # Put the previous version back rather than leave none.
+            if (Test-Path "$exe.old") { Move-Item -Force "$exe.old" $exe }
+            throw
+        }
         Remove-Item -Force "$exe.old" -ErrorAction SilentlyContinue
     }
     finally {
@@ -66,14 +73,39 @@ function Install-Ferrika {
     & $exe --version
 
     if ($env:FERRIKA_NO_MODIFY_PATH -eq '1') { return }
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $parts = @()
-    if ($userPath) { $parts = $userPath -split ';' | Where-Object { $_ } }
-    if ($parts -notcontains $dir) {
-        [Environment]::SetEnvironmentVariable('Path', (($parts + $dir) -join ';'), 'User')
+    if (Add-UserPath $dir) {
         $env:Path = "$env:Path;$dir"
         Write-Host "ferrika-install: added $dir to your user PATH; open a new terminal to use 'ferrika'"
     }
+}
+
+# Appends $dir to the user PATH unless it is there already; $true when it
+# was added. The value is read and written as stored (REG_EXPAND_SZ):
+# [Environment]::SetEnvironmentVariable would write back the expanded text
+# as REG_SZ, turning entries such as %USERPROFILE%\AppData\Local\Microsoft\
+# WindowsApps into fixed paths. $subKey is for tests.
+function Add-UserPath([string]$dir, [string]$subKey = 'Environment') {
+    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($subKey)
+    try {
+        $raw = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $parts = @($raw -split ';' | Where-Object { $_ })
+        $want = $dir.TrimEnd('\')
+        foreach ($part in $parts) {
+            if ([Environment]::ExpandEnvironmentVariables($part).TrimEnd('\') -eq $want) { return $false }
+        }
+        $key.SetValue('Path', (($parts + $dir) -join ';'), [Microsoft.Win32.RegistryValueKind]::ExpandString)
+    }
+    finally {
+        $key.Close()
+    }
+    if ($subKey -eq 'Environment') {
+        # A registry write does not tell Explorer the environment changed;
+        # setting a user variable through .NET does (WM_SETTINGCHANGE), so
+        # set and remove a throwaway one. New terminals then see the PATH.
+        [Environment]::SetEnvironmentVariable('FERRIKA_INSTALL_PATH_CHANGED', '1', 'User')
+        [Environment]::SetEnvironmentVariable('FERRIKA_INSTALL_PATH_CHANGED', $null, 'User')
+    }
+    return $true
 }
 
 Install-Ferrika
