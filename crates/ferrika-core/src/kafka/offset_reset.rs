@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::admin::KafkaAdminClient;
 use crate::kafka::config::KafkaClientConfig;
-use crate::kafka::consumer::KafkaConsumerClient;
+use crate::kafka::consumer::{KafkaConsumerClient, Lookup};
 
 /// Supported strategy for resetting consumer group offsets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +108,7 @@ pub async fn prepare_offset_reset(
     let by_time = match strategy {
         ResetStrategy::Timestamp(ts) => {
             let keys: Vec<(&str, i32)> = partitions_to_check.iter().map(|&p| (topic, p)).collect();
-            Some(consumer.offsets_for_timestamp(&keys, *ts, None)?)
+            Some(consumer.offsets_at_time(&keys, *ts, None)?)
         }
         _ => None,
     };
@@ -135,10 +135,12 @@ pub async fn prepare_offset_reset(
             }
         };
         let strategy = match &by_time {
-            Some(offsets) => match offsets.get(&(topic.to_string(), p)) {
-                Some(Offset::Offset(o)) => ResetStrategy::Specific(*o),
-                // No record at or after the timestamp.
-                _ => ResetStrategy::Specific(high),
+            Some(lookups) => match time_target(lookups.get(&(topic.to_string(), p)), high) {
+                Ok(offset) => ResetStrategy::Specific(offset),
+                Err(why) => {
+                    failures.push((p, why));
+                    continue;
+                }
             },
             None => strategy.clone(),
         };
@@ -269,9 +271,38 @@ pub fn commit_offset_reset(
     Ok(())
 }
 
+/// The target of a timestamp reset on one partition: the first offset at or
+/// after the time, or the end when there is none. A lookup that failed (a
+/// moving leader, a timeout) or did not answer is an error, not the end: it
+/// would otherwise skip the partition's unread records for good.
+fn time_target(lookup: Option<&Lookup>, high: i64) -> Result<i64, String> {
+    match lookup {
+        Some(Lookup::At(offset)) => Ok(*offset),
+        Some(Lookup::End) => Ok(high),
+        Some(Lookup::Failed(failure)) => Err(format!(
+            "cannot find the offset at the time: {}",
+            failure.message
+        )),
+        None => Err("no answer for the offset at the time".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_time_lookup_refuses_instead_of_moving_to_the_end() {
+        assert_eq!(time_target(Some(&Lookup::At(42)), 100), Ok(42));
+        assert_eq!(time_target(Some(&Lookup::End), 100), Ok(100));
+        assert!(time_target(None, 100).is_err());
+        let failed = Lookup::Failed(crate::kafka::consumer::LookupFailure::new(
+            "NotLeaderForPartition",
+            crate::error::ErrorClass::Retriable,
+        ));
+        let why = time_target(Some(&failed), 100).unwrap_err();
+        assert!(why.contains("NotLeaderForPartition"), "{why}");
+    }
 
     #[test]
     fn test_check_group_idle() {
