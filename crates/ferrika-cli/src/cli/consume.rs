@@ -276,9 +276,14 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                 let at_end = starts.iter().any(|&(sp, start)| {
                     sp == p
                         && match start {
-                            Offset::Stored => committed
-                                .get(&(args.topic.clone(), p))
-                                .is_some_and(|&c| c >= high),
+                            Offset::Stored => match committed.get(&(args.topic.clone(), p)) {
+                                Some(&c) => c >= high,
+                                // No commit: the reset policy picks the start.
+                                None => match kafka_config.auto_offset_reset {
+                                    crate::kafka::config::AutoOffsetReset::Latest => true,
+                                    _ => low >= high,
+                                },
+                            },
                             start => starts_at_end(start, low, high),
                         }
                 });
