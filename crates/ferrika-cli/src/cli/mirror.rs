@@ -1,5 +1,4 @@
 use std::io::Write;
-use std::time::Duration;
 
 use clap::Args;
 use colored::Colorize;
@@ -116,7 +115,7 @@ fn cluster_config(
         config.bootstrap_servers = g_bs.clone();
     }
 
-    config.request_timeout = Duration::from_secs(global.timeout);
+    config.request_timeout = global.request_timeout();
     config
 }
 
@@ -661,7 +660,7 @@ mod tests {
             profile: None,
             bootstrap_servers: None,
             format: OutputFormat::Table,
-            timeout: 30,
+            timeout: Some(30),
             resolved: None,
             write: None,
         }
