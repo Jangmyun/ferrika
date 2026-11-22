@@ -12,6 +12,11 @@ use ferrika_core::kafka::filter::MessageFilter;
 use ferrika_core::kafka::producer::{
     DeliveryOutcome, KafkaProducerClient, OwnedProducerRecord, TaggedDeliveryPipeline,
 };
+use ferrika_core::model::policy::PolicyAction;
+use ferrika_governance::audit::AuditEntry;
+use ferrika_governance::policy::{
+    self, AuditMode, AuditSink, EffectivePolicy, ExportChannel, ExportRequest, WriteRequest,
+};
 
 /// Unacknowledged records allowed in flight while mirroring. librdkafka
 /// sends a batch after `linger.ms` (5 ms), so a window of N records caps the
@@ -691,6 +696,195 @@ fn within_end(ends: &mut HashMap<i32, i64>, partition: i32, offset: i64) -> bool
     offset < end
 }
 
+/// One side of a record copy, as the front end resolved it.
+#[derive(Debug, Clone, Copy)]
+pub struct CopyCluster<'a> {
+    /// The profile name the policy's read-only rules and the audit log name
+    /// the cluster by; empty when there is none (entries then name its
+    /// bootstrap servers).
+    pub profile: &'a str,
+    /// The resolved connection: its bootstrap servers and whether the
+    /// profile is marked read-only.
+    pub config: &'a KafkaClientConfig,
+}
+
+impl CopyCluster<'_> {
+    /// The profile name, else the bootstrap servers.
+    fn audit_name(&self) -> &str {
+        if self.profile.is_empty() {
+            &self.config.bootstrap_servers
+        } else {
+            self.profile
+        }
+    }
+}
+
+/// A record copy to authorise (`mirror`, a transform that writes): the
+/// plain inputs [`authorize_copy`] checks, so every front end applies the
+/// same rules as the CLI.
+#[derive(Debug, Clone, Copy)]
+pub struct CopyCheck<'a> {
+    /// Who asks, for the audit log: `cli`, `gui`, `mcp`.
+    pub source: &'a str,
+    /// The copy as the audit log names it, e.g. `mirror`.
+    pub label: &'a str,
+    pub src_topic: &'a str,
+    pub dst_topic: &'a str,
+    pub src: CopyCluster<'a>,
+    pub dst: CopyCluster<'a>,
+    /// The destination was named by its bootstrap servers rather than a
+    /// profile: the export entry then names it by them.
+    pub dst_named_by_brokers: bool,
+    /// Whether to run the write gate for the destination here. `false` when
+    /// the destination is the cluster the caller's own write gate already
+    /// checked and recorded (the CLI without cluster options).
+    pub check_destination: bool,
+    /// Whether every record is PII-masked before anything else reads it,
+    /// so enforced masking does not refuse the copy.
+    pub masks_first: bool,
+    /// Appended to the enforced-masking refusal: how to make the copy
+    /// acceptable (may be empty).
+    pub masking_hint: &'a str,
+    /// Appended to the read-only destination refusal: how to turn read-only
+    /// off (may be empty).
+    pub read_only_hint: &'a str,
+    /// How the write gate satisfies auditing.
+    pub audit_mode: AuditMode,
+}
+
+/// What [`authorize_copy`] allowed and recorded.
+#[derive(Debug, Clone, Default)]
+pub struct CopyAuthorized {
+    /// The name the destination's write request entry used (its profile, or
+    /// its brokers without one), when one was recorded: pair a result entry
+    /// with it after the copy.
+    pub write_requested: Option<String>,
+    /// The copy goes to another cluster, so it passed the export gate.
+    pub cross_cluster: bool,
+    /// The export's result entry to complete with the record count (outcome
+    /// `records: N`) after the copy; `None` unless exports are audited.
+    pub export_result: Option<AuditEntry>,
+}
+
+/// The policy checks for copying records from one cluster to another, in
+/// order:
+///
+/// 1. Enforced PII masking refuses the copy unless it masks first.
+/// 2. A destination whose brokers are not all among the source's is another
+///    cluster: the export gate decides it for the source's brokers
+///    (`destination_within_source`; `export: forbidden` refuses, `audited`
+///    records it).
+/// 3. With [`CopyCheck::check_destination`], the write gate for the
+///    destination as a `produce`: a read-only rule, `forbid: produce` or a
+///    read-only destination profile refuses it.
+///
+/// Refusals are recorded as `policy.blocked` in `sink`. `fetch` lists the
+/// brokers a cluster reports, for `read_only_brokers` and `export_clusters`
+/// (a tunnel or an IP address must not dodge them); it is called only when
+/// the policy has such rules.
+pub fn authorize_copy(
+    policy: &EffectivePolicy,
+    sink: &impl AuditSink,
+    check: &CopyCheck<'_>,
+    fetch: impl Fn(&KafkaClientConfig) -> Result<Vec<String>, String>,
+) -> Result<CopyAuthorized, String> {
+    let label = check.label;
+    let target = format!("{} -> {}", check.src_topic, check.dst_topic);
+    let blocked = |named: &str, reason: &str, target: &str| {
+        let entry =
+            policy::blocked_entry(check.source, named, &format!("{label} {target}"), reason);
+        if let Err(e) = sink.record(&entry) {
+            tracing::warn!(%e, "Could not write the audit log");
+        }
+    };
+    if policy.masking_enforced() && !check.masks_first {
+        let reason = format!(
+            "Refused by {}: PII masking is enforced, and `{label}` would copy unmasked records to another cluster.{}",
+            policy.label(),
+            check.masking_hint
+        );
+        blocked(check.src.audit_name(), &reason, &target);
+        return Err(reason);
+    }
+
+    let mut authorized = CopyAuthorized::default();
+    let src = check.src.config;
+    let dst = check.dst.config;
+    if !policy::destination_within_source(&src.bootstrap_servers, &dst.bootstrap_servers) {
+        let destination = if check.dst.profile.is_empty() || check.dst_named_by_brokers {
+            dst.bootstrap_servers.as_str()
+        } else {
+            check.dst.profile
+        };
+        let export_target = format!("{target} (to {destination})");
+        let src_brokers = match policy::export_brokers_with(policy, src, &fetch) {
+            Ok(brokers) => brokers,
+            Err(reason) => {
+                blocked(check.src.audit_name(), &reason, &export_target);
+                return Err(reason);
+            }
+        };
+        let request = ExportRequest {
+            source: check.source,
+            channel: ExportChannel::Cluster,
+            label,
+            target: &export_target,
+            records: None,
+            profile: check.src.profile,
+            bootstrap: &src_brokers,
+            actor: None,
+        };
+        policy::authorize_export_with(policy, sink, &request)
+            .map_err(|refusal| refusal.to_string())?;
+        authorized.cross_cluster = true;
+        authorized.export_result = policy::export_result_entry(policy, &request, 0);
+    }
+
+    if !check.check_destination {
+        return Ok(authorized);
+    }
+    let profile = check.dst.profile;
+    let brokers = match policy::brokers_for_with(dst, policy.write_needs_broker_metadata(), &fetch)
+    {
+        Ok(brokers) => brokers,
+        Err(reason) => {
+            blocked(check.dst.audit_name(), &reason, &target);
+            return Err(reason);
+        }
+    };
+    let request = WriteRequest {
+        source: check.source,
+        action: PolicyAction::Produce,
+        label,
+        target: &target,
+        profile,
+        bootstrap: &brokers,
+        actor: None,
+        op: None,
+    };
+    policy::authorize_write_with(policy, sink, &request, check.audit_mode, || {
+        if !dst.read_only {
+            return Ok(());
+        }
+        let name = if profile.is_empty() {
+            "the destination profile"
+        } else {
+            profile
+        };
+        Err(format!(
+            "Destination profile '{name}' is read-only, so `{label}` is refused.{}",
+            check.read_only_hint
+        ))
+    })
+    .map_err(|refusal| refusal.to_string())?;
+    authorized.write_requested = Some(if profile.is_empty() {
+        brokers
+    } else {
+        profile.to_string()
+    });
+    Ok(authorized)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,5 +1111,159 @@ mod tests {
             .with_until_end(true);
         assert_eq!(config.from_timestamp, Some(1_700_000_000_000));
         assert!(config.until_end);
+    }
+
+    /// Collects audit entries.
+    #[derive(Default)]
+    struct FakeLog {
+        entries: std::cell::RefCell<Vec<AuditEntry>>,
+    }
+
+    impl AuditSink for FakeLog {
+        fn record(&self, entry: &AuditEntry) -> std::io::Result<()> {
+            self.entries.borrow_mut().push(entry.clone());
+            Ok(())
+        }
+
+        fn probe(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn copy_check<'a>(src: CopyCluster<'a>, dst: CopyCluster<'a>) -> CopyCheck<'a> {
+        CopyCheck {
+            source: "gui",
+            label: "Copying records",
+            src_topic: "orders",
+            dst_topic: "orders-copy",
+            src,
+            dst,
+            dst_named_by_brokers: false,
+            check_destination: true,
+            masks_first: false,
+            masking_hint: " Mask first.",
+            read_only_hint: "",
+            audit_mode: AuditMode::RecordRequest,
+        }
+    }
+
+    fn no_brokers(_: &KafkaClientConfig) -> Result<Vec<String>, String> {
+        Err("no cluster in this test".to_string())
+    }
+
+    #[test]
+    fn a_copy_within_a_writable_cluster_is_requested() {
+        let dev = KafkaClientConfig::new("localhost:9092");
+        let side = CopyCluster {
+            profile: "dev",
+            config: &dev,
+        };
+        let log = FakeLog::default();
+        let none = ferrika_governance::test_policy::none();
+        let authorized = authorize_copy(&none, &log, &copy_check(side, side), no_brokers).unwrap();
+        assert_eq!(authorized.write_requested.as_deref(), Some("dev"));
+        assert!(!authorized.cross_cluster);
+        let entries = log.entries.borrow();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, "Copying records");
+        assert_eq!(entries[0].source, "gui");
+
+        // Without the destination check, nothing is recorded.
+        let log = FakeLog::default();
+        let check = CopyCheck {
+            check_destination: false,
+            ..copy_check(side, side)
+        };
+        let authorized = authorize_copy(&none, &log, &check, no_brokers).unwrap();
+        assert_eq!(authorized.write_requested, None);
+        assert!(log.entries.borrow().is_empty());
+    }
+
+    #[test]
+    fn enforced_masking_refuses_unless_the_copy_masks_first() {
+        let dev = KafkaClientConfig::new("localhost:9092");
+        let side = CopyCluster {
+            profile: "",
+            config: &dev,
+        };
+        let policy = ferrika_governance::test_policy::masking();
+        let log = FakeLog::default();
+        let reason =
+            authorize_copy(&policy, &log, &copy_check(side, side), no_brokers).unwrap_err();
+        assert!(reason.contains("PII masking is enforced"), "{reason}");
+        assert!(reason.ends_with(" Mask first."), "{reason}");
+        let entries = log.entries.borrow();
+        assert_eq!(entries[0].action, "policy.blocked");
+        // Without a profile the entry names the brokers.
+        assert_eq!(entries[0].profile, "localhost:9092");
+
+        let check = CopyCheck {
+            masks_first: true,
+            ..copy_check(side, side)
+        };
+        assert!(authorize_copy(&policy, &FakeLog::default(), &check, no_brokers).is_ok());
+    }
+
+    #[test]
+    fn another_cluster_passes_the_export_gate() {
+        let src = KafkaClientConfig::new("kafka.prod:9092");
+        let dst = KafkaClientConfig::new("kafka.dev:9092");
+        let check = copy_check(
+            CopyCluster {
+                profile: "prod",
+                config: &src,
+            },
+            CopyCluster {
+                profile: "dev",
+                config: &dst,
+            },
+        );
+        let forbidden = ferrika_governance::test_policy::export_forbidden();
+        let log = FakeLog::default();
+        assert!(authorize_copy(&forbidden, &log, &check, no_brokers).is_err());
+        assert_eq!(log.entries.borrow()[0].action, "policy.blocked");
+
+        let audited = ferrika_governance::test_policy::export_audited();
+        let log = FakeLog::default();
+        let authorized = authorize_copy(&audited, &log, &check, no_brokers).unwrap();
+        assert!(authorized.cross_cluster);
+        let result = authorized.export_result.unwrap();
+        assert_eq!(result.action, "record.export");
+        assert!(result.target.ends_with("(to dev)"), "{}", result.target);
+        // Named by brokers, the destination shows them.
+        let by_brokers = CopyCheck {
+            dst_named_by_brokers: true,
+            ..check
+        };
+        let authorized =
+            authorize_copy(&audited, &FakeLog::default(), &by_brokers, no_brokers).unwrap();
+        let target = authorized.export_result.unwrap().target;
+        assert!(target.ends_with("(to kafka.dev:9092)"), "{target}");
+    }
+
+    #[test]
+    fn a_read_only_destination_profile_is_refused() {
+        let src = KafkaClientConfig::new("localhost:9092");
+        let mut dst = KafkaClientConfig::new("localhost:9092");
+        dst.read_only = true;
+        let check = CopyCheck {
+            read_only_hint: " Turn it off first.",
+            ..copy_check(
+                CopyCluster {
+                    profile: "dev",
+                    config: &src,
+                },
+                CopyCluster {
+                    profile: "locked",
+                    config: &dst,
+                },
+            )
+        };
+        let none = ferrika_governance::test_policy::none();
+        let reason = authorize_copy(&none, &FakeLog::default(), &check, no_brokers).unwrap_err();
+        assert_eq!(
+            reason,
+            "Destination profile 'locked' is read-only, so `Copying records` is refused. Turn it off first."
+        );
     }
 }

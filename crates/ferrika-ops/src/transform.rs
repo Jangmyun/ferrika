@@ -12,12 +12,16 @@
 //! ([`ferrika_core::model::expr`]): `$.user.country == "KR"`,
 //! `$.amount > 100`, `key =~ "^order-"`, `headers.source == "web"`.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use ferrika_core::codec::pii::{mask_bytes, mask_header_value, mask_json_value, MaskStrategy};
+use ferrika_core::error::KafkaError;
 use ferrika_core::kafka::consumer::ConsumedMessage;
 use ferrika_core::kafka::producer::OwnedProducerRecord;
+use ferrika_core::kafka::schema::PayloadDecoder;
+
+use crate::mirror::{MirrorStats, RecordTransform};
 use ferrika_core::model::expr::{expression_text, Expr, RecordView};
 
 /// The most steps one pipeline may hold.
@@ -533,6 +537,233 @@ fn parse_body(payload: Option<&[u8]>) -> Body {
     }
 }
 
+/// How a transform run reads and where it starts, as plain data: what
+/// [`check_options`] judges before connecting. Front ends fill it from
+/// their own inputs (command-line flags, a form).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunOptions {
+    /// Start at the earliest offset.
+    pub from_beginning: bool,
+    /// Start each partition at its first record at or after this epoch ms.
+    pub from_timestamp: Option<i64>,
+    /// Stop at the end each partition had when the run started.
+    pub until_end: bool,
+    /// A consumer group is given (a writing run resumes from its offsets).
+    pub group: bool,
+    /// The run writes (not a dry run). A dry run ignores the group.
+    pub execute: bool,
+    /// Records per second.
+    pub rate_limit: Option<f64>,
+}
+
+/// An option combination [`check_options`] refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionsProblem {
+    /// Stopping at the end needs a start before it: from the current end
+    /// there is nothing to read.
+    UntilEndWithoutStart,
+    /// The rate limit is zero, negative or not a number.
+    RateLimitNotPositive,
+}
+
+impl std::fmt::Display for OptionsProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UntilEndWithoutStart => {
+                "Stopping at the end needs a start: the beginning, a timestamp, or a consumer \
+                 group on a writing run (from the current end there is nothing to read)"
+            }
+            Self::RateLimitNotPositive => "The rate limit must be greater than 0",
+        })
+    }
+}
+
+impl std::error::Error for OptionsProblem {}
+
+/// Option combinations that cannot work, found before connecting. Check the
+/// steps with [`Pipeline::parse`].
+///
+/// ```
+/// use ferrika_ops::transform::{check_options, OptionsProblem, RunOptions};
+///
+/// let until_end = RunOptions { until_end: true, ..RunOptions::default() };
+/// assert_eq!(check_options(&until_end), Err(OptionsProblem::UntilEndWithoutStart));
+/// let from_start = RunOptions { from_beginning: true, ..until_end };
+/// assert_eq!(check_options(&from_start), Ok(()));
+/// ```
+pub fn check_options(options: &RunOptions) -> Result<(), OptionsProblem> {
+    if options.until_end && !options.from_beginning && options.from_timestamp.is_none() {
+        let resumes = options.execute && options.group;
+        if !resumes {
+            return Err(OptionsProblem::UntilEndWithoutStart);
+        }
+    }
+    if options
+        .rate_limit
+        .is_some_and(|r| !r.is_finite() || r <= 0.0)
+    {
+        return Err(OptionsProblem::RateLimitNotPositive);
+    }
+    Ok(())
+}
+
+/// The copy pipeline's per-record hook for a transform: decode the value
+/// (Schema Registry wire format, when a decoder is given) to JSON, then
+/// apply the [`Pipeline`]. Pass it to [`crate::mirror::run_copy_pipeline`];
+/// read [`Self::counters`] afterwards for the [`TransformSummary`].
+pub struct DecodingTransform {
+    pipeline: Pipeline,
+    dst_topic: String,
+    decoder: Option<PayloadDecoder>,
+    counters: TransformCounters,
+}
+
+impl std::fmt::Debug for DecodingTransform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodingTransform")
+            .field("pipeline", &self.pipeline)
+            .field("dst_topic", &self.dst_topic)
+            .field("decodes", &self.decoder.is_some())
+            .field("counters", &self.counters)
+            .finish()
+    }
+}
+
+impl DecodingTransform {
+    /// Applies `pipeline` and writes to `dst_topic`; values are not decoded.
+    pub fn new(pipeline: Pipeline, dst_topic: impl Into<String>) -> Self {
+        Self {
+            pipeline,
+            dst_topic: dst_topic.into(),
+            decoder: None,
+            counters: TransformCounters::default(),
+        }
+    }
+
+    /// Decodes values with `decoder` first; decoded values are written as
+    /// JSON. A value that does not decode goes on as it was read.
+    pub fn with_decoder(mut self, decoder: Option<PayloadDecoder>) -> Self {
+        self.decoder = decoder;
+        self
+    }
+
+    pub fn pipeline(&self) -> &Pipeline {
+        &self.pipeline
+    }
+
+    /// What the steps did so far.
+    pub fn counters(&self) -> &TransformCounters {
+        &self.counters
+    }
+}
+
+impl RecordTransform for DecodingTransform {
+    async fn apply(&mut self, msg: &ConsumedMessage) -> Option<OwnedProducerRecord> {
+        let decoded = match (&mut self.decoder, msg.payload.as_deref()) {
+            // A value that did not decode (no wire format, unknown
+            // schema) is not JSON text and goes on as it was read.
+            (Some(decoder), Some(payload)) => decoder
+                .decode(payload)
+                .await
+                .and_then(|d| serde_json::from_str::<Value>(&d.text).ok()),
+            _ => None,
+        };
+        self.pipeline
+            .apply(msg, decoded, &self.dst_topic, &mut self.counters)
+    }
+}
+
+/// The numbers a transform run reports, on screen and (without record data)
+/// in the audit log; serializable for JSON output and audit detail.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TransformSummary {
+    pub src_topic: String,
+    pub dst_topic: String,
+    pub dry_run: bool,
+    /// Records read from the source.
+    pub read: u64,
+    /// Records the steps kept.
+    pub kept: u64,
+    /// Records written (or, in a dry run, previewed).
+    pub written: u64,
+    /// Records a filter step dropped.
+    pub filtered: u64,
+    /// Records the sample step left out.
+    pub sampled_out: u64,
+    /// Values that were not JSON objects, passed through field steps.
+    pub not_json: u64,
+    /// Records whose rekey field was missing (key kept).
+    pub rekey_missing: u64,
+    /// Records the destination did not acknowledge.
+    pub failed: u64,
+    pub stopped_on_failures: bool,
+    pub elapsed_secs: f64,
+    /// SHA-256 of the steps as given ([`Pipeline::digest`]).
+    pub steps_sha256: String,
+}
+
+impl TransformSummary {
+    /// The summary of a run from `src_topic` to `dst_topic` that ended with
+    /// `stats` and `counters`; `digest` is [`Pipeline::digest`].
+    pub fn new(
+        src_topic: &str,
+        dst_topic: &str,
+        dry_run: bool,
+        stats: &MirrorStats,
+        counters: &TransformCounters,
+        digest: String,
+    ) -> Self {
+        Self {
+            src_topic: src_topic.to_string(),
+            dst_topic: dst_topic.to_string(),
+            dry_run,
+            read: stats.read_count,
+            kept: stats.read_count.saturating_sub(stats.filtered_count),
+            written: stats.mirrored_count,
+            filtered: counters.filtered,
+            sampled_out: counters.sampled_out,
+            not_json: counters.not_json,
+            rekey_missing: counters.rekey_missing,
+            failed: stats.failed_count,
+            stopped_on_failures: stats.stopped_on_failures,
+            elapsed_secs: stats.elapsed_secs,
+            steps_sha256: digest,
+        }
+    }
+
+    /// The audit log's account of the run: counts and the steps' digest,
+    /// never the steps themselves (a filter or a set step can quote a value).
+    pub fn audit_detail(&self) -> String {
+        format!(
+            "read {}, written {}, filtered {}, sampled out {}, not JSON {}, failed {}; steps sha256:{}",
+            self.read,
+            self.written,
+            self.filtered,
+            self.sampled_out,
+            self.not_json,
+            self.failed,
+            self.steps_sha256
+        )
+    }
+
+    /// The error to report when a write failed.
+    pub fn failure(&self) -> Option<KafkaError> {
+        if self.failed == 0 {
+            return None;
+        }
+        let stopped = if self.stopped_on_failures {
+            "; stopped early after reaching the failure limit"
+        } else {
+            ""
+        };
+        Some(KafkaError::Check(format!(
+            "{} of {} transformed records failed delivery{stopped}",
+            self.failed,
+            self.failed + self.written
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -856,5 +1087,124 @@ mod tests {
             names,
             ["filter", "drop", "rename", "set", "rekey", "mask", "sample"]
         );
+    }
+
+    #[test]
+    fn options_need_a_start_before_the_end() {
+        let base = RunOptions {
+            until_end: true,
+            ..RunOptions::default()
+        };
+        assert_eq!(
+            check_options(&base),
+            Err(OptionsProblem::UntilEndWithoutStart)
+        );
+        for ok in [
+            RunOptions {
+                from_beginning: true,
+                ..base.clone()
+            },
+            RunOptions {
+                from_timestamp: Some(5),
+                ..base.clone()
+            },
+            RunOptions {
+                group: true,
+                execute: true,
+                ..base.clone()
+            },
+        ] {
+            assert_eq!(check_options(&ok), Ok(()), "{ok:?}");
+        }
+        // A dry run ignores the group, so it starts at the end.
+        let dry = RunOptions {
+            group: true,
+            ..base
+        };
+        assert!(check_options(&dry).is_err());
+        let rate = |r: f64| RunOptions {
+            rate_limit: Some(r),
+            ..RunOptions::default()
+        };
+        assert_eq!(
+            check_options(&rate(0.0)),
+            Err(OptionsProblem::RateLimitNotPositive)
+        );
+        assert!(check_options(&rate(f64::NAN)).is_err());
+        assert_eq!(check_options(&rate(50.0)), Ok(()));
+    }
+
+    fn stats(read: u64, filtered: u64, written: u64, failed: u64) -> MirrorStats {
+        let mut stats = MirrorStats::new();
+        stats.read_count = read;
+        stats.filtered_count = filtered;
+        stats.mirrored_count = written;
+        stats.failed_count = failed;
+        stats
+    }
+
+    #[test]
+    fn summary_counts_and_audit_detail_hold_no_record_data() {
+        let counters = TransformCounters {
+            filtered: 6,
+            sampled_out: 1,
+            not_json: 2,
+            rekey_missing: 0,
+        };
+        let summary = TransformSummary::new(
+            "orders",
+            "orders-copy",
+            false,
+            &stats(10, 7, 3, 0),
+            &counters,
+            "ab12".into(),
+        );
+        assert_eq!(summary.kept, 3);
+        assert!(!summary.dry_run);
+        assert_eq!(
+            summary.audit_detail(),
+            "read 10, written 3, filtered 6, sampled out 1, not JSON 2, failed 0; steps sha256:ab12"
+        );
+        assert!(summary.failure().is_none());
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["steps_sha256"], "ab12");
+        let back: TransformSummary = serde_json::from_value(json).unwrap();
+        assert_eq!(back, summary);
+
+        let failed = TransformSummary::new(
+            "a",
+            "b",
+            false,
+            &stats(5, 0, 3, 2),
+            &counters,
+            String::new(),
+        );
+        let err = failed.failure().unwrap().to_string();
+        assert!(err.contains("2 of 5 transformed records failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_decoding_transform_applies_the_steps_without_a_decoder() {
+        let steps = pipeline(&[
+            (StepKind::Drop, "email"),
+            (StepKind::Filter, "$.amount > 1"),
+        ]);
+        let mut transform = DecodingTransform::new(steps, "dst").with_decoder(None);
+        let kept = transform
+            .apply(&json_msg(
+                0,
+                &json!({"amount": 5, "email": "kim@example.com"}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(kept.topic, "dst");
+        let value: Value = serde_json::from_slice(kept.payload.as_deref().unwrap()).unwrap();
+        assert_eq!(value, json!({"amount": 5}));
+        assert!(transform
+            .apply(&json_msg(1, &json!({"amount": 0})))
+            .await
+            .is_none());
+        assert_eq!(transform.counters().filtered, 1);
+        assert_eq!(transform.pipeline().steps().len(), 2);
     }
 }

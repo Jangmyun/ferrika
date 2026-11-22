@@ -434,8 +434,9 @@ Topology writes are undoable and fit the existing model:
    derived one), so a `read_only`, `read_only_brokers` or `export_clusters`
    rule naming either applies to every `rabbit` command on that connection.
 7. **A redrive needs `produce` as well as `messages.move`**, because it
-   republishes. `cli/app.rs` (`also_requires`) checks the extra category
-   before the write gate; under `forbid: ["produce"]` a `dlq redrive
+   republishes. `PolicyAction::also_requires` lists the extra category and
+   `ferrika_governance::policy::extra_category_refusal` checks it (the CLI
+   in `cli/app.rs`, before the write gate); under `forbid: ["produce"]` a `dlq redrive
    --execute` is refused (recorded as `policy.blocked`) with a message that
    names `produce`.
 8. **Redriven messages keep their headers**, `x-death` included, plus

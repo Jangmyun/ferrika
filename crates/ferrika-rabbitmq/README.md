@@ -16,9 +16,14 @@ change in any release until it leaves preview.
   to their original exchange over AMQP 0-9-1 with
   [lapin](https://crates.io/crates/lapin): one message at a time, published
   with publisher confirms and acknowledged only after the confirm
+- `connection`: a profile with the user's overrides applied, and from it
+  the login, the management client and the AMQP target
+- `view`: messages as a front end shows them (PII-masked on request), the
+  dead-letter inspection grouped by `x-death` origin, the redrive preview
+  and the redrive's audit text
 
-The crate talks to the broker only. Ferrika's company policy, audit log and
-PII masking are applied by the caller (the `ferrika` command line).
+Ferrika's company policy and audit log are applied by the caller (the
+`ferrika` command line or another front end) through `ferrika-governance`.
 
 ## Stability
 

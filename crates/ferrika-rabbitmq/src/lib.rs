@@ -12,10 +12,16 @@
 //!   the OS credential store.
 //! - [`amqp`] (feature `amqp`, default): moving dead-lettered messages back
 //!   to their exchange with manual acks and publisher confirms.
+//! - [`connection`]: a profile with the user's overrides applied, and from
+//!   it the login, the management client and the AMQP target.
+//! - [`view`]: messages as a front end shows them, PII-masked on request;
+//!   the dead-letter inspection, the redrive preview and the redrive's
+//!   audit text.
 //!
-//! This crate only talks to the broker. The company policy, the audit log
-//! and PII masking are applied by the caller (the `ferrika rabbit` command),
-//! through the same gates as the Kafka commands; see
+//! The company policy and the audit log are applied by the caller (the
+//! `ferrika rabbit` command, or another front end), through the same gates
+//! as the Kafka commands (`ferrika_governance::policy`, including
+//! `extra_category_refusal` for a redrive); see
 //! `docs/plans/multi-broker.md`.
 //!
 //! # Example
@@ -36,6 +42,8 @@
 #[cfg(feature = "amqp")]
 pub mod amqp;
 pub mod client;
+pub mod connection;
 pub mod error;
 pub mod model;
 pub mod profile;
+pub mod view;

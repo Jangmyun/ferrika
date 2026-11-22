@@ -359,15 +359,9 @@ fn stopped(report: RedriveReport, failure: RedriveFailure, detail: String) -> Re
     }
 }
 
-/// `exchange 'X', routing key 'K'`, as reports and the audit log name a
-/// destination.
-pub fn destination_label(destination: &RedriveDestination) -> String {
-    format!(
-        "exchange '{}', routing key '{}'",
-        destination.exchange_name(),
-        destination.routing_key
-    )
-}
+/// `exchange 'X', routing key 'K'` (moved to [`crate::model`]; re-exported
+/// here).
+pub use crate::model::destination_label;
 
 /// The lapin side of [`Mover`]: one channel in confirm mode.
 struct LapinMover {
