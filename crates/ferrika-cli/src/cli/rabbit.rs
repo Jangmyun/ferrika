@@ -11,23 +11,21 @@
 //! The gates match the management API's `host:port` and the RabbitMQ
 //! profile, never a Kafka profile.
 
-use std::collections::BTreeMap;
 use std::time::Duration;
 
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use comfy_table::Cell;
-use serde::Serialize;
-use serde_json::{Map, Value};
 
 use crate::cli::{output, GlobalOpts, OutputFormat};
-use crate::codec::pii::{mask_bytes, mask_header_value, MaskStrategy};
-use crate::rabbitmq::amqp::{AmqpTarget, RedriveRequest};
-use crate::rabbitmq::client::ManagementClient;
-use crate::rabbitmq::model::{
-    DeathRecord, OutgoingMessage, PeekedMessage, RedriveDestination, DEFAULT_EXCHANGE, MAX_PEEK,
+use crate::rabbitmq::amqp::RedriveRequest;
+pub use crate::rabbitmq::connection::ResolvedRabbit;
+use crate::rabbitmq::connection::{CredentialsError, RabbitOverrides, ResolveError};
+use crate::rabbitmq::model::{exchange_name, OutgoingMessage, MAX_PEEK};
+use crate::rabbitmq::profile::RabbitProfileStore;
+use crate::rabbitmq::view::{
+    parse_headers, redrive_outcome, Inspection, RedrivePreview, ShownMessage,
 };
-use crate::rabbitmq::profile::{RabbitProfile, RabbitProfileStore};
 
 /// Environment variable with the RabbitMQ password.
 pub const PASSWORD_ENV: &str = "FERRIKA_RABBIT_PASSWORD";
@@ -135,11 +133,6 @@ impl std::fmt::Debug for RabbitConnection {
 }
 
 impl RabbitConnection {
-    /// The `--rabbit-url` given, if any (blank counts as none).
-    fn given_url(&self) -> Option<&str> {
-        self.url.as_deref().map(str::trim).filter(|u| !u.is_empty())
-    }
-
     /// The password given by option, environment or stdin (read once).
     fn given_password(&self) -> Result<Option<String>, String> {
         if self.password_stdin {
@@ -148,142 +141,37 @@ impl RabbitConnection {
             Ok(self.password.clone())
         }
     }
-}
 
-/// The connection a command uses: options over the RabbitMQ profile.
-#[derive(Clone, PartialEq, Eq)]
-pub struct ResolvedRabbit {
-    /// The RabbitMQ profile used, if any: what `read_only` globs match.
-    pub profile: Option<String>,
-    /// The profile is marked read-only.
-    pub read_only: bool,
-    pub management_url: String,
-    pub vhost: String,
-    pub user: Option<String>,
-    /// The profile's password (from the OS credential store); a password
-    /// given by option or environment wins.
-    profile_password: Option<String>,
-    pub amqp_url: Option<String>,
-}
-
-// Manual so the password never reaches debug output.
-impl std::fmt::Debug for ResolvedRabbit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedRabbit")
-            .field("profile", &self.profile)
-            .field("read_only", &self.read_only)
-            .field(
-                "management_url",
-                &crate::model::format::redact_url(&self.management_url),
-            )
-            .field("vhost", &self.vhost)
-            .field("user", &self.user)
-            .field(
-                "profile_password",
-                &self.profile_password.as_ref().map(|_| "<redacted>"),
-            )
-            .field("amqp_url", &self.amqp_url)
-            .finish()
-    }
-}
-
-impl ResolvedRabbit {
-    /// `host:port` of the management API (no credentials), which the
-    /// policy's broker-address rules and the audit log see.
-    pub fn address(&self) -> Result<String, String> {
-        ManagementClient::new(&self.management_url)
-            .map(|client| client.address())
-            .map_err(|e| e.to_string())
-    }
-
-    /// The AMQP URL: `--amqp-url`, the profile's, or the management host
-    /// on the AMQP port.
-    fn amqp_url(&self) -> Result<String, String> {
-        match &self.amqp_url {
-            Some(url) => Ok(url.clone()),
-            None => crate::rabbitmq::profile::derive_amqp_url(&self.management_url)
-                .map_err(|e| e.to_string()),
+    /// The options as `ResolvedRabbit::resolve` takes them.
+    fn overrides(&self) -> RabbitOverrides<'_> {
+        RabbitOverrides {
+            profile: self.profile.as_deref(),
+            url: self.url.as_deref(),
+            vhost: self.vhost.as_deref(),
+            user: self.user.as_deref(),
+            amqp_url: self.amqp_url.as_deref(),
         }
     }
+}
 
-    /// The addresses the policy's broker-address rules match, as a
-    /// comma-separated list: the management API's `host:port` and the AMQP
-    /// listener's, so a rule naming either covers every command on this
-    /// connection.
-    pub fn gate_addresses(&self) -> Result<String, String> {
-        let management = self.address()?;
-        let amqp = crate::rabbitmq::profile::amqp_host_port(&self.amqp_url()?)
-            .map_err(|e| e.to_string())?;
-        Ok(if amqp == management {
-            management
-        } else {
-            format!("{management},{amqp}")
-        })
-    }
-
-    /// Whether the management URL carries a user or password.
-    fn url_has_credentials(&self) -> bool {
-        crate::rabbitmq::profile::url_credentials(&self.management_url).is_some()
-    }
-
-    /// The user and password to log in with, or `None` for credentials in
-    /// the URL (or none). Reads stdin for `--rabbit-password-stdin`, so
-    /// call it once.
-    fn credentials(
-        &self,
-        connection: &RabbitConnection,
-    ) -> Result<Option<(String, String)>, String> {
-        let password = connection
-            .given_password()?
-            .or_else(|| self.profile_password.clone());
-        match (&self.user, password) {
-            (Some(user), Some(password)) => Ok(Some((user.clone(), password))),
-            (Some(_), None) => Err(format!(
+/// The user and password to log in with for `resolved`
+/// (`ResolvedRabbit::credentials`), with the password the options give.
+/// Reads stdin for `--rabbit-password-stdin`, so call it once.
+fn credentials(
+    resolved: &ResolvedRabbit,
+    connection: &RabbitConnection,
+) -> Result<Option<(String, String)>, String> {
+    resolved
+        .credentials(connection.given_password()?)
+        .map_err(|e| match e {
+            CredentialsError::MissingPassword => format!(
                 "The RabbitMQ user needs a password: set {PASSWORD_ENV}, pass \
                  --rabbit-password-stdin or store one in the profile"
-            )),
-            (None, Some(_)) => {
-                Err("A RabbitMQ password was given without --rabbit-user".to_string())
+            ),
+            CredentialsError::PasswordWithoutUser => {
+                "A RabbitMQ password was given without --rabbit-user".to_string()
             }
-            // Credentials in the URL, or none.
-            (None, None) => Ok(None),
-        }
-    }
-
-    /// The management API client.
-    fn client(
-        &self,
-        credentials: Option<&(String, String)>,
-        timeout: Duration,
-    ) -> Result<ManagementClient, String> {
-        let client = ManagementClient::new(&self.management_url)
-            .map_err(|e| e.to_string())?
-            .with_timeout(timeout);
-        Ok(match credentials {
-            Some((user, password)) => client.with_credentials(user, password),
-            None => client,
         })
-    }
-
-    /// Where to connect over AMQP (see [`Self::amqp_url`]), logged in as
-    /// `credentials`, else as the user and password in the management URL
-    /// (the same RabbitMQ user serves both).
-    fn amqp_target(
-        &self,
-        credentials: Option<&(String, String)>,
-        timeout: Duration,
-    ) -> Result<AmqpTarget, String> {
-        let login = credentials
-            .cloned()
-            .or_else(|| crate::rabbitmq::profile::url_credentials(&self.management_url));
-        Ok(AmqpTarget {
-            url: self.amqp_url()?,
-            vhost: self.vhost.clone(),
-            user: login.as_ref().map(|(user, _)| user.clone()),
-            password: login.map(|(_, password)| password),
-            timeout,
-        })
-    }
 }
 
 /// Fills in `args.resolved` for the commands that talk to a broker (not
@@ -312,70 +200,22 @@ fn needs_connection(command: &RabbitSubcommands) -> bool {
     }
 }
 
-/// The connection for `connection`: the profile it names, else the active
-/// profile unless `--rabbit-url` is given (a URL without
-/// `--rabbit-profile` means no profile: a profile's password is never sent
-/// to a broker the user named by hand); each option overrides the
-/// profile's value. `load_store` runs only when a profile can apply.
+/// The connection for `connection` (`ResolvedRabbit::resolve`): the
+/// profile it names, else the active profile unless `--rabbit-url` is
+/// given; each option overrides the profile's value. `load_store` runs only
+/// when a profile can apply.
 fn resolve_with(
     connection: &RabbitConnection,
     load_store: impl FnOnce() -> Result<RabbitProfileStore, String>,
 ) -> Result<ResolvedRabbit, String> {
-    let profile_name = connection
-        .profile
-        .as_deref()
-        .map(str::trim)
-        .filter(|p| !p.is_empty());
-    let wants_profile = profile_name.is_some() || connection.given_url().is_none();
-    let chosen: Option<(String, RabbitProfile)> = if wants_profile {
-        let store = load_store()?;
-        match profile_name {
-            Some(name) => Some((
-                name.to_string(),
-                store.get(name).map_err(|e| e.to_string())?.clone(),
-            )),
-            None => store.active().map(|(n, p)| (n.to_string(), p.clone())),
-        }
-    } else {
-        None
-    };
-    let profile = chosen.as_ref().map(|(_, p)| p);
-    let management_url = connection
-        .given_url()
-        .map(str::to_string)
-        .or_else(|| profile.map(|p| p.management_url.clone()))
-        .ok_or_else(|| {
+    ResolvedRabbit::resolve(&connection.overrides(), load_store).map_err(|e| match e {
+        ResolveError::NoConnection => {
             "No RabbitMQ connection: pass --rabbit-url http://host:15672 (or set \
              FERRIKA_RABBIT_URL), or add a profile with `ferrika rabbit profile add NAME \
              --rabbit-url URL`"
                 .to_string()
-        })?;
-    let user = connection
-        .user
-        .clone()
-        .or_else(|| profile.and_then(|p| p.user.clone()));
-    // The stored password belongs to the profile's user only.
-    let profile_password = profile
-        .filter(|p| connection.user.is_none() || connection.user == p.user)
-        .and_then(|p| p.password.clone());
-    Ok(ResolvedRabbit {
-        profile: chosen.as_ref().map(|(name, _)| name.clone()),
-        read_only: profile.is_some_and(|p| p.read_only),
-        management_url,
-        vhost: connection
-            .vhost
-            .clone()
-            .or_else(|| profile.map(|p| p.vhost.clone()))
-            .unwrap_or_else(|| "/".to_string()),
-        user,
-        profile_password,
-        amqp_url: connection
-            .amqp_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-            .map(str::to_string)
-            .or_else(|| profile.and_then(|p| p.amqp_url.clone())),
+        }
+        ResolveError::Profile(reason) => reason,
     })
 }
 
@@ -625,15 +465,6 @@ pub fn export(args: &RabbitArgs) -> Option<(&'static str, String)> {
     }
 }
 
-/// The exchange as given, with the default exchange named `amq.default`.
-fn exchange_name(exchange: &str) -> &str {
-    if exchange.is_empty() {
-        DEFAULT_EXCHANGE
-    } else {
-        exchange
-    }
-}
-
 pub async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result<()> {
     let json = global.format == OutputFormat::Json;
     if let RabbitSubcommands::Profile(profile) = &args.command {
@@ -650,9 +481,7 @@ pub async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result<()> {
     if resolved.url_has_credentials() {
         eprintln!("{}", URL_CREDENTIALS_WARNING.yellow());
     }
-    let credentials = resolved
-        .credentials(&args.connection)
-        .map_err(anyhow::Error::msg)?;
+    let credentials = credentials(resolved, &args.connection).map_err(anyhow::Error::msg)?;
     let client = resolved
         .client(credentials.as_ref(), timeout)
         .map_err(anyhow::Error::msg)?;
@@ -749,7 +578,7 @@ pub async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result<()> {
                         Cell::new(exchange_name(&m.exchange)),
                         Cell::new(&m.routing_key),
                         Cell::new(m.redelivered),
-                        Cell::new(m.payload_preview()),
+                        Cell::new(m.payload_preview(TABLE_PAYLOAD_CHARS)),
                     ]);
                 }
                 println!("{table}");
@@ -826,7 +655,8 @@ pub async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result<()> {
                     &messages,
                     to_exchange.as_deref(),
                     routing_key.as_deref(),
-                );
+                )
+                .with_unmovable_problem("no x-death header; pass --to-exchange");
                 output::emit(json, &preview, print_preview)?;
                 note_requeued(messages.len(), queue);
                 if !json {
@@ -913,29 +743,6 @@ fn note_requeued(count: usize, queue: &str) {
     }
 }
 
-/// The audit result of a redrive: counts, source and destinations, never
-/// message content or broker error text.
-fn redrive_outcome(
-    queue: &str,
-    report: &crate::rabbitmq::amqp::RedriveReport,
-    failure: Option<crate::rabbitmq::amqp::RedriveFailure>,
-) -> String {
-    let destinations = report
-        .destinations
-        .iter()
-        .map(|(destination, n)| format!("{n} to {destination}"))
-        .collect::<Vec<_>>()
-        .join("; ");
-    let mut outcome = format!("moved {} message(s) from queue {queue}", report.moved);
-    if !destinations.is_empty() {
-        outcome.push_str(&format!(" ({destinations})"));
-    }
-    if let Some(failure) = failure {
-        outcome.push_str(&format!(", then stopped: {failure}"));
-    }
-    outcome
-}
-
 fn print_redrive(
     json: bool,
     queue: &str,
@@ -974,186 +781,6 @@ fn print_redrive(
     Ok(())
 }
 
-/// `KEY:VALUE` headers, as `produce` takes them.
-fn parse_headers(headers: &[String]) -> Result<Vec<(String, String)>, String> {
-    headers
-        .iter()
-        .map(|h| {
-            h.split_once(':')
-                .map(|(k, v)| (k.trim().to_string(), v.to_string()))
-                .filter(|(k, _)| !k.is_empty())
-                .ok_or_else(|| format!("Invalid header '{h}': expected KEY:VALUE"))
-        })
-        .collect()
-}
-
-/// One peeked message as `peek` prints it: masked when `mask` is set, the
-/// payload as text when it is UTF-8 (else `payload_base64`, never under
-/// masking).
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct ShownMessage {
-    exchange: String,
-    routing_key: String,
-    redelivered: bool,
-    /// The whole payload's size in bytes.
-    size: u64,
-    /// Whether the broker returned only the start of the payload.
-    truncated: bool,
-    payload: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    payload_base64: Option<String>,
-    properties: Map<String, Value>,
-}
-
-impl ShownMessage {
-    fn new(message: &PeekedMessage, mask: bool) -> Self {
-        let body = message.body();
-        let (payload, payload_base64) = match &body {
-            Ok(bytes) if mask => (Some(mask_bytes(bytes, MaskStrategy::Partial)), None),
-            Ok(bytes) => match std::str::from_utf8(bytes) {
-                Ok(text) => (Some(text.to_string()), None),
-                Err(_) => (None, Some(crate::codec::base64::encode(bytes))),
-            },
-            Err(e) => (Some(format!("[{e}]")), None),
-        };
-        let properties = if mask {
-            mask_properties(&message.properties)
-        } else {
-            message.properties.clone()
-        };
-        Self {
-            exchange: message.exchange.clone(),
-            routing_key: message.routing_key.clone(),
-            redelivered: message.redelivered,
-            size: message.size,
-            truncated: message.is_truncated(),
-            payload,
-            payload_base64,
-            properties,
-        }
-    }
-
-    /// The payload as one table cell.
-    fn payload_preview(&self) -> String {
-        let payload = self
-            .payload
-            .clone()
-            .or_else(|| self.payload_base64.as_ref().map(|b| format!("base64:{b}")))
-            .unwrap_or_default();
-        crate::codec::pii::ellipsize(&payload, TABLE_PAYLOAD_CHARS)
-    }
-}
-
-/// AMQP properties with every text value masked by its name, the way
-/// record headers are (`mask_header_value`); headers one by one, by
-/// header name. Numbers and flags (`delivery_mode`, `priority`) stay.
-fn mask_properties(properties: &Map<String, Value>) -> Map<String, Value> {
-    let mask_value = |name: &str, value: &Value| -> Value {
-        match value {
-            Value::String(text) => Value::String(mask_header_value(
-                name,
-                text.as_bytes(),
-                MaskStrategy::Partial,
-            )),
-            Value::Number(_) | Value::Bool(_) | Value::Null => value.clone(),
-            // Lists and tables (`x-death`) are masked as JSON text.
-            other => Value::String(mask_header_value(
-                name,
-                other.to_string().as_bytes(),
-                MaskStrategy::Partial,
-            )),
-        }
-    };
-    properties
-        .iter()
-        .map(|(name, value)| {
-            let shown = match (name.as_str(), value) {
-                ("headers", Value::Object(headers)) => Value::Object(
-                    headers
-                        .iter()
-                        .map(|(k, v)| (k.clone(), mask_value(k, v)))
-                        .collect(),
-                ),
-                _ => mask_value(name, value),
-            };
-            (name.clone(), shown)
-        })
-        .collect()
-}
-
-/// `rabbit dlq inspect`: the messages with their `x-death` history, and
-/// how many came from each queue for each reason.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct Inspection {
-    groups: Vec<DeathGroup>,
-    messages: Vec<InspectedMessage>,
-}
-
-/// Messages that died in the same queue for the same reason, published to
-/// the same exchange with the same routing key (from the newest `x-death`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct DeathGroup {
-    queue: String,
-    reason: String,
-    exchange: String,
-    routing_key: String,
-    messages: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct InspectedMessage {
-    /// The `x-death` entries, newest first (queue, reason, count, exchange
-    /// and routing keys: names, not content).
-    deaths: Vec<DeathRecord>,
-    #[serde(flatten)]
-    message: ShownMessage,
-}
-
-impl Inspection {
-    fn new(messages: &[PeekedMessage], mask: bool) -> Self {
-        let messages: Vec<InspectedMessage> = messages
-            .iter()
-            .map(|m| InspectedMessage {
-                deaths: DeathRecord::from_headers(&m.headers()),
-                message: ShownMessage::new(m, mask),
-            })
-            .collect();
-        let mut groups: BTreeMap<(String, String, String, String), u64> = BTreeMap::new();
-        for message in &messages {
-            let key = match message.deaths.first() {
-                Some(d) => (
-                    d.queue.clone(),
-                    d.reason.clone(),
-                    exchange_name(&d.exchange).to_string(),
-                    d.routing_key().to_string(),
-                ),
-                None => (
-                    String::new(),
-                    "no x-death".to_string(),
-                    String::new(),
-                    String::new(),
-                ),
-            };
-            *groups.entry(key).or_default() += 1;
-        }
-        Self {
-            groups: groups
-                .into_iter()
-                .map(
-                    |((queue, reason, exchange, routing_key), messages)| DeathGroup {
-                        queue,
-                        reason,
-                        exchange,
-                        routing_key,
-                        messages,
-                    },
-                )
-                .collect(),
-            messages,
-        }
-    }
-}
-
 fn print_inspection(inspection: &Inspection) {
     let mut groups = output::table(vec![
         "FROM QUEUE",
@@ -1180,82 +807,10 @@ fn print_inspection(inspection: &Inspection) {
             Cell::new(newest.map(|d| d.queue.as_str()).unwrap_or_default()),
             Cell::new(newest.map(|d| d.reason.as_str()).unwrap_or("no x-death")),
             Cell::new(newest.map(|d| d.count).unwrap_or_default()),
-            Cell::new(m.message.payload_preview()),
+            Cell::new(m.message.payload_preview(TABLE_PAYLOAD_CHARS)),
         ]);
     }
     println!("{messages}");
-}
-
-/// What `rabbit dlq redrive` without `--execute` shows: where each read
-/// message would go. No message bodies.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct RedrivePreview {
-    dry_run: bool,
-    queue: String,
-    vhost: String,
-    messages: Vec<PlannedMove>,
-    /// Messages per destination.
-    destinations: BTreeMap<String, u64>,
-    /// Messages that could not be moved (no x-death and no --to-exchange).
-    unmovable: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct PlannedMove {
-    from_queue: String,
-    reason: String,
-    deaths: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    destination: Option<RedriveDestination>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    problem: Option<String>,
-}
-
-impl RedrivePreview {
-    fn new(
-        queue: &str,
-        vhost: &str,
-        messages: &[PeekedMessage],
-        to_exchange: Option<&str>,
-        routing_key: Option<&str>,
-    ) -> Self {
-        let mut destinations = BTreeMap::new();
-        let mut unmovable = 0;
-        let planned = messages
-            .iter()
-            .map(|m| {
-                let deaths = DeathRecord::from_headers(&m.headers());
-                let newest = deaths.first();
-                let destination = RedriveDestination::resolve(newest, to_exchange, routing_key);
-                match &destination {
-                    Ok(d) => {
-                        *destinations
-                            .entry(crate::rabbitmq::amqp::destination_label(d))
-                            .or_default() += 1;
-                    }
-                    Err(_) => unmovable += 1,
-                }
-                PlannedMove {
-                    from_queue: newest.map(|d| d.queue.clone()).unwrap_or_default(),
-                    reason: newest.map(|d| d.reason.clone()).unwrap_or_default(),
-                    deaths: newest.map(|d| d.count).unwrap_or_default(),
-                    problem: destination
-                        .as_ref()
-                        .err()
-                        .map(|_| "no x-death header; pass --to-exchange".to_string()),
-                    destination: destination.ok(),
-                }
-            })
-            .collect();
-        Self {
-            dry_run: true,
-            queue: queue.to_string(),
-            vhost: vhost.to_string(),
-            messages: planned,
-            destinations,
-            unmovable,
-        }
-    }
 }
 
 fn print_preview(preview: &RedrivePreview) {
@@ -1301,6 +856,7 @@ fn print_preview(preview: &RedrivePreview) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rabbitmq::profile::RabbitProfile;
     use clap::Parser;
 
     #[derive(Parser)]
@@ -1313,10 +869,6 @@ mod tests {
         Wrapper::try_parse_from(std::iter::once("rabbit").chain(args.iter().copied()))
             .unwrap_or_else(|e| panic!("{args:?} should parse: {e}"))
             .args
-    }
-
-    fn peeked(json: &str) -> PeekedMessage {
-        serde_json::from_str(json).unwrap()
     }
 
     /// A connection with only what the test sets (no environment).
@@ -1469,7 +1021,7 @@ mod tests {
         assert_eq!(resolved.user.as_deref(), Some("ops"));
         assert_eq!(resolved.address().unwrap(), "rabbit.prod.corp:443");
         assert_eq!(
-            resolved.credentials(&connection()).unwrap(),
+            credentials(&resolved, &connection()).unwrap(),
             Some(("ops".to_string(), "stored-pw".to_string()))
         );
     }
@@ -1493,7 +1045,7 @@ mod tests {
             ..conn.clone()
         };
         let resolved = resolve_with(&other_user, || Ok(store())).unwrap();
-        assert!(resolved.credentials(&connection()).is_err());
+        assert!(credentials(&resolved, &connection()).is_err());
 
         let unknown = RabbitConnection {
             profile: Some("nope".to_string()),
@@ -1513,7 +1065,7 @@ mod tests {
         assert!(!resolved.read_only);
         assert_eq!(resolved.vhost, "/");
         assert_eq!(resolved.address().unwrap(), "rabbit.dev:15672");
-        assert_eq!(resolved.credentials(&connection()).unwrap(), None);
+        assert_eq!(credentials(&resolved, &connection()).unwrap(), None);
         // The URL's user and password log in over AMQP too, and a warning
         // (which names neither) is due.
         assert!(resolved.url_has_credentials());
@@ -1605,17 +1157,17 @@ mod tests {
         )
         .unwrap();
         resolved.user = Some("ops".to_string());
-        let err = resolved.credentials(&connection()).unwrap_err();
+        let err = credentials(&resolved, &connection()).unwrap_err();
         assert!(err.contains(PASSWORD_ENV), "{err}");
         resolved.user = None;
         let with_password = RabbitConnection {
             password: Some("pw".to_string()),
             ..connection()
         };
-        assert!(resolved.credentials(&with_password).is_err());
+        assert!(credentials(&resolved, &with_password).is_err());
         resolved.user = Some("ops".to_string());
         assert_eq!(
-            resolved.credentials(&with_password).unwrap(),
+            credentials(&resolved, &with_password).unwrap(),
             Some(("ops".to_string(), "pw".to_string()))
         );
     }
@@ -1659,149 +1211,5 @@ mod tests {
         .unwrap();
         let debug = format!("{resolved:?}");
         assert!(!debug.contains("stored-pw"), "{debug}");
-    }
-
-    #[test]
-    fn headers_are_key_colon_value() {
-        assert_eq!(
-            parse_headers(&["a:1".to_string(), "trace: x:y".to_string()]).unwrap(),
-            vec![
-                ("a".to_string(), "1".to_string()),
-                ("trace".to_string(), " x:y".to_string())
-            ]
-        );
-        assert!(parse_headers(&["novalue".to_string()]).is_err());
-        assert!(parse_headers(&[":v".to_string()]).is_err());
-    }
-
-    #[test]
-    fn peeked_messages_are_masked_only_when_asked() {
-        let message = peeked(
-            r#"{"exchange":"users","routing_key":"u.1","redelivered":false,"payload_bytes":61,
-                "payload":"{\"email\":\"kim@example.com\",\"password\":\"hunter2hunter2\"}",
-                "payload_encoding":"string",
-                "properties":{"delivery_mode":2,"user_id":"kim@example.com",
-                  "headers":{"authorization":"Bearer abc.def.ghi","x-retries":3,
-                    "x-death":[{"queue":"users","reason":"rejected","count":1}]}}}"#,
-        );
-        let plain = ShownMessage::new(&message, false);
-        assert!(plain
-            .payload
-            .as_deref()
-            .unwrap()
-            .contains("kim@example.com"));
-        assert_eq!(plain.properties, message.properties);
-
-        let masked = ShownMessage::new(&message, true);
-        let text = serde_json::to_string(&masked).unwrap();
-        assert!(!text.contains("kim@example.com"), "{text}");
-        assert!(!text.contains("hunter2hunter2"), "{text}");
-        assert!(!text.contains("abc.def.ghi"), "{text}");
-        assert_eq!(masked.properties["delivery_mode"], 2);
-        assert_eq!(masked.properties["headers"]["x-retries"], 3);
-        // Tables such as x-death stay readable, as masked JSON text.
-        let death = masked.properties["headers"]["x-death"].as_str().unwrap();
-        assert!(death.contains("rejected"), "{death}");
-    }
-
-    #[test]
-    fn binary_payloads_are_base64_unless_masked() {
-        let message = peeked(
-            r#"{"payload_bytes":3,"payload":"AP8B","payload_encoding":"base64","properties":[]}"#,
-        );
-        let plain = ShownMessage::new(&message, false);
-        assert_eq!(plain.payload, None);
-        assert_eq!(plain.payload_base64.as_deref(), Some("AP8B"));
-        let masked = ShownMessage::new(&message, true);
-        assert_eq!(masked.payload_base64, None);
-        assert!(masked.payload.as_deref().unwrap().contains("hidden"));
-    }
-
-    fn dead_lettered(exchange: &str, key: &str, body: &str) -> PeekedMessage {
-        peeked(&format!(
-            r#"{{"payload":{body:?},"payload_encoding":"string","properties":{{"headers":{{
-                "x-death":[{{"count":2,"reason":"rejected","queue":"orders",
-                  "exchange":"{exchange}","routing-keys":["{key}"]}}]}}}}}}"#
-        ))
-    }
-
-    #[test]
-    fn inspect_groups_by_origin_and_masks_bodies() {
-        let messages = vec![
-            dead_lettered("shop", "order.created", r#"{"email":"kim@example.com"}"#),
-            dead_lettered("shop", "order.created", "x"),
-            dead_lettered("", "orders", "y"),
-            peeked(r#"{"payload":"z","payload_encoding":"string","properties":{}}"#),
-        ];
-        let inspection = Inspection::new(&messages, true);
-        assert_eq!(inspection.messages.len(), 4);
-        assert_eq!(inspection.groups.len(), 3);
-        let shop = inspection
-            .groups
-            .iter()
-            .find(|g| g.exchange == "shop")
-            .unwrap();
-        assert_eq!(
-            (shop.queue.as_str(), shop.reason.as_str(), shop.messages),
-            ("orders", "rejected", 2)
-        );
-        assert!(inspection
-            .groups
-            .iter()
-            .any(|g| g.exchange == DEFAULT_EXCHANGE));
-        assert!(inspection.groups.iter().any(|g| g.reason == "no x-death"));
-        let text = serde_json::to_string(&inspection).unwrap();
-        assert!(!text.contains("kim@example.com"), "{text}");
-        assert_eq!(inspection.messages[0].deaths[0].count, 2);
-    }
-
-    #[test]
-    fn the_redrive_preview_shows_destinations_not_bodies() {
-        let messages = vec![
-            dead_lettered("shop", "order.created", "secret-body"),
-            dead_lettered("shop", "order.created", "x"),
-            peeked(r#"{"payload":"z","payload_encoding":"string","properties":{}}"#),
-        ];
-        let preview = RedrivePreview::new("orders.dlq", "/", &messages, None, None);
-        assert!(preview.dry_run);
-        assert_eq!(
-            preview.destinations["exchange 'shop', routing key 'order.created'"],
-            2
-        );
-        assert_eq!(preview.unmovable, 1);
-        assert!(preview.messages[2].problem.is_some());
-        let text = serde_json::to_string(&preview).unwrap();
-        assert!(!text.contains("secret-body"), "{text}");
-
-        let overridden =
-            RedrivePreview::new("orders.dlq", "/", &messages, Some("retry"), Some("again"));
-        assert_eq!(overridden.unmovable, 0);
-        assert_eq!(
-            overridden.destinations["exchange 'retry', routing key 'again'"],
-            3
-        );
-    }
-
-    #[test]
-    fn the_redrive_audit_outcome_has_counts_and_destinations_only() {
-        use crate::rabbitmq::amqp::{RedriveFailure, RedriveReport};
-        let report = RedriveReport {
-            moved: 3,
-            destinations: BTreeMap::from([(
-                "exchange 'shop', routing key 'order.created'".to_string(),
-                3,
-            )]),
-        };
-        assert_eq!(
-            redrive_outcome("orders.dlq", &report, None),
-            "moved 3 message(s) from queue orders.dlq (3 to exchange 'shop', routing key \
-             'order.created')"
-        );
-        let stopped = redrive_outcome(
-            "orders.dlq",
-            &RedriveReport::default(),
-            Some(RedriveFailure::Unroutable),
-        );
-        assert!(stopped.starts_with("moved 0 message(s) from queue orders.dlq, then stopped"));
     }
 }

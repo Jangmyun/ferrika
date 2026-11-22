@@ -277,7 +277,14 @@ pub fn remember_export_with(
     policy: &crate::governance::policy::EffectivePolicy,
     request: &crate::governance::policy::ExportRequest<'_>,
 ) {
-    let entry = crate::governance::policy::export_result_entry(policy, request, 0);
+    remember_export_entry(crate::governance::policy::export_result_entry(
+        policy, request, 0,
+    ));
+}
+
+/// Remembers the result entry of an export that passed the gate (`None`
+/// when it is not audited), for [`export_finished`].
+pub fn remember_export_entry(entry: Option<crate::governance::audit::AuditEntry>) {
     if let Ok(mut slot) = AUDITED_EXPORT.lock() {
         *slot = entry;
     }

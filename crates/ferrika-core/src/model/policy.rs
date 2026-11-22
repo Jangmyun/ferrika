@@ -650,6 +650,33 @@ impl PolicyAction {
         Self::ALL.into_iter().find(|a| a.id() == id)
     }
 
+    /// Policy categories a change of this category also needs allowed: a
+    /// RabbitMQ redrive moves messages (`messages.move`) by publishing them
+    /// again, so `forbid: ["produce"]` refuses it too. Every front end that
+    /// authorises a change checks these besides the change's own category
+    /// (see `ferrika_governance::policy::extra_category_refusal`).
+    pub fn also_requires(self) -> &'static [PolicyAction] {
+        // No wildcard arm: a new category must decide what it also needs.
+        match self {
+            Self::MessagesMove => &[Self::Produce],
+            Self::TopicsCreate
+            | Self::TopicsDelete
+            | Self::TopicsPurge
+            | Self::TopicsAlter
+            | Self::ConfigChange
+            | Self::Produce
+            | Self::OffsetsReset
+            | Self::OffsetsCommit
+            | Self::GroupsDelete
+            | Self::AclChange
+            | Self::UsersChange
+            | Self::QuotaChange
+            | Self::SchemaChange
+            | Self::ConnectChange
+            | Self::MessagesPeek => &[],
+        }
+    }
+
     /// The category of a CLI write action (as named by `main.rs`).
     pub fn from_cli(action: &str) -> Self {
         let head = action.split_whitespace().next().unwrap_or_default();
@@ -689,6 +716,18 @@ impl PolicyAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_move_needs_another_category() {
+        for action in PolicyAction::ALL {
+            let extra = action.also_requires();
+            if action == PolicyAction::MessagesMove {
+                assert_eq!(extra, &[PolicyAction::Produce]);
+            } else {
+                assert!(extra.is_empty(), "{action:?}");
+            }
+        }
+    }
 
     #[test]
     fn action_ids_round_trip() {

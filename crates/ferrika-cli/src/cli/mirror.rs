@@ -7,14 +7,13 @@ use serde_json::json;
 
 use crate::cli::{output, print_connection_hint, GlobalOpts, OutputFormat};
 use crate::error::{KafkaError, KafkaResult};
-use crate::governance::policy::{
-    self, AuditMode, AuditSink, EffectivePolicy, ExportChannel, ExportRequest, WriteRequest,
-};
+use crate::governance::policy::{AuditMode, AuditSink, EffectivePolicy};
 use crate::kafka::config::KafkaClientConfig;
 use crate::kafka::filter::MessageFilter;
 use crate::kafka::profile::ProfileStore;
-use crate::model::policy::PolicyAction;
-use crate::ops::mirror::{run_mirror_pipeline, MirrorConfig};
+use crate::ops::mirror::{
+    authorize_copy, run_mirror_pipeline, CopyCheck, CopyCluster, MirrorConfig,
+};
 
 /// Command line arguments for topic mirroring and replication.
 #[derive(Args, Debug, Clone, PartialEq)]
@@ -243,15 +242,16 @@ fn authorize_with(
     .map(|_| ())
 }
 
-/// Refuses `mirror` under enforced PII masking (it would copy unmasked
-/// records to another cluster), then the export gate when the destination is
-/// another cluster (see [`authorize_cross_cluster`]), then the write gate for the destination
-/// cluster as a `produce`: a read-only target or `forbid: produce` refuses it
-/// with a `policy.blocked` entry, and so does a read-only destination profile.
+/// The policy checks for a copy (`ops::mirror::authorize_copy`): enforced
+/// PII masking, the export gate when the destination is another cluster,
+/// then (when `args` name the clusters) the write gate for the destination
+/// cluster as a `produce`. This resolves the profiles and connections the
+/// options name; an unknown profile is refused rather than falling back to
+/// localhost.
 ///
-/// `fetch` lists the brokers a cluster reports, for `read_only_brokers`:
-/// a tunnel or an IP address of the destination must not dodge it (the gate
-/// in `main` does the same for the global cluster).
+/// `fetch` lists the brokers a cluster reports, for `read_only_brokers` and
+/// `export_clusters`: a tunnel or an IP address of the destination must not
+/// dodge them (the gate in `main` does the same for the global cluster).
 fn authorize_checking_brokers(
     policy: &EffectivePolicy,
     sink: &impl AuditSink,
@@ -260,7 +260,6 @@ fn authorize_checking_brokers(
     global: &GlobalOpts,
     fetch: impl Fn(&KafkaClientConfig) -> Result<Vec<String>, String>,
 ) -> Result<Option<String>, String> {
-    let label = args.label();
     // An unknown profile would silently fall back to localhost.
     for name in [args.src_profile(), args.dst_profile()]
         .into_iter()
@@ -272,141 +271,46 @@ fn authorize_checking_brokers(
             ));
         }
     }
-    let target = format!("{} -> {}", args.src_topic(), args.dst_topic());
-    if policy.masking_enforced() && !args.masks_first() {
-        let reason = format!(
-            "Refused by {}: PII masking is enforced, and `{label}` would copy unmasked records to another cluster.{}",
-            policy.label(),
-            args.masking_hint()
-        );
-        let src_profile = args.src_profile();
-        let mut profile = cluster_profile_name(store, src_profile, global);
-        if profile.is_empty() {
-            profile = cluster_config(store, src_profile, args.src_bootstrap_servers(), global)
-                .bootstrap_servers;
-        }
-        let attempted = format!("{label} {target}");
-        let entry = policy::blocked_entry("cli", &profile, &attempted, &reason);
-        if let Err(e) = sink.record(&entry) {
-            tracing::warn!(%e, "Could not write the audit log");
-        }
-        return Err(reason);
-    }
-    authorize_cross_cluster(policy, sink, store, args, global, &target, &fetch)?;
-
-    // Without any cluster option the destination is the cluster the gate in
-    // `main` already checked and recorded.
-    if !names_clusters(args) {
-        return Ok(None);
-    }
-    let dst_name = args.dst_profile().or(args.src_profile());
-    let profile = cluster_profile_name(store, dst_name, global);
-    let config = cluster_config(store, dst_name, args.dst_bootstrap_servers(), global);
-    let brokers =
-        match policy::brokers_for_with(&config, policy.write_needs_broker_metadata(), &fetch) {
-            Ok(brokers) => brokers,
-            Err(reason) => {
-                let named = if profile.is_empty() {
-                    config.bootstrap_servers.as_str()
-                } else {
-                    profile.as_str()
-                };
-                let entry =
-                    policy::blocked_entry("cli", named, &format!("{label} {target}"), &reason);
-                if let Err(e) = sink.record(&entry) {
-                    tracing::warn!(%e, "Could not write the audit log");
-                }
-                return Err(reason);
-            }
-        };
-    let request = WriteRequest {
-        source: "cli",
-        action: PolicyAction::Produce,
-        label,
-        target: &target,
-        profile: &profile,
-        bootstrap: &brokers,
-        actor: None,
-        op: None,
-    };
-    policy::authorize_write_with(policy, sink, &request, AuditMode::RecordRequest, || {
-        if !config.read_only {
-            return Ok(());
-        }
-        let name = if profile.is_empty() {
-            "the destination profile"
-        } else {
-            profile.as_str()
-        };
-        Err(format!(
-            "Destination profile '{name}' is read-only, so `{label}` is refused. \
-             Turn it off with `ferrika profile read-only {name} --off`."
-        ))
-    })
-    .map_err(|refusal| refusal.to_string())?;
-    // The profile the request entry names (its brokers without a name), for
-    // the result entry to pair with.
-    Ok(Some(if profile.is_empty() { brokers } else { profile }))
-}
-
-/// Copying records to another cluster takes them out of the source cluster:
-/// the export gate decides it (`export: forbidden` refuses, `audited`
-/// records it), for the source cluster's brokers. Destinations whose brokers are all
-/// among the source's are the same cluster, where `mirror` is
-/// only a `produce`.
-fn authorize_cross_cluster(
-    policy: &EffectivePolicy,
-    sink: &impl AuditSink,
-    store: &ProfileStore,
-    args: &impl CopyRoute,
-    global: &GlobalOpts,
-    target: &str,
-    fetch: &impl Fn(&KafkaClientConfig) -> Result<Vec<String>, String>,
-) -> Result<(), String> {
-    let label = args.label();
     let src_name = args.src_profile();
     let dst_name = args.dst_profile().or(src_name);
+    let src_profile = cluster_profile_name(store, src_name, global);
+    let dst_profile = cluster_profile_name(store, dst_name, global);
     let src = cluster_config(store, src_name, args.src_bootstrap_servers(), global);
     let dst = cluster_config(store, dst_name, args.dst_bootstrap_servers(), global);
-    if policy::destination_within_source(&src.bootstrap_servers, &dst.bootstrap_servers) {
-        return Ok(());
-    }
-    let mut destination = cluster_profile_name(store, dst_name, global);
-    if destination.is_empty() || args.dst_bootstrap_servers().is_some() {
-        destination = dst.bootstrap_servers.clone();
-    }
-    let target = format!("{target} (to {destination})");
-    let profile = cluster_profile_name(store, src_name, global);
-    // `export_clusters` matches the brokers the source reports too, as the
-    // export gate in `main` does: a tunnel or an IP must not dodge it.
-    let src_brokers = match policy::export_brokers_with(policy, &src, fetch) {
-        Ok(brokers) => brokers,
-        Err(reason) => {
-            let named = if profile.is_empty() {
-                src.bootstrap_servers.as_str()
-            } else {
-                profile.as_str()
-            };
-            let entry = policy::blocked_entry("cli", named, &format!("{label} {target}"), &reason);
-            if let Err(e) = sink.record(&entry) {
-                tracing::warn!(%e, "Could not write the audit log");
-            }
-            return Err(reason);
-        }
+    let read_only_name = if dst_profile.is_empty() {
+        "the destination profile"
+    } else {
+        dst_profile.as_str()
     };
-    let request = ExportRequest {
+    let read_only_hint =
+        format!(" Turn it off with `ferrika profile read-only {read_only_name} --off`.");
+    let check = CopyCheck {
         source: "cli",
-        channel: ExportChannel::Cluster,
-        label,
-        target: &target,
-        records: None,
-        profile: &profile,
-        bootstrap: &src_brokers,
-        actor: None,
+        label: args.label(),
+        src_topic: args.src_topic(),
+        dst_topic: args.dst_topic(),
+        src: CopyCluster {
+            profile: &src_profile,
+            config: &src,
+        },
+        dst: CopyCluster {
+            profile: &dst_profile,
+            config: &dst,
+        },
+        dst_named_by_brokers: args.dst_bootstrap_servers().is_some(),
+        // Without any cluster option the destination is the cluster the
+        // gate in `main` already checked and recorded.
+        check_destination: names_clusters(args),
+        masks_first: args.masks_first(),
+        masking_hint: args.masking_hint(),
+        read_only_hint: &read_only_hint,
+        audit_mode: AuditMode::RecordRequest,
     };
-    policy::authorize_export_with(policy, sink, &request).map_err(|refusal| refusal.to_string())?;
-    crate::cli::remember_export_with(policy, &request);
-    Ok(())
+    let authorized = authorize_copy(policy, sink, &check, fetch)?;
+    if authorized.cross_cluster {
+        crate::cli::remember_export_entry(authorized.export_result);
+    }
+    Ok(authorized.write_requested)
 }
 
 /// Main entry point for `ferrika mirror`.

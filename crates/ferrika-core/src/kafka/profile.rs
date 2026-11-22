@@ -290,6 +290,99 @@ pub fn url_with_basic_auth(url: &str, user: &str, secret: &str) -> Option<String
     ))
 }
 
+/// Whether `url` carries `user@` or `user:password@` before its host. A URL
+/// without `scheme://` is read as starting at its authority.
+///
+/// ```
+/// use ferrika_core::kafka::profile::url_has_credentials;
+/// assert!(url_has_credentials("https://KEY:SECRET@psrc.example.com"));
+/// assert!(!url_has_credentials("https://psrc.example.com/a@b"));
+/// ```
+pub fn url_has_credentials(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    rest[..authority_end].contains('@')
+}
+
+/// The user and password in a URL's user info (`scheme://user:pass@host`),
+/// percent-decoded; the password is empty when only a user is given.
+/// `None` without user info. The inverse of [`url_with_basic_auth`].
+///
+/// ```
+/// use ferrika_core::kafka::profile::url_credentials;
+/// assert_eq!(
+///     url_credentials("https://KEY:a%2Fb%40c@host"),
+///     Some(("KEY".to_string(), "a/b@c".to_string()))
+/// );
+/// assert_eq!(url_credentials("https://host"), None);
+/// ```
+pub fn url_credentials(url: &str) -> Option<(String, String)> {
+    let (_, rest) = url.trim().split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (userinfo, _) = rest[..end].rsplit_once('@')?;
+    let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
+    Some((percent_decode(user), percent_decode(password)))
+}
+
+/// Splits `url` into the URL without its user info and the user and
+/// password it carried (percent-decoded, see [`url_credentials`]), for a
+/// form that shows the address and the credentials in separate fields.
+/// [`url_with_basic_auth`] puts them back together.
+///
+/// ```
+/// use ferrika_core::kafka::profile::split_url_credentials;
+/// let (url, login) = split_url_credentials("https://KEY:S%40CRET@host:8081/x");
+/// assert_eq!(url, "https://host:8081/x");
+/// assert_eq!(login, Some(("KEY".to_string(), "S@CRET".to_string())));
+/// ```
+pub fn split_url_credentials(url: &str) -> (String, Option<(String, String)>) {
+    let trimmed = url.trim();
+    let Some(login) = url_credentials(trimmed) else {
+        return (url.to_string(), None);
+    };
+    let Some(scheme_end) = trimmed.find("://").map(|i| i + 3) else {
+        return (url.to_string(), None);
+    };
+    let rest = &trimmed[scheme_end..];
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let Some(at) = rest[..end].rfind('@') else {
+        return (url.to_string(), None);
+    };
+    (
+        format!("{}{}", &trimmed[..scheme_end], &rest[at + 1..]),
+        Some(login),
+    )
+}
+
+/// Decodes `%XX` escapes (as in URL user info); a malformed escape stays as
+/// it is, and bytes that are not UTF-8 become U+FFFD.
+///
+/// ```
+/// use ferrika_core::kafka::profile::percent_decode;
+/// assert_eq!(percent_decode("p%40ss%3Aw"), "p@ss:w");
+/// assert_eq!(percent_decode("100%"), "100%");
+/// ```
+pub fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (bytes[i], bytes.get(i + 1), bytes.get(i + 2)) {
+            (b'%', Some(&h), Some(&l)) if hex(h).is_some() && hex(l).is_some() => {
+                let value = hex(h).unwrap_or(0) * 16 + hex(l).unwrap_or(0);
+                out.push(u8::try_from(value).unwrap_or(b'?'));
+                i += 3;
+            }
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// `https://KEY:SECRET@host/x` -> `https://KEY@host/x`; `None` when the URL
 /// has no password.
 fn url_without_password(url: &str) -> Option<String> {
@@ -1197,6 +1290,43 @@ ssl.truststore.location=/etc/truststore.jks
         );
         assert_eq!(url_with_basic_auth("https://K:S@host", "K2", "S2"), None);
         assert_eq!(url_with_basic_auth("host:8081", "K", "S"), None);
+    }
+
+    #[test]
+    fn credentials_come_out_of_a_url_decoded() {
+        assert_eq!(
+            url_credentials("http://ops:p%40ss%3Aw@rabbit:15672/x"),
+            Some(("ops".to_string(), "p@ss:w".to_string()))
+        );
+        assert_eq!(
+            url_credentials("https://ops@rabbit"),
+            Some(("ops".to_string(), String::new()))
+        );
+        assert_eq!(url_credentials("http://rabbit:15672/a@b"), None);
+        assert_eq!(url_credentials("rabbit"), None);
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz%4"), "%zz%4");
+        assert!(url_has_credentials("K:S@host:8081"));
+        assert!(!url_has_credentials("https://host/a@b"));
+    }
+
+    #[test]
+    fn split_and_join_round_trip() {
+        let joined = url_with_basic_auth("https://host:8081/x", "KEY", "a/b+c@d").unwrap();
+        let (url, login) = split_url_credentials(&joined);
+        assert_eq!(url, "https://host:8081/x");
+        assert_eq!(login, Some(("KEY".to_string(), "a/b+c@d".to_string())));
+        assert_eq!(
+            split_url_credentials("https://host/a@b"),
+            ("https://host/a@b".to_string(), None)
+        );
+        assert_eq!(
+            split_url_credentials("http://u@h?q=1"),
+            (
+                "http://h?q=1".to_string(),
+                Some(("u".to_string(), String::new()))
+            )
+        );
     }
 
     #[test]

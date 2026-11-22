@@ -16,6 +16,7 @@ pub mod metrics;
 pub mod oauth;
 pub mod oauth_refresh;
 pub mod offset_reset;
+pub mod preset;
 pub mod producer;
 pub mod profile;
 pub mod reassign;

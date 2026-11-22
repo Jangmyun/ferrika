@@ -1133,6 +1133,53 @@ pub fn blocked_entry(source: &str, profile: &str, attempted: &str, reason: &str)
     }
 }
 
+/// The refusal when `policy` forbids one of the categories `action` also
+/// needs ([`PolicyAction::also_requires`]) on the cluster `profile` /
+/// `bootstrap`, naming that category; `None` when they are all allowed.
+/// `label` is the change as the caller names it (the CLI's command, a GUI's
+/// action name). Check it besides `action` itself, before the write gate,
+/// so every front end refuses the same changes.
+///
+/// ```
+/// use ferrika_core::model::policy::PolicyAction;
+/// use ferrika_governance::policy::{extra_category_refusal, EffectivePolicy};
+///
+/// let policy = EffectivePolicy::absent(std::path::PathBuf::new());
+/// let refusal = extra_category_refusal(
+///     &policy,
+///     PolicyAction::MessagesMove,
+///     "rabbit dlq redrive --execute",
+///     "",
+///     "rabbit:15672",
+/// );
+/// assert_eq!(refusal, None);
+/// ```
+pub fn extra_category_refusal(
+    policy: &EffectivePolicy,
+    action: PolicyAction,
+    label: &str,
+    profile: &str,
+    bootstrap: &str,
+) -> Option<String> {
+    action.also_requires().iter().find_map(|extra| {
+        policy
+            .check(*extra, profile, bootstrap)
+            .err()
+            .map(|reason| {
+                let why = match action {
+                    PolicyAction::MessagesMove => "republishes messages",
+                    _ => "does the work of more than one category",
+                };
+                format!(
+                    "{} `{label}` {why}, so it needs `{}` allowed as well as `{}`.",
+                    &*reason,
+                    extra.id(),
+                    action.id()
+                )
+            })
+    })
+}
+
 /// Where the write gate's audit entries go. [`AuditLog`] is the real log.
 pub trait AuditSink {
     /// Appends one entry.
@@ -1543,6 +1590,28 @@ mod tests {
     use ferrika_core::kafka::admin::broker_address;
 
     const PAYLOAD: &str = r#"{"issuer":"보안팀","issued_at":"2026-11-02","rules":{"read_only":["prod-*"],"forbid":["topics.delete","topics.purge"],"masking":"enforced","unmask":"with_reason","audit":"required"}}"#;
+
+    #[test]
+    fn a_move_needs_produce_as_well() {
+        let action = PolicyAction::MessagesMove;
+        let label = "rabbit dlq redrive --execute";
+        let address = "rabbit.prod:15672,rabbit.prod:5672";
+        let mut policy = crate::test_policy::masking();
+        assert_eq!(
+            extra_category_refusal(&policy, action, label, "", address),
+            None
+        );
+        policy.rules.forbid = vec!["produce".to_string()];
+        let refusal = extra_category_refusal(&policy, action, label, "", address).unwrap();
+        assert!(refusal.contains("`produce`"), "{refusal}");
+        assert!(refusal.contains("messages.move"), "{refusal}");
+        assert!(refusal.contains(label), "{refusal}");
+        // Other changes are judged by their own category only.
+        assert_eq!(
+            extra_category_refusal(&policy, PolicyAction::MessagesPeek, "peek", "", address),
+            None
+        );
+    }
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

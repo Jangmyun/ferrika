@@ -227,38 +227,9 @@ fn has_userinfo(url: &str) -> bool {
     rest[..end].contains('@')
 }
 
-/// The user and password in a URL's user info (`scheme://user:pass@host`),
-/// percent-decoded; the password is empty when only a user is given.
-/// `None` without user info.
-pub fn url_credentials(url: &str) -> Option<(String, String)> {
-    let (_, rest) = url.trim().split_once("://")?;
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (userinfo, _) = rest[..end].rsplit_once('@')?;
-    let (user, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
-    Some((percent_decode(user), percent_decode(password)))
-}
-
-/// Decodes `%XX` escapes; a malformed escape stays as it is.
-fn percent_decode(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let hex = |b: u8| (b as char).to_digit(16);
-        match (bytes[i], bytes.get(i + 1), bytes.get(i + 2)) {
-            (b'%', Some(&h), Some(&l)) if hex(h).is_some() && hex(l).is_some() => {
-                let value = hex(h).unwrap_or(0) * 16 + hex(l).unwrap_or(0);
-                out.push(u8::try_from(value).unwrap_or(b'?'));
-                i += 3;
-            }
-            (b, _, _) => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
+/// The user and password in a URL's user info, percent-decoded (moved to
+/// `ferrika_core::kafka::profile::url_credentials`; re-exported here).
+pub use ferrika_core::kafka::profile::url_credentials;
 
 /// Where passwords are kept. The OS credential store in production; a
 /// map in tests.
@@ -699,7 +670,7 @@ mod tests {
         );
         assert_eq!(url_credentials("http://rabbit:15672/a@b"), None);
         assert_eq!(url_credentials("rabbit"), None);
-        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(ferrika_core::kafka::profile::percent_decode("100%"), "100%");
     }
 
     #[test]

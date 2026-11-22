@@ -291,6 +291,26 @@ impl RedriveDestination {
     }
 }
 
+/// `exchange 'X', routing key 'K'`, as reports and the audit log name a
+/// destination.
+pub fn destination_label(destination: &RedriveDestination) -> String {
+    format!(
+        "exchange '{}', routing key '{}'",
+        destination.exchange_name(),
+        destination.routing_key
+    )
+}
+
+/// An exchange name as people read it: `amq.default` for the default
+/// exchange (the empty name).
+pub fn exchange_name(exchange: &str) -> &str {
+    if exchange.is_empty() {
+        DEFAULT_EXCHANGE
+    } else {
+        exchange
+    }
+}
+
 /// The body of a peek: take `count` messages and put them back
 /// (`ack_requeue_true`), payloads as text when they are UTF-8, else Base64.
 pub fn peek_request(count: u32) -> RabbitResult<Value> {

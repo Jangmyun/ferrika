@@ -440,7 +440,7 @@ fn report_preset(p: Preset, filled: &[(&'static str, String)], warnings: &[Strin
             .collect();
         println!("  Preset {}: {}.", p.name().cyan(), settings.join(", "));
     }
-    for note in p.notes() {
+    for note in preset::cli_notes(p) {
         println!("  {} {note}", "i".blue());
     }
     for warning in warnings {

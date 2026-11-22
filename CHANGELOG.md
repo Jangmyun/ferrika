@@ -13,6 +13,32 @@ The RabbitMQ entries below are planned for 0.2.0.
 
 ### Added
 
+- Library API for front ends (GUI front ends and other library users), so
+  they reuse the CLI's own checks instead of copies that could drift. The
+  CLI now calls these itself; its behaviour is unchanged.
+  - `ferrika_core::kafka::preset`: the connection presets with
+    `display_name`, `credential_fields` (what the service calls each
+    credential), `credentials_hint` and `notes` that name no CLI flags,
+    `resolve` and a structured `missing_settings`.
+  - `ferrika_core::kafka::profile::{url_credentials, split_url_credentials,
+    url_has_credentials, percent_decode}`: the inverse of
+    `url_with_basic_auth`.
+  - `ferrika_core::model::policy::PolicyAction::also_requires` and
+    `ferrika_governance::policy::extra_category_refusal`: a RabbitMQ redrive
+    needs `produce` allowed as well as `messages.move`, in every front end.
+  - `ferrika_ops::transform::{check_options, RunOptions, DecodingTransform,
+    TransformSummary}`: option checks on plain data, the per-record
+    decode-then-steps hook and the serializable run summary with its audit
+    detail.
+  - `ferrika_ops::mirror::authorize_copy` (`CopyCheck`, `CopyCluster`,
+    `CopyAuthorized`): the policy checks for copying records between
+    clusters (enforced masking unless the copy masks first, the export gate
+    for another cluster, the destination's write gate and read-only
+    profile) on plain inputs.
+  - `ferrika_rabbitmq::connection` (`ResolvedRabbit::resolve`,
+    `credentials`, `client`, `amqp_target`) and `ferrika_rabbitmq::view`
+    (`ShownMessage` with PII masking, `mask_properties`, `Inspection`,
+    `RedrivePreview`, `redrive_outcome`, `parse_headers`).
 - `ferrika profile add --preset NAME` fills in the security protocol and
   SASL mechanism for Kafka-compatible services: `confluent-cloud`
   (SASL_SSL + PLAIN), `msk-iam` (SASL_SSL + AWS-MSK-IAM), `msk-scram`

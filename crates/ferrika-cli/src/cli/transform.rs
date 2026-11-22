@@ -11,19 +11,20 @@ use std::io::IsTerminal;
 use clap::{Arg, ArgAction, ArgMatches, Args, Command, FromArgMatches};
 use colored::Colorize;
 use comfy_table::{Cell, Color};
-use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::cli::mirror::{resolve_cluster_config, CopyRoute};
 use crate::cli::{output, print_connection_hint, GlobalOpts, OutputFormat};
 use crate::error::{KafkaError, KafkaResult};
-use crate::kafka::consumer::ConsumedMessage;
 use crate::kafka::producer::OwnedProducerRecord;
 use crate::kafka::schema::PayloadDecoder;
 use crate::ops::mirror::{
-    is_self_mirror, run_copy_pipeline, CopyDestination, MirrorConfig, MirrorStats, RecordTransform,
+    is_self_mirror, run_copy_pipeline, CopyDestination, MirrorConfig, MirrorStats,
 };
-use crate::ops::transform::{Pipeline, StepKind, TransformCounters};
+use crate::ops::transform::{
+    check_options, DecodingTransform, OptionsProblem, Pipeline, RunOptions, StepKind,
+    TransformSummary,
+};
 
 /// Records a dry run prints when `--max-records` is not given.
 pub const DRY_RUN_LIMIT: usize = 10;
@@ -243,187 +244,103 @@ pub fn authorize(args: &TransformArgs, global: &GlobalOpts) -> Result<(), String
     crate::cli::mirror::authorize(args, global)
 }
 
-/// Option combinations that cannot work, found before connecting.
+/// Option combinations that cannot work, found before connecting
+/// (`ops::transform::check_options`), with the flags named.
 fn check_args(args: &TransformArgs) -> Result<(), String> {
-    if args.until_end && !args.from_beginning && args.from_timestamp.is_none() {
-        let resumes = args.execute && args.group.is_some();
-        if !resumes {
-            return Err(
+    check_options(&RunOptions {
+        from_beginning: args.from_beginning,
+        from_timestamp: args.from_timestamp,
+        until_end: args.until_end,
+        group: args.group.is_some(),
+        execute: args.execute,
+        rate_limit: args.rate_limit,
+    })
+    .map_err(|problem| {
+        match problem {
+            OptionsProblem::UntilEndWithoutStart => {
                 "--until-end needs a start: --from-beginning, --from-timestamp or \
                  --group with --execute (from the current end there is nothing to read)"
-                    .to_string(),
-            );
+            }
+            OptionsProblem::RateLimitNotPositive => "--rate-limit must be greater than 0",
         }
-    }
-    if args.rate_limit.is_some_and(|r| !r.is_finite() || r <= 0.0) {
-        return Err("--rate-limit must be greater than 0".to_string());
-    }
-    Ok(())
+        .to_string()
+    })
 }
 
-/// The copy pipeline's per-record hook: decode (with `-D`), then the steps.
-struct CliTransform {
-    pipeline: Pipeline,
-    dst_topic: String,
-    decoder: Option<PayloadDecoder>,
-    counters: TransformCounters,
+/// The summary of a run of `args`.
+fn run_summary(
+    args: &TransformArgs,
+    stats: &MirrorStats,
+    transform: &DecodingTransform,
+    digest: String,
+) -> TransformSummary {
+    TransformSummary::new(
+        &args.src_topic,
+        &args.dst_topic,
+        !args.execute,
+        stats,
+        transform.counters(),
+        digest,
+    )
 }
 
-impl RecordTransform for CliTransform {
-    async fn apply(&mut self, msg: &ConsumedMessage) -> Option<OwnedProducerRecord> {
-        let decoded = match (&mut self.decoder, msg.payload.as_deref()) {
-            // A value that did not decode (no wire format, unknown
-            // schema) is not JSON text and goes on as it was read.
-            (Some(decoder), Some(payload)) => decoder
-                .decode(payload)
-                .await
-                .and_then(|d| serde_json::from_str::<Value>(&d.text).ok()),
-            _ => None,
-        };
-        self.pipeline
-            .apply(msg, decoded, &self.dst_topic, &mut self.counters)
-    }
-}
-
-/// The numbers a run reports, on screen and (without record data) in the
-/// audit log.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct Summary {
-    src_topic: String,
-    dst_topic: String,
-    dry_run: bool,
-    /// Records read from the source.
-    read: u64,
-    /// Records the steps kept.
-    kept: u64,
-    /// Records written (or, in a dry run, printed).
-    written: u64,
-    /// Records a `--filter` dropped.
-    filtered: u64,
-    /// Records `--sample` left out.
-    sampled_out: u64,
-    /// Values that were not JSON objects, passed through field steps.
-    not_json: u64,
-    /// Records whose `--rekey` field was missing (key kept).
-    rekey_missing: u64,
-    /// Records the destination did not acknowledge.
-    failed: u64,
-    stopped_on_failures: bool,
-    elapsed_secs: f64,
-    /// SHA-256 of the steps as given.
-    steps_sha256: String,
-}
-
-impl Summary {
-    fn new(
-        args: &TransformArgs,
-        stats: &MirrorStats,
-        counters: &TransformCounters,
-        digest: String,
-    ) -> Self {
-        Self {
-            src_topic: args.src_topic.clone(),
-            dst_topic: args.dst_topic.clone(),
-            dry_run: !args.execute,
-            read: stats.read_count,
-            kept: stats.read_count.saturating_sub(stats.filtered_count),
-            written: stats.mirrored_count,
-            filtered: counters.filtered,
-            sampled_out: counters.sampled_out,
-            not_json: counters.not_json,
-            rekey_missing: counters.rekey_missing,
-            failed: stats.failed_count,
-            stopped_on_failures: stats.stopped_on_failures,
-            elapsed_secs: stats.elapsed_secs,
-            steps_sha256: digest,
-        }
-    }
-
-    /// The audit log's account of the run: counts and the steps' digest,
-    /// never the steps themselves (a filter or `--set` can quote a value).
-    fn audit_detail(&self) -> String {
-        format!(
-            "read {}, written {}, filtered {}, sampled out {}, not JSON {}, failed {}; steps sha256:{}",
-            self.read,
-            self.written,
-            self.filtered,
-            self.sampled_out,
-            self.not_json,
-            self.failed,
-            self.steps_sha256
-        )
-    }
-
-    fn table(&self) -> comfy_table::Table {
-        let mut table = output::table(vec![
-            Cell::new("TRANSFORM").fg(Color::Cyan),
-            Cell::new("VALUE").fg(Color::Cyan),
+/// The summary as the table output prints it.
+fn summary_table(summary: &TransformSummary) -> comfy_table::Table {
+    let mut table = output::table(vec![
+        Cell::new("TRANSFORM").fg(Color::Cyan),
+        Cell::new("VALUE").fg(Color::Cyan),
+    ]);
+    let written = if summary.dry_run {
+        "Printed"
+    } else {
+        "Written"
+    };
+    let rows: [(&str, String, Color); 9] = [
+        ("Source Topic", summary.src_topic.clone(), Color::Yellow),
+        ("Destination Topic", summary.dst_topic.clone(), Color::Green),
+        ("Read", summary.read.to_string(), Color::White),
+        ("Kept by the steps", summary.kept.to_string(), Color::White),
+        (written, summary.written.to_string(), Color::Cyan),
+        (
+            "Dropped by --filter",
+            summary.filtered.to_string(),
+            Color::DarkGrey,
+        ),
+        (
+            "Left out by --sample",
+            summary.sampled_out.to_string(),
+            Color::DarkGrey,
+        ),
+        (
+            "Not JSON (passed through)",
+            summary.not_json.to_string(),
+            Color::DarkGrey,
+        ),
+        (
+            "Duration",
+            format!("{:.2} s", summary.elapsed_secs),
+            Color::Blue,
+        ),
+    ];
+    for (name, value, color) in rows {
+        table.add_row(vec![
+            Cell::new(name).fg(Color::DarkGrey),
+            Cell::new(value).fg(color),
         ]);
-        let written = if self.dry_run { "Printed" } else { "Written" };
-        let rows: [(&str, String, Color); 9] = [
-            ("Source Topic", self.src_topic.clone(), Color::Yellow),
-            ("Destination Topic", self.dst_topic.clone(), Color::Green),
-            ("Read", self.read.to_string(), Color::White),
-            ("Kept by the steps", self.kept.to_string(), Color::White),
-            (written, self.written.to_string(), Color::Cyan),
-            (
-                "Dropped by --filter",
-                self.filtered.to_string(),
-                Color::DarkGrey,
-            ),
-            (
-                "Left out by --sample",
-                self.sampled_out.to_string(),
-                Color::DarkGrey,
-            ),
-            (
-                "Not JSON (passed through)",
-                self.not_json.to_string(),
-                Color::DarkGrey,
-            ),
-            (
-                "Duration",
-                format!("{:.2} s", self.elapsed_secs),
-                Color::Blue,
-            ),
-        ];
-        for (name, value, color) in rows {
-            table.add_row(vec![
-                Cell::new(name).fg(Color::DarkGrey),
-                Cell::new(value).fg(color),
-            ]);
-        }
-        if self.rekey_missing > 0 {
-            table.add_row(vec![
-                Cell::new("--rekey field missing (key kept)").fg(Color::DarkGrey),
-                Cell::new(self.rekey_missing.to_string()).fg(Color::Yellow),
-            ]);
-        }
-        if self.failed > 0 {
-            table.add_row(vec![
-                Cell::new("Failed deliveries").fg(Color::DarkGrey),
-                Cell::new(self.failed.to_string()).fg(Color::Red),
-            ]);
-        }
-        table
     }
-
-    /// The error to exit with when a write failed.
-    fn failure(&self) -> Option<KafkaError> {
-        if self.failed == 0 {
-            return None;
-        }
-        let stopped = if self.stopped_on_failures {
-            "; stopped early after reaching the failure limit"
-        } else {
-            ""
-        };
-        Some(KafkaError::Check(format!(
-            "{} of {} transformed records failed delivery{stopped}",
-            self.failed,
-            self.failed + self.written
-        )))
+    if summary.rekey_missing > 0 {
+        table.add_row(vec![
+            Cell::new("--rekey field missing (key kept)").fg(Color::DarkGrey),
+            Cell::new(summary.rekey_missing.to_string()).fg(Color::Yellow),
+        ]);
     }
+    if summary.failed > 0 {
+        table.add_row(vec![
+            Cell::new("Failed deliveries").fg(Color::DarkGrey),
+            Cell::new(summary.failed.to_string()).fg(Color::Red),
+        ]);
+    }
+    table
 }
 
 /// One transformed record of a dry run, as a JSON line: the key and header
@@ -548,12 +465,8 @@ pub async fn run(args: TransformArgs, global: &GlobalOpts) -> KafkaResult<()> {
         }
     }
 
-    let mut transform = CliTransform {
-        pipeline,
-        dst_topic: args.dst_topic.clone(),
-        decoder,
-        counters: TransformCounters::default(),
-    };
+    let mut transform =
+        DecodingTransform::new(pipeline, args.dst_topic.clone()).with_decoder(decoder);
     let result = if args.execute {
         let progress = table && std::io::stderr().is_terminal();
         run_copy_pipeline(
@@ -594,7 +507,7 @@ pub async fn run(args: TransformArgs, global: &GlobalOpts) -> KafkaResult<()> {
         }
     };
 
-    let summary = Summary::new(&args, &stats, &transform.counters, digest);
+    let summary = run_summary(&args, &stats, &transform, digest);
     if args.execute {
         crate::cli::export_finished(stats.mirrored_count);
         crate::cli::set_audit_result_detail(summary.audit_detail());
@@ -608,9 +521,9 @@ pub async fn run(args: TransformArgs, global: &GlobalOpts) -> KafkaResult<()> {
         },
         (OutputFormat::Table, true) => {
             eprintln!();
-            println!("{}", summary.table());
+            println!("{}", summary_table(&summary));
         }
-        (OutputFormat::Table, false) => eprintln!("{}", summary.table()),
+        (OutputFormat::Table, false) => eprintln!("{}", summary_table(&summary)),
     }
     match summary.failure() {
         Some(err) => Err(err),
@@ -749,38 +662,21 @@ mod tests {
         ])));
     }
 
-    fn stats(read: u64, filtered: u64, written: u64, failed: u64) -> MirrorStats {
-        let mut stats = MirrorStats::new();
-        stats.read_count = read;
-        stats.filtered_count = filtered;
-        stats.mirrored_count = written;
-        stats.failed_count = failed;
-        stats
-    }
-
     #[test]
-    fn summary_counts_and_audit_detail_hold_no_record_data() {
+    fn summary_follows_the_run_mode_and_names_no_steps() {
         let args = parse(&["--execute", "--filter", "$.email == \"kim@example.com\""]);
-        let counters = TransformCounters {
-            filtered: 6,
-            sampled_out: 1,
-            not_json: 2,
-            rekey_missing: 0,
-        };
-        let summary = Summary::new(&args, &stats(10, 7, 3, 0), &counters, "ab12".into());
-        assert_eq!(summary.kept, 3);
+        let pipeline = Pipeline::parse(args.steps.0.iter().map(|(k, v)| (*k, v.as_str()))).unwrap();
+        let digest = pipeline.digest();
+        let transform = DecodingTransform::new(pipeline, "orders-copy");
+        let mut stats = MirrorStats::new();
+        stats.read_count = 10;
+        stats.mirrored_count = 3;
+        let summary = run_summary(&args, &stats, &transform, digest);
         assert!(!summary.dry_run);
-        let detail = summary.audit_detail();
-        assert_eq!(
-            detail,
-            "read 10, written 3, filtered 6, sampled out 1, not JSON 2, failed 0; steps sha256:ab12"
-        );
-        assert!(!detail.contains("kim@example.com"));
-        assert!(summary.failure().is_none());
-
-        let failed = Summary::new(&args, &stats(5, 0, 3, 2), &counters, String::new());
-        let err = failed.failure().unwrap().to_string();
-        assert!(err.contains("2 of 5 transformed records failed"), "{err}");
+        assert_eq!(summary.src_topic, "orders");
+        assert!(!summary.audit_detail().contains("kim@example.com"));
+        assert!(run_summary(&parse(&[]), &stats, &transform, String::new()).dry_run);
+        assert!(summary_table(&summary).to_string().contains("Written"));
     }
 
     #[test]
