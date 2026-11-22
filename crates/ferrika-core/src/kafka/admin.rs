@@ -589,27 +589,31 @@ fn entry_views(entries: Vec<rdkafka::admin::ConfigEntry>) -> Vec<ConfigEntryView
 /// the broker's own operation timeout should answer first.
 const WRITE_RESPONSE_MARGIN: Duration = Duration::from_secs(5);
 
-/// The client-side limit of a write that waits up to `timeout` (or the
-/// configured request timeout) on the broker.
-fn write_request_timeout(timeout: Option<Duration>, default: Duration) -> Duration {
-    timeout.unwrap_or(default) + WRITE_RESPONSE_MARGIN
+/// librdkafka refuses admin timeouts above one hour.
+const MAX_ADMIN_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// The broker-side and client-side limits of a write: the broker waits up
+/// to `timeout` (or the configured request timeout) for the operation, the
+/// client a little longer, both within librdkafka's range.
+fn write_timeouts(timeout: Option<Duration>, default: Duration) -> (Duration, Duration) {
+    let operation = timeout
+        .unwrap_or(default)
+        .min(MAX_ADMIN_TIMEOUT - WRITE_RESPONSE_MARGIN);
+    (operation, operation + WRITE_RESPONSE_MARGIN)
 }
 
 impl KafkaAdminClient {
-    /// Options for a write. The broker waits up to `timeout` for the
-    /// operation to finish when one is given. The client always gives up a
-    /// little after it: without a request timeout librdkafka waits for
-    /// `socket.timeout.ms` (60 s) when no broker answers, whatever
-    /// `--timeout` says.
+    /// Options for a write (see [`write_timeouts`]). Both limits are set:
+    /// without a request timeout librdkafka waits `socket.timeout.ms` (60 s)
+    /// when no broker answers, whatever `--timeout` says, and an operation
+    /// timeout longer than the request timeout (it defaults to
+    /// `socket.timeout.ms`) would report a write the broker then finishes
+    /// as timed out.
     fn write_options(&self, timeout: Option<Duration>) -> AdminOptions {
-        let mut options = AdminOptions::new().request_timeout(Some(write_request_timeout(
-            timeout,
-            self.config.request_timeout,
-        )));
-        if let Some(to) = timeout {
-            options = options.operation_timeout(Some(to));
-        }
-        options
+        let (operation, request) = write_timeouts(timeout, self.config.request_timeout);
+        AdminOptions::new()
+            .operation_timeout(Some(operation))
+            .request_timeout(Some(request))
     }
 
     /// Raises the partition count of `topic` to `total`. Kafka cannot remove partitions,
@@ -802,9 +806,7 @@ impl KafkaAdminClient {
             list.add_partition_offset(topic, p, rdkafka::Offset::End)
                 .map_err(|e| KafkaError::Admin(format!("invalid partition {p}: {e}")))?;
         }
-        let options = self
-            .write_options(Some(timeout))
-            .operation_timeout(Some(timeout));
+        let options = self.write_options(Some(timeout));
         let result = self
             .admin
             .delete_records(&list, &options)
@@ -892,17 +894,16 @@ pub fn known_brokers(config: &KafkaClientConfig) -> Result<Vec<String>, String> 
 mod tests {
     #[test]
     fn writes_give_up_shortly_after_their_timeout() {
-        use super::write_request_timeout;
+        use super::write_timeouts;
         use std::time::Duration;
-        let configured = Duration::from_secs(30);
-        assert_eq!(
-            write_request_timeout(Some(Duration::from_secs(2)), configured),
-            Duration::from_secs(7)
-        );
-        assert_eq!(
-            write_request_timeout(None, configured),
-            Duration::from_secs(35)
-        );
+        let s = Duration::from_secs;
+        let configured = s(30);
+        assert_eq!(write_timeouts(Some(s(2)), configured), (s(2), s(7)));
+        // Without a timeout the broker still answers before the client
+        // gives up (its own default would be 60 s).
+        assert_eq!(write_timeouts(None, configured), (s(30), s(35)));
+        // librdkafka refuses more than an hour; huge values do not overflow.
+        assert_eq!(write_timeouts(None, s(u64::MAX)), (s(3595), s(3600)));
     }
 
     #[test]
