@@ -62,6 +62,7 @@ impl PolicyPayload {
             || !self.rules.watermark.is_off()
             || self.rules.watermark_text.is_some()
             || !self.rules.screen_capture.is_allowed()
+            || !self.rules.mcp_write.is_allowed()
     }
 
     /// The `format` a signed file with this payload carries.
@@ -149,6 +150,11 @@ pub struct PolicyRules {
     /// of the payload when `allowed`.
     #[serde(default, skip_serializing_if = "ScreenCaptureRule::is_allowed")]
     pub screen_capture: ScreenCaptureRule,
+    /// Policy pack v2: what `ferrika mcp --allow-write` may do on behalf of
+    /// an AI assistant, on top of the other rules. Left out of the payload
+    /// when `allowed`.
+    #[serde(default, skip_serializing_if = "McpWriteRule::is_allowed")]
+    pub mcp_write: McpWriteRule,
 }
 
 /// Longest `watermark_text`, in characters.
@@ -182,6 +188,9 @@ impl PolicyRules {
             // badge to whoever fixes it, often over a screen share; the
             // watermark still marks what they share.
             screen_capture: ScreenCaptureRule::Allowed,
+            // Every change is refused anyway (`forbid: *`); a refusal names
+            // the untrusted policy rather than this rule.
+            mcp_write: McpWriteRule::Allowed,
         }
     }
 
@@ -304,6 +313,27 @@ pub enum ScreenCaptureRule {
 }
 
 impl ScreenCaptureRule {
+    pub fn is_allowed(&self) -> bool {
+        *self == Self::Allowed
+    }
+}
+
+/// What AI assistants may change through `ferrika mcp --allow-write`
+/// (policy pack v2), on top of the rules every change passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpWriteRule {
+    /// Like any other change (the server's own confirmation still applies).
+    #[default]
+    Allowed,
+    /// Only after a person confirms in the client (MCP elicitation); the
+    /// one-time token, which the model can pass on its own, is refused.
+    ConfirmHuman,
+    /// No write tools at all.
+    Forbidden,
+}
+
+impl McpWriteRule {
     pub fn is_allowed(&self) -> bool {
         *self == Self::Allowed
     }
@@ -985,6 +1015,27 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<PolicyRules>(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn mcp_write_rule_parses_needs_format_2_and_is_omitted_when_allowed() {
+        let parse = |json: &str| serde_json::from_str::<PolicyRules>(json);
+        assert_eq!(parse("{}").unwrap().mcp_write, McpWriteRule::Allowed);
+        for (text, rule) in [
+            ("confirm_human", McpWriteRule::ConfirmHuman),
+            ("forbidden", McpWriteRule::Forbidden),
+        ] {
+            let rules = parse(&format!(r#"{{"mcp_write":"{text}"}}"#)).unwrap();
+            assert_eq!(rules.mcp_write, rule);
+            let payload = PolicyPayload {
+                rules,
+                ..serde_json::from_str("{}").unwrap()
+            };
+            assert_eq!(payload.format(), POLICY_FORMAT_V2);
+        }
+        assert!(parse(r#"{"mcp_write":"human"}"#).is_err());
+        let text = serde_json::to_string(&PolicyRules::default()).unwrap();
+        assert!(!text.contains("mcp_write"), "{text}");
     }
 
     #[test]

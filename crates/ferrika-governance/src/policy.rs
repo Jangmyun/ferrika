@@ -212,7 +212,7 @@ pub fn verify_with(
         return Err(PolicyError::Rules(
             "format 2 fields (expires_at, on_expiry, audit_forward, audit_anchor, \
              anchor_required, read_only_brokers, export, export_clusters, watermark, \
-             watermark_text, screen_capture) need format 2"
+             watermark_text, screen_capture, mcp_write) need format 2"
                 .to_string(),
         ));
     }
@@ -836,6 +836,16 @@ impl EffectivePolicy {
     /// (`screen_capture: blocked`).
     pub fn screen_capture_blocked_at(&self, now: Timestamp) -> bool {
         self.is_active() && !self.rules_at(now).screen_capture.is_allowed()
+    }
+
+    /// What AI assistants may change through the MCP server at `now`
+    /// (`mcp_write`); `allowed` without an active policy.
+    pub fn mcp_write_at(&self, now: Timestamp) -> ferrika_core::model::policy::McpWriteRule {
+        if self.is_active() {
+            self.rules_at(now).mcp_write
+        } else {
+            ferrika_core::model::policy::McpWriteRule::Allowed
+        }
     }
 }
 

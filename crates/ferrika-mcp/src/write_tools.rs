@@ -20,6 +20,7 @@ use ferrika_core::kafka::context::ResolvedContext;
 use ferrika_core::kafka::offset_reset::{check_group_idle, OffsetResetPlan, ResetStrategy};
 use ferrika_core::kafka::producer::OwnedProducerRecord;
 use ferrika_core::model::history::{Reversibility, Scope};
+use ferrika_core::model::policy::McpWriteRule;
 use ferrika_ops::history::{capture, Change, Journal, Recorder};
 
 /// Most records one produce_messages call sends.
@@ -231,10 +232,20 @@ impl WriteTools {
             .collect()
     }
 
+    /// The confirmation mode in force: `--confirm`, raised to `elicit` while
+    /// the company policy says `mcp_write: confirm_human`.
+    fn confirm_mode(&self) -> ConfirmMode {
+        if self.guard.mcp_write_rule() == McpWriteRule::ConfirmHuman {
+            ConfirmMode::Elicit
+        } else {
+            self.confirm
+        }
+    }
+
     /// Whether writes are confirmed by asking a person through the client
     /// (elicitation) for a client that declared `elicitation` or not.
     fn asks_person(&self, client_elicitation: bool) -> bool {
-        match self.confirm {
+        match self.confirm_mode() {
             ConfirmMode::Elicit => true,
             ConfirmMode::Token => false,
             ConfirmMode::Auto => client_elicitation,
@@ -243,7 +254,7 @@ impl WriteTools {
 
     /// How writes are confirmed, for `mcp.session_start`.
     pub(super) fn confirm_label(&self, client_elicitation: bool) -> &'static str {
-        match (self.confirm, client_elicitation) {
+        match (self.confirm_mode(), client_elicitation) {
             (ConfirmMode::Auto, true) => "auto (elicitation)",
             (ConfirmMode::Auto, false) => "auto (token)",
             (ConfirmMode::Elicit, true) => "elicit",
@@ -256,7 +267,7 @@ impl WriteTools {
     /// by the profile or the policy (nor needing elicitation the client
     /// does not offer).
     pub(super) fn definitions(&self, client_elicitation: bool) -> Vec<Value> {
-        if self.confirm == ConfirmMode::Elicit && !client_elicitation {
+        if self.confirm_mode() == ConfirmMode::Elicit && !client_elicitation {
             return Vec::new();
         }
         definitions()
@@ -320,11 +331,16 @@ impl WriteTools {
         args: &Value,
         ctx: &CallContext<'_>,
     ) -> Result<(Value, bool), ToolError> {
-        if self.confirm == ConfirmMode::Elicit && !ctx.elicitation {
+        if self.confirm_mode() == ConfirmMode::Elicit && !ctx.elicitation {
+            let why = if self.guard.mcp_write_rule() == McpWriteRule::ConfirmHuman {
+                "The company policy requires a person to confirm every change an AI assistant \
+                 makes (mcp_write: confirm_human)"
+            } else {
+                "This server confirms writes by asking the user (--confirm elicit)"
+            };
             return Err(ToolError::new(
                 "elicitation_unsupported",
-                "This server confirms writes by asking the user (--confirm elicit), and this \
-                 client does not support MCP elicitation.",
+                format!("{why}, and this client does not support MCP elicitation."),
             ));
         }
         self.guard.check_cooldown()?;
@@ -2187,6 +2203,57 @@ pub(super) mod tests {
         let plan = tools.call_token("create_topic", &args).await;
         assert_eq!(plan["isError"], false, "{plan}");
         assert_eq!(quiet.known_calls.get(), 0);
+    }
+
+    fn mcp_write_policy(
+        rule: ferrika_core::model::policy::McpWriteRule,
+    ) -> &'static ferrika_governance::policy::EffectivePolicy {
+        crate::guard::tests::policy(ferrika_core::model::policy::PolicyRules {
+            mcp_write: rule,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn mcp_write_forbidden_hides_the_tools_and_refuses_calls() {
+        let c: &'static FakeCluster = Box::leak(Box::new(cluster()));
+        let (guard, log, _) =
+            crate::guard::tests::guard_with(config(), mcp_write_policy(McpWriteRule::Forbidden));
+        let mut tools = WriteTools::new(guard, Box::new(c));
+        assert!(tools.definitions(true).is_empty());
+        assert!(tools.startup_warnings()[0].contains("mcp_write: forbidden"));
+        let result = tools
+            .call_token("create_topic", &json!({ "topic": "t" }))
+            .await;
+        assert_eq!(code(&result), "policy_refused", "{result}");
+        assert!(c.changes.borrow().is_empty());
+        assert!(log
+            .entries
+            .borrow()
+            .iter()
+            .any(|e| !e.ok && e.outcome.contains("mcp_write: forbidden")));
+    }
+
+    #[tokio::test]
+    async fn mcp_write_confirm_human_turns_token_mode_into_asking_a_person() {
+        let c: &'static FakeCluster = Box::leak(Box::new(cluster()));
+        let (guard, _, _) =
+            crate::guard::tests::guard_with(config(), mcp_write_policy(McpWriteRule::ConfirmHuman));
+        let mut tools = WriteTools::new(guard, Box::new(c));
+        tools.confirm = ConfirmMode::Token;
+        // A client that cannot ask the user gets no write tools, and a call
+        // says why.
+        assert!(tools.definitions(false).is_empty());
+        assert!(!tools.definitions(true).is_empty());
+        assert_eq!(tools.confirm_label(true), "elicit");
+        let args = json!({ "topic": "t", "partitions": 1 });
+        let result = tools.call_token("create_topic", &args).await;
+        assert_eq!(code(&result), "elicitation_unsupported", "{result}");
+        assert!(
+            result.to_string().contains("mcp_write: confirm_human"),
+            "{result}"
+        );
+        assert!(c.changes.borrow().is_empty());
     }
 
     #[tokio::test]

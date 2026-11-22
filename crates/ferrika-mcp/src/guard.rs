@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use jiff::{SignedDuration, Timestamp};
 use serde_json::{json, Value};
 
-use ferrika_core::model::policy::PolicyAction;
+use ferrika_core::model::policy::{McpWriteRule, PolicyAction};
 use ferrika_governance::audit::AuditEntry;
 use ferrika_governance::policy::{
     authorize_write_at, AuditMode, AuditSink, EffectivePolicy, WriteRefusal, WriteRequest,
@@ -237,6 +237,9 @@ impl WriteGuard {
         if let Some(reason) = &self.config.profile_refusal {
             return Some(reason.clone());
         }
+        if let Some(reason) = self.mcp_write_refusal() {
+            return Some(reason);
+        }
         self.policy
             .check_at(
                 self.now(),
@@ -379,6 +382,20 @@ impl WriteGuard {
         self.policy.write_needs_broker_metadata()
     }
 
+    /// The company policy's `mcp_write` at this moment.
+    pub(super) fn mcp_write_rule(&self) -> McpWriteRule {
+        self.policy.mcp_write_at(self.now())
+    }
+
+    /// The refusal when the policy forbids AI writes altogether.
+    fn mcp_write_refusal(&self) -> Option<String> {
+        (self.mcp_write_rule() == McpWriteRule::Forbidden).then(|| {
+            "Refused by company policy: AI assistants may not change clusters \
+             (mcp_write: forbidden)"
+                .to_string()
+        })
+    }
+
     /// [`Self::authorize`] with the brokers learned from cluster metadata
     /// added to the bootstrap list the policy checks.
     pub(super) fn authorize_with(
@@ -387,6 +404,10 @@ impl WriteGuard {
         target: &str,
         known_brokers: &[String],
     ) -> Result<(), ToolError> {
+        if let Some(reason) = self.mcp_write_refusal() {
+            let _ = self.record_result(tool, target, &reason, false, None);
+            return Err(ToolError::new("policy_refused", reason));
+        }
         let brokers =
             ferrika_governance::policy::with_known_brokers(&self.config.bootstrap, known_brokers);
         let label = format!("mcp {tool}");
