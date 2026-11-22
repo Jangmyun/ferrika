@@ -38,6 +38,9 @@ pub enum Commands {
     Generate(cli::generator::GenerateArgs),
     /// Copy records between topics, also across clusters
     Mirror(cli::mirror::MirrorArgs),
+    /// Copy records to another topic through filter, drop, rename, set, rekey, mask and
+    /// sample steps (a dry run unless --execute)
+    Transform(cli::transform::TransformArgs),
     /// Show and reset consumer group offsets
     Offset(cli::offset::OffsetArgs),
     /// Back up topic records to a JSON Lines (.jsonl) file
@@ -336,6 +339,14 @@ pub fn run(mut cli: Cli) {
             cli::exit_with_error(&refusal);
         }
     }
+    // The same for `transform --execute`, unless its first step masks PII.
+    if let Some(Commands::Transform(args)) = &cli.command {
+        if args.execute {
+            if let Err(refusal) = cli::transform::authorize(args, &cli.global_opts) {
+                cli::exit_with_error(&refusal);
+            }
+        }
+    }
 
     if let Some(action) = cli.command.as_ref().and_then(main_gate_action) {
         let profile = cli.global_opts.resolved_profile_name().unwrap_or_default();
@@ -444,6 +455,7 @@ pub fn run(mut cli: Cli) {
         Some(Commands::Schema(args)) => run_async(cli::schema::run(args, global)),
         Some(Commands::Generate(args)) => run_async(cli::generator::run(args, global)),
         Some(Commands::Mirror(args)) => run_async(cli::mirror::run(args, global)),
+        Some(Commands::Transform(args)) => run_async(cli::transform::run(args, global)),
         Some(Commands::Offset(args)) => run_async(cli::offset::run(args, global)),
         Some(Commands::Dump(args)) => run_async(cli::backup::run_dump(args, global)),
         Some(Commands::Restore(args)) => run_async(cli::backup::run_restore(args, global)),
@@ -576,6 +588,7 @@ fn fails_fast_without_broker(command: &Commands) -> bool {
 fn main_gate_action(command: &Commands) -> Option<&'static str> {
     match command {
         Commands::Mirror(args) if cli::mirror::names_clusters(args) => None,
+        Commands::Transform(args) if cli::mirror::names_clusters(args) => None,
         _ => write_action(command),
     }
 }
@@ -618,6 +631,9 @@ fn write_action(command: &Commands) -> Option<&'static str> {
         Commands::Consume(_) => None,
         Commands::Generate(_) => Some("generate"),
         Commands::Mirror(_) => Some("mirror"),
+        Commands::Transform(args) if args.execute => Some(cli::transform::EXECUTE_LABEL),
+        // Without --execute, transform only prints the records it would write.
+        Commands::Transform(_) => None,
         Commands::Restore(_) => Some("restore"),
         Commands::Probe(_) => Some("probe"),
         Commands::Offset(args) => match &args.command {
@@ -802,8 +818,13 @@ fn export_gate(command: &Commands) -> Option<ExportGate> {
             }) => gate(Stdout, "crypto mask", topic),
             cli::crypto::CryptoCommands::Mask(_) | cli::crypto::CryptoCommands::Audit(_) => None,
         },
+        // A dry run prints the transformed records.
+        Commands::Transform(a) if !a.execute => gate(Stdout, "transform --dry-run", &a.src_topic),
         // Metadata or counts only, records read in, or checked elsewhere.
-        Commands::Mirror(_) | Commands::Mcp(_) | Commands::Completions { .. } => None,
+        Commands::Mirror(_)
+        | Commands::Transform(_)
+        | Commands::Mcp(_)
+        | Commands::Completions { .. } => None,
         Commands::Topics(_)
         | Commands::Produce(_)
         | Commands::Monitor(_)
@@ -892,6 +913,7 @@ fn write_target(command: &Commands) -> String {
         },
         Commands::Generate(a) => a.topic.clone(),
         Commands::Mirror(a) => format!("{} -> {}", a.src_topic, a.dst_topic),
+        Commands::Transform(a) => format!("{} -> {}", a.src_topic, a.dst_topic),
         Commands::Restore(a) => format!("{} from {}", a.topic, a.input),
         Commands::Probe(a) => a.topic.clone(),
         Commands::Offset(args) => match &args.command {
@@ -1058,6 +1080,7 @@ mod tests {
             | Commands::Consume(_)
             | Commands::Generate(_)
             | Commands::Mirror(_)
+            | Commands::Transform(_)
             | Commands::Restore(_)
             | Commands::Probe(_)
             | Commands::Offset(_)
@@ -1157,6 +1180,35 @@ mod tests {
         ] {
             assert!(!fails_fast_without_broker(&command(args)), "{args:?}");
         }
+    }
+
+    #[test]
+    fn transform_writes_only_with_execute() {
+        use super::main_gate_action;
+        assert_eq!(
+            write_action(&command(&["transform", "orders", "--to", "copy"])),
+            None
+        );
+        let execute = command(&["transform", "orders", "--to", "copy", "--execute"]);
+        assert_eq!(write_action(&execute), Some("transform --execute"));
+        assert_eq!(main_gate_action(&execute), Some("transform --execute"));
+        assert_eq!(write_target(&execute), "orders -> copy");
+        // A named destination is checked by `transform::authorize` instead.
+        for args in [
+            &["--dst-profile", "staging"][..],
+            &["--dst-bootstrap-servers", "h:9092"][..],
+        ] {
+            let argv: Vec<&str> = ["transform", "orders", "--to", "copy", "--execute"]
+                .iter()
+                .chain(args)
+                .copied()
+                .collect();
+            assert_eq!(main_gate_action(&command(&argv)), None, "{args:?}");
+        }
+        assert_eq!(
+            model::policy::PolicyAction::from_cli("transform --execute"),
+            model::policy::PolicyAction::Produce
+        );
     }
 
     #[test]
@@ -1279,6 +1331,7 @@ mod tests {
             | Commands::Crypto(_)
             // Gated in `cli::mirror::authorize` and the MCP server.
             | Commands::Mirror(_)
+            | Commands::Transform(_)
             | Commands::Mcp(_) => true,
             // Counts, sizes and offsets only; or records read in.
             Commands::Topics(_)
@@ -1357,6 +1410,14 @@ mod tests {
             (&["compact", "analyze", "users"][..], None),
             (&["trace", "audit", "orders"][..], None),
             (&["mirror", "a", "b"][..], None),
+            (
+                &["transform", "orders", "--to", "copy"][..],
+                Some((Stdout, "transform --dry-run", "orders")),
+            ),
+            (
+                &["transform", "orders", "--to", "copy", "--execute"][..],
+                None,
+            ),
             (&["mcp"][..], None),
             (&["topics", "analyze", "orders"][..], None),
             (&["report", "--since", "30m"][..], None),

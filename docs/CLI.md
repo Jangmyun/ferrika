@@ -569,6 +569,66 @@ ferrika mirror telemetry telemetry-staging -p 0 -k "sensor-temp" -n 10000
 ferrika mirror orders-v1 orders-v1 --src-profile prod --dst-profile staging -g orders-mirror -b
 ```
 
+### Stream transform (`ferrika transform`)
+
+Copies records from a topic (on the cluster the global options select) to
+another topic, through steps applied in the order they are given:
+
+| Step | Effect |
+| --- | --- |
+| `--filter EXPR` | Keep records the expression matches (the `consume --where` syntax: `$.user.country == "KR"`, `$.amount > 100`, `key =~ "^order-"`, `headers.source == "web"`, `&&`, `\|\|`, `!`) |
+| `--drop FIELD` | Remove a value field (`user.email`, `items.0`) |
+| `--rename OLD=NEW` | Move a value field to another name or path |
+| `--set FIELD=JSON` | Set a value field to a JSON value (`env='"staging"'`, `retries=0`) |
+| `--rekey FIELD` | Use a value field as the record key (text as is, other JSON as JSON text, `null` as no key) |
+| `--mask[=redact]` | Mask PII in the key, the value and header values (partial by default) |
+| `--sample N` | Keep one record in N: those whose offset is a multiple of N |
+
+Field steps work on values that are JSON objects. Other values (text,
+binary, JSON scalars and arrays) pass through them unchanged and are counted
+as "not JSON"; a `$.` filter on them is false. A value no step changed is
+written byte for byte; a changed one is written as compact JSON. Source
+timestamps and headers are kept; the partition follows the (new) key.
+
+Without `--execute` the command is a dry run: it prints up to 10 transformed
+records (or `-n`) as JSON lines on stdout and writes nothing; the summary
+goes to stderr. With `--execute` it writes them and prints the summary
+(`-f json` for JSON). It exits non-zero when a write fails.
+
+```bash
+# Preview: Korean orders over 100, without the e-mail field
+ferrika transform orders --to orders-kr -b \
+  --filter '$.user.country == "KR" && $.amount > 100' --drop user.email
+
+# Copy a masked 1% sample of what is in the topic now to staging, then stop
+ferrika -p prod transform orders --to orders --dst-profile staging \
+  --mask --sample 100 --from-beginning --until-end --execute
+
+# Re-key by customer and tag the copy; resumable with a consumer group
+ferrika transform orders --to orders-by-customer --rekey customer.id \
+  --set 'copied_by="ferrika"' -g orders-rekey -b --execute
+
+# Avro/Protobuf values decoded with the Schema Registry, written as JSON
+ferrika transform payments --to payments-json -D --rename amt=amount \
+  --from-timestamp 1767225600000 --until-end --execute
+```
+
+- Start: the current end (default), `-b/--from-beginning`,
+  `--from-timestamp MS`, or a consumer group's committed offsets (`-g`).
+- Stop: `-n/--max-records` written, `--until-end` (each partition up to the
+  end it had when the run started), or Ctrl-C.
+- `-g/--group` (with `--execute`): an offset is committed only after the
+  destination acknowledged the record, so a failed or interrupted run copies
+  records again rather than skipping them (at least once). A dry run ignores
+  it.
+- `-D` decodes the value only; keys are not decoded.
+- Policy: `--execute` passes the same checks as `mirror` (the destination's
+  write gate, and the export gate when the destination is another cluster).
+  Under enforced PII masking a run, dry or not, is refused unless `--mask` is
+  the first step, so no other step sees raw values. The audit log records
+  the counts and a SHA-256 of the steps, never the steps themselves or
+  record data.
+
 ### 10. Consumer Group Offset Reset & Replay (`ferrika offset reset`)
 ```bash
 # Dry-run simulation: Preview resetting consumer group to the beginning (earliest)

@@ -104,7 +104,7 @@ still starting can answer.
 | --- | --- |
 | Clusters and profiles | `profile` (add, use, show, import a client `.properties` file, read-only guard), `cluster`, `topology` |
 | Topics | `topics` (list, describe, create, clone, config, purge, delete, histogram, analyze, ...), `compact`, `reassign` |
-| Records | `produce`, `consume` (regex, key, header and `--where` expression filters), `generate`, `mirror`, `dump`, `restore`, `diff`, `dlq`, `trace`, `probe` |
+| Records | `produce`, `consume` (regex, key, header and `--where` expression filters), `generate`, `mirror`, `transform` (filter, reshape and mask while copying), `dump`, `restore`, `diff`, `dlq`, `trace`, `probe` |
 | Consumer groups | `monitor`, `top`, `offset` (inspect and reset) |
 | Checks | `health` (exit code for CI), `lint` (config rules with fixes), `report`, `crypto audit` (PII scan), `bench` |
 | Schemas and integrations | `schema`, `connect`, `acl`, `quota`, `user` |
@@ -142,6 +142,25 @@ Without a terminal, or with `--plain`, `-n <count>` or `--json`, `top` prints
 a refreshing text view or one JSON snapshot instead. The dashboard is the
 default-on `tui` cargo feature of `ferrika-cli` (ratatui and crossterm);
 build with `--no-default-features` to leave it out.
+## Stream transform
+
+`ferrika transform` copies records to another topic or cluster through a
+short pipeline of steps, applied in the order given: filter, drop, rename,
+set, rekey, mask and sample. It previews by default and writes only with
+`--execute`:
+
+```bash
+# Preview, then copy a masked subset of production orders to staging
+ferrika -p prod transform orders --to orders --dst-profile staging \
+  --mask --filter '$.amount > 100' --drop user.email --from-beginning --until-end
+ferrika -p prod transform orders --to orders --dst-profile staging \
+  --mask --filter '$.amount > 100' --drop user.email --from-beginning --until-end --execute
+```
+
+Writes go through the same policy and audit checks as `mirror`. It is a
+stateless, at-least-once copy tool for debugging and test data, not a stream
+processor: no joins, windows or exactly-once delivery. See
+[the command reference](docs/CLI.md#stream-transform-ferrika-transform).
 
 ## Policy, audit and MCP
 

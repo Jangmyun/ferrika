@@ -39,6 +39,23 @@ and 0.2.0 makes it crate-internal.
   panic. It is the default-on `tui` feature of `ferrika-cli` (ratatui 0.30,
   crossterm 0.29). `--plain` keeps the previous printed view, which is also
   used with `-n`, `--json` or when stdout is not a terminal.
+- `ferrika transform SRC --to DST`: copy records to another topic (also on
+  another cluster with `--dst-profile` or `--dst-bootstrap-servers`) through
+  steps applied in the order given: `--filter EXPR` (the `consume --where`
+  syntax), `--drop FIELD`, `--rename OLD=NEW`, `--set FIELD=JSON`,
+  `--rekey FIELD`, `--mask[=redact]` and `--sample N`. Without `--execute` it
+  is a dry run that prints the transformed records. Bounded runs with
+  `--from-beginning`, `--from-timestamp`, `--max-records` and `--until-end`;
+  `-g` commits offsets only after the destination acknowledged the record;
+  `-D` decodes Schema Registry values to JSON first. Writes pass the same
+  policy checks as `mirror`; under enforced PII masking a run is allowed when
+  `--mask` is its first step. The audit result entry records the counts and
+  a SHA-256 of the steps, never the steps or record data.
+- `ferrika-ops`: `transform` (the step pipeline), and
+  `mirror::run_copy_pipeline` with a `RecordTransform` hook, a preview
+  destination and `MirrorConfig::from_timestamp` / `until_end`.
+- `ferrika-core`: `Expr::matches_parsed` (evaluate an expression on an
+  already parsed JSON value) and `DriverError::partition_eof`.
 
 ### Changed
 

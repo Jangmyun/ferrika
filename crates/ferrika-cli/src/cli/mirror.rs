@@ -79,7 +79,7 @@ pub struct MirrorArgs {
 }
 
 /// Resolves a KafkaClientConfig for a given profile name and bootstrap server override.
-fn resolve_cluster_config(
+pub fn resolve_cluster_config(
     profile_name: Option<&str>,
     bootstrap_override: Option<&str>,
     global: &GlobalOpts,
@@ -137,16 +137,67 @@ fn cluster_profile_name(
         .unwrap_or_default()
 }
 
+/// The topics and clusters a command that copies records (`mirror`,
+/// `transform --execute`) reads from and writes to, for the policy checks
+/// in [`authorize`]. A cluster not named falls back to the global options.
+pub trait CopyRoute {
+    /// The command as the audit log names it.
+    fn label(&self) -> &'static str;
+    fn src_topic(&self) -> &str;
+    fn dst_topic(&self) -> &str;
+    fn src_profile(&self) -> Option<&str>;
+    fn dst_profile(&self) -> Option<&str>;
+    fn src_bootstrap_servers(&self) -> Option<&str>;
+    fn dst_bootstrap_servers(&self) -> Option<&str>;
+    /// Whether every record is PII-masked before anything else reads it,
+    /// so enforced masking does not refuse the copy.
+    fn masks_first(&self) -> bool;
+    /// How to make the copy acceptable under enforced masking.
+    fn masking_hint(&self) -> &'static str;
+}
+
+impl CopyRoute for MirrorArgs {
+    fn label(&self) -> &'static str {
+        "mirror"
+    }
+    fn src_topic(&self) -> &str {
+        &self.src_topic
+    }
+    fn dst_topic(&self) -> &str {
+        &self.dst_topic
+    }
+    fn src_profile(&self) -> Option<&str> {
+        self.src_profile.as_deref()
+    }
+    fn dst_profile(&self) -> Option<&str> {
+        self.dst_profile.as_deref()
+    }
+    fn src_bootstrap_servers(&self) -> Option<&str> {
+        self.src_bootstrap_servers.as_deref()
+    }
+    fn dst_bootstrap_servers(&self) -> Option<&str> {
+        self.dst_bootstrap_servers.as_deref()
+    }
+    fn masks_first(&self) -> bool {
+        false
+    }
+    fn masking_hint(&self) -> &'static str {
+        ""
+    }
+}
+
 /// Whether `args` name the clusters to copy between; then [`authorize`]
 /// checks the destination, and the gate in `main` stays out (see
 /// `main_gate_action`).
-pub fn names_clusters(args: &MirrorArgs) -> bool {
-    args.dst_profile.is_some() || args.src_profile.is_some() || args.dst_bootstrap_servers.is_some()
+pub fn names_clusters(args: &impl CopyRoute) -> bool {
+    args.dst_profile().is_some()
+        || args.src_profile().is_some()
+        || args.dst_bootstrap_servers().is_some()
 }
 
 /// The write gate in `main` checks the cluster the global options name, but
 /// `mirror` writes to its destination cluster; see `authorize_checking_brokers`.
-pub fn authorize(args: &MirrorArgs, global: &GlobalOpts) -> Result<(), String> {
+pub fn authorize(args: &impl CopyRoute, global: &GlobalOpts) -> Result<(), String> {
     let store = global.profile_store();
     let requested = authorize_checking_brokers(
         crate::governance::policy::current(),
@@ -163,8 +214,8 @@ pub fn authorize(args: &MirrorArgs, global: &GlobalOpts) -> Result<(), String> {
             time_ms: 0,
             source: "cli".to_string(),
             profile,
-            action: "mirror".to_string(),
-            target: format!("{} -> {}", args.src_topic, args.dst_topic),
+            action: args.label().to_string(),
+            target: format!("{} -> {}", args.src_topic(), args.dst_topic()),
             outcome: String::new(),
             ok: true,
             user: String::new(),
@@ -183,7 +234,7 @@ fn authorize_with(
     policy: &EffectivePolicy,
     sink: &impl AuditSink,
     store: &ProfileStore,
-    args: &MirrorArgs,
+    args: &impl CopyRoute,
     global: &GlobalOpts,
 ) -> Result<(), String> {
     authorize_checking_brokers(policy, sink, store, args, global, |_| {
@@ -205,12 +256,13 @@ fn authorize_checking_brokers(
     policy: &EffectivePolicy,
     sink: &impl AuditSink,
     store: &ProfileStore,
-    args: &MirrorArgs,
+    args: &impl CopyRoute,
     global: &GlobalOpts,
     fetch: impl Fn(&KafkaClientConfig) -> Result<Vec<String>, String>,
 ) -> Result<Option<String>, String> {
+    let label = args.label();
     // An unknown profile would silently fall back to localhost.
-    for name in [args.src_profile.as_deref(), args.dst_profile.as_deref()]
+    for name in [args.src_profile(), args.dst_profile()]
         .into_iter()
         .flatten()
     {
@@ -220,24 +272,20 @@ fn authorize_checking_brokers(
             ));
         }
     }
-    let target = format!("{} -> {}", args.src_topic, args.dst_topic);
-    if policy.masking_enforced() {
+    let target = format!("{} -> {}", args.src_topic(), args.dst_topic());
+    if policy.masking_enforced() && !args.masks_first() {
         let reason = format!(
-            "Refused by {}: PII masking is enforced, and `mirror` would copy unmasked records to another cluster.",
-            policy.label()
+            "Refused by {}: PII masking is enforced, and `{label}` would copy unmasked records to another cluster.{}",
+            policy.label(),
+            args.masking_hint()
         );
-        let src_profile = args.src_profile.as_deref();
+        let src_profile = args.src_profile();
         let mut profile = cluster_profile_name(store, src_profile, global);
         if profile.is_empty() {
-            profile = cluster_config(
-                store,
-                src_profile,
-                args.src_bootstrap_servers.as_deref(),
-                global,
-            )
-            .bootstrap_servers;
+            profile = cluster_config(store, src_profile, args.src_bootstrap_servers(), global)
+                .bootstrap_servers;
         }
-        let attempted = format!("mirror {target}");
+        let attempted = format!("{label} {target}");
         let entry = policy::blocked_entry("cli", &profile, &attempted, &reason);
         if let Err(e) = sink.record(&entry) {
             tracing::warn!(%e, "Could not write the audit log");
@@ -251,14 +299,9 @@ fn authorize_checking_brokers(
     if !names_clusters(args) {
         return Ok(None);
     }
-    let dst_name = args.dst_profile.as_deref().or(args.src_profile.as_deref());
+    let dst_name = args.dst_profile().or(args.src_profile());
     let profile = cluster_profile_name(store, dst_name, global);
-    let config = cluster_config(
-        store,
-        dst_name,
-        args.dst_bootstrap_servers.as_deref(),
-        global,
-    );
+    let config = cluster_config(store, dst_name, args.dst_bootstrap_servers(), global);
     let brokers =
         match policy::brokers_for_with(&config, policy.write_needs_broker_metadata(), &fetch) {
             Ok(brokers) => brokers,
@@ -269,7 +312,7 @@ fn authorize_checking_brokers(
                     profile.as_str()
                 };
                 let entry =
-                    policy::blocked_entry("cli", named, &format!("mirror {target}"), &reason);
+                    policy::blocked_entry("cli", named, &format!("{label} {target}"), &reason);
                 if let Err(e) = sink.record(&entry) {
                     tracing::warn!(%e, "Could not write the audit log");
                 }
@@ -279,7 +322,7 @@ fn authorize_checking_brokers(
     let request = WriteRequest {
         source: "cli",
         action: PolicyAction::Produce,
-        label: "mirror",
+        label,
         target: &target,
         profile: &profile,
         bootstrap: &brokers,
@@ -296,7 +339,7 @@ fn authorize_checking_brokers(
             profile.as_str()
         };
         Err(format!(
-            "Destination profile '{name}' is read-only, so `mirror` is refused. \
+            "Destination profile '{name}' is read-only, so `{label}` is refused. \
              Turn it off with `ferrika profile read-only {name} --off`."
         ))
     })
@@ -315,30 +358,21 @@ fn authorize_cross_cluster(
     policy: &EffectivePolicy,
     sink: &impl AuditSink,
     store: &ProfileStore,
-    args: &MirrorArgs,
+    args: &impl CopyRoute,
     global: &GlobalOpts,
     target: &str,
     fetch: &impl Fn(&KafkaClientConfig) -> Result<Vec<String>, String>,
 ) -> Result<(), String> {
-    let src_name = args.src_profile.as_deref();
-    let dst_name = args.dst_profile.as_deref().or(src_name);
-    let src = cluster_config(
-        store,
-        src_name,
-        args.src_bootstrap_servers.as_deref(),
-        global,
-    );
-    let dst = cluster_config(
-        store,
-        dst_name,
-        args.dst_bootstrap_servers.as_deref(),
-        global,
-    );
+    let label = args.label();
+    let src_name = args.src_profile();
+    let dst_name = args.dst_profile().or(src_name);
+    let src = cluster_config(store, src_name, args.src_bootstrap_servers(), global);
+    let dst = cluster_config(store, dst_name, args.dst_bootstrap_servers(), global);
     if policy::destination_within_source(&src.bootstrap_servers, &dst.bootstrap_servers) {
         return Ok(());
     }
     let mut destination = cluster_profile_name(store, dst_name, global);
-    if destination.is_empty() || args.dst_bootstrap_servers.is_some() {
+    if destination.is_empty() || args.dst_bootstrap_servers().is_some() {
         destination = dst.bootstrap_servers.clone();
     }
     let target = format!("{target} (to {destination})");
@@ -353,7 +387,7 @@ fn authorize_cross_cluster(
             } else {
                 profile.as_str()
             };
-            let entry = policy::blocked_entry("cli", named, &format!("mirror {target}"), &reason);
+            let entry = policy::blocked_entry("cli", named, &format!("{label} {target}"), &reason);
             if let Err(e) = sink.record(&entry) {
                 tracing::warn!(%e, "Could not write the audit log");
             }
@@ -363,7 +397,7 @@ fn authorize_cross_cluster(
     let request = ExportRequest {
         source: "cli",
         channel: ExportChannel::Cluster,
-        label: "mirror",
+        label,
         target: &target,
         records: None,
         profile: &profile,
@@ -1000,5 +1034,70 @@ mod tests {
             let reason = authorize_with(&policy, &log, &store(), &args, &global()).unwrap_err();
             assert!(reason.contains("'nope' does not exist"), "{reason}");
         }
+    }
+
+    fn transform_args(args: &[&str]) -> crate::cli::transform::TransformArgs {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(flatten)]
+            args: crate::cli::transform::TransformArgs,
+        }
+
+        TestCli::try_parse_from(
+            ["test", "orders", "--to", "orders-copy", "--execute"]
+                .iter()
+                .chain(args),
+        )
+        .unwrap_or_else(|e| panic!("{args:?} should parse: {e}"))
+        .args
+    }
+
+    #[test]
+    fn transform_passes_enforced_masking_only_when_it_masks_first() {
+        let policy = test_policy::masking();
+        let log = FakeLog::default();
+        let reason =
+            authorize_with(&policy, &log, &store(), &transform_args(&[]), &global()).unwrap_err();
+        assert!(reason.contains("PII masking is enforced"), "{reason}");
+        assert!(reason.contains("Add --mask as the first step"), "{reason}");
+        let entries = log.entries.borrow();
+        assert_eq!(entries[0].action, "policy.blocked");
+        assert_eq!(
+            entries[0].target,
+            "transform --execute orders -> orders-copy"
+        );
+        drop(entries);
+
+        // A mask after another step is too late: that step saw raw values.
+        let args = transform_args(&["--filter", "$.a == 1", "--mask"]);
+        assert!(authorize_with(&policy, &FakeLog::default(), &store(), &args, &global()).is_err());
+
+        let args = transform_args(&["--mask", "--drop", "a"]);
+        assert_eq!(
+            authorize_with(&policy, &FakeLog::default(), &store(), &args, &global()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn transform_to_another_cluster_is_an_export_and_a_write() {
+        let policy = test_policy::export_forbidden();
+        let log = FakeLog::default();
+        let args = transform_args(&["--dst-profile", "prod-eu"]);
+        let reason = authorize_with(&policy, &log, &store(), &args, &global()).unwrap_err();
+        assert!(reason.contains("export: forbidden"), "{reason}");
+        assert_eq!(
+            log.entries.borrow()[0].target,
+            "export:cluster transform --execute orders -> orders-copy (to prod-eu)"
+        );
+
+        // A read-only destination refuses the write.
+        let policy = verified(&["locked"], &[]);
+        let log = FakeLog::default();
+        let args = transform_args(&["--dst-profile", "locked"]);
+        assert!(authorize_with(&policy, &log, &store(), &args, &global()).is_err());
+        assert_eq!(log.entries.borrow()[0].action, "policy.blocked");
     }
 }
