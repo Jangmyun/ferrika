@@ -80,6 +80,67 @@ pub fn alter_partition_reassignments(
     Ok(results)
 }
 
+/// [`alter_partition_reassignments`] for plans that may change how many
+/// replicas partitions have. Some Kafka-compatible brokers (Redpanda) refuse
+/// that through reassignment (`INVALID_REPLICATION_FACTOR`: the count must
+/// match the topic's replication factor) and change it through the topic
+/// config `replication.factor`, placing the replicas themselves. When every
+/// partition is refused that way and each topic's plan has one replica
+/// count, that config is set instead, and the second value is `true` (the
+/// replicas are then where the broker put them, not as planned).
+pub fn reassign_or_set_replication(
+    config: &KafkaClientConfig,
+    assignments: &[PartitionAssignment],
+) -> KafkaResult<(Vec<PartitionReassignmentResult>, bool)> {
+    let results = alter_partition_reassignments(config, assignments)?;
+    let Some(targets) = replication_fallback(assignments, &results) else {
+        return Ok((results, false));
+    };
+    for (topic, replication) in &targets {
+        incremental_alter_topic_config(
+            config,
+            topic,
+            &[ConfigChange::Set(
+                "replication.factor".to_string(),
+                replication.to_string(),
+            )],
+            false,
+        )?;
+    }
+    let accepted = results
+        .into_iter()
+        .map(|r| PartitionReassignmentResult { error: None, ..r })
+        .collect();
+    Ok((accepted, true))
+}
+
+/// The `(topic, replica count)` to set through `replication.factor` when
+/// the broker refused every partition of `assignments` for its replica
+/// count; `None` otherwise, or when a topic's plan mixes replica counts.
+fn replication_fallback(
+    assignments: &[PartitionAssignment],
+    results: &[PartitionReassignmentResult],
+) -> Option<Vec<(String, usize)>> {
+    let refused_for_count = !results.is_empty()
+        && results.iter().all(|r| {
+            r.error
+                .as_deref()
+                .is_some_and(|e| e.contains("INVALID_REPLICATION_FACTOR"))
+        });
+    if !refused_for_count {
+        return None;
+    }
+    let mut targets: Vec<(String, usize)> = Vec::new();
+    for a in assignments {
+        match targets.iter().find(|(t, _)| *t == a.topic) {
+            Some((_, n)) if *n != a.replicas.len() => return None,
+            Some(_) => {}
+            None => targets.push((a.topic.clone(), a.replicas.len())),
+        }
+    }
+    Some(targets)
+}
+
 /// A partition the broker's response does not mention was not confirmed:
 /// callers read "no error" as "reassignment started", so it gets an error.
 fn add_missing_reassignment_results(
@@ -2584,6 +2645,40 @@ mod tests {
         }
         assert_eq!(deleted[0].resource_type, AclResourceType::Group);
         assert_eq!(deleted[0].permission_type, AclPermissionType::Deny);
+    }
+
+    #[test]
+    fn replica_count_refusals_fall_back_to_the_topic_config() {
+        let plan = |n: usize| {
+            (0..2)
+                .map(|p| PartitionAssignment::new("orders", p, (0..n as i32).collect()))
+                .collect::<Vec<_>>()
+        };
+        let refused = |error: &str| {
+            (0..2)
+                .map(|p| PartitionReassignmentResult {
+                    topic: "orders".into(),
+                    partition: p,
+                    error: Some(error.to_string()),
+                })
+                .collect::<Vec<_>>()
+        };
+        let count = "INVALID_REPLICATION_FACTOR (code 38): Number of replicas does not match the topic replication factor";
+        assert_eq!(
+            replication_fallback(&plan(3), &refused(count)),
+            Some(vec![("orders".to_string(), 3)])
+        );
+        // Other refusals, or a plan mixing counts, are reported as they are.
+        assert_eq!(
+            replication_fallback(&plan(3), &refused("NOT_CONTROLLER (code 41)")),
+            None
+        );
+        let mut mixed = plan(3);
+        mixed[1].replicas = vec![0, 1];
+        assert_eq!(replication_fallback(&mixed, &refused(count)), None);
+        let mut one_accepted = refused(count);
+        one_accepted[0].error = None;
+        assert_eq!(replication_fallback(&plan(3), &one_accepted), None);
     }
 
     #[test]
