@@ -374,6 +374,17 @@ pub fn run(mut cli: Cli) {
                 cli::exit_with_error(&reason)
             }
         };
+        // A change that does the work of more than one category needs each
+        // of them allowed (a RabbitMQ redrive republishes: `produce` too).
+        if let Some(reason) = extra_category_refusal(policy, action, &profile, &bootstrap) {
+            let audit_profile = if profile.is_empty() {
+                bootstrap.as_str()
+            } else {
+                profile.as_str()
+            };
+            governance::policy::record_blocked("cli", audit_profile, action, &reason);
+            cli::exit_with_error(&reason);
+        }
         let target = cli.command.as_ref().map(write_target).unwrap_or_default();
         // The id is made here so the request entry can name the operation
         // the handler records (`op`); its result entry adds `op_digest`.
@@ -785,6 +796,40 @@ fn write_action(command: &Commands) -> Option<&'static str> {
         | Commands::Audit { .. }
         | Commands::Policy(_) => None,
     }
+}
+
+/// Policy categories write command `label` needs allowed besides its own
+/// (`PolicyAction::from_cli`): a RabbitMQ redrive moves messages
+/// (`messages.move`) by publishing them again, so `forbid: ["produce"]`
+/// refuses it too.
+fn also_requires(label: &str) -> &'static [model::policy::PolicyAction] {
+    match label {
+        "rabbit dlq redrive --execute" => &[model::policy::PolicyAction::Produce],
+        _ => &[],
+    }
+}
+
+/// The refusal when `policy` forbids one of the [`also_requires`]
+/// categories of `action`, naming that category.
+fn extra_category_refusal(
+    policy: &governance::policy::EffectivePolicy,
+    action: &str,
+    profile: &str,
+    bootstrap: &str,
+) -> Option<String> {
+    also_requires(action).iter().find_map(|extra| {
+        policy
+            .check(*extra, profile, bootstrap)
+            .err()
+            .map(|reason| {
+                format!(
+                    "{} `{action}` republishes messages, so it needs `{}` allowed as well as `{}`.",
+                    &*reason,
+                    extra.id(),
+                    model::policy::PolicyAction::from_cli(action).id()
+                )
+            })
+    })
 }
 
 /// Whether the handler of write command `label` (from [`write_action`])
@@ -1635,9 +1680,47 @@ mod tests {
         assert_eq!(gate_profile(Some(&publish), &global), "");
         assert_eq!(
             gate_brokers(Some(&publish), &global, true).unwrap(),
-            "rabbit.prod.corp:443"
+            "rabbit.prod.corp:443,rabbit.prod.corp:5671"
         );
         assert!(!super::fails_fast_without_broker(&publish));
+    }
+
+    #[test]
+    fn a_rabbit_redrive_needs_produce_as_well_as_messages_move() {
+        use super::{also_requires, extra_category_refusal};
+        use model::policy::PolicyAction;
+        let action = "rabbit dlq redrive --execute";
+        assert_eq!(also_requires(action), &[PolicyAction::Produce]);
+        assert!(also_requires("rabbit peek").is_empty());
+        assert!(also_requires("produce").is_empty());
+
+        let mut policy = crate::governance::test_policy::masking();
+        let address = "rabbit.prod:15672,rabbit.prod:5672";
+        assert_eq!(extra_category_refusal(&policy, action, "", address), None);
+        policy.rules.forbid = vec!["produce".to_string()];
+        let refusal = extra_category_refusal(&policy, action, "", address).unwrap();
+        assert!(refusal.contains("`produce`"), "{refusal}");
+        assert!(refusal.contains("messages.move"), "{refusal}");
+        // Other writes are judged by their own category only.
+        assert_eq!(
+            extra_category_refusal(&policy, "rabbit peek", "", address),
+            None
+        );
+    }
+
+    #[test]
+    fn a_read_only_rule_on_the_amqp_address_covers_rabbit_commands() {
+        use model::policy::PolicyAction;
+        let mut policy = crate::governance::test_policy::masking();
+        policy.rules.read_only_brokers = vec!["amqp.prod.corp:*".to_string()];
+        // The gate address lists the management and the AMQP listener.
+        let address = "mgmt.prod.corp:15672,amqp.prod.corp:5672";
+        assert!(policy
+            .check(PolicyAction::MessagesPeek, "", address)
+            .is_err());
+        assert!(policy
+            .check(PolicyAction::MessagesPeek, "", "mgmt.prod.corp:15672")
+            .is_ok());
     }
 
     #[test]

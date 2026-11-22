@@ -2,6 +2,7 @@
 name = "ferrika-rabbitmq"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Ferrika RabbitMQ support (preview): management HTTP API client, connection profiles and AMQP dead-letter redrive"
 license.workspace = true
 repository.workspace = true

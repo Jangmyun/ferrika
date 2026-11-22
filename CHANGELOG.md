@@ -88,20 +88,27 @@ The RabbitMQ entries below are planned for 0.2.0.
   [-k K] [-n N]`: a preview of where each message would go; with
   `--execute` (asks first unless `--yes`) the messages are moved over AMQP
   0-9-1, one at a time, acknowledged only after the broker confirmed the
-  republished copy, stopping at the first failure. New dependency `lapin`
+  republished copy, stopping at the first failure. Redriven messages keep
+  their headers (`x-death` included). Credentials in `--rabbit-url` are
+  used for AMQP too, with a warning that they can end up in shell
+  history. New dependency `lapin`
   (MIT) in `ferrika-rabbitmq`, behind its default feature `amqp`.
 - Policy categories `messages.peek` (`rabbit peek`, `rabbit dlq inspect`,
   the `rabbit dlq redrive` preview) and `messages.move` (`rabbit dlq redrive
   --execute`). `rabbit publish` is `produce`, so `forbid: ["produce"]`
-  covers both brokers. `PolicyAction` gains `MessagesPeek` and
-  `MessagesMove` (a breaking change for code that matches on it).
+  covers both brokers, and a RabbitMQ redrive needs `produce` allowed as
+  well as `messages.move`. For `rabbit` commands the policy's
+  broker-address rules match both the management and the AMQP
+  `host:port`. `PolicyAction` gains `MessagesPeek` and `MessagesMove` (a
+  breaking change for code that matches on it).
 
 ### Changed
 
 - `rabbit peek` is a write: it changes the messages it reads (redelivered
   flag, quorum-queue delivery count), so read-only rules and profiles refuse
   it and it is audited like other writes, besides being a record export.
-- Building now needs Rust 1.89 or newer (`lapin` and its AMQP crates).
+- Building now needs Rust 1.89 or newer (`lapin` and its AMQP crates);
+  the crates declare `rust-version = "1.89"` and CI checks it.
 
 ### Compatibility
 

@@ -2,6 +2,7 @@
 name = "ferrika-ops"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Ferrika operations: backup, mirror, DLQ, diff, lint, health, reports and change history with undo"
 license.workspace = true
 repository.workspace = true

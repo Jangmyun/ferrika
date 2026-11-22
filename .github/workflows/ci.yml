@@ -35,6 +35,19 @@ jobs:
       - run: cargo clippy -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq --all-targets -- -D warnings
       - run: cargo test -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq
 
+  # The minimum supported Rust version (`rust-version` in Cargo.toml, also
+  # in README.md and CONTRIBUTING.md): everything must still build with it.
+  msrv:
+    name: MSRV (Rust 1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake build-essential pkg-config
+      - uses: dtolnay/rust-toolchain@1.89
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked --all-targets -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq
+
   # Windows and macOS minutes cost more, and this repository may be private,
   # so these run automatically only once the repository is public. Start them
   # by hand with "Run workflow" (workflow_dispatch) at any time.

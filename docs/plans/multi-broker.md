@@ -42,7 +42,7 @@ the profile and broker addresses to match, and (3) the history state model.
 
 - **Target address.** The policy matches "broker addresses". For Kafka these
   are bootstrap servers (plus metadata brokers); for RabbitMQ it is the
-  `host:port` of the management API the command talks to. `read_only`,
+  `host:port` of the management API and of the AMQP listener (decision 6). `read_only`,
   `read_only_brokers` and `export_clusters` globs therefore cover RabbitMQ
   without a policy format change: `read_only_brokers: ["*.prod.corp"]`
   makes `rabbit.prod.corp:15672` read-only too.
@@ -291,7 +291,7 @@ connection does not need Kafka's required `bootstrap_servers`.
 | `rabbit publish` | write gate | `produce` | request entry before the call, result entry after (`rabbit publish`, target exchange/vhost/routing key) |
 | `rabbit dlq inspect` | write gate, and export gate (channel `stdout`) | `messages.peek` | as `peek` |
 | `rabbit dlq redrive` (preview) | write gate | `messages.peek` | request and result entries; shows destinations, no bodies |
-| `rabbit dlq redrive --execute` | write gate, confirmation unless `--yes` | `messages.move` | request entry (source queue, vhost, destination rule); result entry with the moved count per destination and, on failure, a fixed reason; never bodies or broker error text |
+| `rabbit dlq redrive --execute` | write gate, confirmation unless `--yes` | `messages.move`, and `produce` must be allowed too | request entry (source queue, vhost, destination rule); result entry with the moved count per destination and, on failure, a fixed reason; never bodies or broker error text |
 | `rabbit profile ...` | none (local configuration) | | none |
 
 Masking applies to `peek` when the policy enforces it (or with
@@ -322,7 +322,8 @@ adds an `x-death` header: a list of tables, newest first, each with `queue`,
 - `redrive ... --execute [--yes]`: moves up to N messages over AMQP
   (below), category `messages.move`. The destination is the first (newest)
   `x-death` entry's `exchange` and first `routing-keys` value; each can be
-  overridden. A message without `x-death` needs `--to-exchange`.
+  overridden. A message without `x-death` needs `--to-exchange`. The
+  redrive needs `produce` allowed as well (decision 7).
 
 The move must not lose or duplicate silently. With the management API
 alone the safest order is per message: `get` with `ack_requeue_false` is
@@ -341,7 +342,9 @@ one message at a time on one channel in publisher-confirm mode:
    at a time, so no prefetched messages are held);
 2. `basic.publish` to the destination with `mandatory`, the message's
    properties and headers kept (`x-death` included) plus
-   `x-ferrika-redriven-from: <queue>`, then wait for the confirm;
+   `x-ferrika-redriven-from: <queue>` (decision 8: `x-death` is kept, so
+   the broker's history of the message stays and repeated failures keep
+   counting), then wait for the confirm;
 3. `basic.ack` only after a positive confirm with no returned message.
 
 The first failure stops the move: an unroutable (returned) or nacked
@@ -412,8 +415,8 @@ Topology writes are undoable and fit the existing model:
    `<profile>/rabbitmq_password`. CLI: `ferrika rabbit profile
    add|list|use|remove|show`; commands take `--rabbit-profile` (default:
    the active RabbitMQ profile) with `--rabbit-url`, `--vhost` and
-   `--rabbit-user` as overrides. The policy gate still matches the
-   management `host:port`.
+   `--rabbit-user` as overrides. The policy gate matches the
+   management `host:port` (and the AMQP one, decision 6).
 4. **DLQ redrive uses AMQP via `lapin`** (MIT, 4.13, tokio, rustls with
    ring), only in `ferrika-rabbitmq`, behind the default-on feature `amqp`.
    `rabbit dlq inspect` and `rabbit dlq redrive [--execute]` as described in
@@ -425,24 +428,33 @@ Topology writes are undoable and fit the existing model:
    other crates (`cargo publish --workspace`): metadata and a README marked
    preview are in place; it is not published from this branch.
 
+6. **The AMQP address is matched by the policy too.** The gate matches a
+   comma-separated list of the management `host:port` and the AMQP
+   listener's `host:port` (`--amqp-url`, the profile's `amqp_url`, or the
+   derived one), so a `read_only`, `read_only_brokers` or `export_clusters`
+   rule naming either applies to every `rabbit` command on that connection.
+7. **A redrive needs `produce` as well as `messages.move`**, because it
+   republishes. `cli/app.rs` (`also_requires`) checks the extra category
+   before the write gate; under `forbid: ["produce"]` a `dlq redrive
+   --execute` is refused (recorded as `policy.blocked`) with a message that
+   names `produce`.
+8. **Redriven messages keep their headers**, `x-death` included, plus
+   `x-ferrika-redriven-from`; said in `--help` and in [DLQ
+   reprocessing](#dlq-reprocessing).
+9. **Credentials in the management URL** are used for AMQP too (percent-
+   decoded, `ferrika_rabbitmq::profile::url_credentials`) when no user is
+   given otherwise. Every `rabbit` command with such a URL prints one
+   warning on stderr that credentials in a URL can end up in shell history,
+   recommending `rabbit profile add ... --rabbit-password-stdin`; the
+   warning never names the user or password.
+10. **Rust 1.89 is the minimum for 0.2.0**: `rust-version = "1.89"` in the
+    workspace (every crate inherits it), a CI job `msrv` on 1.89, README and
+    CONTRIBUTING.
+11. **`ferrika-rabbitmq` shares the workspace version**
+    (`version.workspace = true`) and is labelled preview in its README and
+    crate description.
+
 ## Open questions
 
-1. **Address matching.** The policy matches the management API's
-   `host:port`, not the AMQP listener (5672/5671) that `dlq redrive
-   --execute` connects to, nor the cluster's node names. Should the gate
-   also match the AMQP address (and `GET /api/nodes`), the way Kafka adds
-   metadata brokers?
-2. **`forbid: ["produce"]` and redrive.** A redrive republishes messages
-   but is gated as `messages.move` only (Kafka's `dlq redrive --execute` is
-   `produce`). Should a RabbitMQ redrive also be refused when `produce` is
-   forbidden?
-3. **`x-death` on redriven messages.** They keep their headers, `x-death`
-   included, so the broker's history of them stays and repeated failures
-   keep counting. Strip it instead (a clean retry), or make it an option?
-4. **Credentials in a management URL** used without a profile are not
-   carried over to AMQP (lapin then logs in as `guest`); pass
-   `--rabbit-user` for a redrive. Parse them out of the URL instead?
-5. **MSRV.** lapin 4.13 needs Rust 1.89 (the README said 1.85). Accept the
-   bump for 0.2.0, or make the CLI's AMQP support a non-default feature?
-6. **Publishing the crate** under the shared workspace version (0.2.0), or
-   a version series of its own while it is a preview?
+1. **Cluster node names.** Should the gate also match the cluster's nodes
+   (`GET /api/nodes`), the way Kafka adds metadata brokers?

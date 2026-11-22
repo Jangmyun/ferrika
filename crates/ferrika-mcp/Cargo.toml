@@ -2,6 +2,7 @@
 name = "ferrika-mcp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Ferrika MCP server: Kafka cluster tools for AI agents, read-only by default, policy-gated writes"
 license.workspace = true
 repository.workspace = true

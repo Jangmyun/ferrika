@@ -36,6 +36,13 @@ pub const PASSWORD_ENV: &str = "FERRIKA_RABBIT_PASSWORD";
 /// timeout does not apply: these commands do not use a Kafka profile.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Printed once per command when the management URL carries credentials.
+/// Names no user or password.
+const URL_CREDENTIALS_WARNING: &str =
+    "Warning: the RabbitMQ URL contains credentials, which can end up in shell history. \
+     Store them in a profile instead: ferrika rabbit profile add NAME --rabbit-url URL \
+     --rabbit-user USER --rabbit-password-stdin";
+
 /// Longest payload shown in the `peek` table.
 const TABLE_PAYLOAD_CHARS: usize = 120;
 
@@ -189,6 +196,36 @@ impl ResolvedRabbit {
             .map_err(|e| e.to_string())
     }
 
+    /// The AMQP URL: `--amqp-url`, the profile's, or the management host
+    /// on the AMQP port.
+    fn amqp_url(&self) -> Result<String, String> {
+        match &self.amqp_url {
+            Some(url) => Ok(url.clone()),
+            None => crate::rabbitmq::profile::derive_amqp_url(&self.management_url)
+                .map_err(|e| e.to_string()),
+        }
+    }
+
+    /// The addresses the policy's broker-address rules match, as a
+    /// comma-separated list: the management API's `host:port` and the AMQP
+    /// listener's, so a rule naming either covers every command on this
+    /// connection.
+    pub fn gate_addresses(&self) -> Result<String, String> {
+        let management = self.address()?;
+        let amqp = crate::rabbitmq::profile::amqp_host_port(&self.amqp_url()?)
+            .map_err(|e| e.to_string())?;
+        Ok(if amqp == management {
+            management
+        } else {
+            format!("{management},{amqp}")
+        })
+    }
+
+    /// Whether the management URL carries a user or password.
+    fn url_has_credentials(&self) -> bool {
+        crate::rabbitmq::profile::url_credentials(&self.management_url).is_some()
+    }
+
     /// The user and password to log in with, or `None` for credentials in
     /// the URL (or none). Reads stdin for `--rabbit-password-stdin`, so
     /// call it once.
@@ -228,23 +265,22 @@ impl ResolvedRabbit {
         })
     }
 
-    /// Where to connect over AMQP: `--amqp-url`, the profile's AMQP URL, or
-    /// the management host on the AMQP port.
+    /// Where to connect over AMQP (see [`Self::amqp_url`]), logged in as
+    /// `credentials`, else as the user and password in the management URL
+    /// (the same RabbitMQ user serves both).
     fn amqp_target(
         &self,
         credentials: Option<&(String, String)>,
         timeout: Duration,
     ) -> Result<AmqpTarget, String> {
-        let url = match &self.amqp_url {
-            Some(url) => url.clone(),
-            None => crate::rabbitmq::profile::derive_amqp_url(&self.management_url)
-                .map_err(|e| e.to_string())?,
-        };
+        let login = credentials
+            .cloned()
+            .or_else(|| crate::rabbitmq::profile::url_credentials(&self.management_url));
         Ok(AmqpTarget {
-            url,
+            url: self.amqp_url()?,
             vhost: self.vhost.clone(),
-            user: credentials.map(|(user, _)| user.clone()),
-            password: credentials.map(|(_, password)| password.clone()),
+            user: login.as_ref().map(|(user, _)| user.clone()),
+            password: login.map(|(_, password)| password),
             timeout,
         })
     }
@@ -343,13 +379,14 @@ fn resolve_with(
     })
 }
 
-/// The address the policy gates match for `args`: the management API's
-/// `host:port`.
+/// The addresses the policy gates match for `args`: the management API's
+/// and the AMQP listener's `host:port` (see
+/// [`ResolvedRabbit::gate_addresses`]).
 pub fn gate_address(args: &RabbitArgs) -> Result<String, String> {
     args.resolved
         .as_ref()
         .ok_or_else(|| "No RabbitMQ connection was resolved".to_string())?
-        .address()
+        .gate_addresses()
 }
 
 /// The profile name the gates and the audit log use: the RabbitMQ
@@ -444,7 +481,10 @@ pub enum RabbitDlqSubcommands {
         mask_pii: bool,
     },
     /// Move dead-lettered messages back to their original exchange and
-    /// routing key (from x-death). A preview unless --execute
+    /// routing key (from x-death). A preview unless --execute. Redriven
+    /// messages keep their headers, x-death included, plus
+    /// x-ferrika-redriven-from. Needs the policy categories messages.move
+    /// and produce
     Redrive {
         queue: String,
         /// Publish to this exchange instead of each message's original one
@@ -607,6 +647,9 @@ pub async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result<()> {
         .resolved
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("No RabbitMQ connection was resolved"))?;
+    if resolved.url_has_credentials() {
+        eprintln!("{}", URL_CREDENTIALS_WARNING.yellow());
+    }
     let credentials = resolved
         .credentials(&args.connection)
         .map_err(anyhow::Error::msg)?;
@@ -1471,6 +1514,42 @@ mod tests {
         assert_eq!(resolved.vhost, "/");
         assert_eq!(resolved.address().unwrap(), "rabbit.dev:15672");
         assert_eq!(resolved.credentials(&connection()).unwrap(), None);
+        // The URL's user and password log in over AMQP too, and a warning
+        // (which names neither) is due.
+        assert!(resolved.url_has_credentials());
+        assert!(!URL_CREDENTIALS_WARNING.contains("admin"));
+        let target = resolved.amqp_target(None, DEFAULT_TIMEOUT).unwrap();
+        assert_eq!(target.url, "amqp://rabbit.dev:5672");
+        assert_eq!(target.user.as_deref(), Some("admin"));
+        assert_eq!(target.password.as_deref(), Some("pw"));
+        // Credentials given explicitly win.
+        let given = Some(("ops".to_string(), "x".to_string()));
+        let target = resolved
+            .amqp_target(given.as_ref(), DEFAULT_TIMEOUT)
+            .unwrap();
+        assert_eq!(target.user.as_deref(), Some("ops"));
+    }
+
+    #[test]
+    fn the_gate_matches_the_management_and_the_amqp_address() {
+        let mut resolved = resolve_with(
+            &RabbitConnection {
+                url: Some("http://rabbit.dev".to_string()),
+                ..connection()
+            },
+            || unreachable!(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.gate_addresses().unwrap(),
+            "rabbit.dev:15672,rabbit.dev:5672"
+        );
+        resolved.amqp_url = Some("amqps://amqp.dev".to_string());
+        assert_eq!(
+            resolved.gate_addresses().unwrap(),
+            "rabbit.dev:15672,amqp.dev:5671"
+        );
+        assert!(!resolved.url_has_credentials());
     }
 
     #[test]
@@ -1494,7 +1573,10 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(gate_profile(&args), "prod");
-        assert_eq!(gate_address(&args).unwrap(), "rabbit.prod.corp:443");
+        assert_eq!(
+            gate_address(&args).unwrap(),
+            "rabbit.prod.corp:443,rabbit.prod.corp:5671"
+        );
         let err = ensure_writable(&args, "rabbit publish").unwrap_err();
         assert!(err.contains("read-only"), "{err}");
         args.resolved = Some(

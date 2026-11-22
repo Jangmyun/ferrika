@@ -294,7 +294,12 @@ quorum queue this can count towards its delivery limit): they are writes in
 the category `messages.peek` (refused on read-only profiles and brokers,
 audited), and their output is a record export like `consume`, masked when
 the policy enforces masking. The `dlq redrive` preview reads the same way
-(`messages.peek`); `dlq redrive --execute` is `messages.move`.
+(`messages.peek`); `dlq redrive --execute` is `messages.move` and also
+needs `produce` allowed, since it republishes. The policy's broker-address
+rules match both the management `host:port` and the AMQP listener's.
+Credentials in `--rabbit-url` (`http://user:pass@host`) also log in over
+AMQP, but every command then warns that they can end up in shell history;
+a profile with `--rabbit-password-stdin` avoids that.
 
 ```bash
 ferrika rabbit profile add prod --rabbit-url https://rabbit.prod:15671 \
@@ -329,8 +334,8 @@ https) and moves one message at a time: get without auto-ack, publish to
 the original exchange and routing key of the newest `x-death` entry (or the
 overrides) with `mandatory` and publisher confirms, and ack only after the
 confirm. It stops at the first failure and returns that message to the
-queue. Redriven messages keep their headers and get
-`x-ferrika-redriven-from: <queue>`. The audit log records the counts, the
+queue. Redriven messages keep their headers, `x-death` included, and
+get `x-ferrika-redriven-from: <queue>`. The audit log records the counts, the
 source queue and the destinations, never message bodies.
 
 ### Client quotas (`ferrika quota`)

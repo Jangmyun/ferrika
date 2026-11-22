@@ -11,6 +11,8 @@ members = ["crates/ferrika-core", "crates/ferrika-governance", "crates/ferrika-o
 [workspace.package]
 version = "0.1.1"
 edition = "2021"
+# Minimum Rust version (lapin and its AMQP crates need 1.89); CI checks it.
+rust-version = "1.89"
 license = "Apache-2.0"
 description = "A fast, lightweight, native Kafka client and management tool built with Rust"
 repository = "https://github.com/Jangmyun/ferrika"
