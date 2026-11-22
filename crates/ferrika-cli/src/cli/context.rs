@@ -1,8 +1,6 @@
 //! The cluster a CLI command talks to, resolved once in `main` (see
 //! [`crate::kafka::context`]). A broken `profiles.json` gets a repair hint.
 
-use std::path::Path;
-
 use crate::cli::GlobalOpts;
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::context::ResolvedContext;
@@ -16,7 +14,8 @@ pub fn resolve(opts: &GlobalOpts) -> KafkaResult<ResolvedContext> {
 }
 
 /// [`resolve`] with the store at `path` (no OS credential store).
-pub fn resolve_from_path(opts: &GlobalOpts, path: &Path) -> KafkaResult<ResolvedContext> {
+#[cfg(test)]
+fn resolve_from_path(opts: &GlobalOpts, path: &std::path::Path) -> KafkaResult<ResolvedContext> {
     let store = ProfileStore::load_from_path(path).map_err(with_repair_hint)?;
     ResolvedContext::from_store(&opts.selection(), store)
 }

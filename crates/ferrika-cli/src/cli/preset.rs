@@ -2,7 +2,7 @@
 //! their settings live in `ferrika_core::kafka::preset`, shared with other
 //! front ends; this module keeps the texts that name the CLI's flags.
 
-pub use crate::kafka::preset::{resolve, MissingSetting, Preset, Resolved};
+pub(crate) use crate::kafka::preset::{resolve, MissingSetting, Preset};
 
 /// What the user still has to give for the preset's own settings, named the
 /// way the service names them and with the flags that take them.

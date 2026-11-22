@@ -56,7 +56,8 @@ pub struct TopArgs {
 
 /// Whether to open the interactive dashboard: only for a person at a
 /// terminal who asked for neither text, JSON nor a fixed number of refreshes.
-pub fn wants_dashboard(args: &TopArgs, json: bool, terminal: bool) -> bool {
+#[cfg(any(feature = "tui", test))]
+fn wants_dashboard(args: &TopArgs, json: bool, terminal: bool) -> bool {
     terminal && !json && !args.plain && args.iterations == 0
 }
 

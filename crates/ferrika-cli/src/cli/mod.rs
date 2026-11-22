@@ -1,45 +1,54 @@
-pub mod acl;
+pub(crate) mod acl;
 pub mod app;
-pub mod audit;
-pub mod backup;
-pub mod bench;
-pub mod cluster_sync;
-pub mod compact;
-pub mod connect;
-pub mod consume;
-pub mod context;
-pub mod crypto;
-pub mod diff;
-pub mod dlq;
-pub mod generator;
-pub mod health;
-pub mod history;
-pub mod lint;
-pub mod mcp;
-pub mod mirror;
-pub mod monitor;
-pub mod offset;
+pub(crate) mod audit;
+pub(crate) mod backup;
+pub(crate) mod bench;
+pub(crate) mod cluster_sync;
+pub(crate) mod compact;
+pub(crate) mod connect;
+pub(crate) mod consume;
+pub(crate) mod context;
+pub(crate) mod crypto;
+pub(crate) mod diff;
+pub(crate) mod dlq;
+pub(crate) mod generator;
+pub(crate) mod health;
+pub(crate) mod history;
+pub(crate) mod lint;
+pub(crate) mod mcp;
+pub(crate) mod mirror;
+pub(crate) mod monitor;
+pub(crate) mod offset;
 mod output;
-pub mod policy;
-pub mod preset;
-pub mod probe;
-pub mod produce;
-pub mod profile;
-pub mod quota;
+pub(crate) mod policy;
+pub(crate) mod preset;
+pub(crate) mod probe;
+pub(crate) mod produce;
+pub(crate) mod profile;
+pub(crate) mod quota;
+/// `ferrika rabbit`: public because GUI front ends route their RabbitMQ
+/// operations through its policy classification (`RabbitArgs`,
+/// `RabbitConnection`, `RabbitSubcommands`, `RabbitDlqArgs`,
+/// `RabbitDlqSubcommands`, `ResolvedRabbit`, `resolve`, `write_action`,
+/// `write_target`, `gate_profile`, `gate_address`, `ensure_writable`).
+/// Everything else in it is crate-internal.
 pub mod rabbit;
-pub mod rabbit_profile;
-pub mod reassign;
-pub mod record;
-pub mod report;
-pub mod schema;
-pub mod top;
-pub mod topics;
-pub mod topology;
-pub mod trace;
+pub(crate) mod rabbit_profile;
+pub(crate) mod reassign;
+pub(crate) mod record;
+pub(crate) mod report;
+pub(crate) mod schema;
+pub(crate) mod top;
+pub(crate) mod topics;
+pub(crate) mod topology;
+pub(crate) mod trace;
+/// `ferrika transform`: public only for the constants GUI front ends share
+/// with it (`DRY_RUN_LIMIT`, `EXECUTE_LABEL`). Everything else in it is
+/// crate-internal.
 pub mod transform;
 #[cfg(feature = "tui")]
-pub mod tui;
-pub mod user;
+pub(crate) mod tui;
+pub(crate) mod user;
 
 use clap::{Args, ValueEnum};
 use colored::Colorize;
@@ -73,7 +82,8 @@ fn effective_timeout(
     }
 }
 
-/// Global CLI options shared across subcommands.
+/// Global CLI options shared across subcommands. Public: GUI front ends
+/// parse them for their own start-up.
 #[derive(Args, Debug, Clone)]
 pub struct GlobalOpts {
     /// Select a cluster profile from configuration store

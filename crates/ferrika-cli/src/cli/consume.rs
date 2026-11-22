@@ -873,7 +873,8 @@ async fn sleep_until_or_forever(deadline: Option<tokio::time::Instant>) {
 }
 
 /// Formats a consumed message with terminal colors and optional pretty JSON, wire format decoding, or hex dump.
-pub fn format_message_display_ext(
+#[cfg(test)]
+fn format_message_display_ext(
     msg: &ConsumedMessage,
     pretty_json: bool,
     show_headers: bool,
@@ -1010,12 +1011,9 @@ fn format_message(
     out
 }
 
-/// Backwards-compatible wrapper for format_message_display_ext.
-pub fn format_message_display(
-    msg: &ConsumedMessage,
-    pretty_json: bool,
-    show_headers: bool,
-) -> String {
+/// [`format_message_display_ext`] without decoding or hex.
+#[cfg(test)]
+fn format_message_display(msg: &ConsumedMessage, pretty_json: bool, show_headers: bool) -> String {
     format_message_display_ext(msg, pretty_json, show_headers, false, false)
 }
 
