@@ -186,8 +186,49 @@ fn diff_findings(
 /// One key for every connection failure, whatever its error text.
 const UNREACHABLE_KEY: &str = "unreachable";
 
+/// How far apart two snapshots must be to judge consumer progress: a group
+/// that commits every 30 s would look stalled between two 10 s polls.
+const PROGRESS_WINDOW_MS: i64 = 60_000;
+
+/// Gives `health --watch` snapshots the consume rates the stalled-consumer
+/// check needs (one snapshot has none). Rates come from a baseline at least
+/// [`PROGRESS_WINDOW_MS`] old; polls in between reuse the last rates, so a
+/// finding does not clear and reappear between windows.
+#[derive(Default)]
+struct ProgressTracker {
+    baseline: Option<(i64, ClusterSnapshot)>,
+    rates: BTreeMap<String, f64>,
+}
+
+impl ProgressTracker {
+    fn apply(&mut self, snapshot: &mut ClusterSnapshot, now_ms: i64) {
+        match &self.baseline {
+            Some((at, base)) if now_ms - at >= PROGRESS_WINDOW_MS => {
+                crate::ops::report::fill_consume_rates(base, *at, snapshot, now_ms);
+                self.rates = snapshot
+                    .consumers
+                    .iter()
+                    .filter_map(|g| Some((g.group_id.clone(), g.consume_rate?)))
+                    .collect();
+                self.baseline = Some((now_ms, snapshot.clone()));
+            }
+            Some(_) => {
+                for g in snapshot
+                    .consumers
+                    .iter_mut()
+                    .filter(|g| g.consume_rate.is_none())
+                {
+                    g.consume_rate = self.rates.get(&g.group_id).copied();
+                }
+            }
+            None => self.baseline = Some((now_ms, snapshot.clone())),
+        }
+    }
+}
+
 async fn watch(args: &HealthArgs, global: &GlobalOpts, every: Duration) -> KafkaResult<()> {
     let cluster = cluster_name(global);
+    let mut progress = ProgressTracker::default();
     let mut before: BTreeMap<String, HealthIssue> = BTreeMap::new();
     // The findings as the webhook last reported them.
     let mut notified: BTreeMap<String, HealthIssue> = BTreeMap::new();
@@ -197,7 +238,11 @@ async fn watch(args: &HealthArgs, global: &GlobalOpts, every: Duration) -> Kafka
         every.as_secs()
     );
     loop {
-        let now: BTreeMap<String, HealthIssue> = match collect(global).await {
+        let polled = snapshot(global).await.map(|mut data| {
+            progress.apply(&mut data, crate::kafka::clock::now_ms());
+            health_checks(&data)
+        });
+        let now: BTreeMap<String, HealthIssue> = match polled {
             Ok(issues) => issues
                 .into_iter()
                 .filter(|i| args.min_severity.admits(i.severity))
@@ -341,6 +386,52 @@ pub(crate) async fn snapshot(global: &GlobalOpts) -> KafkaResult<ClusterSnapshot
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_judges_progress_over_a_minute_and_keeps_the_verdict_between() {
+        use crate::model::cluster::{ConsumerGroupSummary, ConsumerState};
+        let at = |offset: i64| {
+            let mut data = ClusterSnapshot::empty("p", "b");
+            data.consumers.push(ConsumerGroupSummary {
+                group_id: "billing".into(),
+                state: ConsumerState::Stable,
+                active_members: 2,
+                target_topics: vec!["orders".into()],
+                current_offset: offset,
+                end_offset: 50_000,
+                total_lag: 50_000 - offset,
+                coordinator_node: "-".into(),
+                consume_rate: None,
+                partitions: Vec::new(),
+            });
+            data
+        };
+        let stalled = |data: &ClusterSnapshot| {
+            health_checks(data)
+                .iter()
+                .any(|i| i.message.contains("no progress"))
+        };
+        let mut tracker = ProgressTracker::default();
+        let mut first = at(100);
+        tracker.apply(&mut first, 0);
+        assert!(!stalled(&first), "one sample says nothing");
+        // 10 s later: too soon to judge.
+        let mut early = at(100);
+        tracker.apply(&mut early, 10_000);
+        assert!(!stalled(&early));
+        // A minute later and no commit moved: stalled.
+        let mut later = at(100);
+        tracker.apply(&mut later, 60_000);
+        assert!(stalled(&later));
+        // The next poll inside the window keeps that verdict.
+        let mut between = at(100);
+        tracker.apply(&mut between, 70_000);
+        assert!(stalled(&between));
+        // Progress over the next window clears it.
+        let mut moving = at(900);
+        tracker.apply(&mut moving, 120_000);
+        assert!(!stalled(&moving));
+    }
 
     #[test]
     fn debug_output_redacts_the_webhook_url() {

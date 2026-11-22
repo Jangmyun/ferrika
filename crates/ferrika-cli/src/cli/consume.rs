@@ -206,6 +206,10 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
     // --to-timestamp finishes a partition at its first record past it; the
     // command ends once all are finished.
     let mut time_stop = TimestampStop::new(args.to_timestamp, &[]);
+    // With a --to-timestamp already past, each partition's current end: the
+    // command finishes a partition there even when no later record arrives
+    // (it used to wait for one forever).
+    let mut ends: std::collections::HashMap<i32, i64> = std::collections::HashMap::new();
     let timestamps = args.from_timestamp.is_some() || args.to_timestamp.is_some();
     if args.partition.is_some() || args.offset.is_some() || timestamps || !use_group {
         let existing = consumer.topic_partitions(&args.topic, None)?;
@@ -224,7 +228,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                     .iter()
                     .map(|&p| (args.topic.as_str(), p))
                     .collect();
-                let lookup = consumer.offsets_for_timestamp(&keys, ts, None)?;
+                let lookup = time_lookup_offsets(consumer.offsets_at_time(&keys, ts, None)?)?;
                 let starts = timestamp_start_offsets(&args.topic, &partitions, &lookup);
                 // Nothing at or after --from-timestamp, and --to-timestamp
                 // has passed: the window is empty.
@@ -246,6 +250,61 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                 partitions.iter().map(|&p| (p, start)).collect()
             }
         };
+        if args
+            .to_timestamp
+            .is_some_and(|to| to < jiff::Timestamp::now().as_millisecond())
+        {
+            let keys: Vec<(&str, i32)> = partitions
+                .iter()
+                .map(|&p| (args.topic.as_str(), p))
+                .collect();
+            // A group starting at its committed offsets: where those are.
+            let committed = match (
+                &kafka_config.group_id,
+                starts.iter().any(|(_, s)| *s == Offset::Stored),
+            ) {
+                (Some(group), true) => crate::kafka::wire::fetch_group_offsets(
+                    &kafka_config,
+                    std::slice::from_ref(group),
+                )
+                .ok()
+                .and_then(|mut all| all.remove(group))
+                .unwrap_or_default(),
+                _ => Default::default(),
+            };
+            for ((_, p), (low, high)) in consumer.fetch_watermarks_batch(&keys, None)? {
+                let at_end = starts.iter().any(|&(sp, start)| {
+                    sp == p
+                        && match start {
+                            Offset::Stored => match committed.get(&(args.topic.clone(), p)) {
+                                Some(&c) => c >= high,
+                                // No commit: the reset policy picks the start.
+                                None => match kafka_config.auto_offset_reset {
+                                    crate::kafka::config::AutoOffsetReset::Latest => true,
+                                    _ => low >= high,
+                                },
+                            },
+                            start => starts_at_end(start, low, high),
+                        }
+                });
+                if at_end {
+                    time_stop.finish(p);
+                }
+                ends.insert(p, high);
+            }
+            let unbounded: Vec<String> = partitions
+                .iter()
+                .filter(|p| !ends.contains_key(p))
+                .map(i32::to_string)
+                .collect();
+            if !unbounded.is_empty() {
+                eprintln!(
+                    "{} Could not read the end of partition(s) {}; they finish only at a record past --to-timestamp.",
+                    "!".yellow(),
+                    unbounded.join(", ")
+                );
+            }
+        }
         let assignments: Vec<(&str, i32, Offset)> = starts
             .iter()
             .map(|&(p, start)| (args.topic.as_str(), p, start))
@@ -259,7 +318,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                     topic,
                     partition,
                     start,
-                    end: None,
+                    end: ends.get(&partition).copied(),
                 })
                 .collect();
             let keep = filter.clone();
@@ -321,6 +380,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
     let mut stats = FilterStats::default();
     // Offsets of processed records that could not be stored (`--group`).
     let mut store_failures = 0usize;
+    let mut read_errors = 0usize;
     let idle_timeout = args.timeout.map(Duration::from_millis);
     // Buffer terminal output: println! issues one write per message, which dominates
     // the cost of consuming large topics. Buffers are flushed whenever the stream pauses.
@@ -350,7 +410,11 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                 eprintln!("\n{}", "Consumer interrupted by user (Ctrl+C).".yellow());
                 break;
             }
-            event = next_event(&consumer, reader.as_mut()) => {
+            event = next_event(&consumer, reader.as_mut(), !ends.is_empty()) => {
+                let Some(event) = event else {
+                    // Every partition was read to its end.
+                    break;
+                };
                 match event {
                     ReadEvent::Skipped(count) => {
                         idle_deadline = idle_timeout.map(|d| tokio::time::Instant::now() + d);
@@ -362,6 +426,9 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                         if !time_stop.admit(msg.partition, msg.timestamp_ms) {
                             stats.record_skip();
                             continue;
+                        }
+                        if ends.get(&msg.partition).is_some_and(|&end| msg.offset + 1 >= end) {
+                            time_stop.finish(msg.partition);
                         }
                         if use_group {
                             if let Err(e) = consumer.store_processed(&msg) {
@@ -381,7 +448,9 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
 
                         // Decoded before --where so expressions see Avro and
                         // Protobuf records as JSON.
-                        let decode = !args.hex && (where_expr.is_some() || !json_lines);
+                        // (`decoder` exists only with -D; JSON lines carry the
+                        // decoded record next to the raw one.)
+                        let decode = !args.hex;
                         let decoded = match (&mut decoder, msg.payload.as_deref()) {
                             (Some(decoder), Some(payload)) if decode => {
                                 decoder.decode(payload).await
@@ -429,7 +498,9 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                         }
 
                         if json_lines {
-                            writeln!(out, "{}", jsonl_record(&msg))?;
+                            let mut record = jsonl_record(&msg);
+                            add_decoded(&mut record, decoded.as_ref(), decoded_key.as_ref());
+                            writeln!(out, "{record}")?;
                         } else {
                             let shown;
                             let msg_ref = match decoded_key {
@@ -458,6 +529,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                     }
                     ReadEvent::Error(err) => {
                         eprintln!("{} Consumer error: {err}", "✖".red());
+                        read_errors += 1;
                     }
                 }
             }
@@ -516,7 +588,51 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
 
     // The group's position did not (fully) move: say so in the exit code,
     // so a script does not take the run as done and skip the re-read.
-    group_outcome(commit.is_ok(), store_failures)
+    group_outcome(commit.is_ok(), store_failures)?;
+    read_outcome(read_errors, stats.total_received)
+}
+
+/// `Err` when the consumer reported errors and nothing was read (no read
+/// permission on the topic, brokers gone): "Consumed 0" alone would look
+/// like an empty topic to a script.
+fn read_outcome(errors: usize, received: u64) -> anyhow::Result<()> {
+    if errors > 0 && received == 0 {
+        anyhow::bail!("nothing was read and the consumer reported {errors} error(s) (see above)");
+    }
+    Ok(())
+}
+
+/// Adds `-D`'s decoded value and key to a JSON line (`decoded`,
+/// `decoded_key`, and `decoded_with` naming the schema), as JSON when the
+/// text is JSON. The raw fields stay, so the line still restores. Text that
+/// is neither JSON nor decoded with a schema (a failed lookup of an Avro or
+/// Protobuf schema leaves the raw bytes) is left out.
+fn add_decoded(
+    record: &mut serde_json::Value,
+    value: Option<&crate::codec::schema::DecodedPayload>,
+    key: Option<&crate::codec::schema::DecodedPayload>,
+) {
+    let as_json = |d: &crate::codec::schema::DecodedPayload| {
+        serde_json::from_str::<serde_json::Value>(&d.text)
+            .ok()
+            .or_else(|| {
+                d.schema_ref
+                    .is_some()
+                    .then(|| serde_json::Value::from(d.text.clone()))
+            })
+    };
+    let Some(obj) = record.as_object_mut() else {
+        return;
+    };
+    if let Some(d) = value {
+        if let Some(v) = as_json(d) {
+            obj.insert("decoded".into(), v);
+            obj.insert("decoded_with".into(), d.label.clone().into());
+        }
+    }
+    if let Some(k) = key.and_then(as_json) {
+        obj.insert("decoded_key".into(), k);
+    }
 }
 
 /// `Err` when `consume --group` could not commit where it got to: the next
@@ -536,20 +652,57 @@ fn group_outcome(committed: bool, store_failures: usize) -> anyhow::Result<()> {
 }
 
 /// The next record from `reader` when there is one, else from `consumer`.
+/// `None` when the reader read every partition to its end (`bounded`: each
+/// was given one).
 async fn next_event(
     consumer: &KafkaConsumerClient,
     reader: Option<&mut ParallelReader>,
-) -> ReadEvent {
+    bounded: bool,
+) -> Option<ReadEvent> {
     match reader {
-        // Every reader thread has stopped; the idle timeout or Ctrl+C ends the command.
         Some(reader) => match reader.recv().await {
-            Some(event) => event,
+            Some(event) => Some(event),
+            None if bounded => None,
+            // Every reader thread has stopped; the idle timeout or Ctrl+C ends the command.
             None => std::future::pending().await,
         },
-        None => match consumer.recv().await {
+        None => Some(match consumer.recv().await {
             Ok(msg) => ReadEvent::Record(msg),
             Err(err) => ReadEvent::Error(err),
-        },
+        }),
+    }
+}
+
+/// Start offsets from a `--from-timestamp` lookup. A partition the broker
+/// could not answer for (a moving leader, a timeout) is an error: starting
+/// it at the end would leave its records out without a word.
+fn time_lookup_offsets(
+    lookups: std::collections::HashMap<(String, i32), crate::kafka::consumer::Lookup>,
+) -> anyhow::Result<std::collections::HashMap<(String, i32), Offset>> {
+    use crate::kafka::consumer::Lookup;
+    lookups
+        .into_iter()
+        .map(|(key, lookup)| match lookup {
+            Lookup::At(offset) => Ok((key, Offset::Offset(offset))),
+            Lookup::End => Ok((key, Offset::End)),
+            Lookup::Failed(failure) => Err(anyhow::anyhow!(
+                "cannot find where partition {} starts at --from-timestamp: {}",
+                key.1,
+                failure.message
+            )),
+        })
+        .collect()
+}
+
+/// Whether reading from `start` finds nothing before `high` (an empty
+/// partition, or a start at its end).
+fn starts_at_end(start: Offset, low: i64, high: i64) -> bool {
+    match start {
+        Offset::Beginning => low >= high,
+        Offset::End => true,
+        Offset::Offset(o) => o >= high,
+        Offset::OffsetTail(n) => n <= 0 || low >= high,
+        _ => false,
     }
 }
 
@@ -788,6 +941,80 @@ pub fn format_message_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partitions_with_nothing_to_read_are_recognised() {
+        assert!(starts_at_end(Offset::Beginning, 5, 5));
+        assert!(!starts_at_end(Offset::Beginning, 0, 5));
+        assert!(starts_at_end(Offset::End, 0, 5));
+        assert!(starts_at_end(Offset::Offset(5), 0, 5));
+        assert!(!starts_at_end(Offset::Offset(4), 0, 5));
+        assert!(!starts_at_end(Offset::OffsetTail(3), 0, 5));
+        assert!(starts_at_end(Offset::OffsetTail(3), 5, 5));
+        // A group's stored position is not known here.
+        assert!(!starts_at_end(Offset::Stored, 5, 5));
+    }
+
+    #[test]
+    fn a_failed_time_lookup_stops_instead_of_starting_at_the_end() {
+        use crate::kafka::consumer::{Lookup, LookupFailure};
+        let ok = time_lookup_offsets(
+            [
+                (("t".to_string(), 0), Lookup::At(7)),
+                (("t".to_string(), 1), Lookup::End),
+            ]
+            .into(),
+        )
+        .unwrap();
+        assert_eq!(ok[&("t".to_string(), 0)], Offset::Offset(7));
+        assert_eq!(ok[&("t".to_string(), 1)], Offset::End);
+        let failed = time_lookup_offsets(
+            [(
+                ("t".to_string(), 2),
+                Lookup::Failed(LookupFailure::new(
+                    "NotLeaderForPartition",
+                    crate::error::ErrorClass::Retriable,
+                )),
+            )]
+            .into(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            failed.contains("partition 2") && failed.contains("NotLeaderForPartition"),
+            "{failed}"
+        );
+    }
+
+    #[test]
+    fn errors_with_nothing_read_fail_the_run() {
+        assert!(read_outcome(3, 0).is_err());
+        // Transient errors during a run that read records are only shown.
+        assert!(read_outcome(3, 10).is_ok());
+        // An empty topic read without errors is fine.
+        assert!(read_outcome(0, 0).is_ok());
+    }
+
+    #[test]
+    fn json_lines_carry_the_decoded_record() {
+        use crate::codec::schema::DecodedPayload;
+        let decoded = DecodedPayload {
+            text: r#"{"amount":42}"#.into(),
+            label: "AVRO schema 12".into(),
+            schema_ref: None,
+        };
+        let failed = DecodedPayload {
+            text: "not decoded".into(),
+            label: "schema 12 (lookup failed: timeout)".into(),
+            schema_ref: None,
+        };
+        let mut record = serde_json::json!({"payload_base64": "AAAA"});
+        add_decoded(&mut record, Some(&decoded), Some(&failed));
+        assert_eq!(record["decoded"]["amount"], 42);
+        assert_eq!(record["decoded_with"], "AVRO schema 12");
+        assert_eq!(record["payload_base64"], "AAAA");
+        assert!(record.get("decoded_key").is_none(), "{record}");
+    }
 
     #[test]
     fn group_runs_fail_when_their_position_was_not_saved() {

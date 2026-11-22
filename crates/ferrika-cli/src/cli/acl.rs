@@ -77,9 +77,14 @@ impl AclBackend {
         }
     }
 
-    fn delete(&mut self, filter: &AclFilter) -> KafkaResult<usize> {
+    /// Deletes `listed`, the bindings `filter` matched when they were shown.
+    /// On the cluster only those are deleted (one exact filter each): the
+    /// filter itself could also remove kinds the listing cannot show (User
+    /// resources, token operations) and bindings added since, which the
+    /// preview and the undo record would then miss.
+    fn delete(&mut self, filter: &AclFilter, listed: &[AclBinding]) -> KafkaResult<usize> {
         match self {
-            Self::Cluster(config) => wire::delete_acls(config, filter).map(|d| d.len()),
+            Self::Cluster(config) => wire::delete_acl_bindings(config, listed).map(|d| d.len()),
             Self::Local(store) => {
                 let deleted = store.delete_exact(filter);
                 store.save()?;
@@ -511,7 +516,7 @@ fn run_delete(
             vec![acl_state(&matching, false)],
         ),
     );
-    let deleted = backend.delete(&filter);
+    let deleted = backend.delete(&filter, &matching);
     record::finish(
         pending,
         &deleted,
