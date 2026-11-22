@@ -55,8 +55,10 @@ docker exec ferrika-redpanda-redpanda-0-1 rpk security user create admin -p admi
 docker exec ferrika-redpanda-redpanda-0-1 rpk cluster config set superusers '["admin"]'
 docker exec ferrika-redpanda-redpanda-0-1 rpk cluster config set enable_sasl true
 # PLAIN as well, for the default build of ferrika (SCRAM needs --features ssl):
-docker exec ferrika-redpanda-redpanda-0-1 rpk cluster config set sasl_mechanisms '["SCRAM","PLAIN"]'   -X user=admin -X pass=admin-secret -X sasl.mechanism=SCRAM-SHA-256
-ferrika profile add rp-admin -b localhost:39092 --security-protocol sasl_plaintext   --sasl-mechanism PLAIN --sasl-username admin --sasl-password-stdin
+docker exec ferrika-redpanda-redpanda-0-1 rpk cluster config set sasl_mechanisms '["SCRAM","PLAIN"]' \
+  -X user=admin -X pass=admin-secret -X sasl.mechanism=SCRAM-SHA-256
+ferrika profile add rp-admin -b localhost:39092 --security-protocol sasl_plaintext \
+  --sasl-mechanism PLAIN --sasl-username admin --sasl-password-stdin
 ```
 
 ## Kafka APIs
