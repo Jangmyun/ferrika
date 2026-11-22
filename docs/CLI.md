@@ -511,8 +511,11 @@ ferrika schema subject orders-value -S http://localhost:8081
 # Decode hexadecimal message to inspect schema ID, headers, and payload
 ferrika schema decode "00 00 00 00 2a 7b 22 69 64 22 3a 31 7d"
 
-# Test candidate schema compatibility against latest registered subject schema (BACKWARD/FORWARD/FULL)
-ferrika schema check orders-value -f ./candidate-schema.avsc -m backward --fail-on-incompatible
+# Ask the registry whether a candidate schema would be accepted (the subject's own level)
+ferrika schema check orders-value -f ./candidate-schema.avsc --fail-on-incompatible
+
+# What-if under another mode, evaluated locally field by field (Avro and JSON)
+ferrika schema check orders-value -f ./candidate-schema.avsc -m full_transitive
 
 # Offline diff and evolutionary compatibility analysis between two local schema files
 ferrika schema diff-schema ./schemas/order-v1.avsc ./schemas/order-v2.avsc -m full
