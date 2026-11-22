@@ -162,7 +162,8 @@ jobs:
         env:
           FERRIKA_SECRET_STORE: file
         run: |
-          python3 tools/e2e/rabbit_smoke.py target/debug/ferrika --url http://localhost:15672             --user ferrika-e2e --password ferrika-e2e-pw --amqp-url amqp://localhost:5672
+          python3 tools/e2e/rabbit_smoke.py target/debug/ferrika --url http://localhost:15672 \
+            --user ferrika-e2e --password ferrika-e2e-pw --amqp-url amqp://localhost:5672
 
   # Dependency licenses, advisories and sources (see deny.toml).
   deny:

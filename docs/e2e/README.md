@@ -28,12 +28,14 @@ the MCP one in the Kafka job and the RabbitMQ one against a
 # confirmation token, a destination outside --topics, the audit entries).
 python3 tools/e2e/mcp_smoke.py target/debug/ferrika --broker localhost:9092
 # Optional: also call the RabbitMQ read tools through a temporary profile.
-python3 tools/e2e/mcp_smoke.py target/debug/ferrika --broker localhost:9092   --rabbit-url http://localhost:15672 --rabbit-user zz --rabbit-password zz-pw
+python3 tools/e2e/mcp_smoke.py target/debug/ferrika --broker localhost:9092 \
+  --rabbit-url http://localhost:15672 --rabbit-user zz --rabbit-password zz-pw
 
 # RabbitMQ: profiles, queues/exchanges/bindings, publish, peek, dead-lettering,
 # dlq inspect and redrive (preview and --execute), read-only profiles, audit.
 docker run -d --name ferrika-rabbit-test -p 15672:15672 -p 5672:5672   -e RABBITMQ_DEFAULT_USER=zz -e RABBITMQ_DEFAULT_PASS=zz-pw rabbitmq:4-management
-python3 tools/e2e/rabbit_smoke.py target/debug/ferrika --url http://localhost:15672   --user zz --password zz-pw --amqp-url amqp://localhost:5672
+python3 tools/e2e/rabbit_smoke.py target/debug/ferrika --url http://localhost:15672 \
+  --user zz --password zz-pw --amqp-url amqp://localhost:5672
 ```
 
 Both scripts need only the Python 3 standard library, run the CLI with their
