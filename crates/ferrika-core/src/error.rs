@@ -200,6 +200,15 @@ impl DriverError {
     pub fn is_client_config(&self) -> bool {
         matches!(self.0, rdkafka::error::KafkaError::ClientConfig(..))
     }
+
+    /// The partition whose end a consumer reached, when this is that
+    /// notice (`enable.partition.eof`) rather than an error.
+    pub fn partition_eof(&self) -> Option<i32> {
+        match self.0 {
+            rdkafka::error::KafkaError::PartitionEOF(partition) => Some(partition),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for DriverError {
@@ -289,6 +298,17 @@ impl From<crate::codec::base64::DecodeError> for KafkaError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partition_eof_is_told_apart() {
+        let eof = KafkaError::from(rdkafka::error::KafkaError::PartitionEOF(3));
+        let KafkaError::Driver(driver) = eof else {
+            panic!("not a driver error");
+        };
+        assert_eq!(driver.partition_eof(), Some(3));
+        let other = DriverError(rdkafka::error::KafkaError::Canceled);
+        assert_eq!(other.partition_eof(), None);
+    }
 
     #[test]
     fn test_error_constructors_and_display() {

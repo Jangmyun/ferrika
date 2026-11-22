@@ -651,9 +651,8 @@ impl PolicyAction {
             "consume --group" => Self::OffsetsCommit,
             _ => match head {
                 "topics" | "reassign" => Self::TopicsAlter,
-                "produce" | "generate" | "mirror" | "restore" | "probe" | "bench" | "dlq" => {
-                    Self::Produce
-                }
+                "produce" | "generate" | "mirror" | "transform" | "restore" | "probe" | "bench"
+                | "dlq" => Self::Produce,
                 "offset" => Self::OffsetsReset,
                 "acl" => Self::AclChange,
                 "user" => Self::UsersChange,
@@ -699,6 +698,10 @@ mod tests {
             PolicyAction::AclChange
         );
         assert_eq!(PolicyAction::from_cli("produce"), PolicyAction::Produce);
+        assert_eq!(
+            PolicyAction::from_cli("transform --execute"),
+            PolicyAction::Produce
+        );
         assert_eq!(
             PolicyAction::from_cli("consume --group"),
             PolicyAction::OffsetsCommit

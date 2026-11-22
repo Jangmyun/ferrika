@@ -41,6 +41,12 @@ pub struct MirrorConfig {
     pub rate_limit: Option<f64>,
     /// Real-time message filter (grep, key, headers, timestamps)
     pub filter: MessageFilter,
+    /// Start each partition at its first record at or after this epoch
+    /// millisecond (overrides `from_beginning`; not with a consumer group)
+    pub from_timestamp: Option<i64>,
+    /// Stop once every partition is read up to the end it had when the
+    /// pipeline started, instead of waiting for new records
+    pub until_end: bool,
 }
 
 impl MirrorConfig {
@@ -55,7 +61,21 @@ impl MirrorConfig {
             max_failures: DEFAULT_MAX_FAILURES,
             rate_limit: None,
             filter: MessageFilter::new(),
+            from_timestamp: None,
+            until_end: false,
         }
+    }
+
+    /// Sets the start timestamp (epoch milliseconds).
+    pub fn with_from_timestamp(mut self, from_timestamp: Option<i64>) -> Self {
+        self.from_timestamp = from_timestamp;
+        self
+    }
+
+    /// Sets whether to stop at the end each partition had at the start.
+    pub fn with_until_end(mut self, until_end: bool) -> Self {
+        self.until_end = until_end;
+        self
     }
 
     /// Sets how many failed deliveries stop the pipeline (at least 1).
@@ -313,6 +333,46 @@ pub fn is_self_mirror(
         && ferrika_governance::policy::shares_broker(src_bootstrap, dst_bootstrap)
 }
 
+/// Turns a source record into the record to write, or `None` to skip it.
+/// The copy pipeline calls it for each record [`MirrorConfig::filter`]
+/// kept, in offset order per partition.
+pub trait RecordTransform {
+    fn apply(
+        &mut self,
+        msg: &ConsumedMessage,
+    ) -> impl std::future::Future<Output = Option<OwnedProducerRecord>>;
+}
+
+/// Copies every record unchanged ([`mirror_record`]) to `dst_topic`.
+#[derive(Debug, Clone)]
+pub struct Verbatim {
+    pub dst_topic: String,
+}
+
+impl RecordTransform for Verbatim {
+    fn apply(
+        &mut self,
+        msg: &ConsumedMessage,
+    ) -> impl std::future::Future<Output = Option<OwnedProducerRecord>> {
+        std::future::ready(Some(mirror_record(msg, &self.dst_topic)))
+    }
+}
+
+/// Where a copy pipeline sends its records.
+pub enum CopyDestination<'a> {
+    /// Produce them to this cluster.
+    Cluster(&'a KafkaClientConfig),
+    /// Hand them to the callback and write nothing (a dry run). No consumer
+    /// group is joined and no offset is committed.
+    Preview(&'a mut dyn FnMut(&OwnedProducerRecord)),
+}
+
+/// The open side of a [`CopyDestination`].
+enum Output<'a> {
+    Producer(Box<KafkaProducerClient>),
+    Preview(&'a mut dyn FnMut(&OwnedProducerRecord)),
+}
+
 /// Executes an asynchronous streaming pipe from source topic to destination topic.
 ///
 /// Delivery failures do not end the call with an error; they are counted in
@@ -323,13 +383,50 @@ pub async fn run_mirror_pipeline<F>(
     src_config: &KafkaClientConfig,
     dst_config: &KafkaClientConfig,
     mirror_config: MirrorConfig,
-    mut progress_callback: F,
+    progress_callback: F,
 ) -> KafkaResult<MirrorStats>
 where
     F: FnMut(&MirrorStats),
 {
+    let mut verbatim = Verbatim {
+        dst_topic: mirror_config.dst_topic.clone(),
+    };
+    run_copy_pipeline(
+        src_config,
+        CopyDestination::Cluster(dst_config),
+        mirror_config,
+        &mut verbatim,
+        progress_callback,
+    )
+    .await
+}
+
+/// [`run_mirror_pipeline`] with each kept record passed through `transform`
+/// on its way, to a cluster or to a preview callback.
+///
+/// With a consumer group (in `src_config`) an offset is committed only after
+/// the record's copy was acknowledged (or the record was skipped), so the
+/// copy is at least once across restarts. With [`MirrorConfig::until_end`]
+/// the pipeline stops once each partition is read to the end it had at the
+/// start; records past that end are left for a later run.
+pub async fn run_copy_pipeline<T, F>(
+    src_config: &KafkaClientConfig,
+    destination: CopyDestination<'_>,
+    mirror_config: MirrorConfig,
+    transform: &mut T,
+    mut progress_callback: F,
+) -> KafkaResult<MirrorStats>
+where
+    T: RecordTransform,
+    F: FnMut(&MirrorStats),
+{
+    let topic = mirror_config.src_topic.as_str();
     // Configure consumer
     let mut consumer_cfg = src_config.clone();
+    if matches!(destination, CopyDestination::Preview(_)) {
+        // A preview must not join (and rebalance) a group or commit for it.
+        consumer_cfg.group_id = None;
+    }
     if mirror_config.from_beginning {
         consumer_cfg = consumer_cfg.with_auto_offset_reset(AutoOffsetReset::Earliest);
     }
@@ -338,43 +435,108 @@ where
     // Without one it reads directly (no throwaway group is created) from the
     // beginning or the current end.
     let use_group = consumer_cfg.group_id.is_some();
+    if use_group && mirror_config.from_timestamp.is_some() {
+        return Err(KafkaError::config(
+            "A start timestamp cannot be combined with a consumer group, which resumes from its committed offsets",
+        ));
+    }
     if use_group {
         // Offsets are stored by hand once the copy is delivered (see
         // `CommitTracker`) and committed by the periodic auto-commit and at
         // the end; storing them on receipt would commit records in flight.
         consumer_cfg = consumer_cfg.with_property("enable.auto.offset.store", "false");
     }
+    if mirror_config.until_end {
+        // A partition that ends in transaction markers never delivers its
+        // last offset; the end-of-partition notice finishes it instead.
+        consumer_cfg = consumer_cfg.with_property("enable.partition.eof", "true");
+    }
     let consumer = if use_group {
         KafkaConsumerClient::new(&consumer_cfg)?
     } else {
         KafkaConsumerClient::scanner(&consumer_cfg)?
     };
-    if let Some(partition) = mirror_config.partition {
-        // An unknown partition would otherwise only log errors and wait forever.
-        let existing = consumer.topic_partitions(&mirror_config.src_topic, None)?;
-        ferrika_core::kafka::filter::ensure_partition(
-            &mirror_config.src_topic,
-            &existing,
-            partition,
-        )?;
-    }
-    let producer = KafkaProducerClient::new(dst_config)?;
+    // The partitions read, when the start or the end needs them listed.
+    let needs_partitions = mirror_config.partition.is_some()
+        || mirror_config.from_timestamp.is_some()
+        || mirror_config.until_end;
+    let partitions: Vec<i32> = if needs_partitions {
+        let existing = consumer.topic_partitions(topic, None)?;
+        match mirror_config.partition {
+            Some(partition) => {
+                // An unknown partition would otherwise only log errors and wait forever.
+                ferrika_core::kafka::filter::ensure_partition(topic, &existing, partition)?;
+                vec![partition]
+            }
+            None => existing,
+        }
+    } else {
+        Vec::new()
+    };
+    let keys: Vec<(&str, i32)> = partitions.iter().map(|&p| (topic, p)).collect();
+    let mut output = match destination {
+        CopyDestination::Cluster(dst_config) => {
+            Output::Producer(Box::new(KafkaProducerClient::new(dst_config)?))
+        }
+        CopyDestination::Preview(sink) => Output::Preview(sink),
+    };
     let start = if mirror_config.from_beginning {
         Offset::Beginning
     } else {
         Offset::End
     };
+    let timestamp_starts = match mirror_config.from_timestamp {
+        Some(ts) => {
+            let lookup = consumer.offsets_for_timestamp(&keys, ts, None)?;
+            Some(ferrika_core::kafka::consumer::timestamp_start_offsets(
+                topic,
+                &partitions,
+                &lookup,
+            ))
+        }
+        None => None,
+    };
 
-    match (mirror_config.partition, use_group) {
-        (Some(partition), true) => {
-            consumer.assign_partitions(&[(&mirror_config.src_topic, partition)])?
+    // With `until_end`, the offset each unfinished partition stops before.
+    let mut ends: HashMap<i32, i64> = HashMap::new();
+    if mirror_config.until_end {
+        let marks = consumer.fetch_watermarks_batch(&keys, None)?;
+        for &p in &partitions {
+            let Some(&(low, high)) = marks.get(&(topic.to_string(), p)) else {
+                return Err(KafkaError::Consumer(format!(
+                    "Could not read the end offset of partition {p} of '{topic}'"
+                )));
+            };
+            let first = match (use_group, &timestamp_starts) {
+                (false, Some(starts)) => match starts.iter().find(|(sp, _)| *sp == p) {
+                    Some((_, Offset::Offset(o))) => *o,
+                    _ => high,
+                },
+                (false, None) if !mirror_config.from_beginning => high,
+                // From the beginning, or from the group's committed offset
+                // (the end-of-partition notice finishes it when that is
+                // already the end).
+                _ => low,
+            };
+            if first < high {
+                ends.insert(p, high);
+            }
         }
-        (Some(partition), false) => {
-            consumer.assign_with_offsets(&[(&mirror_config.src_topic, partition, start)])?
+    }
+
+    match (mirror_config.partition, use_group, &timestamp_starts) {
+        (_, false, Some(starts)) => {
+            let assignments: Vec<(&str, i32, Offset)> =
+                starts.iter().map(|&(p, o)| (topic, p, o)).collect();
+            consumer.assign_with_offsets(&assignments)?
         }
-        (None, true) => consumer.subscribe(&[&mirror_config.src_topic])?,
-        (None, false) => {
-            consumer.assign_topic(&mirror_config.src_topic, start)?;
+        (Some(partition), true, _) => consumer.assign_partitions(&[(topic, partition)])?,
+        (Some(partition), false, None) => {
+            consumer.assign_with_offsets(&[(topic, partition, start)])?
+        }
+        (None, true, _) => consumer.subscribe(&[topic])?,
+        (None, false, None) => {
+            consumer.assign_topic(topic, start)?;
         }
     }
 
@@ -394,9 +556,7 @@ where
             return;
         }
         if let Some(last) = tracker.finished(partition, offset, done) {
-            if let Err(e) =
-                consumer.store_processed_offset(&mirror_config.src_topic, partition, last)
-            {
+            if let Err(e) = consumer.store_processed_offset(topic, partition, last) {
                 // Usually a partition this member lost in a rebalance; the
                 // new owner reads from the last commit, so nothing is skipped.
                 tracing::debug!("Could not store mirror offset {partition}@{last}: {e}");
@@ -412,6 +572,9 @@ where
         }
         if stats.failed_count >= mirror_config.max_failures {
             stats.stopped_on_failures = true;
+            break;
+        }
+        if mirror_config.until_end && ends.is_empty() {
             break;
         }
 
@@ -432,6 +595,11 @@ where
                 stats.record_outcome(outcome);
             }
             MirrorStep::Received(Ok(msg)) => {
+                if mirror_config.until_end && !within_end(&mut ends, msg.partition, msg.offset) {
+                    // Past the end captured at the start: left for a later
+                    // run (with a group its offset is not stored).
+                    continue;
+                }
                 stats.record_read();
                 let source = (msg.partition, msg.offset);
 
@@ -441,18 +609,30 @@ where
                     continue;
                 }
 
-                let record = mirror_record(&msg, &mirror_config.dst_topic);
+                let Some(record) = transform.apply(&msg).await else {
+                    stats.record_filtered();
+                    store(&mut tracker, source, true);
+                    continue;
+                };
                 forwarded += 1;
-                if let Some((done, outcome)) = pipeline.make_room().await {
-                    store(&mut tracker, done, outcome.result.is_ok());
-                    stats.record_outcome(outcome);
-                }
-                if use_group {
-                    tracker.sent(source.0, source.1);
-                }
-                if let Err(e) = pipeline.push(&producer, &record, source).await {
-                    store(&mut tracker, source, false);
-                    stats.record_failed(&e);
+                match &mut output {
+                    Output::Producer(producer) => {
+                        if let Some((done, outcome)) = pipeline.make_room().await {
+                            store(&mut tracker, done, outcome.result.is_ok());
+                            stats.record_outcome(outcome);
+                        }
+                        if use_group {
+                            tracker.sent(source.0, source.1);
+                        }
+                        if let Err(e) = pipeline.push(producer, &record, source).await {
+                            store(&mut tracker, source, false);
+                            stats.record_failed(&e);
+                        }
+                    }
+                    Output::Preview(sink) => {
+                        stats.record_mirrored(record.payload.as_ref().map_or(0, Vec::len));
+                        sink(&record);
+                    }
                 }
 
                 // Rate throttling
@@ -461,6 +641,11 @@ where
                     if target_interval > elapsed {
                         tokio::time::sleep(target_interval - elapsed).await;
                     }
+                }
+            }
+            MirrorStep::Received(Err(KafkaError::Driver(e))) if e.partition_eof().is_some() => {
+                if let Some(partition) = e.partition_eof() {
+                    ends.remove(&partition);
                 }
             }
             MirrorStep::Received(Err(e)) => {
@@ -490,6 +675,20 @@ where
     stats.update_rates();
     progress_callback(&stats);
     Ok(stats)
+}
+
+/// For a run bounded by the ends captured at its start (`ends`, by
+/// partition): whether the record at `offset` is before its partition's end.
+/// Removes the partition once its last record (or anything past it) arrives.
+fn within_end(ends: &mut HashMap<i32, i64>, partition: i32, offset: i64) -> bool {
+    let Some(&end) = ends.get(&partition) else {
+        // Finished, or empty when the run started.
+        return false;
+    };
+    if offset + 1 >= end {
+        ends.remove(&partition);
+    }
+    offset < end
 }
 
 #[cfg(test)]
@@ -687,5 +886,36 @@ mod tests {
 
         assert_eq!(stats.average_eps, 1.0);
         assert!(stats.average_mbps > 0.0);
+    }
+
+    #[test]
+    fn within_end_stops_each_partition_at_its_captured_end() {
+        let mut ends = HashMap::from([(0, 3), (1, 1)]);
+        assert!(within_end(&mut ends, 0, 1));
+        assert!(
+            within_end(&mut ends, 0, 2),
+            "the last record is still copied"
+        );
+        assert!(!ends.contains_key(&0), "partition 0 is finished");
+        assert!(!within_end(&mut ends, 0, 3), "past the end: left for later");
+        // A compacted partition can jump over its last offset.
+        assert!(!within_end(&mut ends, 1, 5));
+        assert!(ends.is_empty());
+        assert!(
+            !within_end(&mut ends, 7, 0),
+            "never tracked: empty at the start"
+        );
+    }
+
+    #[test]
+    fn mirror_config_bounds_default_off() {
+        let config = MirrorConfig::new("a", "b");
+        assert_eq!(config.from_timestamp, None);
+        assert!(!config.until_end);
+        let config = config
+            .with_from_timestamp(Some(1_700_000_000_000))
+            .with_until_end(true);
+        assert_eq!(config.from_timestamp, Some(1_700_000_000_000));
+        assert!(config.until_end);
     }
 }

@@ -19,6 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 jiff.workspace = true
 tracing.workspace = true
+ring.workspace = true
 
 [dev-dependencies]
 ferrika-governance = { path = "../ferrika-governance", features = ["test-util"] }

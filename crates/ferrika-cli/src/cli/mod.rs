@@ -34,6 +34,7 @@ pub mod top;
 pub mod topics;
 pub mod topology;
 pub mod trace;
+pub mod transform;
 #[cfg(feature = "tui")]
 pub mod tui;
 pub mod user;
@@ -386,7 +387,35 @@ pub fn expect_audit_result(request: crate::governance::audit::AuditEntry) {
 pub fn record_audit_result(ok: bool, outcome: &str) {
     let owed = PENDING_RESULT.lock().ok().and_then(|mut p| p.take());
     if let Some(request) = owed {
-        crate::governance::audit::record(&result_entry(request, ok, outcome));
+        let detail = RESULT_DETAIL
+            .lock()
+            .ok()
+            .map(|mut d| std::mem::take(&mut *d))
+            .unwrap_or_default();
+        let outcome = with_detail(outcome, &detail);
+        crate::governance::audit::record(&result_entry(request, ok, &outcome));
+    }
+}
+
+/// Counts and digests the running command adds to its owed result entry
+/// (see [`set_audit_result_detail`]).
+static RESULT_DETAIL: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Adds `detail` to the result entry [`record_audit_result`] writes, e.g.
+/// `transform`'s record counts and the digest of its steps. It must never
+/// hold record data (keys, values, header values) or secrets.
+pub fn set_audit_result_detail(detail: String) {
+    if let Ok(mut slot) = RESULT_DETAIL.lock() {
+        *slot = detail;
+    }
+}
+
+/// `outcome`, followed by `detail` when there is one.
+fn with_detail(outcome: &str, detail: &str) -> String {
+    if detail.is_empty() {
+        outcome.to_string()
+    } else {
+        format!("{outcome}; {detail}")
     }
 }
 
@@ -734,6 +763,15 @@ mod tests {
         if let Some(reason) = reason {
             assert!(reason.contains("connection refused"), "{reason}");
         }
+    }
+
+    #[test]
+    fn audit_result_detail_follows_the_outcome() {
+        assert_eq!(super::with_detail("finished", ""), "finished");
+        assert_eq!(
+            super::with_detail("finished", "read 3, written 2"),
+            "finished; read 3, written 2"
+        );
     }
 
     #[test]

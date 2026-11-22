@@ -818,6 +818,7 @@ dependencies = [
  "ferrika-governance",
  "jiff",
  "rdkafka",
+ "ring",
  "serde",
  "serde_json",
  "tokio",
