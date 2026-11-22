@@ -172,24 +172,7 @@ fn run_plan(mut args: ReassignPlanArgs, global: &GlobalOpts) -> KafkaResult<()> 
         let admin = KafkaAdminClient::new(&kafka_config)?;
         let timeout = Some(Duration::from_secs(5));
 
-        let known: Vec<i32> = admin.list_brokers(timeout)?.iter().map(|b| b.id).collect();
-        let unknown: Vec<String> = args
-            .brokers
-            .iter()
-            .filter(|id| !known.contains(id))
-            .map(i32::to_string)
-            .collect();
-        if !unknown.is_empty() {
-            return Err(KafkaError::config(format!(
-                "Broker id(s) {} are not in the cluster (known: {})",
-                unknown.join(", "),
-                known
-                    .iter()
-                    .map(i32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
+        check_target_brokers(&admin.list_brokers(timeout)?, &args.brokers)?;
 
         let mut current = Vec::new();
         for topic in &args.topics {
@@ -584,8 +567,71 @@ fn render_plan_table(plan: &ReassignmentPlan, target_brokers: &[i32]) {
     println!("{table}");
 }
 
+/// Refuses target brokers the cluster does not know, or that are offline:
+/// the broker list also names offline brokers that still host replicas,
+/// and a plan placing replicas there cannot complete.
+fn check_target_brokers(
+    brokers: &[crate::model::cluster::BrokerInfo],
+    targets: &[i32],
+) -> Result<(), KafkaError> {
+    let ids = |pick: &dyn Fn(i32) -> bool| -> Vec<String> {
+        targets
+            .iter()
+            .filter(|id| pick(**id))
+            .map(i32::to_string)
+            .collect()
+    };
+    let unknown = ids(&|id| !brokers.iter().any(|b| b.id == id));
+    if !unknown.is_empty() {
+        return Err(KafkaError::config(format!(
+            "Broker id(s) {} are not in the cluster (known: {})",
+            unknown.join(", "),
+            brokers
+                .iter()
+                .map(|b| b.id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    let offline = ids(&|id| brokers.iter().any(|b| b.id == id && !b.is_online));
+    if !offline.is_empty() {
+        return Err(KafkaError::config(format!(
+            "Broker id(s) {} are offline: a plan cannot place replicas on them. \
+             Leave them out of -b, or start them first.",
+            offline.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plans_refuse_unknown_and_offline_target_brokers() {
+        use super::check_target_brokers;
+        let broker = |id: i32, is_online: bool| crate::model::cluster::BrokerInfo {
+            id,
+            host: format!("b{id}"),
+            port: 9092,
+            is_controller: false,
+            partition_leaders: 0,
+            replicas_hosted: 0,
+            is_online,
+            log_dir_bytes: None,
+            log_dirs: Vec::new(),
+        };
+        let brokers = [broker(1, true), broker(2, true), broker(3, false)];
+        assert!(check_target_brokers(&brokers, &[1, 2]).is_ok());
+        let offline = check_target_brokers(&brokers, &[1, 2, 3])
+            .unwrap_err()
+            .to_string();
+        assert!(offline.contains("3 are offline"), "{offline}");
+        let unknown = check_target_brokers(&brokers, &[1, 9])
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("9 are not in the cluster"), "{unknown}");
+    }
+
     use super::*;
 
     #[test]
