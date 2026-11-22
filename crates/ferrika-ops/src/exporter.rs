@@ -219,7 +219,8 @@ pub async fn scrape_cluster_metrics(
 }
 
 /// [`scrape_cluster_metrics`] and the steps that failed (`brokers`,
-/// `topics`, `groups`, `watermarks`), whose metrics are missing or partial:
+/// `topics`, `groups`, `watermarks`, `offsets` when the committed offsets
+/// of some groups could not be read), whose metrics are missing or partial:
 /// an unreachable cluster otherwise looks like one with no brokers and no
 /// lag.
 pub async fn scrape_cluster_metrics_checked(
@@ -291,6 +292,11 @@ pub(crate) async fn scrape(
                 committed_via_clients(config, &groups, &partitions)
             }
         };
+        // A group missing from the result had its offsets refused or its
+        // coordinator not found: its lag is unknown, not zero.
+        if groups.iter().any(|g| !committed.contains_key(g)) {
+            failed.push("offsets");
+        }
         for group_id in &groups {
             if let Some(offsets) = committed.get(group_id) {
                 metrics.consumer_lags.extend(group_lag_metrics(

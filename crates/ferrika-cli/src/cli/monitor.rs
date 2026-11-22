@@ -375,7 +375,13 @@ async fn handle_lag(
         // State, members and lag as `health` reads them (this used to show
         // every group as Stable with no lag).
         let group_summaries = match crate::cli::health::snapshot(global).await {
-            Ok(snapshot) => snapshot.consumers,
+            Ok(snapshot) => {
+                // On stderr, so JSON on stdout stays parseable.
+                for warning in &snapshot.warnings {
+                    eprintln!("{} {warning}", "⚠ Incomplete:".yellow());
+                }
+                snapshot.consumers
+            }
             Err(err) => {
                 print_connection_hint(&global.to_kafka_config(), &err);
                 return Err(err.into());

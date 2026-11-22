@@ -84,6 +84,10 @@ pub struct TopClusterSnapshot {
     pub total_lag: i64,
     pub topics: Vec<TopTopicItem>,
     pub consumers: Vec<TopConsumerItem>,
+    /// What could not be read (the group list, committed or end offsets):
+    /// lag and groups shown are then incomplete. Empty when all was read.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 impl TopClusterSnapshot {
@@ -164,6 +168,7 @@ mod tests {
                     target_topics: vec!["z-topic".to_string()],
                 },
             ],
+            warnings: Vec::new(),
         };
 
         // Sort by Lag (default)

@@ -114,7 +114,7 @@ async fn read(
                 .map(move |p| (t.name.as_str(), p.partition_id))
         })
         .collect();
-    let (watermarks, warning) = match c
+    let (watermarks, watermark_warning) = match c
         .probe
         .fetch_watermarks_batch(&keys, Some(global.request_timeout()))
     {
@@ -127,7 +127,15 @@ async fn read(
         ),
     };
     fill_watermarks(&mut snapshot, &watermarks);
+    let warning = combined_warning(&snapshot.warnings, watermark_warning);
     Ok((snapshot, watermarks, warning))
+}
+
+/// One status-line warning from what the snapshot could not read and the
+/// watermark lookup; `None` when everything was read.
+fn combined_warning(snapshot: &[String], watermarks: Option<String>) -> Option<String> {
+    let all: Vec<String> = snapshot.iter().cloned().chain(watermarks).collect();
+    (!all.is_empty()).then(|| all.join("; "))
 }
 
 /// Puts the watermarks into the snapshot's partitions, for the health checks
@@ -150,6 +158,19 @@ fn fill_watermarks(snapshot: &mut ClusterSnapshot, watermarks: &Watermarks) {
 mod tests {
     use super::*;
     use crate::cli::tui::state::tests::{sample_snapshot, sample_watermarks};
+
+    #[test]
+    fn snapshot_and_watermark_warnings_share_the_status_line() {
+        assert_eq!(combined_warning(&[], None), None);
+        assert_eq!(
+            combined_warning(&["Consumer groups could not be listed: x".into()], None),
+            Some("Consumer groups could not be listed: x".into())
+        );
+        assert_eq!(
+            combined_warning(&["a".into()], Some("b".into())),
+            Some("a; b".into())
+        );
+    }
 
     #[test]
     fn watermarks_go_into_the_snapshot_partitions() {

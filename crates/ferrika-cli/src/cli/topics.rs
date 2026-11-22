@@ -8,7 +8,7 @@ use serde_json::json;
 use crate::cli::offset::confirm;
 use crate::cli::record::{self, Change, CANNOT_UNDO};
 use crate::cli::{output, print_connection_hint, GlobalOpts, OutputFormat};
-use crate::kafka::admin::KafkaAdminClient;
+use crate::kafka::admin::{KafkaAdminClient, TopicCreation, BROKER_DEFAULT};
 use crate::kafka::consumer::KafkaConsumerClient;
 use crate::kafka::wire::{incremental_alter_topic_config, ConfigChange};
 use crate::model::cluster::TopicSummary;
@@ -87,15 +87,19 @@ pub enum TopicsSubcommands {
         limit: u64,
     },
     /// Create a new Kafka topic
+    ///
+    /// Without -p or -r the broker's defaults apply (`num.partitions`,
+    /// `default.replication.factor`), as with kafka-topics.sh; brokers older
+    /// than Kafka 2.4 get 1 instead. The resulting counts are shown.
     Create {
         /// Topic name to create
         name: String,
-        /// Number of partitions
-        #[arg(short, long, default_value_t = 1)]
-        partitions: i32,
-        /// Replication factor
-        #[arg(short, long, default_value_t = 1)]
-        replication: i32,
+        /// Number of partitions (default: the broker's `num.partitions`)
+        #[arg(short, long, value_parser = clap::value_parser!(i32).range(1..))]
+        partitions: Option<i32>,
+        /// Replication factor (default: the broker's `default.replication.factor`)
+        #[arg(short, long, value_parser = clap::value_parser!(i32).range(1..))]
+        replication: Option<i32>,
         /// Optional configuration overrides in KEY=VALUE format
         #[arg(short = 'c', long = "config")]
         configs: Vec<String>,
@@ -449,8 +453,8 @@ async fn handle_create(
     admin: &KafkaAdminClient,
     global: &GlobalOpts,
     name: &str,
-    partitions: i32,
-    replication: i32,
+    partitions: Option<i32>,
+    replication: Option<i32>,
     raw_configs: &[String],
 ) -> anyhow::Result<()> {
     let parsed_configs = parse_topic_configs(raw_configs)?;
@@ -461,19 +465,34 @@ async fn handle_create(
         created_topic(name),
     );
     let result = admin
-        .create_topic(name, partitions, replication, Some(&parsed_configs), None)
+        .create_topic_with_broker_defaults(
+            name,
+            partitions,
+            replication,
+            Some(&parsed_configs),
+            None,
+        )
         .await;
     record::finish(pending, &result, &format!("Created topic {name}"));
     match result {
-        Ok(_) => {
+        Ok(created) => {
+            if created.fell_back {
+                eprintln!(
+                    "{} the broker cannot apply its default partition count or replication \
+                     factor (Kafka 2.4+ needed), so 1 was used for what -p/-r left out.",
+                    "Note:".yellow().bold()
+                );
+            }
+            let (partitions, replication) = created_shape(admin, name, created).await;
+            let shown = |n: Option<i32>| n.map_or("unknown".to_string(), |n| n.to_string());
             match global.format {
                 OutputFormat::Table => {
                     println!(
                         "{} Topic '{}' created successfully (partitions: {}, replication: {})",
                         "✔".green().bold(),
                         name.cyan().bold(),
-                        partitions.to_string().green(),
-                        replication.to_string().yellow()
+                        shown(partitions).green(),
+                        shown(replication).yellow()
                     );
                 }
                 OutputFormat::Json => {
@@ -482,6 +501,7 @@ async fn handle_create(
                         "topic": name,
                         "partitions": partitions,
                         "replication": replication,
+                        "broker_defaults_unsupported": created.fell_back,
                     });
                     output::print_json(&res)?;
                 }
@@ -493,6 +513,36 @@ async fn handle_create(
             Err(err.into())
         }
     }
+}
+
+/// The partition count and replication factor `name` was created with.
+/// Values the broker chose are read back from the metadata, which may lag
+/// the creation briefly; `None` if they still cannot be read.
+async fn created_shape(
+    admin: &KafkaAdminClient,
+    name: &str,
+    created: TopicCreation,
+) -> (Option<i32>, Option<i32>) {
+    let sent = |n: i32| (n != BROKER_DEFAULT).then_some(n);
+    for attempt in 0..5 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        let Ok(topic) = admin.describe_topic(name, Some(std::time::Duration::from_secs(5))) else {
+            continue;
+        };
+        if let Some(shape) = shape_of(&topic) {
+            return (Some(shape.0), Some(shape.1));
+        }
+    }
+    (sent(created.partitions), sent(created.replication_factor))
+}
+
+/// Partition count and replication factor of `topic`; `None` while the
+/// metadata has no partitions for it yet.
+fn shape_of(topic: &TopicSummary) -> Option<(i32, i32)> {
+    let first = topic.partitions.first()?;
+    Some((topic.partitions.len() as i32, first.replicas.len() as i32))
 }
 
 /// Builds the change list for `topics config`, rejecting malformed entries and
@@ -1607,6 +1657,24 @@ mod tests {
     use crate::model::cluster::PartitionDetail;
 
     #[test]
+    fn created_topic_shape_comes_from_its_partitions() {
+        let mut topic = crate::model::cluster::ClusterSnapshot::demo().topics[0].clone();
+        topic.partitions = Vec::new();
+        assert_eq!(shape_of(&topic), None, "metadata not there yet");
+        topic.partitions = (0..6)
+            .map(|id| PartitionDetail {
+                partition_id: id,
+                leader: 1,
+                replicas: vec![1, 2, 3],
+                isr: vec![1, 2, 3],
+                high_watermark: 0,
+                low_watermark: 0,
+            })
+            .collect();
+        assert_eq!(shape_of(&topic), Some((6, 3)));
+    }
+
+    #[test]
     fn test_config_changes_parses_set_and_delete() {
         let changes = config_changes(
             &["retention.ms = 3600000".to_string(), "x=a=b".to_string()],
@@ -1912,11 +1980,25 @@ mod tests {
             cli.cmd,
             TopicsSubcommands::Create {
                 name: "orders".to_string(),
-                partitions: 3,
-                replication: 2,
+                partitions: Some(3),
+                replication: Some(2),
                 configs: vec!["cleanup.policy=compact".to_string()],
             }
         );
+
+        // Omitted counts are left to the broker; zero or less is refused.
+        let cli = TestCli::try_parse_from(["test", "create", "orders"]).unwrap();
+        assert_eq!(
+            cli.cmd,
+            TopicsSubcommands::Create {
+                name: "orders".to_string(),
+                partitions: None,
+                replication: None,
+                configs: Vec::new(),
+            }
+        );
+        assert!(TestCli::try_parse_from(["test", "create", "orders", "-p", "0"]).is_err());
+        assert!(TestCli::try_parse_from(["test", "create", "orders", "-r", "-1"]).is_err());
 
         let cli = TestCli::try_parse_from(["test", "delete", "orders", "-y"]).unwrap();
         assert_eq!(

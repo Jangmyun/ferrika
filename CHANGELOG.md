@@ -174,6 +174,38 @@ The RabbitMQ entries below are planned for 0.2.0.
 
 ### Changed
 
+- **Breaking:** `topics create` without `-p/--partitions` or
+  `-r/--replication` leaves them to the broker (`num.partitions`,
+  `default.replication.factor`, KIP-464), like `kafka-topics.sh`, instead of
+  using 1. A broker older than Kafka 2.4 (no CreateTopics v4) gets 1 for
+  what was omitted, with a note. The output shows the partition count and
+  replication factor the topic was created with (read back from the
+  metadata); `--json` adds `broker_defaults_unsupported`. `-p`/`-r` must be
+  at least 1. New `KafkaAdminClient::create_topic_with_broker_defaults`,
+  `TopicCreation` and `BROKER_DEFAULT` in `ferrika_core::kafka::admin`. The
+  MCP `create_topic` tool is unchanged (partitions required, replication
+  factor defaults to the broker's).
+- **Breaking:** `health` no longer reports a consumer group list or lag
+  lookup that failed as "no groups". `ClusterSnapshot` has a new `warnings`
+  field (filled by `ferrika_ops::health::snapshot` when the group listing,
+  committed offsets or partition end offsets cannot be read; empty from
+  `ClusterSnapshot::empty`/`demo`), and `health_checks` turns each into a
+  warning finding starting with `Incomplete check:` (shown by `health`,
+  `--json`, `--watch`, webhooks, `report`, the `top` dashboard and the MCP
+  `cluster_health` tool). `health` then exits with status 3 unless a finding
+  fails `--fail-on` first (status 1) or `--fail-on never` is given.
+  `monitor lag` (all groups) prints the warnings on stderr, and plain `top`
+  shows them (`TopClusterSnapshot::warnings`). The exporter's failed steps
+  (`scrape_cluster_metrics_checked`) include `offsets` when some groups'
+  committed offsets could not be read, so `ferrika_scrape_success` is 0 then.
+  New `ferrika_ops::health::{lag_warnings, INCOMPLETE_PREFIX}`.
+- **Breaking (library):** `ferrika_ops::report::ReportContext` takes the
+  caller's `product` and `product_version`; the report shows them ("Made
+  by", e.g. `Ferrika CLI 0.2.0`) and the ferrika-ops version on a line of
+  its own, instead of calling the ops crate's version the "Ferrika" version.
+  `Report::ferrika_version` is replaced by `product`, `product_version` and
+  `ops_version` (also in `report --format json`); new
+  `Report::product_line` and `report::OPS_VERSION`.
 - `ferrika top`: the refresh interval option is now `--interval` (the old
   `--interval-secs` still works) and defaults to 5 seconds instead of 2.
 - `rabbit peek` is a write: it changes the messages it reads (redelivered
