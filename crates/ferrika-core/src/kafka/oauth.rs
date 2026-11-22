@@ -127,7 +127,7 @@ pub fn format_extensions(extensions: &BTreeMap<String, String>) -> String {
 }
 
 /// Decodes base64url, with or without padding (JWT segments).
-pub fn base64url_decode(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64url_decode(text: &str) -> Option<Vec<u8>> {
     let text = text.trim_end_matches('=');
     let mut out = Vec::with_capacity(text.len() * 3 / 4);
     let mut acc = 0u32;
@@ -154,7 +154,7 @@ pub fn base64url_decode(text: &str) -> Option<Vec<u8>> {
 
 /// The claims of a JWT (`header.claims.signature`), unverified: Ferrika only
 /// reads `exp` and `sub` from its own token; the broker verifies it.
-pub fn jwt_claims(token: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+pub(crate) fn jwt_claims(token: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
     let mut parts = token.split('.');
     let (_header, claims) = (parts.next()?, parts.next()?);
     parts.next()?;
@@ -209,10 +209,10 @@ pub fn forget(source: &dyn TokenSource) {
 }
 
 /// Resolves AWS credentials (environment, shared files, `credential_process`).
-pub type CredentialResolver = Arc<dyn Fn() -> KafkaResult<AwsCredentials> + Send + Sync>;
+pub(crate) type CredentialResolver = Arc<dyn Fn() -> KafkaResult<AwsCredentials> + Send + Sync>;
 
 /// AWS MSK IAM: a SigV4-presigned `kafka-cluster:Connect` URL as the token.
-pub struct MskIamSource {
+pub(crate) struct MskIamSource {
     region: String,
     resolver: CredentialResolver,
     credentials: Mutex<AwsCredentials>,
@@ -305,7 +305,7 @@ pub enum OAuthClientAuth {
 }
 
 /// `application/x-www-form-urlencoded` encoding of one value.
-pub fn form_encode(text: &str) -> String {
+pub(crate) fn form_encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for b in text.bytes() {
         match b {
@@ -325,7 +325,7 @@ const DEFAULT_TOKEN_LIFETIME_MS: i64 = 3_600_000;
 
 /// OIDC / OAuth 2.0 client credentials grant against a token endpoint.
 #[derive(Clone)]
-pub struct OidcSource {
+pub(crate) struct OidcSource {
     pub token_endpoint: String,
     pub client_id: String,
     pub client_secret: String,
