@@ -34,7 +34,9 @@ and 0.2.0 makes it crate-internal.
   `SchemaRegistryClient::with_timeout`, `ConnectClient::with_timeout`,
   `audit::recent_matching`, `exporter::scrape_cluster_metrics_checked`,
   `model::acl::kafka_principal`, `model::quota::{canonical_quota_entity,
-  same_quota_entity}`.
+  same_quota_entity}`, `wire::delete_acl_bindings`.
+- `consume -D -f json` lines carry the decoded record (`decoded`,
+  `decoded_key`, `decoded_with`) next to the raw one.
 - `monitor export` serves `ferrika_scrape_success` (0 when a step of the last
   scrape failed). A failed scrape used to look like a cluster with no brokers
   and no lag, so other alerts went quiet.
@@ -140,6 +142,22 @@ and 0.2.0 makes it crate-internal.
 - `monitor lag` without a group showed every group as Stable with lag 0; it
   shows their real state, members and lag. `monitor --watch` no longer ends
   on an error after the first refresh.
+- `health --watch` never ran its stalled-consumer check; it now compares
+  committed offsets over at least a minute.
+- `acl delete` could also delete bindings its preview did not show (User
+  resources, token operations, bindings added meanwhile); it deletes only
+  the listed ones.
+- With `FERRIKA_SECRET_STORE=file`, saving profiles copied the passwords
+  held in the OS credential store into `profiles.json` in plain text.
+- `profile add`/`import` over an existing profile dropped its read-only mark
+  (kept now) and silently dropped its secrets and URLs (now listed).
+- `KAFKA_BOOTSTRAP_SERVERS` replacing the brokers of the profile in use is
+  now warned about: that profile's credentials go to those brokers.
+- `consume --to-timestamp` with a time in the past could wait forever; a
+  partition whose `--from-timestamp` lookup failed was skipped silently.
+- `consume` exited 0 when it read nothing and reported errors (no read
+  permission).
+- `reassign plan` accepted offline brokers as targets.
 
 ### Changed
 
