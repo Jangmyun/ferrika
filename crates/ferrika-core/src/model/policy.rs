@@ -4,6 +4,8 @@
 //! finds it in the machine-wide policy directory enforces it. The signature
 //! covers the exact bytes of `payload`, so no JSON canonicalisation is needed.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// The original format: issuer, issued_at and rules.
@@ -63,6 +65,9 @@ impl PolicyPayload {
             || self.rules.watermark_text.is_some()
             || !self.rules.screen_capture.is_allowed()
             || !self.rules.mcp_write.is_allowed()
+            || !self.rules.environments.is_empty()
+            || self.rules.default_environment.is_some()
+            || !self.rules.copy_down.is_allow()
     }
 
     /// The `format` a signed file with this payload carries.
@@ -155,6 +160,93 @@ pub struct PolicyRules {
     /// when `allowed`.
     #[serde(default, skip_serializing_if = "McpWriteRule::is_allowed")]
     pub mcp_write: McpWriteRule,
+    /// Policy pack v2: environment tiers by name (`prod`, `staging`,
+    /// `dev`), each with the clusters it covers and its own stricter rules.
+    /// Left out of the payload when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environments: BTreeMap<String, Environment>,
+    /// Policy pack v2: the environment of a cluster no environment matches;
+    /// none when not given (such a cluster has no environment).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_environment: Option<String>,
+    /// Policy pack v2: what a record copy from a higher tier to a lower one
+    /// (or to a cluster without an environment) needs. Left out when `allow`.
+    #[serde(default, skip_serializing_if = "CopyDownRule::is_allow")]
+    pub copy_down: CopyDownRule,
+}
+
+/// Longest environment name, in characters.
+pub const ENVIRONMENT_NAME_MAX: usize = 32;
+
+/// One environment of `rules.environments` (policy pack v2).
+///
+/// ```json
+/// { "tier": 3, "profiles": ["prod-*"], "brokers": ["*.prod.corp"],
+///   "read_only": false, "forbid": ["topics.delete"] }
+/// ```
+///
+/// A cluster is in the environment when its profile name matches one of
+/// `profiles` or one of its broker addresses matches one of `brokers`
+/// (matched like `read_only_brokers`). Unknown fields are refused.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Environment {
+    /// Higher is more sensitive: a copy from a higher tier to a lower one
+    /// is a copy down (see [`CopyDownRule`]).
+    pub tier: u32,
+    /// Profile-name globs. The profile name is the user's to choose, so
+    /// prefer `brokers` for clusters that must not be reclassified.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<String>,
+    /// Broker-address globs (`*.prod.corp`, `10.20.*:9093`), never the
+    /// profile name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub brokers: Vec<String>,
+    /// Every change to a cluster of this environment is refused.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    /// Categories ([`PolicyAction::id`]) refused in this environment, on top
+    /// of the global `forbid`; `*` = every change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forbid: Vec<String>,
+}
+
+impl Environment {
+    /// Whether the environment restricts changes itself (`read_only` or
+    /// `forbid`), besides classifying clusters.
+    pub fn restricts_changes(&self) -> bool {
+        self.read_only || !self.forbid.is_empty()
+    }
+}
+
+/// What a record copy from a higher environment tier to a lower one needs
+/// (policy pack v2). Without `environments` nothing is a copy down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopyDownRule {
+    /// No extra condition (the default, as before).
+    #[default]
+    Allow,
+    /// Allowed only when every record is PII-masked before anything else
+    /// reads it (`transform --mask` as the first step, `mirror --mask`).
+    Masked,
+    /// Refused and recorded as `policy.blocked`.
+    Forbid,
+}
+
+impl CopyDownRule {
+    pub fn is_allow(&self) -> bool {
+        *self == Self::Allow
+    }
+
+    /// The name in the policy file.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Masked => "masked",
+            Self::Forbid => "forbid",
+        }
+    }
 }
 
 /// Longest `watermark_text`, in characters.
@@ -191,6 +283,11 @@ impl PolicyRules {
             // Every change is refused anyway (`forbid: *`); a refusal names
             // the untrusted policy rather than this rule.
             mcp_write: McpWriteRule::Allowed,
+            // `read_only: *` and `forbid: *` already refuse every change
+            // and copy; an untrusted classification is not used.
+            environments: BTreeMap::new(),
+            default_environment: None,
+            copy_down: CopyDownRule::Allow,
         }
     }
 
@@ -214,13 +311,60 @@ impl PolicyRules {
         None
     }
 
-    /// Forbid entries that name no known category.
+    /// Forbid entries that name no known category: the global ones as
+    /// written, an environment's as `<environment>: <entry>`.
     pub fn unknown_forbid_entries(&self) -> Vec<String> {
+        let unknown = |f: &&String| f.as_str() != "*" && PolicyAction::from_id(f).is_none();
         self.forbid
             .iter()
-            .filter(|f| f.as_str() != "*" && PolicyAction::from_id(f).is_none())
+            .filter(unknown)
             .cloned()
+            .chain(self.environments.iter().flat_map(|(name, env)| {
+                env.forbid
+                    .iter()
+                    .filter(unknown)
+                    .map(move |f| format!("{name}: {f}"))
+            }))
             .collect()
+    }
+
+    /// Why the environment rules make no sense, if they do not: a bad
+    /// environment name, an empty glob, a `default_environment` that names
+    /// no environment, or `copy_down` without environments to compare.
+    pub fn environment_rules_error(&self) -> Option<String> {
+        for (name, env) in &self.environments {
+            let chars = name.chars().count();
+            if chars == 0
+                || chars > ENVIRONMENT_NAME_MAX
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
+                return Some(format!(
+                    "environment name '{name}' must be 1-{ENVIRONMENT_NAME_MAX} letters, \
+                     digits, '-', '_' or '.'"
+                ));
+            }
+            if env
+                .profiles
+                .iter()
+                .chain(&env.brokers)
+                .any(|g| g.trim().is_empty())
+            {
+                return Some(format!("environment '{name}' has an empty glob"));
+            }
+        }
+        if let Some(default) = &self.default_environment {
+            if !self.environments.contains_key(default) {
+                return Some(format!(
+                    "default_environment '{default}' is not one of the environments"
+                ));
+            }
+        }
+        if !self.copy_down.is_allow() && self.environments.is_empty() {
+            return Some("copy_down needs environments to compare".to_string());
+        }
+        None
     }
 }
 
@@ -1097,6 +1241,83 @@ mod tests {
         assert_eq!(defaults.format(), POLICY_FORMAT_V1);
     }
 
+    const ENVIRONMENTS: &str = r#"{
+        "environments": {
+            "prod": {"tier": 3, "profiles": ["prod-*"], "brokers": ["*.prod.corp"],
+                     "forbid": ["topics.delete"]},
+            "staging": {"tier": 2, "brokers": ["*.staging.corp"], "read_only": true},
+            "dev": {"tier": 1}
+        },
+        "default_environment": "dev",
+        "copy_down": "masked"
+    }"#;
+
+    #[test]
+    fn environments_parse_and_need_format_2() {
+        let rules: PolicyRules = serde_json::from_str(ENVIRONMENTS).unwrap();
+        assert_eq!(rules.environments.len(), 3);
+        let prod = &rules.environments["prod"];
+        assert_eq!(prod.tier, 3);
+        assert_eq!(prod.profiles, vec!["prod-*".to_string()]);
+        assert!(!prod.read_only && prod.restricts_changes());
+        assert!(rules.environments["staging"].read_only);
+        assert!(!rules.environments["dev"].restricts_changes());
+        assert_eq!(rules.default_environment.as_deref(), Some("dev"));
+        assert_eq!(rules.copy_down, CopyDownRule::Masked);
+        assert_eq!(rules.environment_rules_error(), None);
+        assert!(rules.unknown_forbid_entries().is_empty());
+
+        let payload = PolicyPayload {
+            rules,
+            ..PolicyPayload::default()
+        };
+        assert_eq!(payload.format(), POLICY_FORMAT_V2);
+        for json in [
+            r#"{"rules":{"environments":{"dev":{"tier":1}}}}"#,
+            r#"{"rules":{"copy_down":"forbid"}}"#,
+            r#"{"rules":{"default_environment":"dev"}}"#,
+        ] {
+            let payload: PolicyPayload = serde_json::from_str(json).unwrap();
+            assert_eq!(payload.format(), POLICY_FORMAT_V2, "{json}");
+        }
+        // The defaults are not written out and stay format 1.
+        let v1: PolicyRules = serde_json::from_str(r#"{"copy_down":"allow"}"#).unwrap();
+        let text = serde_json::to_string(&v1).unwrap();
+        assert!(
+            !text.contains("environment") && !text.contains("copy_down"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn bad_environment_sections_are_refused() {
+        // Typos are refused while parsing, so the policy fails closed.
+        for bad in [
+            r#"{"environments":{"prod":{"tier":3,"readonly":true}}}"#,
+            r#"{"environments":{"prod":{"profiles":["prod-*"]}}}"#,
+            r#"{"environments":{"prod":{"tier":-1}}}"#,
+            r#"{"copy_down":"masked_only"}"#,
+            r#"{"environment":{}}"#,
+        ] {
+            assert!(serde_json::from_str::<PolicyRules>(bad).is_err(), "{bad}");
+        }
+        let rules = |json: &str| serde_json::from_str::<PolicyRules>(json).unwrap();
+        for bad in [
+            r#"{"environments":{"":{"tier":1}}}"#,
+            r#"{"environments":{"pro d":{"tier":1}}}"#,
+            r#"{"environments":{"prod":{"tier":1,"brokers":[" "]}}}"#,
+            r#"{"environments":{"prod":{"tier":1}},"default_environment":"dev"}"#,
+            r#"{"copy_down":"forbid"}"#,
+        ] {
+            assert!(rules(bad).environment_rules_error().is_some(), "{bad}");
+        }
+        assert_eq!(
+            rules(r#"{"environments":{"prod":{"tier":3,"forbid":["topics.nuke"]}}}"#)
+                .unknown_forbid_entries(),
+            vec!["prod: topics.nuke"]
+        );
+    }
+
     #[test]
     fn strictest_forbids_export_and_turns_the_watermark_on() {
         let rules = PolicyRules::strictest();
@@ -1104,5 +1325,7 @@ mod tests {
         assert!(rules.export_clusters.is_empty());
         assert_eq!(rules.watermark, WatermarkRule::On);
         assert_eq!(rules.watermark_text, None);
+        assert!(rules.environments.is_empty());
+        assert_eq!(rules.copy_down, CopyDownRule::Allow);
     }
 }

@@ -354,7 +354,8 @@ pub fn run(mut cli: Cli) {
         }
     }
     // `mirror` writes to its destination cluster, which the gate below does
-    // not see; it is refused outright under enforced masking.
+    // not see; under enforced masking (or `copy_down: masked` into a lower
+    // environment) it is refused unless it runs with `--mask`.
     if let Some(Commands::Mirror(args)) = &cli.command {
         if let Err(refusal) = cli::mirror::authorize(args, &cli.global_opts) {
             cli::exit_with_error(&refusal);

@@ -400,9 +400,56 @@ fn export_lines(rules: &PolicyRules) -> Vec<String> {
     vec![export, watermark, capture, mcp]
 }
 
+/// The environment rules for `policy show`: one line per environment,
+/// highest tier first, then the default environment and `copy_down`. Empty
+/// when the policy has no environments, so other output is unchanged.
+fn environment_lines(rules: &PolicyRules) -> Vec<String> {
+    if rules.environments.is_empty() {
+        return Vec::new();
+    }
+    let mut envs: Vec<_> = rules.environments.iter().collect();
+    envs.sort_by(|a, b| b.1.tier.cmp(&a.1.tier).then_with(|| a.0.cmp(b.0)));
+    let mut lines: Vec<String> = envs
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, env))| {
+            let head = if i == 0 {
+                "environments:     "
+            } else {
+                "                  "
+            };
+            let mut parts = Vec::new();
+            if !env.profiles.is_empty() {
+                parts.push(format!("profiles {}", env.profiles.join(", ")));
+            }
+            if !env.brokers.is_empty() {
+                parts.push(format!("brokers {}", env.brokers.join(", ")));
+            }
+            if env.read_only {
+                parts.push("read-only".to_string());
+            }
+            if !env.forbid.is_empty() {
+                parts.push(format!("forbids {}", env.forbid.join(", ")));
+            }
+            let detail = if parts.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", parts.join("; "))
+            };
+            format!("{head} {name} (tier {}){detail}", env.tier)
+        })
+        .collect();
+    lines.push(format!(
+        "default env:       {}",
+        rules.default_environment.as_deref().unwrap_or("- (none)")
+    ));
+    lines.push(format!("copy down:         {}", rules.copy_down.id()));
+    lines
+}
+
 /// `rules` for `-f json policy show`: as signed, plus `export`,
-/// `export_clusters` and `watermark` even at their defaults, which the
-/// payload leaves out.
+/// `export_clusters`, `watermark` and `copy_down` even at their defaults,
+/// which the payload leaves out.
 fn rules_json(rules: &PolicyRules) -> serde_json::Value {
     let mut value = serde_json::json!(rules);
     if let Some(map) = value.as_object_mut() {
@@ -416,6 +463,8 @@ fn rules_json(rules: &PolicyRules) -> serde_json::Value {
             .or_insert_with(|| serde_json::json!(rules.screen_capture));
         map.entry("mcp_write")
             .or_insert_with(|| serde_json::json!(rules.mcp_write));
+        map.entry("copy_down")
+            .or_insert_with(|| serde_json::json!(rules.copy_down));
     }
     value
 }
@@ -530,6 +579,9 @@ fn show(policy: &EffectivePolicy, global: &GlobalOpts) {
         name(serde_json::json!(rules.audit))
     );
     for line in export_lines(&rules) {
+        println!("  {line}");
+    }
+    for line in environment_lines(&rules) {
         println!("  {line}");
     }
     if let Some(forward) = &rules.audit_forward {
@@ -685,6 +737,28 @@ mod tests {
         assert_eq!(json["screen_capture"], "blocked");
         assert_eq!(json["export"], "forbidden");
         assert_eq!(json["watermark_text"], "대외비");
+    }
+
+    #[test]
+    fn show_lists_environments_only_when_set() {
+        use crate::model::policy::CopyDownRule;
+        assert!(environment_lines(&PolicyRules::default()).is_empty());
+        let mut rules = crate::governance::test_policy::environments(CopyDownRule::Masked).rules;
+        rules.default_environment = Some("dev".into());
+        assert_eq!(
+            environment_lines(&rules),
+            vec![
+                "environments:      prod (tier 3): profiles prod-*; brokers *.prod.corp; forbids topics.delete",
+                "                   staging (tier 2): brokers *.staging.corp; read-only",
+                "                   dev (tier 1): profiles dev*; brokers localhost",
+                "default env:       dev",
+                "copy down:         masked",
+            ]
+        );
+        assert_eq!(rules_json(&PolicyRules::default())["copy_down"], "allow");
+        let json = rules_json(&rules);
+        assert_eq!(json["copy_down"], "masked");
+        assert_eq!(json["environments"]["staging"]["read_only"], true);
     }
 
     #[test]

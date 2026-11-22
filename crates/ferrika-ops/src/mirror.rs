@@ -12,7 +12,7 @@ use ferrika_core::kafka::filter::MessageFilter;
 use ferrika_core::kafka::producer::{
     DeliveryOutcome, KafkaProducerClient, OwnedProducerRecord, TaggedDeliveryPipeline,
 };
-use ferrika_core::model::policy::PolicyAction;
+use ferrika_core::model::policy::{CopyDownRule, PolicyAction};
 use ferrika_governance::audit::AuditEntry;
 use ferrika_governance::policy::{
     self, AuditMode, AuditSink, EffectivePolicy, ExportChannel, ExportRequest, WriteRequest,
@@ -772,9 +772,11 @@ pub struct CopyAuthorized {
 ///
 /// 1. Enforced PII masking refuses the copy unless it masks first.
 /// 2. A destination whose brokers are not all among the source's is another
-///    cluster: the export gate decides it for the source's brokers
-///    (`destination_within_source`; `export: forbidden` refuses, `audited`
-///    records it).
+///    cluster (`destination_within_source`). A copy from a higher
+///    environment tier to a lower one (or to a cluster in no environment)
+///    is refused under `copy_down: forbid`, and under `copy_down: masked`
+///    unless it masks first. Then the export gate decides it for the
+///    source's brokers (`export: forbidden` refuses, `audited` records it).
 /// 3. With [`CopyCheck::check_destination`], the write gate for the
 ///    destination as a `produce`: a read-only rule, `forbid: produce` or a
 ///    read-only destination profile refuses it.
@@ -818,6 +820,10 @@ pub fn authorize_copy(
             check.dst.profile
         };
         let export_target = format!("{target} (to {destination})");
+        if let Err(reason) = check_copy_down(policy, check, &fetch) {
+            blocked(check.src.audit_name(), &reason, &export_target);
+            return Err(reason);
+        }
         let src_brokers = match policy::export_brokers_with(policy, src, &fetch) {
             Ok(brokers) => brokers,
             Err(reason) => {
@@ -884,6 +890,48 @@ pub fn authorize_copy(
         profile.to_string()
     });
     Ok(authorized)
+}
+
+/// The policy's `copy_down` rule for a copy between two clusters: the
+/// refusal when it goes from a higher environment tier to a lower one and
+/// the rule forbids that, or asks for masking the copy does not do first.
+/// The environments are matched against the brokers each cluster reports
+/// when the policy tells them apart by broker address; a lookup that fails
+/// refuses the copy.
+fn check_copy_down(
+    policy: &EffectivePolicy,
+    check: &CopyCheck<'_>,
+    fetch: impl Fn(&KafkaClientConfig) -> Result<Vec<String>, String>,
+) -> Result<(), String> {
+    let needed = policy.copy_down_needs_broker_metadata();
+    let src_brokers = policy::brokers_for_with(check.src.config, needed, &fetch)?;
+    let dst_brokers = policy::brokers_for_with(check.dst.config, needed, &fetch)?;
+    let Some(down) = policy.copy_down(
+        check.src.profile,
+        &src_brokers,
+        check.dst.profile,
+        &dst_brokers,
+    ) else {
+        return Ok(());
+    };
+    let label = check.label;
+    match down.rule {
+        CopyDownRule::Allow => Ok(()),
+        CopyDownRule::Masked if check.masks_first => Ok(()),
+        CopyDownRule::Masked => Err(format!(
+            "Refused by {}: `{label}` would copy unmasked records {}, a lower environment, \
+             and the policy requires them masked (copy_down: masked).{}",
+            policy.label(),
+            down.describe(),
+            check.masking_hint
+        )),
+        CopyDownRule::Forbid => Err(format!(
+            "Refused by {}: `{label}` would copy records {}, a lower environment, \
+             which the policy forbids (copy_down: forbid).",
+            policy.label(),
+            down.describe()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1240,6 +1288,108 @@ mod tests {
             authorize_copy(&audited, &FakeLog::default(), &by_brokers, no_brokers).unwrap();
         let target = authorized.export_result.unwrap().target;
         assert!(target.ends_with("(to kafka.dev:9092)"), "{target}");
+    }
+
+    #[test]
+    fn copy_down_needs_masking_or_is_forbidden() {
+        let prod = KafkaClientConfig::new("kafka1.prod.corp:9092");
+        let dev = KafkaClientConfig::new("localhost:9092");
+        let down = copy_check(
+            CopyCluster {
+                profile: "prod-eu",
+                config: &prod,
+            },
+            CopyCluster {
+                profile: "dev",
+                config: &dev,
+            },
+        );
+        let reported = |c: &KafkaClientConfig| Ok(vec![c.bootstrap_servers.clone()]);
+
+        let masked = ferrika_governance::test_policy::environments(CopyDownRule::Masked);
+        let log = FakeLog::default();
+        let reason = authorize_copy(&masked, &log, &down, reported).unwrap_err();
+        assert!(
+            reason.contains("from 'prod' (tier 3) to 'dev' (tier 1)"),
+            "{reason}"
+        );
+        assert!(reason.contains("copy_down: masked"), "{reason}");
+        assert!(reason.ends_with(" Mask first."), "{reason}");
+        let entries = log.entries.borrow();
+        assert_eq!(entries[0].action, "policy.blocked");
+        assert_eq!(entries[0].profile, "prod-eu");
+        assert!(
+            entries[0].target.ends_with("(to dev)"),
+            "{}",
+            entries[0].target
+        );
+        drop(entries);
+        // Masking first makes it acceptable; the destination's request
+        // entry names its environment.
+        let log = FakeLog::default();
+        let masks = CopyCheck {
+            masks_first: true,
+            ..down
+        };
+        assert!(authorize_copy(&masked, &log, &masks, reported).is_ok());
+        let entries = log.entries.borrow();
+        assert_eq!(entries[0].outcome, "requested (environment dev)");
+        drop(entries);
+        // Up is not down.
+        let up = CopyCheck {
+            src: down.dst,
+            dst: down.src,
+            ..down
+        };
+        let up_forbid = ferrika_governance::test_policy::environments(CopyDownRule::Forbid);
+        // (`prod` forbids no `produce`, so only `copy_down` could refuse.)
+        assert!(authorize_copy(&up_forbid, &FakeLog::default(), &up, reported).is_ok());
+
+        let forbid = ferrika_governance::test_policy::environments(CopyDownRule::Forbid);
+        let reason = authorize_copy(&forbid, &FakeLog::default(), &masks, reported).unwrap_err();
+        assert!(reason.contains("copy_down: forbid"), "{reason}");
+
+        // The brokers decide, not the profile name: a "dev" profile that
+        // reports prod's brokers is prod.
+        let unknown = KafkaClientConfig::new("10.9.9.9:9092");
+        let renamed = copy_check(
+            CopyCluster {
+                profile: "dev-alias",
+                config: &dev,
+            },
+            CopyCluster {
+                profile: "",
+                config: &unknown,
+            },
+        );
+        let prod_brokers = |c: &KafkaClientConfig| {
+            Ok(if c.bootstrap_servers == "localhost:9092" {
+                vec!["kafka1.prod.corp:9092".to_string()]
+            } else {
+                Vec::new()
+            })
+        };
+        let reason =
+            authorize_copy(&forbid, &FakeLog::default(), &renamed, prod_brokers).unwrap_err();
+        assert!(
+            reason.contains("to a cluster in no environment"),
+            "{reason}"
+        );
+        // The brokers cannot be read: refused, not let through.
+        assert!(authorize_copy(&forbid, &FakeLog::default(), &renamed, no_brokers).is_err());
+
+        // Within one cluster nothing goes down.
+        let side = CopyCluster {
+            profile: "prod-eu",
+            config: &prod,
+        };
+        assert!(authorize_copy(
+            &forbid,
+            &FakeLog::default(),
+            &copy_check(side, side),
+            reported
+        )
+        .is_ok());
     }
 
     #[test]

@@ -152,10 +152,12 @@ failed deliveries.
   steps sha256:...`). The steps themselves are not logged: a filter or
   `--set` can quote a record value. Record keys, values and header values
   are never logged.
-- The policy has no "lower environment" classification today. The
-  destination is judged by its profile and brokers (read-only rules) and,
-  across clusters, by the export rules. A rule such as "copies to these
-  clusters must be masked" is a possible follow-up in the policy format.
+- Lower environments: the policy's `environments` tiers and `copy_down:
+  allow | masked | forbid` (docs/POLICY.md "Environments") judge a copy
+  across clusters by the source's and destination's tiers; `masked` needs
+  `--mask` as the first step (or `mirror --mask`). Besides that the
+  destination is judged by its profile and brokers (read-only rules and
+  per-environment rules) and, across clusters, by the export rules.
 
 ## Code layout
 

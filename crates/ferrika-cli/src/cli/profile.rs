@@ -5,6 +5,7 @@ use serde_json::json;
 
 use crate::cli::preset::{self, Preset};
 use crate::cli::{output, GlobalOpts, OutputFormat};
+use crate::governance::policy::EffectivePolicy;
 use crate::kafka::config::{OAuthClientAuth, OAuthMethod, SaslMechanism, SecurityProtocol};
 use crate::kafka::profile::{ClusterProfile, ProfileStore};
 
@@ -451,8 +452,24 @@ fn report_preset(p: Preset, filled: &[(&'static str, String)], warnings: &[Strin
 /// Shown in place of a stored password.
 const MASKED_SECRET: &str = "********";
 
+/// Whether `profile list` shows the ENV column: the policy in force names
+/// environments.
+fn shows_environments(policy: &EffectivePolicy) -> bool {
+    policy.is_active() && !policy.rules.environments.is_empty()
+}
+
+/// The policy environment of a profile, judged by its name and bootstrap
+/// servers (no cluster metadata is read, so a profile reached through an
+/// alias may show another environment than the brokers it reports).
+fn profile_environment(policy: &EffectivePolicy, profile: &ClusterProfile) -> Option<String> {
+    policy
+        .environment(&profile.name, &profile.bootstrap_servers)
+        .map(|env| env.name)
+}
+
 fn handle_list(store: &ProfileStore, global: &GlobalOpts) -> anyhow::Result<()> {
     let profiles = store.list();
+    let policy = crate::governance::policy::current();
 
     if global.format == OutputFormat::Json {
         let json_list: Vec<_> = profiles
@@ -464,6 +481,7 @@ fn handle_list(store: &ProfileStore, global: &GlobalOpts) -> anyhow::Result<()> 
                     "bootstrap_servers": p.bootstrap_servers,
                     "security_protocol": p.security_protocol.as_str(),
                     "description": p.description,
+                    "environment": profile_environment(policy, p),
                 })
             })
             .collect();
@@ -477,15 +495,20 @@ fn handle_list(store: &ProfileStore, global: &GlobalOpts) -> anyhow::Result<()> 
         return Ok(());
     }
 
-    let mut table = output::table(vec![
+    let with_env = shows_environments(policy);
+    let mut header = vec![
         Cell::new("ACTIVE")
             .fg(Color::Cyan)
             .set_alignment(CellAlignment::Center),
         Cell::new("PROFILE NAME").fg(Color::Cyan),
         Cell::new("BOOTSTRAP SERVERS").fg(Color::Cyan),
-        Cell::new("SECURITY").fg(Color::Cyan),
-        Cell::new("DESCRIPTION").fg(Color::Cyan),
-    ]);
+    ];
+    if with_env {
+        header.push(Cell::new("ENV").fg(Color::Cyan));
+    }
+    header.push(Cell::new("SECURITY").fg(Color::Cyan));
+    header.push(Cell::new("DESCRIPTION").fg(Color::Cyan));
+    let mut table = output::table(header);
 
     for (p, is_active) in profiles {
         let active_cell = if is_active {
@@ -502,13 +525,18 @@ fn handle_list(store: &ProfileStore, global: &GlobalOpts) -> anyhow::Result<()> 
             Cell::new(&p.name).fg(Color::White)
         };
 
-        table.add_row(vec![
+        let mut row = vec![
             active_cell,
             name_cell,
             Cell::new(&p.bootstrap_servers).fg(Color::DarkCyan),
-            Cell::new(p.security_protocol.as_str()).fg(Color::Magenta),
-            Cell::new(p.description.as_deref().unwrap_or("-")).fg(Color::DarkGrey),
-        ]);
+        ];
+        if with_env {
+            let env = profile_environment(policy, p);
+            row.push(Cell::new(env.as_deref().unwrap_or("-")).fg(Color::Yellow));
+        }
+        row.push(Cell::new(p.security_protocol.as_str()).fg(Color::Magenta));
+        row.push(Cell::new(p.description.as_deref().unwrap_or("-")).fg(Color::DarkGrey));
+        table.add_row(row);
     }
 
     println!("{table}");
@@ -978,6 +1006,26 @@ fn handle_remove(store: &mut ProfileStore, name: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_list_shows_the_policy_environment() {
+        use crate::governance::test_policy;
+        use crate::model::policy::CopyDownRule;
+        let policy = test_policy::environments(CopyDownRule::Allow);
+        assert!(shows_environments(&policy));
+        assert!(!shows_environments(&test_policy::none()));
+        assert!(!shows_environments(&test_policy::masking()));
+        let env = |name: &str, bootstrap: &str| {
+            profile_environment(&policy, &ClusterProfile::new(name, bootstrap))
+        };
+        assert_eq!(env("prod-eu", "10.0.0.1:9092").as_deref(), Some("prod"));
+        assert_eq!(
+            env("local", "kafka1.prod.corp:9092").as_deref(),
+            Some("prod")
+        );
+        assert_eq!(env("dev", "localhost:9092").as_deref(), Some("dev"));
+        assert_eq!(env("laptop", "10.1.1.1:9092"), None);
+    }
 
     #[test]
     fn updating_a_profile_keeps_read_only_and_names_what_it_drops() {

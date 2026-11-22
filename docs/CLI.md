@@ -650,6 +650,11 @@ ferrika mirror telemetry telemetry-staging -p 0 -k "sensor-temp" -n 10000
 # An offset is committed only after its record reached the destination, so a
 # failed or interrupted run copies records again instead of skipping them.
 ferrika mirror orders-v1 orders-v1 --src-profile prod --dst-profile staging -g orders-mirror -b
+
+# Mask PII in keys, values and header values on the way (--mask=redact hides
+# whole values). Needed under enforced masking or a policy's
+# `copy_down: masked` into a lower environment; not combined with -G/-k/--header-filter.
+ferrika mirror orders-v1 orders-v1 --src-profile prod --dst-profile dev -b --mask
 ```
 
 ### Stream transform (`ferrika transform`)

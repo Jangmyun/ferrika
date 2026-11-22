@@ -67,7 +67,8 @@ Ferrika looks in a machine-wide directory that normal users cannot write:
 - `format`: 1, or 2 when the payload uses a format 2 field (`expires_at`,
   `on_expiry`, `read_only_brokers`, `audit_forward`, `audit_anchor`,
   `anchor_required`, `export`, `export_clusters`, `watermark`,
-  `watermark_text`; below). Rules left at their defaults are not written
+  `watermark_text`, `environments`, `default_environment`, `copy_down`;
+  below). Rules left at their defaults are not written
   out, so they do not make a policy format 2.
 - `key_id`: first 16 hex digits of SHA-256 of the public key.
 - `signature`: Ed25519 over the exact bytes of the `payload` string, so no
@@ -95,7 +96,7 @@ Ferrika looks in a machine-wide directory that normal users cannot write:
 | `read_only` | Globs (`*`, `?`, case-insensitive) matched against the profile name and each bootstrap address (`prod-*`, `*.prod.corp:*`). `*` = everything. Every change to a match is refused. The profile name is chosen by the user, so a name glob alone can be avoided by renaming a profile; use `read_only_brokers` for clusters that must stay read-only. |
 | `read_only_brokers` | v2, optional: globs matched against broker addresses only, never the profile name (see [Read-only brokers](#read-only-brokers-format-2)). |
 | `forbid` | Categories refused everywhere: `topics.create`, `topics.delete`, `topics.purge`, `topics.alter` (partitions, replication, leader election, reassignment), `config.change`, `produce` (also generate, mirror, restore, probe, bench produce, DLQ redrive), `offsets.reset`, `offsets.commit` (`consume --group`, which commits the group's offsets), `groups.delete`, `acl.change`, `users.change`, `quota.change`, `schema.change`, `connect.change`, `messages.peek` (RabbitMQ: `rabbit peek`, `rabbit dlq inspect` and the `rabbit dlq redrive` preview, which take messages and requeue them), `messages.move` (RabbitMQ: `rabbit dlq redrive --execute`, which also needs `produce` allowed since it republishes); `*` = every change. `rabbit publish` is `produce`. `messages.peek` and `messages.move` are new in 0.2.0: builds before 0.2.0 do not know them and treat a policy that names them as invalid (strictest mode). |
-| `masking` | `optional` (default) or `enforced`: PII stays masked in the desktop app's Message Studio, `consume`, `dlq`, `diff`, `trace`, `compact` and MCP; `dump` and `mirror` are refused. |
+| `masking` | `optional` (default) or `enforced`: PII stays masked in the desktop app's Message Studio, `consume`, `dlq`, `diff`, `trace`, `compact` and MCP; `dump` is refused, and so are `mirror` without `--mask` and `transform` without `--mask` as its first step. |
 | `unmask` | With enforced masking: `allowed`, `with_reason` (the desktop app asks for a reason and records `record.unmask`), `forbidden` (the toggle is disabled). |
 | `audit` | `optional` or `required`: a CLI change whose audit entry cannot be written is refused, and so is a desktop app unmask. The desktop app checks that the audit log can be written before it runs a change and refuses it otherwise ("Refused by company policy: the audit log cannot be written (audit: required)"). |
 | `audit_anchor` | v2, optional: `none` (default) or `os_log`: every audit line's `seq` and `hash` are also written to the OS log so `audit verify --anchor` can detect a truncated or replaced log (see below). |
@@ -108,6 +109,9 @@ Ferrika looks in a machine-wide directory that normal users cannot write:
 | `watermark_text` | v2, optional: 1–40 characters (no control characters) put in front of the watermark, e.g. `"CONFIDENTIAL"`. |
 | `mcp_write` | v2, optional: what an AI assistant may change through `ferrika mcp --allow-write`, on top of every other rule: `allowed` (default), `confirm_human` (only after a person confirms in the client through MCP elicitation; the one-time token, which the model can pass on its own, is refused, and clients without elicitation get no write tools) or `forbidden` (no write tools; calls are refused and audited). The CLI and the desktop app are not affected. |
 | `screen_capture` | v2, optional: `allowed` (default) or `blocked`: the desktop app's window stays out of screenshots, screen recordings and screen shares (Windows; see [Record export and watermark](#record-export-and-watermark-format-2)). No effect in the CLI. |
+| `environments` | v2, optional: environment tiers by name, each with the clusters it covers (`profiles`, `brokers` globs) and its own `read_only` and `forbid` (see [Environments](#environments-format-2)). |
+| `default_environment` | v2, optional: the environment of a cluster no environment matches. |
+| `copy_down` | v2, optional: `allow` (default), `masked` or `forbid`: what a record copy from a higher tier to a lower one needs. |
 
 Unknown rule names or categories make the policy invalid (fail closed), so a
 typo cannot silently weaken it.
@@ -221,7 +225,7 @@ What counts as an export:
 |---|---|---|
 | CLI, files | `dump`, `consume --save`, `dlq export`, `compact snapshot` | `report`, `monitor export`, `topics analyze` and other metadata (topics, groups, lag, brokers) |
 | CLI, stdout | `consume` (also `-f json`), `dlq inspect`, `compact tombstones`, `diff`, `trace inspect`, `crypto mask --topic`: only when stdout is redirected or piped. On a terminal the records are only viewed and are allowed. | `crypto mask` reading stdin (the user's own input) |
-| CLI, other cluster | `mirror` whose destination shares no broker address with the source (normalized like `read_only_brokers`; the same brokers under another profile name are the same cluster). Under enforced masking `mirror` is refused outright anyway. | `mirror` within one cluster (a `produce`) |
+| CLI, other cluster | `mirror` and `transform --execute` whose destination brokers are not all brokers of the source (normalized like `read_only_brokers`; the same brokers under another profile name are the same cluster). Under enforced masking `mirror` needs `--mask` anyway. | A copy within one cluster (a `produce`) |
 | Desktop app | Message Studio: Export (JSONL), Save payload, Copy record as JSON, Copy payload, and Resend (its text can be copied from the producer form). Under `forbidden` these buttons are disabled with the tooltip "Disabled by company policy (export: forbidden)", and pressing one anyway is refused. | Topics/Consumers Export CSV, Overview Report (metadata) |
 | MCP | `peek_messages` hands records to an outside AI service: under `forbidden` it is left out of `tools/list` and refused if called; under `audited` each call is recorded. | The other tools (metadata) |
 
@@ -272,6 +276,113 @@ What counts as an export:
   machine before installing a policy that uses them. A typo in a value
   (`"forbiden"`), an empty `export_clusters` entry or a bad `watermark_text`
   makes the policy invalid; `policy sign` refuses them.
+
+
+### Environments (format 2)
+
+Environment tiers classify clusters (`prod`, `staging`, `dev`) so a policy
+can say "production data may not be copied to a lower environment
+unmasked" and give production stricter rules than the global ones.
+
+```json
+{
+  "issuer": "Security team",
+  "issued_at": "2026-11-22",
+  "rules": {
+    "forbid": ["acl.change"],
+    "environments": {
+      "prod":    { "tier": 3, "brokers": ["*.prod.corp", "10.20.*"],
+                   "profiles": ["prod-*"],
+                   "forbid": ["topics.delete", "topics.purge", "offsets.reset"] },
+      "staging": { "tier": 2, "brokers": ["*.staging.corp"] },
+      "dev":     { "tier": 1, "brokers": ["localhost", "127.0.0.1", "*.dev.corp"] }
+    },
+    "default_environment": "dev",
+    "copy_down": "masked"
+  }
+}
+```
+
+- **Names and tiers.** An environment name is 1–32 letters, digits, `-`,
+  `_` or `.`. `tier` is a whole number; higher is more sensitive. Two
+  environments may share a tier (neither is below the other).
+- **Matching.** A cluster is in an environment when one of its broker
+  addresses matches one of the environment's `brokers` globs (matched like
+  `read_only_brokers`: normalized, a pattern without a port matches any
+  port, and the brokers from the cluster metadata count too), or its
+  profile name matches one of its `profiles` globs. The profile name is the
+  user's to choose, so a name glob alone can be avoided by renaming a
+  profile: classify clusters that matter by `brokers`. A cluster that no
+  environment matches is in `default_environment`, or in no environment
+  when that is not set.
+- **More than one match.** A cluster can match several environments. Their
+  `read_only` and `forbid` rules all apply; it is shown (and judged as a
+  copy source) as the highest of them, and judged as a copy destination as
+  the lowest, so the stricter reading always wins.
+- **`read_only` and `forbid` per environment.** `"read_only": true` refuses
+  every change to the environment's clusters; `forbid` refuses those
+  categories there, on top of the global `forbid` (which still applies
+  everywhere). So `prod` can forbid `topics.delete` while `dev` allows it.
+  Refusals name the environment: "Refused by company policy …:
+  `topics.delete` is forbidden in the environment 'prod'." They apply in
+  the CLI, the MCP write tools and the desktop app alike (the shared
+  `EffectivePolicy::check`). When an environment with such rules is told
+  apart by `brokers`, the CLI reads the cluster metadata before a change,
+  as for `read_only_brokers`; if that fails, the change is refused.
+- **`copy_down`.** A record copy from a cluster whose environment has a
+  higher tier to one with a lower tier, or to a cluster in no environment,
+  is a copy down. A copy whose source is in no environment is not judged,
+  and a copy within one cluster never is.
+
+  | `copy_down` | A copy down is |
+  |---|---|
+  | `allow` (default) | allowed, as without the rule. |
+  | `masked` | allowed only when every record is PII-masked before anything else reads it: `transform --mask …` (mask as the first step) or `mirror --mask` (which cannot be combined with mirror's raw-value filters). Otherwise refused and recorded as `policy.blocked`. |
+  | `forbid` | refused and recorded as `policy.blocked`, masked or not. |
+
+  The rule is checked in `ferrika_ops::mirror::authorize_copy`, which
+  `mirror`, `transform --execute` and the desktop app's copy all use, before
+  the export gate. Both clusters' metadata is read when `copy_down` is set
+  and an environment has `brokers` globs; if that fails, the copy is
+  refused. Example refusal: "Refused by company policy …: `mirror` would
+  copy unmasked records from 'prod' (tier 3) to 'dev' (tier 1), a lower
+  environment, and the policy requires them masked (copy_down: masked). Add
+  --mask to copy masked records." `dlq redrive` re-produces records to the
+  same cluster, so it is never a copy down.
+- **Where the environment shows.** `policy show` lists the environments
+  (highest tier first), `default env:` and `copy down:`; `-f json policy
+  show` always has `copy_down` in `rules`. `profile list` adds an `ENV`
+  column while the policy names environments (and `-f json profile list`
+  an `environment` field, `null` without one); it judges each profile by
+  its name and bootstrap servers only, without reading cluster metadata.
+  An allowed change's audit request entry has the outcome `requested
+  (environment prod)` instead of `requested`.
+- **Why not an audit field.** The environment goes into the outcome text
+  rather than a new audit field. A new optional field would keep the hash
+  chain valid (older lines keep their hashes, like `actor`), but every
+  front end builds audit entries itself, so a new field would change the
+  entry type for all of them; the text needs no such change.
+- **Strictest mode** ignores the environments: `read_only: *` and
+  `forbid: *` already refuse every change and copy.
+- **Mistakes fail closed.** An unknown field in an environment
+  (`"readonly"`), a missing `tier`, an unknown category in its `forbid`, an
+  empty glob, a `default_environment` that names no environment, or
+  `copy_down` without `environments` makes the policy invalid; `policy
+  sign` refuses them.
+
+### Compatibility
+
+- Policies without these fields verify and behave exactly as before, and
+  `sign` keeps writing format 1 for them.
+- A policy that uses `environments`, `default_environment` or a
+  `copy_down` other than `allow` is format 2.
+- **Older builds** (any build without environment support) refuse unknown
+  rule fields rather than ignore them, so they treat such a policy as
+  invalid and run in the strictest mode: every change and every record export is refused until
+  Ferrika is updated. Builds that only read format 1 refuse format 2 files
+  the same way. Ignoring an unknown section would silently drop a
+  restriction, so failing closed is deliberate. Update Ferrika on every
+  machine before installing a policy that uses environments.
 
 
 ## Forwarding audit entries (SIEM)
@@ -448,8 +559,9 @@ direction.
   header values they print or write (JSON included; previews are cut after
   masking). `diff` still compares the real values and `dlq redrive --execute`
   re-produces the real records, which is a change the policy checks like any
-  other. `dump` and `mirror` (it would copy unmasked records to another
-  cluster) are refused under enforced masking. `mirror` is also checked
+  other. `dump` is refused under enforced masking, and so is `mirror` (it
+  would copy unmasked records to another cluster) unless it runs with
+  `--mask`. `mirror` is also checked
   against its destination cluster (`--dst-profile`/`--dst-bootstrap-servers`)
   as a `produce`, so a read-only destination or `forbid: produce` refuses it.
   Under `export: forbidden`/`audited` the commands that write record data to
