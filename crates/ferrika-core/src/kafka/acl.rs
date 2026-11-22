@@ -26,13 +26,19 @@ impl Default for AclStore {
     }
 }
 
+/// `acls.json` in the folder of the profiles file `profiles`.
+fn storage_path_next_to(profiles: &std::path::Path) -> PathBuf {
+    profiles
+        .parent()
+        .map_or_else(|| PathBuf::from("acls.json"), |dir| dir.join("acls.json"))
+}
+
 impl AclStore {
-    /// Returns default file location `~/.ferrika/acls.json`
+    /// Returns default file location: `acls.json` next to `profiles.json`
+    /// (`~/.ferrika/acls.json` unless `FERRIKA_CONFIG_DIR` or
+    /// `FERRIKA_CONFIG_PATH` moves the configuration).
     pub fn default_storage_path() -> PathBuf {
-        let home = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".ferrika").join("acls.json")
+        storage_path_next_to(&crate::kafka::profile::ProfileStore::default_path())
     }
 
     /// Loads the ACL store from the default location or initializes sample rules
@@ -357,6 +363,15 @@ pub fn audit_security_rules(bindings: &[AclBinding]) -> Vec<AclSecurityFinding> 
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+
+    #[test]
+    fn the_local_acl_file_sits_next_to_the_profiles() {
+        let dir = std::path::Path::new("cfg").join("ferrika");
+        assert_eq!(
+            super::storage_path_next_to(&dir.join("profiles.json")),
+            dir.join("acls.json")
+        );
+    }
 
     use super::*;
 
