@@ -1110,9 +1110,14 @@ pub fn delete_acl_bindings(
         false,
         &encode_delete_acl_bindings(bindings),
     )?;
-    let (deleted, errors) = decode_delete_acls_partial(&body)?;
+    let (deleted, mut errors) = decode_delete_acls_partial(&body)?;
     if errors.is_empty() {
         return Ok(deleted);
+    }
+    // Nothing deleted: the broker's own error keeps its kind and hint (an
+    // authorization failure, for example).
+    if deleted.is_empty() {
+        return Err(errors.swap_remove(0));
     }
     let detail = errors
         .iter()
