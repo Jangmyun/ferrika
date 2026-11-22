@@ -645,7 +645,7 @@ impl<'a> ClusterRunner<'a> {
                         moves.join(", ")
                     ));
                 }
-                let results = wire::alter_partition_reassignments(self.config, &plan)?;
+                let (results, _) = wire::reassign_or_set_replication(self.config, &plan)?;
                 let failed: Vec<String> = results
                     .iter()
                     .filter_map(|r| r.error.as_ref().map(|e| format!("{}: {e}", r.partition)))

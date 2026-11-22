@@ -8,6 +8,16 @@ The quickest check is the smoke test, which needs one plain broker
 (`apache/kafka:3.9.0`) and no files from this folder; see
 [`tools/e2e/smoke.py`](../../tools/e2e/smoke.py) and the README.
 
+The same smoke test runs against Redpanda, a Kafka API compatible broker
+(CI does both):
+
+```bash
+docker run -d --name redpanda -p 9092:9092 docker.redpanda.com/redpandadata/redpanda:v26.3.1 \
+  redpanda start --mode dev-container --smp 1 --memory 1G --overprovisioned \
+  --kafka-addr 0.0.0.0:9092 --advertise-kafka-addr localhost:9092
+python3 tools/e2e/smoke.py target/debug/ferrika --broker localhost:9092
+```
+
 | File | What it starts or does |
 | --- | --- |
 | `kafka-sasl-compose.yml` | Three-node KRaft cluster with SASL/PLAIN on `localhost:19092` |
@@ -15,6 +25,7 @@ The quickest check is the smoke test, which needs one plain broker
 | `kafka-scram-compose.yml` | One broker with SASL SCRAM-SHA-256/512 on `localhost:19392`; the file lists how to create the users |
 | `kafka-oauth-compose.yml` | One broker that accepts unsecured JWTs on `localhost:19096`, plus a token endpoint on `localhost:18080` served by `oauth-idp.py` |
 | `oauth-idp.py` | Test-only OAuth 2.0 client-credentials endpoint (standard library only) |
+| `redpanda-compose.yml` | Three-node Redpanda (Kafka API on `localhost:39092`-`39094`, Schema Registry on `localhost:38081`) |
 | `undo.sh` | Checks `ferrika history` and `ferrika undo` against a broker; the header lists its variables |
 
 Usage, for example (undo check against a plain single-node broker):

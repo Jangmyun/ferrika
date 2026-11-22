@@ -381,6 +381,8 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
     // Offsets of processed records that could not be stored (`--group`).
     let mut store_failures = 0usize;
     let mut read_errors = 0usize;
+    // The group permission hint is shown once, at the first refusal.
+    let mut group_hint_shown = false;
     let idle_timeout = args.timeout.map(Duration::from_millis);
     // Buffer terminal output: println! issues one write per message, which dominates
     // the cost of consuming large topics. Buffers are flushed whenever the stream pauses.
@@ -529,6 +531,12 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                     }
                     ReadEvent::Error(err) => {
                         eprintln!("{} Consumer error: {err}", "✖".red());
+                        if !group_hint_shown {
+                            if let Some(hint) = group_permission_hint(&err, kafka_config.group_id.as_deref()) {
+                                eprintln!("  {} {hint}", "ℹ".cyan());
+                                group_hint_shown = true;
+                            }
+                        }
                         read_errors += 1;
                     }
                 }
@@ -600,6 +608,23 @@ fn read_outcome(errors: usize, received: u64) -> anyhow::Result<()> {
         anyhow::bail!("nothing was read and the consumer reported {errors} error(s) (see above)");
     }
     Ok(())
+}
+
+/// What to grant when the group is refused: Kafka lets Read on a group
+/// imply Describe, Redpanda asks for Describe separately (FindCoordinator).
+fn group_permission_hint(err: &crate::error::KafkaError, group: Option<&str>) -> Option<String> {
+    let refused = matches!(
+        err,
+        crate::error::KafkaError::Driver(e)
+            if e.code() == Some(crate::error::ErrorCode::GroupAuthorizationFailed)
+    );
+    refused.then(|| {
+        let group = group.unwrap_or("<group>");
+        format!(
+            "The user needs Read on group '{group}' (Redpanda also needs Describe): \
+             ferrika acl create -p <user> -o read -g {group}, and -o describe -g {group}"
+        )
+    })
 }
 
 /// Adds `-D`'s decoded value and key to a JSON line (`decoded`,
@@ -984,6 +1009,23 @@ mod tests {
             failed.contains("partition 2") && failed.contains("NotLeaderForPartition"),
             "{failed}"
         );
+    }
+
+    #[test]
+    fn a_refused_group_names_the_permissions_to_grant() {
+        use rdkafka::types::RDKafkaErrorCode as Code;
+        let refused = crate::error::KafkaError::from(
+            rdkafka::error::KafkaError::MessageConsumption(Code::GroupAuthorizationFailed),
+        );
+        let hint = group_permission_hint(&refused, Some("billing")).unwrap_or_default();
+        assert!(
+            hint.contains("-o read -g billing") && hint.contains("-o describe -g billing"),
+            "{hint}"
+        );
+        let other = crate::error::KafkaError::from(rdkafka::error::KafkaError::MessageConsumption(
+            Code::TopicAuthorizationFailed,
+        ));
+        assert_eq!(group_permission_hint(&other, Some("billing")), None);
     }
 
     #[test]

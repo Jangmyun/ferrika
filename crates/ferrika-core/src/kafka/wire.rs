@@ -33,6 +33,7 @@ const API_DESCRIBE_QUORUM: i16 = 55;
 const API_DESCRIBE_LOG_DIRS: i16 = 35;
 const API_DESCRIBE_ACLS: i16 = 29;
 const API_ELECT_LEADERS: i16 = 43;
+const API_API_VERSIONS: i16 = 18;
 const API_CREATE_ACLS: i16 = 30;
 const API_DELETE_ACLS: i16 = 31;
 const API_OFFSET_DELETE: i16 = 47;
@@ -77,6 +78,67 @@ pub fn alter_partition_reassignments(
     let mut results = decode_alter_partition_reassignments(&response)?;
     add_missing_reassignment_results(assignments, &mut results);
     Ok(results)
+}
+
+/// [`alter_partition_reassignments`] for plans that may change how many
+/// replicas partitions have. Some Kafka-compatible brokers (Redpanda) refuse
+/// that through reassignment (`INVALID_REPLICATION_FACTOR`: the count must
+/// match the topic's replication factor) and change it through the topic
+/// config `replication.factor`, placing the replicas themselves. When every
+/// partition is refused that way and each topic's plan has one replica
+/// count, that config is set instead, and the second value is `true` (the
+/// replicas are then where the broker put them, not as planned).
+pub fn reassign_or_set_replication(
+    config: &KafkaClientConfig,
+    assignments: &[PartitionAssignment],
+) -> KafkaResult<(Vec<PartitionReassignmentResult>, bool)> {
+    let results = alter_partition_reassignments(config, assignments)?;
+    let Some(targets) = replication_fallback(assignments, &results) else {
+        return Ok((results, false));
+    };
+    for (topic, replication) in &targets {
+        incremental_alter_topic_config(
+            config,
+            topic,
+            &[ConfigChange::Set(
+                "replication.factor".to_string(),
+                replication.to_string(),
+            )],
+            false,
+        )?;
+    }
+    let accepted = results
+        .into_iter()
+        .map(|r| PartitionReassignmentResult { error: None, ..r })
+        .collect();
+    Ok((accepted, true))
+}
+
+/// The `(topic, replica count)` to set through `replication.factor` when
+/// the broker refused every partition of `assignments` for its replica
+/// count; `None` otherwise, or when a topic's plan mixes replica counts.
+fn replication_fallback(
+    assignments: &[PartitionAssignment],
+    results: &[PartitionReassignmentResult],
+) -> Option<Vec<(String, usize)>> {
+    let refused_for_count = !results.is_empty()
+        && results.iter().all(|r| {
+            r.error
+                .as_deref()
+                .is_some_and(|e| e.contains("INVALID_REPLICATION_FACTOR"))
+        });
+    if !refused_for_count {
+        return None;
+    }
+    let mut targets: Vec<(String, usize)> = Vec::new();
+    for a in assignments {
+        match targets.iter().find(|(t, _)| *t == a.topic) {
+            Some((_, n)) if *n != a.replicas.len() => return None,
+            Some(_) => {}
+            None => targets.push((a.topic.clone(), a.replicas.len())),
+        }
+    }
+    Some(targets)
 }
 
 /// A partition the broker's response does not mention was not confirmed:
@@ -1195,6 +1257,30 @@ pub struct ElectionOutcome {
     pub failed: Vec<(String, i32, String)>,
 }
 
+/// Whether the connected broker accepts `api_key` at `version`
+/// (ApiVersions v0).
+fn supports(conn: &mut WireConnection, api_key: i16, version: i16) -> KafkaResult<bool> {
+    let body = conn.request(API_API_VERSIONS, 0, false, &[])?;
+    Ok(decode_api_versions(&body)?
+        .into_iter()
+        .any(|(key, min, max)| key == api_key && (min..=max).contains(&version)))
+}
+
+/// `(api key, min version, max version)` of each API in an ApiVersions v0
+/// response.
+fn decode_api_versions(body: &[u8]) -> KafkaResult<Vec<(i16, i16, i16)>> {
+    let mut r = Reader::new(body);
+    let error_code = r.i16()?;
+    if error_code != 0 {
+        return Err(error_for_code(error_code, None));
+    }
+    let mut apis = Vec::new();
+    for _ in 0..r.array_len()? {
+        apis.push((r.i16()?, r.i16()?, r.i16()?));
+    }
+    Ok(apis)
+}
+
 /// Moves leadership of `partitions` (every partition when `None`) back to
 /// their preferred (first) replica — ElectLeaders v1, Kafka 2.4+.
 pub fn elect_preferred_leaders(
@@ -1204,6 +1290,14 @@ pub fn elect_preferred_leaders(
     let timeout_ms = i32::try_from(config.request_timeout.as_millis()).unwrap_or(i32::MAX);
     let body = encode_elect_leaders(partitions, timeout_ms);
     let mut conn = connect_to_controller(config)?;
+    // A broker without the API closes the connection on the request, which
+    // only says "failed to fill whole buffer"; ask first and say why.
+    if !supports(&mut conn, API_ELECT_LEADERS, 1)? {
+        return Err(KafkaError::admin(
+            "this cluster does not support preferred leader election (Kafka ElectLeaders API). \
+             Some Kafka-compatible brokers, such as Redpanda, balance leadership themselves",
+        ));
+    }
     let response = conn.request(API_ELECT_LEADERS, 1, false, &body)?;
     let (mut outcome, answered) = decode_elect_leaders_with_seen(&response)?;
     // A requested partition the response omits was not elected.
@@ -2551,6 +2645,56 @@ mod tests {
         }
         assert_eq!(deleted[0].resource_type, AclResourceType::Group);
         assert_eq!(deleted[0].permission_type, AclPermissionType::Deny);
+    }
+
+    #[test]
+    fn replica_count_refusals_fall_back_to_the_topic_config() {
+        let plan = |n: usize| {
+            (0..2)
+                .map(|p| PartitionAssignment::new("orders", p, (0..n as i32).collect()))
+                .collect::<Vec<_>>()
+        };
+        let refused = |error: &str| {
+            (0..2)
+                .map(|p| PartitionReassignmentResult {
+                    topic: "orders".into(),
+                    partition: p,
+                    error: Some(error.to_string()),
+                })
+                .collect::<Vec<_>>()
+        };
+        let count = "INVALID_REPLICATION_FACTOR (code 38): Number of replicas does not match the topic replication factor";
+        assert_eq!(
+            replication_fallback(&plan(3), &refused(count)),
+            Some(vec![("orders".to_string(), 3)])
+        );
+        // Other refusals, or a plan mixing counts, are reported as they are.
+        assert_eq!(
+            replication_fallback(&plan(3), &refused("NOT_CONTROLLER (code 41)")),
+            None
+        );
+        let mut mixed = plan(3);
+        mixed[1].replicas = vec![0, 1];
+        assert_eq!(replication_fallback(&mixed, &refused(count)), None);
+        let mut one_accepted = refused(count);
+        one_accepted[0].error = None;
+        assert_eq!(replication_fallback(&plan(3), &one_accepted), None);
+    }
+
+    #[test]
+    fn api_versions_list_each_api_range() {
+        let mut w = Writer::default();
+        w.i16(0);
+        w.i32(2);
+        for (key, min, max) in [(3i16, 0i16, 13i16), (44, 0, 1)] {
+            w.i16(key);
+            w.i16(min);
+            w.i16(max);
+        }
+        let apis = decode_api_versions(&w.0).unwrap();
+        assert_eq!(apis, vec![(3, 0, 13), (44, 0, 1)]);
+        // ElectLeaders (43) is not listed, as on Redpanda.
+        assert!(!apis.iter().any(|(k, _, _)| *k == API_ELECT_LEADERS));
     }
 
     #[test]

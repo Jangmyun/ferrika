@@ -664,6 +664,30 @@ async fn handle_delete(
     }
 }
 
+/// The replicas of `partitions` once each has `replication` of them (the
+/// broker places them after a `replication.factor` change), waiting up to
+/// ten seconds; `None` when they do not settle in time.
+async fn settled_replicas(
+    admin: &KafkaAdminClient,
+    topic: &str,
+    partitions: &[i32],
+    replication: usize,
+) -> Option<Vec<State>> {
+    for _ in 0..10 {
+        if let Ok(state @ State::Replicas { .. }) =
+            capture::replicas(admin, topic, Some(partitions))
+        {
+            if let State::Replicas { partitions: now } = &state {
+                if now.iter().all(|p| p.replicas.len() == replication) {
+                    return Some(vec![state]);
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    None
+}
+
 async fn handle_set_replication(
     admin: &KafkaAdminClient,
     global: &GlobalOpts,
@@ -708,9 +732,19 @@ async fn handle_set_replication(
     );
     let config = global.to_kafka_config();
     let results = tokio::task::spawn_blocking(move || {
-        crate::kafka::wire::alter_partition_reassignments(&config, &plan)
+        crate::kafka::wire::reassign_or_set_replication(&config, &plan)
     })
     .await?;
+    let (results, via_config) = match results {
+        Ok((results, via_config)) => (Ok(results), via_config),
+        Err(e) => (Err(e), false),
+    };
+    if via_config {
+        println!(
+            "  {} This cluster changes replication through the topic's replication.factor; set it to {replication} (the broker places the replicas).",
+            "ℹ".cyan()
+        );
+    }
     let outcome = results
         .as_ref()
         .map_err(ToString::to_string)
@@ -720,11 +754,25 @@ async fn handle_set_replication(
                 n => Err(format!("{n} partition(s) were not reassigned")),
             },
         );
-    record::finish(
-        pending,
-        &outcome,
-        &format!("Reassignment started for {} partition(s)", partitions.len()),
-    );
+    if let Some(pending) = pending {
+        match &outcome {
+            Ok(()) => {
+                // Through replication.factor the broker picks the replicas:
+                // record where they went, or undo sees a drift from the plan.
+                let after = if via_config {
+                    settled_replicas(admin, topic, &partitions, replication).await
+                } else {
+                    None
+                };
+                pending.finish(
+                    true,
+                    &format!("Reassignment started for {} partition(s)", partitions.len()),
+                    after,
+                );
+            }
+            Err(e) => pending.finish(false, e, None),
+        }
+    }
     let results = results?;
     let failed: Vec<_> = results.iter().filter(|r| r.error.is_some()).collect();
     for r in &failed {
