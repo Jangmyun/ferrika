@@ -172,6 +172,35 @@ The RabbitMQ entries below are planned for 0.2.0.
   copy_down_needs_broker_metadata}`. Code that builds `PolicyRules`
   without `..Default::default()` must add the new fields.
 
+### Security
+
+- History digest version 2. The audit log's `op_digest` used to cover only
+  an operation's before- and after-state, so an edited journal line could
+  move a recorded change to another cluster (`scope`), mark another
+  operation as undone (`undoes`, blocking its undo) or change its `action`
+  or `reversibility` without being noticed. New entries record
+  `op_digest: "v2:<sha256>"`, which covers every field of the entry (id,
+  source, user, scope, action, target, reversibility, limits, info,
+  before-state, `undoes`, final after-state and result). The audit log's
+  digest decides which rule applies, so an edited journal cannot choose the
+  weaker one; 0.1 readers compare the whole string and so refuse a v2
+  entry instead of accepting it.
+- Entries recorded by 0.1 (64 hex digits, no prefix) still verify with the
+  old rule but are shown as `legacy digest (scope not covered)` in
+  `history` (new AUDIT column, `digest` in JSON), `history show` and
+  `audit verify`. Undoing one prints the recorded and the current cluster
+  and asks again; with `-y` it needs `--accept-legacy`.
+- `undo` now refuses unless the cluster in use is the recorded one: when
+  the entry has a cluster id, the current cluster's id must be read and
+  equal (matching bootstrap servers are no longer enough); otherwise the
+  bootstrap set must match. The message names both clusters.
+- An `undoes` link counts only when the undoing entry's v2 digest matches
+  (or, without a policy, when the audit log has no entry for it); an edited
+  or legacy link no longer blocks undoing the original, and an edited one
+  is logged as `history.tampered`.
+- `audit verify` also checks every history entry against its `op_digest`
+  and exits 2 when one was edited.
+
 ### Changed
 
 - Tests: CI runs two more end-to-end smoke tests (Python, standard library
@@ -257,6 +286,21 @@ The RabbitMQ entries below are planned for 0.2.0.
   test against it, and `docs/COMPATIBILITY.md` lists the results and the
   limitations found. `docs/e2e/undo.sh` takes `KAFKA_BIN` for brokers whose
   Kafka tools are not in `/opt/kafka/bin`.
+- The history journal no longer re-reads the whole file on every append
+  once it is over 1 MiB: it is trimmed (1000 operations, 90 days) and, when
+  that leaves more than 512 KiB, rotated to `history.jsonl.1`, replacing the
+  previous one. `history` and `undo` read both files, so the journal keeps
+  at most about 2 MiB.
+- A failed multi-step undo names the steps it applied before the failure
+  (left in place, not rolled back) and the ones it did not run, in its
+  message and in the history entry's outcome.
+- Library: `Operation::digest` returns the v2 digest; `digest_v1`,
+  `verify_digest`, `DigestStatus`, `operation_digest`,
+  `Scope::check_undo_target`, `undo::undo_mark_trusted`,
+  `undo::execute_steps` with `undo::UndoFailure` (the applied and not-run
+  steps of a failed undo as data), `Journal::rotated_path` and
+  `audit::op_digests` are new, and `undo::DigestCheck` has a `Legacy`
+  variant.
 
 ### Compatibility
 
@@ -271,6 +315,10 @@ The RabbitMQ entries below are planned for 0.2.0.
   without these fields are unchanged and still signed as format 1.
 - Under enforced masking `mirror --mask` is now allowed (plain `mirror`
   is still refused).
+- History entries written by 0.2.0 carry a `v2:` digest in the audit log.
+  An 0.1 build reading them refuses to undo them (it reports the entry as
+  edited); undo them with 0.2.0 or later. Audit logs and journals from 0.1
+  stay readable and verifiable (as legacy digests).
 
 ### Fixed
 

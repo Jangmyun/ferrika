@@ -44,8 +44,12 @@ pub struct AuditEntry {
     /// changes `ferrika undo` can find.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub op: String,
-    /// SHA-256 of that operation's recorded before- and after-state; undo
-    /// refuses a journal entry that no longer matches it.
+    /// Digest of that operation's journal entry: `v2:` and SHA-256 of the
+    /// whole entry (scope, action, `undoes` link, reversibility, before-
+    /// and after-state, result; see
+    /// `ferrika_core::model::history::operation_digest`), or, on lines
+    /// written by Ferrika 0.1, 64 hex digits covering only the before- and
+    /// after-state. Undo refuses a journal entry that no longer matches it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub op_digest: String,
 }
@@ -711,6 +715,32 @@ fn op_digest_in(path: &Path, op: &str) -> Option<String> {
     found
 }
 
+/// Every operation's `op_digest` in the audit log, by operation id, read in
+/// one pass (for listing many operations). Like [`op_digest`], an operation
+/// named with two different digests maps to [`CONFLICTING_OP_DIGESTS`].
+pub fn op_digests() -> std::collections::HashMap<String, String> {
+    op_digests_in(&audit_path())
+}
+
+fn op_digests_in(path: &Path) -> std::collections::HashMap<String, String> {
+    let mut found = std::collections::HashMap::new();
+    for entry in lossy_lines(path)
+        .filter_map(|line| serde_json::from_str::<AuditEntry>(&line).ok())
+        .filter(|entry| !entry.op.is_empty() && !entry.op_digest.is_empty())
+    {
+        match found.get(&entry.op) {
+            Some(first) if *first != entry.op_digest => {
+                found.insert(entry.op, CONFLICTING_OP_DIGESTS.to_string());
+            }
+            Some(_) => {}
+            None => {
+                found.insert(entry.op, entry.op_digest);
+            }
+        }
+    }
+    found
+}
+
 /// Current Unix time in milliseconds (kept here for existing callers).
 pub use ferrika_core::kafka::clock::now_ms;
 
@@ -816,6 +846,9 @@ mod tests {
         append(&path, &result).unwrap();
         assert_eq!(op_digest_in(&path, "01JBX3K8Q2M7").as_deref(), Some("old"));
         assert_eq!(op_digest_in(&path, "01JBX3K8Q2M8").as_deref(), Some("new"));
+        let all = op_digests_in(&path);
+        assert_eq!(all.get("01JBX3K8Q2M7").map(String::as_str), Some("old"));
+        assert_eq!(all.get("01JBX3K8Q2M8").map(String::as_str), Some("new"));
         assert_eq!(verify_chain(&path).unwrap().broken, None);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -844,6 +877,10 @@ mod tests {
         assert_eq!(verify_chain(&path).unwrap().broken, None);
         assert_eq!(
             op_digest_in(&path, "01JBX3K8Q2MB").as_deref(),
+            Some(CONFLICTING_OP_DIGESTS)
+        );
+        assert_eq!(
+            op_digests_in(&path).get("01JBX3K8Q2MB").map(String::as_str),
             Some(CONFLICTING_OP_DIGESTS)
         );
         let _ = std::fs::remove_dir_all(dir);
