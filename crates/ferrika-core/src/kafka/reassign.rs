@@ -501,7 +501,7 @@ pub fn ensure_not_moving(
         None => Ok(()),
         Some(list) => Err(KafkaError::config(format!(
             "Partition(s) {list} are being moved: wait for the move to finish \
-             (`ferrika reassign status`) or cancel it before planning another"
+             or cancel it before planning another"
         ))),
     }
 }
