@@ -106,6 +106,7 @@ Ferrika looks in a machine-wide directory that normal users cannot write:
 | `export_clusters` | v2, optional: broker-address globs `export` applies to (matched like `read_only_brokers`, never the profile name). Empty (default) = every cluster. |
 | `watermark` | v2, optional: `off` (default) or `on`: the desktop app draws user, host, time and cluster over the whole window (no effect in the CLI). |
 | `watermark_text` | v2, optional: 1–40 characters (no control characters) put in front of the watermark, e.g. `"CONFIDENTIAL"`. |
+| `screen_capture` | v2, optional: `allowed` (default) or `blocked`: the desktop app's window stays out of screenshots, screen recordings and screen shares (Windows; see [Record export and watermark](#record-export-and-watermark-format-2)). No effect in the CLI. |
 
 Unknown rule names or categories make the policy invalid (fail closed), so a
 typo cannot silently weaken it.
@@ -248,14 +249,23 @@ What counts as an export:
   through. The time follows the UTC setting and moves on every 30 seconds;
   the cluster is the connected profile (or the first bootstrap address). It
   is separate from `export`: turning export off does not turn the watermark
-  on. Blocking screen capture altogether (Windows
-  `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`) is not done: it would
-  also block screen sharing during incidents.
+  on.
+- `screen_capture: blocked` is the stronger, opt-in step: the desktop app
+  window is left out of screenshots, screen recordings and screen shares
+  (Windows 10 2004 or later: `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`,
+  the window is missing from the capture; older Windows: `WDA_MONITOR`, it is
+  black). It also hides the app when someone shares their screen during an
+  incident, which is why it is not part of `export: forbidden` or of the
+  strictest mode. It does not stop a phone camera; combine it with the
+  watermark. macOS and Linux builds ignore it (the badge's rules window says
+  "not supported on this system").
 - The strictest mode (an unverifiable policy, or `on_expiry: strictest`
-  after expiry) forbids export everywhere and turns the watermark on.
-- `policy show` prints `record export:` and `watermark:` lines; `-f json
-  policy show` always has `export`, `export_clusters` and `watermark` in
-  `rules`. The desktop app's rules window lists Export, Export clusters and Watermark.
+  after expiry) forbids export everywhere and turns the watermark on; it
+  does not block screen capture (people need to show the red badge to
+  whoever fixes the policy).
+- `policy show` prints `record export:`, `watermark:` and `screen capture:`
+  lines; `-f json policy show` always has `export`, `export_clusters`,
+  `watermark` and `screen_capture` in `rules`. The desktop app's rules window lists Export, Export clusters, Watermark and Screen capture.
 - **Rolling out.** Older builds reject the unknown rules and fall back to the
   strictest mode, where every change is refused. Update Ferrika on every
   machine before installing a policy that uses them. A typo in a value
