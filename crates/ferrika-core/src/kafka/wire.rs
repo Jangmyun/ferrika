@@ -83,6 +83,12 @@ pub fn alter_partition_reassignments(
     let body = encode_alter_partition_reassignments(assignments, timeout_ms);
 
     let mut conn = connect_to_controller(config)?;
+    require_api(
+        &mut conn,
+        API_ALTER_PARTITION_REASSIGNMENTS,
+        0,
+        "partition reassignment (AlterPartitionReassignments)",
+    )?;
     let response = conn.request(API_ALTER_PARTITION_REASSIGNMENTS, 0, true, &body)?;
     let mut results = decode_alter_partition_reassignments(&response)?;
     add_missing_reassignment_results(assignments, &mut results);
@@ -215,6 +221,12 @@ pub fn list_partition_reassignments(
 ) -> KafkaResult<Vec<crate::model::cluster::OngoingReassignment>> {
     check_supported_security(config)?;
     let mut conn = connect_to_controller(config)?;
+    require_api(
+        &mut conn,
+        API_LIST_PARTITION_REASSIGNMENTS,
+        0,
+        "listing partition reassignments (ListPartitionReassignments)",
+    )?;
     let mut w = Writer::default();
     w.i32(10_000); // timeout_ms
     w.uvarint(0); // topics: null = every reassignment
@@ -270,6 +282,12 @@ pub struct ScramUser {
 pub fn describe_scram_users(config: &KafkaClientConfig) -> KafkaResult<Vec<ScramUser>> {
     check_supported_security(config)?;
     let mut conn = connect_bootstrap(config)?;
+    require_api(
+        &mut conn,
+        API_DESCRIBE_USER_SCRAM_CREDENTIALS,
+        0,
+        "SCRAM user management (DescribeUserScramCredentials)",
+    )?;
     let mut w = Writer::default();
     w.uvarint(0); // users: null = all
     w.uvarint(0); // tagged fields
@@ -348,6 +366,12 @@ pub fn alter_scram_user(
     w.uvarint(0); // tagged fields
                   // ZooKeeper-mode brokers only accept this on the controller; KRaft forwards.
     let mut conn = connect_to_controller(config)?;
+    require_api(
+        &mut conn,
+        API_ALTER_USER_SCRAM_CREDENTIALS,
+        0,
+        "SCRAM user management (AlterUserScramCredentials)",
+    )?;
     let response = conn.request(API_ALTER_USER_SCRAM_CREDENTIALS, 0, true, &w.0)?;
     let mut r = Reader::new(&response);
     let _throttle_ms = r.i32()?;
@@ -378,6 +402,12 @@ pub struct ClientQuota {
 pub fn describe_client_quotas(config: &KafkaClientConfig) -> KafkaResult<Vec<ClientQuota>> {
     check_supported_security(config)?;
     let mut conn = connect_bootstrap(config)?;
+    require_api(
+        &mut conn,
+        API_DESCRIBE_CLIENT_QUOTAS,
+        0,
+        "client quotas (DescribeClientQuotas)",
+    )?;
     let mut w = Writer::default();
     w.i32(0); // no filter components: every quota
     w.i8(0); // strict = false
@@ -435,6 +465,12 @@ pub fn alter_client_quota(
 ) -> KafkaResult<()> {
     check_supported_security(config)?;
     let mut conn = connect_bootstrap(config)?;
+    require_api(
+        &mut conn,
+        API_ALTER_CLIENT_QUOTAS,
+        0,
+        "client quotas (AlterClientQuotas)",
+    )?;
     let response = conn.request(
         API_ALTER_CLIENT_QUOTAS,
         0,
@@ -1270,9 +1306,39 @@ pub struct ElectionOutcome {
 /// (ApiVersions v0).
 fn supports(conn: &mut WireConnection, api_key: i16, version: i16) -> KafkaResult<bool> {
     let body = conn.request(API_API_VERSIONS, 0, false, &[])?;
-    Ok(decode_api_versions(&body)?
-        .into_iter()
-        .any(|(key, min, max)| key == api_key && (min..=max).contains(&version)))
+    Ok(offers(&decode_api_versions(&body)?, api_key, version))
+}
+
+/// Whether an ApiVersions list includes `api_key` at `version`.
+fn offers(apis: &[(i16, i16, i16)], api_key: i16, version: i16) -> bool {
+    apis.iter()
+        .any(|&(key, min, max)| key == api_key && (min..=max).contains(&version))
+}
+
+/// Fails with a message naming `feature` when the connected broker does not
+/// offer `api_key` at `version`. A broker without an API usually closes the
+/// connection on the request, which only says "failed to fill whole buffer";
+/// Kafka-compatible brokers and managed services leave some admin APIs out.
+fn require_api(
+    conn: &mut WireConnection,
+    api_key: i16,
+    version: i16,
+    feature: &str,
+) -> KafkaResult<()> {
+    if supports(conn, api_key, version)? {
+        Ok(())
+    } else {
+        Err(unsupported_api(api_key, version, feature))
+    }
+}
+
+/// The error for a cluster that does not offer an admin API.
+fn unsupported_api(api_key: i16, version: i16, feature: &str) -> KafkaError {
+    KafkaError::admin(format!(
+        "this cluster does not support {feature} (it does not offer Kafka API {api_key} v{version}). \
+         Some Kafka-compatible brokers and managed Kafka services leave this admin API out; \
+         see docs/COMPATIBILITY.md"
+    ))
 }
 
 /// `(api key, min version, max version)` of each API in an ApiVersions v0
@@ -2712,6 +2778,17 @@ mod tests {
         assert_eq!(apis, vec![(3, 0, 13), (44, 0, 1)]);
         // ElectLeaders (43) is not listed, as on Redpanda.
         assert!(!apis.iter().any(|(k, _, _)| *k == API_ELECT_LEADERS));
+        assert!(offers(&apis, 44, 1));
+        assert!(!offers(&apis, 44, 2));
+        assert!(!offers(&apis, API_ELECT_LEADERS, 1));
+    }
+
+    #[test]
+    fn unsupported_api_names_the_feature_and_the_api() {
+        let err = unsupported_api(API_DESCRIBE_CLIENT_QUOTAS, 0, "client quotas").to_string();
+        assert!(err.contains("does not support client quotas"), "{err}");
+        assert!(err.contains("API 48 v0"), "{err}");
+        assert!(err.contains("COMPATIBILITY.md"), "{err}");
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub mod monitor;
 pub mod offset;
 mod output;
 pub mod policy;
+pub mod preset;
 pub mod probe;
 pub mod produce;
 pub mod profile;

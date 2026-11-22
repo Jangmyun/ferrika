@@ -24,6 +24,12 @@ ferrika profile use staging
 # Show profile details
 ferrika profile show staging
 
+# Presets for Kafka-compatible services fill in the security protocol and SASL
+# mechanism (confluent-cloud, msk-iam, msk-scram, redpanda-cloud, warpstream,
+# automq); explicit flags win. See docs/COMPATIBILITY.md
+echo "$API_SECRET" | ferrika profile add cc -b "pkc-xxxx.confluent.cloud:9092" \
+  --preset confluent-cloud --sasl-username "$API_KEY" --sasl-password-stdin
+
 # Import a Kafka client .properties file (e.g. the one Confluent Cloud gives you)
 ferrika profile import cloud -f client.properties --use
 
@@ -35,6 +41,10 @@ ferrika profile add prod -b "prod-kafka.corp:9093" --schema-registry http://sche
 ferrika -p prod consume orders -D --pretty-json
 # HTTPS registries (e.g. Confluent Cloud) take the API key in the URL
 ferrika profile add cloud -b "pkc-xxxx.confluent.cloud:9092"   --schema-registry "https://KEY:SECRET@psrc-xxxx.confluent.cloud"
+# or as a user and a password from stdin (kept out of the process list)
+echo "$SR_SECRET" | ferrika profile add cloud -b "pkc-xxxx.confluent.cloud:9092" \
+  --schema-registry https://psrc-xxxx.confluent.cloud \
+  --schema-registry-user "$SR_KEY" --schema-registry-password-stdin
 # Serialize JSON with the latest schema of orders-value and produce it
 ferrika -p prod produce orders --schema -m '{"id": 1, "note": null}'
 

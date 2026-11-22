@@ -3,6 +3,7 @@ use colored::Colorize;
 use comfy_table::{Cell, CellAlignment, Color};
 use serde_json::json;
 
+use crate::cli::preset::{self, Preset};
 use crate::cli::{output, GlobalOpts, OutputFormat};
 use crate::kafka::config::{OAuthClientAuth, OAuthMethod, SaslMechanism, SecurityProtocol};
 use crate::kafka::profile::{ClusterProfile, ProfileStore};
@@ -72,9 +73,16 @@ pub struct ProfileAddArgs {
     /// Optional human-readable description
     #[arg(short = 'd', long)]
     pub description: Option<String>,
-    /// Security protocol (plaintext, ssl, sasl_plaintext, sasl_ssl)
-    #[arg(long, default_value = "plaintext")]
-    pub security_protocol: String,
+    /// Connection preset for a Kafka-compatible broker or managed service:
+    /// confluent-cloud, msk-iam, msk-scram, redpanda-cloud, warpstream,
+    /// automq. It fills in the security protocol and SASL mechanism the
+    /// service expects; flags given explicitly win
+    #[arg(long, value_name = "NAME")]
+    pub preset: Option<String>,
+    /// Security protocol (plaintext, ssl, sasl_plaintext, sasl_ssl; default:
+    /// the preset's, else plaintext)
+    #[arg(long)]
+    pub security_protocol: Option<String>,
     /// SASL mechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, GSSAPI, OAUTHBEARER
     /// for OIDC client credentials, AWS-MSK-IAM)
     #[arg(long)]
@@ -106,6 +114,21 @@ pub struct ProfileAddArgs {
     /// Schema Registry URL: `schema` commands, Avro/Protobuf/JSON Schema decoding (`consume -D`) and encoding (`produce --schema`), the GUI and MCP
     #[arg(long, value_name = "URL")]
     pub schema_registry: Option<String>,
+    /// Schema Registry basic-auth user (Confluent Cloud: the Schema Registry API key)
+    #[arg(long, requires = "schema_registry")]
+    pub schema_registry_user: Option<String>,
+    /// Schema Registry basic-auth password (visible in the process list;
+    /// prefer --schema-registry-password-stdin)
+    #[arg(long, requires = "schema_registry_user")]
+    pub schema_registry_password: Option<String>,
+    /// Read the Schema Registry password from stdin: the first line, or the
+    /// second when --sasl-password-stdin or --oauth-client-secret-stdin reads the first
+    #[arg(
+        long,
+        requires = "schema_registry_user",
+        conflicts_with = "schema_registry_password"
+    )]
+    pub schema_registry_password_stdin: bool,
     /// Kafka Connect REST URL for `ferrika connect` and the GUI
     #[arg(long, value_name = "URL")]
     pub connect: Option<String>,
@@ -162,6 +185,7 @@ impl std::fmt::Debug for ProfileAddArgs {
             .field("name", &self.name)
             .field("bootstrap_servers", &self.bootstrap_servers)
             .field("description", &self.description)
+            .field("preset", &self.preset)
             .field("security_protocol", &self.security_protocol)
             .field("sasl_mechanism", &self.sasl_mechanism)
             .field("sasl_username", &self.sasl_username)
@@ -174,6 +198,15 @@ impl std::fmt::Debug for ProfileAddArgs {
             .field("read_only", &self.read_only)
             // Their URLs may carry `user:password@`.
             .field("schema_registry", &redacted_url(&self.schema_registry))
+            .field("schema_registry_user", &self.schema_registry_user)
+            .field(
+                "schema_registry_password",
+                &redacted(&self.schema_registry_password),
+            )
+            .field(
+                "schema_registry_password_stdin",
+                &self.schema_registry_password_stdin,
+            )
             .field("connect", &redacted_url(&self.connect))
             .field("oauth", &self.oauth)
             .finish()
@@ -204,6 +237,8 @@ pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
         ProfileSubcommands::List => handle_list(&store, global),
         ProfileSubcommands::Show { name } => handle_show(&store, global, name.as_deref()),
         ProfileSubcommands::Add(mut add_args) => {
+            // Check the preset before reading secrets from stdin.
+            let preset = add_args.preset.as_deref().map(Preset::parse).transpose()?;
             let sasl_password = if add_args.sasl_password_stdin {
                 Some(crate::cli::read_password_stdin().map_err(anyhow::Error::msg)?)
             } else {
@@ -213,13 +248,38 @@ pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
                 add_args.oauth.oauth_client_secret =
                     Some(crate::cli::read_password_stdin().map_err(anyhow::Error::msg)?);
             }
+            // Stdin is buffered process-wide, so this reads the next line.
+            let registry_password = if add_args.schema_registry_password_stdin {
+                Some(crate::cli::read_password_stdin().map_err(anyhow::Error::msg)?)
+            } else {
+                add_args.schema_registry_password
+            };
+            let schema_registry = registry_url(
+                add_args.schema_registry,
+                add_args.schema_registry_user.as_deref(),
+                registry_password.as_deref(),
+            )?;
+            let resolved = preset::resolve(
+                preset,
+                add_args.security_protocol.as_deref(),
+                add_args.sasl_mechanism.as_deref(),
+            );
+            let warnings = match preset {
+                Some(p) => preset::missing_settings(
+                    p,
+                    add_args.sasl_username.is_some(),
+                    sasl_password.is_some(),
+                    schema_registry.as_deref(),
+                ),
+                None => Vec::new(),
+            };
             handle_add(
                 &mut store,
                 add_args.name,
                 add_args.bootstrap_servers,
                 add_args.description,
-                &add_args.security_protocol,
-                add_args.sasl_mechanism.as_deref(),
+                &resolved.security_protocol,
+                resolved.sasl_mechanism.as_deref(),
                 add_args.sasl_username,
                 sasl_password,
                 add_args.ssl_ca_location,
@@ -227,10 +287,13 @@ pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
                 add_args.ssl_key_location,
                 add_args.set_active,
                 add_args.read_only,
-                add_args.schema_registry,
+                schema_registry,
                 add_args.connect,
                 add_args.oauth,
             )?;
+            if let Some(p) = preset {
+                report_preset(p, &resolved.filled, &warnings);
+            }
             Ok(())
         }
         ProfileSubcommands::Use { name } => {
@@ -333,6 +396,55 @@ pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+/// The Schema Registry URL with `user` and `password` added as basic auth,
+/// the form Ferrika keeps them in (the URL then goes to the OS credential
+/// store, like the other secrets). Without a user the URL is kept as given.
+fn registry_url(
+    url: Option<String>,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    match (url, user) {
+        (Some(url), Some(user)) => {
+            let password = password.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--schema-registry-user needs --schema-registry-password-stdin (or --schema-registry-password)"
+                )
+            })?;
+            crate::kafka::profile::url_with_basic_auth(&url, user, password)
+                .map(Some)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--schema-registry-user needs a Schema Registry URL like https://host, without credentials in it"
+                    )
+                })
+        }
+        (url, _) => Ok(url),
+    }
+}
+
+/// Prints what a preset filled in, its notes, and settings still missing.
+fn report_preset(p: Preset, filled: &[(&'static str, String)], warnings: &[String]) {
+    if filled.is_empty() {
+        println!(
+            "  Preset {}: every setting it covers was given explicitly.",
+            p.name().cyan()
+        );
+    } else {
+        let settings: Vec<String> = filled
+            .iter()
+            .map(|(label, value)| format!("{label} {value}"))
+            .collect();
+        println!("  Preset {}: {}.", p.name().cyan(), settings.join(", "));
+    }
+    for note in p.notes() {
+        println!("  {} {note}", "i".blue());
+    }
+    for warning in warnings {
+        eprintln!("  {} {warning}", "!".yellow());
     }
 }
 
@@ -922,6 +1034,89 @@ mod tests {
         assert!(!shown.contains("s3cret-oauth"), "{shown}");
         assert!(shown.contains("registry.example.com"), "{shown}");
         assert!(!shown.contains("url-secret"), "{shown}");
+    }
+
+    #[test]
+    fn registry_credentials_go_into_the_url() {
+        assert_eq!(
+            registry_url(
+                Some("https://psrc.example.com".into()),
+                Some("KEY"),
+                Some("s/e@c")
+            )
+            .unwrap()
+            .as_deref(),
+            Some("https://KEY:s%2Fe%40c@psrc.example.com")
+        );
+        assert_eq!(
+            registry_url(Some("http://sr:8081".into()), None, None).unwrap(),
+            Some("http://sr:8081".to_string())
+        );
+        assert_eq!(registry_url(None, None, None).unwrap(), None);
+        // A user without a password, or a URL that already has credentials.
+        assert!(registry_url(Some("https://sr".into()), Some("KEY"), None).is_err());
+        assert!(registry_url(Some("https://A:B@sr".into()), Some("KEY"), Some("S")).is_err());
+    }
+
+    #[test]
+    fn preset_and_registry_flags_parse() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        struct Wrapper {
+            #[command(subcommand)]
+            cmd: ProfileSubcommands,
+        }
+        let parsed = Wrapper::parse_from([
+            "profile",
+            "add",
+            "cc",
+            "-b",
+            "pkc-1.us-east-1.aws.confluent.cloud:9092",
+            "--preset",
+            "confluent-cloud",
+            "--sasl-username",
+            "KEY",
+            "--sasl-password-stdin",
+            "--schema-registry",
+            "https://psrc-1.us-east-1.aws.confluent.cloud",
+            "--schema-registry-user",
+            "SRKEY",
+            "--schema-registry-password-stdin",
+        ]);
+        let ProfileSubcommands::Add(args) = parsed.cmd else {
+            panic!("expected add");
+        };
+        assert_eq!(args.preset.as_deref(), Some("confluent-cloud"));
+        assert_eq!(args.security_protocol, None);
+        assert!(args.schema_registry_password_stdin);
+        // A registry user needs the registry URL.
+        assert!(Wrapper::try_parse_from([
+            "profile",
+            "add",
+            "x",
+            "-b",
+            "b:1",
+            "--schema-registry-user",
+            "K",
+        ])
+        .is_err());
+        // The registry password is redacted in Debug output.
+        let parsed = Wrapper::parse_from([
+            "profile",
+            "add",
+            "x",
+            "-b",
+            "b:1",
+            "--schema-registry",
+            "https://sr",
+            "--schema-registry-user",
+            "K",
+            "--schema-registry-password",
+            "sr-hunter2",
+        ]);
+        let shown = format!("{parsed:?}");
+        assert!(!shown.contains("sr-hunter2"), "{shown}");
     }
 
     #[test]

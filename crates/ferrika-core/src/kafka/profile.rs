@@ -272,6 +272,24 @@ pub fn mask_url_password(url: &str, mask: &str) -> String {
     }
 }
 
+/// `https://host` with `user` and `secret` -> `https://USER:SECRET@host`,
+/// the form Ferrika keeps HTTP basic-auth credentials in (Schema Registry,
+/// Connect). Both parts are percent-encoded so '/', '@', ':' or '%' in a
+/// secret cannot break the URL. `None` when `url` has no `scheme://` or
+/// already carries credentials.
+pub fn url_with_basic_auth(url: &str, user: &str, secret: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    if rest[..authority_end].contains('@') {
+        return None;
+    }
+    Some(format!(
+        "{scheme}://{}:{}@{rest}",
+        crate::kafka::schema::path_segment(user),
+        crate::kafka::schema::path_segment(secret)
+    ))
+}
+
 /// `https://KEY:SECRET@host/x` -> `https://KEY@host/x`; `None` when the URL
 /// has no password.
 fn url_without_password(url: &str) -> Option<String> {
@@ -919,20 +937,10 @@ impl ClusterProfile {
             let user_info =
                 get("basic.auth.user.info").or_else(|| get("schema.registry.basic.auth.user.info"));
             profile.schema_registry_url = Some(match user_info {
-                Some(info) => match url.split_once("://") {
-                    Some((scheme, rest)) => {
-                        // Keep the user:secret colon; encode the rest so '/',
-                        // '@' or '%' in a secret cannot break the URL.
-                        let (user, secret) = info.split_once(':').unwrap_or((info, ""));
-                        let encoded = format!(
-                            "{}:{}",
-                            crate::kafka::schema::path_segment(user),
-                            crate::kafka::schema::path_segment(secret)
-                        );
-                        format!("{scheme}://{encoded}@{rest}")
-                    }
-                    None => url.to_string(),
-                },
+                Some(info) => {
+                    let (user, secret) = info.split_once(':').unwrap_or((info, ""));
+                    url_with_basic_auth(url, user, secret).unwrap_or_else(|| url.to_string())
+                }
                 None => url.to_string(),
             });
         }
@@ -1174,6 +1182,21 @@ ssl.truststore.location=/etc/truststore.jks
         assert_eq!(url_without_password("http://host:8081"), None);
         assert_eq!(public_part("sasl_password", "pw"), Some(None));
         assert_eq!(public_part("connect_url", "http://host:8083"), None);
+    }
+
+    #[test]
+    fn basic_auth_goes_into_the_url_encoded() {
+        assert_eq!(
+            url_with_basic_auth("https://psrc.example.com/x", "KEY", "a/b+c@d").as_deref(),
+            Some("https://KEY:a%2Fb%2Bc%40d@psrc.example.com/x")
+        );
+        // A path '@' is not a credential.
+        assert_eq!(
+            url_with_basic_auth("https://host/a@b", "K", "S").as_deref(),
+            Some("https://K:S@host/a@b")
+        );
+        assert_eq!(url_with_basic_auth("https://K:S@host", "K2", "S2"), None);
+        assert_eq!(url_with_basic_auth("host:8081", "K", "S"), None);
     }
 
     #[test]

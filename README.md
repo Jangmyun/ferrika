@@ -12,6 +12,12 @@ runtime.
 
 > Status: pre-1.0 (`0.x`). Command names and flags can still change.
 
+Works with Apache Kafka and Kafka-compatible brokers and services:
+Redpanda (tested in CI), and Confluent Cloud, Amazon MSK, Redpanda Cloud,
+WarpStream and AutoMQ through connection presets
+(`ferrika profile add --preset`). What is checked and the known limitations
+are in [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
+
 A commercial desktop app is available separately; it is not part of this
 repository.
 

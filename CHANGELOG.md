@@ -9,6 +9,25 @@ and 0.2.0 makes it crate-internal.
 
 ## Unreleased
 
+### Added
+
+- `ferrika profile add --preset NAME` fills in the security protocol and
+  SASL mechanism for Kafka-compatible services: `confluent-cloud`
+  (SASL_SSL + PLAIN), `msk-iam` (SASL_SSL + AWS-MSK-IAM), `msk-scram`
+  (SASL_SSL + SCRAM-SHA-512), `redpanda-cloud` (SASL_SSL + SCRAM-SHA-256),
+  `warpstream` and `automq` (plaintext). Explicit flags win; the output
+  lists what the preset filled in and notes for the service.
+- `profile add --schema-registry-user` with `--schema-registry-password-stdin`
+  (or `--schema-registry-password`): Schema Registry basic auth such as a
+  Confluent Cloud Schema Registry API key, kept in the OS credential store.
+- Partition reassignment, SCRAM user and client quota commands check the
+  broker's ApiVersions first and say "this cluster does not support ..."
+  when a Kafka-compatible broker leaves the API out, instead of failing
+  with a dropped connection.
+- `docs/COMPATIBILITY.md`: what is tested against which Kafka-compatible
+  broker, the presets and known limitations; `docs/e2e/automq-compose.yml`
+  (not run yet) for a later AutoMQ end-to-end test.
+
 ### Fixed
 
 - `dlq export` saved only a 120-character preview of each value; records
