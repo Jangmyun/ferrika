@@ -7,9 +7,13 @@ use ferrika_core::kafka::consumer::ConsumedMessage;
 /// Characters of payload shown in a DLQ preview.
 const PREVIEW_CHARS: usize = 120;
 
-/// Known header keys commonly used by Kafka DLQ frameworks (Spring Kafka, Strimzi, Micronaut, Sarama, etc.)
+/// Known header keys commonly used by Kafka DLQ frameworks (Spring Kafka's
+/// dead-letter publishing recoverer, Kafka Connect's errant record
+/// reporter, Strimzi, Micronaut, Sarama, etc.)
 pub const ORIGINAL_TOPIC_HEADERS: &[&str] = &[
     "x-original-topic",
+    "kafka_dlt-original-topic",
+    "__connect.errors.topic",
     "kafka_originalTopic",
     "original-topic",
     "x-orig-topic",
@@ -18,6 +22,8 @@ pub const ORIGINAL_TOPIC_HEADERS: &[&str] = &[
 
 pub const ORIGINAL_PARTITION_HEADERS: &[&str] = &[
     "x-original-partition",
+    "kafka_dlt-original-partition",
+    "__connect.errors.partition",
     "kafka_originalPartition",
     "original-partition",
     "x-orig-partition",
@@ -25,6 +31,8 @@ pub const ORIGINAL_PARTITION_HEADERS: &[&str] = &[
 
 pub const ORIGINAL_OFFSET_HEADERS: &[&str] = &[
     "x-original-offset",
+    "kafka_dlt-original-offset",
+    "__connect.errors.offset",
     "kafka_originalOffset",
     "original-offset",
     "x-orig-offset",
@@ -32,6 +40,8 @@ pub const ORIGINAL_OFFSET_HEADERS: &[&str] = &[
 
 pub const EXCEPTION_MESSAGE_HEADERS: &[&str] = &[
     "x-exception-message",
+    "kafka_dlt-exception-message",
+    "__connect.errors.exception.message",
     "kafka_exceptionMessage",
     "x-error-message",
     "error-message",
@@ -41,6 +51,8 @@ pub const EXCEPTION_MESSAGE_HEADERS: &[&str] = &[
 
 pub const EXCEPTION_STACK_HEADERS: &[&str] = &[
     "x-exception-stacktrace",
+    "kafka_dlt-exception-stacktrace",
+    "__connect.errors.exception.stacktrace",
     "kafka_exceptionStacktrace",
     "x-stacktrace",
     "exception-stacktrace",
@@ -193,6 +205,17 @@ impl DlqMessage {
             ..self.clone()
         }
     }
+}
+
+/// Whether a record's `headers` name the topic it came from. Without one,
+/// redrive would send it to a topic guessed from the DLQ's name.
+pub fn names_original_topic(headers: &[(String, Vec<u8>)]) -> bool {
+    headers.iter().any(|(k, v)| {
+        ORIGINAL_TOPIC_HEADERS
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(k))
+            && !String::from_utf8_lossy(v).trim().is_empty()
+    })
 }
 
 /// Helper function to match a header against common synonym keys
@@ -627,6 +650,37 @@ mod tests {
         let msg = "알 수 없는 오류가 발생했습니다 ".repeat(6);
         let out = classify_error_reason(&msg);
         assert!(out.ends_with("..."));
+    }
+
+    #[test]
+    fn spring_and_connect_dead_letter_headers_name_the_origin() {
+        let msg = |headers: &[(&str, &str)]| ConsumedMessage {
+            topic: "orders-dlq".into(),
+            partition: 0,
+            offset: 0,
+            key: None,
+            payload: Some(b"x".to_vec()),
+            timestamp_ms: None,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
+                .collect(),
+        };
+        let spring = msg(&[
+            ("kafka_dlt-original-topic", "orders-v2"),
+            ("kafka_dlt-exception-message", "boom"),
+        ]);
+        let parsed = DlqMessage::from_consumed_message(&spring, "orders-dlq");
+        assert_eq!(parsed.original_topic.as_deref(), Some("orders-v2"));
+        assert_eq!(parsed.exception_message.as_deref(), Some("boom"));
+        assert!(names_original_topic(&spring.headers));
+
+        let connect = msg(&[("__connect.errors.topic", "payments")]);
+        let parsed = DlqMessage::from_consumed_message(&connect, "dlq-s3-sink");
+        assert_eq!(parsed.original_topic.as_deref(), Some("payments"));
+
+        // No header: the topic is only guessed from the DLQ name.
+        assert!(!names_original_topic(&msg(&[]).headers));
     }
 
     #[test]

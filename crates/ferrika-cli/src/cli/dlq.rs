@@ -339,6 +339,22 @@ async fn run_redrive(args: RedriveDlqArgs, global: &GlobalOpts) -> KafkaResult<(
     let examined: Vec<(i32, i64)> = messages.iter().map(|m| (m.partition, m.offset)).collect();
 
     let is_simulation = !args.execute;
+    // Without -t, a record with no origin header goes to a topic guessed
+    // from the DLQ's name (`dlq-s3-sink` -> `s3-sink`): only on request.
+    let guessed = messages
+        .iter()
+        .filter(|m| !crate::ops::dlq::names_original_topic(&m.raw_headers))
+        .count();
+    if !is_simulation && args.target_topic.is_none() && guessed > 0 {
+        let target = crate::ops::dlq::infer_original_topic_from_dlq_name(&args.topic);
+        return Err(KafkaError::config(format!(
+            "{guessed} record(s) carry no original-topic header{}. Pass -t <topic> to choose \
+             where they go.",
+            target.map_or_else(String::new, |t| format!(
+                "; their target '{t}' is only guessed from the DLQ's name"
+            ))
+        )));
+    }
     let (plan_items, summary) = build_redrive_plan_from(
         Some(&args.topic),
         &messages,
@@ -430,7 +446,15 @@ async fn run_redrive(args: RedriveDlqArgs, global: &GlobalOpts) -> KafkaResult<(
     }
 
     if is_simulation {
-        println!("💡 Run with '--execute' to perform the live redrive:\n   ferrika dlq redrive {} --execute\n", args.topic);
+        if guessed > 0 && args.target_topic.is_none() {
+            println!(
+                "💡 {guessed} record(s) carry no original-topic header, so their target is a guess. \
+                 Choose it to perform the live redrive:\n   ferrika dlq redrive {} -t <topic> --execute\n",
+                args.topic
+            );
+        } else {
+            println!("💡 Run with '--execute' to perform the live redrive:\n   ferrika dlq redrive {} --execute\n", args.topic);
+        }
         return Ok(());
     }
 
