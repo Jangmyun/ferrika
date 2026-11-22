@@ -11,6 +11,9 @@ and 0.2.0 makes it crate-internal.
 
 ### Fixed
 
+- A profile's request timeout (`request_timeout_ms`) was always replaced
+  by `--timeout`'s default of 30 s; it now applies unless `--timeout` is
+  given.
 - `consume -D` applied `--grep` and `-k` to the undecoded bytes, so text of an
   Avro or Protobuf record (such as `"age":41`) was never found; they now look
   at the decoded text.

@@ -1205,7 +1205,7 @@ mod tests {
             profile: None,
             bootstrap_servers: None,
             format: super::OutputFormat::Json,
-            timeout: 5,
+            timeout: Some(5),
             resolved: None,
             write: None,
         };
@@ -1492,7 +1492,7 @@ mod tests {
             bootstrap_servers: None,
             profile: None,
             format: OutputFormat::Table,
-            timeout: 30,
+            timeout: Some(30),
             resolved: None,
             write: None,
         };

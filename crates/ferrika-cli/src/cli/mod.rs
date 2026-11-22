@@ -52,6 +52,21 @@ pub enum OutputFormat {
     Json,
 }
 
+/// `--timeout` when neither it nor the profile sets one.
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// `--timeout` when given, else the profile's timeout (looked up only then),
+/// else [`DEFAULT_TIMEOUT_SECS`].
+fn effective_timeout(
+    flag: Option<u64>,
+    profile: impl FnOnce() -> Option<std::time::Duration>,
+) -> std::time::Duration {
+    match flag {
+        Some(secs) => std::time::Duration::from_secs(secs),
+        None => profile().unwrap_or(std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+    }
+}
+
 /// Global CLI options shared across subcommands.
 #[derive(Args, Debug, Clone)]
 pub struct GlobalOpts {
@@ -67,9 +82,9 @@ pub struct GlobalOpts {
     #[arg(short = 'f', long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
 
-    /// Request timeout in seconds
-    #[arg(long, default_value_t = 30)]
-    pub timeout: u64,
+    /// Request timeout in seconds (default: the profile's, else 30)
+    #[arg(long)]
+    pub timeout: Option<u64>,
 
     /// The profile and brokers `main` resolved for this run. Set for every
     /// command that talks to a cluster; `None` elsewhere (GUI, tests).
@@ -109,7 +124,29 @@ impl GlobalOpts {
 
     /// `--timeout` for HTTP requests (Schema Registry, Connect, webhooks).
     pub fn http_timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.timeout)
+        self.request_timeout()
+    }
+
+    /// The request timeout: `--timeout`, else the profile's
+    /// `request_timeout_ms`, else 30 s.
+    pub fn request_timeout(&self) -> std::time::Duration {
+        effective_timeout(self.timeout, || self.profile_request_timeout())
+    }
+
+    /// The `request_timeout_ms` of the profile in use (`-p`, else the
+    /// active one), read without the OS credential store.
+    fn profile_request_timeout(&self) -> Option<std::time::Duration> {
+        let path = crate::kafka::profile::ProfileStore::default_path();
+        if !path.exists() {
+            return None;
+        }
+        let store = crate::kafka::profile::ProfileStore::load_from_path(&path).ok()?;
+        let name = self
+            .profile
+            .clone()
+            .or_else(|| store.active_profile.clone())?;
+        let ms = store.profiles.get(&name)?.request_timeout_ms?;
+        Some(std::time::Duration::from_millis(ms))
     }
 
     /// Whether to print JSON: a command's own `--json` flag or the global
@@ -132,7 +169,7 @@ impl GlobalOpts {
         crate::kafka::context::ClusterSelection {
             profile: self.profile.clone(),
             bootstrap_servers: self.bootstrap_servers.clone(),
-            timeout: std::time::Duration::from_secs(self.timeout),
+            timeout: self.request_timeout(),
         }
     }
 
@@ -619,6 +656,16 @@ fn hint_kind(error: &KafkaError) -> HintKind {
 #[cfg(test)]
 mod tests {
     use super::{connection_hints, hint_kind, read_password_line, HintKind, KERBEROS_HINT};
+
+    #[test]
+    fn the_profile_timeout_applies_unless_timeout_is_given() {
+        use super::effective_timeout;
+        use std::time::Duration;
+        let profile = || Some(Duration::from_millis(5000));
+        assert_eq!(effective_timeout(None, profile), Duration::from_secs(5));
+        assert_eq!(effective_timeout(Some(2), profile), Duration::from_secs(2));
+        assert_eq!(effective_timeout(None, || None), Duration::from_secs(30));
+    }
 
     #[test]
     fn only_certain_failures_stop_a_command_early() {
