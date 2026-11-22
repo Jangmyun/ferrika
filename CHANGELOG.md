@@ -13,6 +13,33 @@ The RabbitMQ entries below are planned for 0.2.0.
 
 ### Added
 
+- MCP: `transform_preview` (read tool) runs `ferrika transform` steps
+  (`[{"filter": ...}, {"drop": ...}, {"mask": "partial"}, ...]`) on a topic
+  from the beginning or `from_timestamp` up to its current end and returns
+  up to 50 transformed records with counts (read, kept, filtered, sampled
+  out, not JSON); it writes nothing and joins no consumer group. It passes
+  the export gate like `peek_messages` (hidden and refused under `export:
+  forbidden`, recorded under `audited`), masks returned text unless
+  `mask_pii` is false, returns header names but not header values, and under
+  enforced masking puts a mask step first so filters see only masked data.
+- MCP: `transform_execute` (write tool, `--allow-write`) copies the
+  transformed records into another existing topic on the same cluster,
+  through the plan/confirm/execute flow of the other write tools. It needs
+  `max_records` (at most 10,000; counted against `--max-produce-records`,
+  the unwritten part given back), absolute start times only, a destination
+  inside `--topics`, and passes the write gate as `produce` plus
+  `ferrika_ops::mirror::authorize_copy` (enforced masking refuses it unless
+  the first step is `mask`). Arguments naming another cluster are refused
+  (`cross_cluster_unsupported`); use the CLI for that. The audit result
+  records the counts and the steps' SHA-256, never the steps or record data.
+- MCP (preview): `rabbit_queues`, `rabbit_exchanges` and `rabbit_bindings`
+  list a virtual host of a RabbitMQ profile (`profile` argument, else the
+  active RabbitMQ profile; `vhost`, `filter`; at most 500 entries). They
+  read no message bodies and take no URL, so a stored password only goes
+  to its profile's broker. `ferrika-mcp` now depends on `ferrika-rabbitmq`
+  without its default `amqp` feature (the workspace dependency turns default
+  features off; `ferrika-cli` enables `amqp`). RabbitMQ peek and DLQ
+  inspect/redrive are not offered over MCP yet (a peek requeues messages).
 - Library API for front ends (GUI front ends and other library users), so
   they reuse the CLI's own checks instead of copies that could drift. The
   CLI now calls these itself; its behaviour is unchanged.

@@ -30,7 +30,7 @@ bodies are masked by the same rules as Kafka records.
 | CLI gates | `ferrika-cli` `cli/app.rs`: `write_action`, `export_gate`, `write_target` | Exhaustive matches over `Commands`; the profile and broker list come from the Kafka `GlobalOpts`. |
 | History and undo | `model::history::{Scope, State}`, `ops::history::{capture, inverse, undo}` | `Scope` has `bootstrap`, `cluster_id`, `registry`, `connect`. Every `State` variant is a Kafka, Schema Registry or Connect resource, and capture and inverse call those clients. |
 | Masking | `codec::pii::{mask_bytes, mask_payload, mask_header_value, mask_record}` | None: they work on bytes, text, JSON and header names. |
-| MCP | `ferrika-mcp` `guard.rs`, `write_tools.rs` | Kafka tools only. |
+| MCP | `ferrika-mcp` `guard.rs`, `write_tools.rs` | Kafka write tools only; RabbitMQ read tools (`rabbit_tools.rs`) list metadata without a gate. |
 
 So the gates and the audit log are already broker-neutral in their data;
 what ties them to Kafka is (1) the policy categories, (2) how the CLI finds
@@ -146,7 +146,7 @@ category), as for any unknown write.
 
 ```
 ferrika-cli ──> ferrika-mcp ──> ferrika-ops ──> ferrika-governance ──> ferrika-core
-     └────────> ferrika-rabbitmq ─────────────────────────────────────────┘
+     └────────> ferrika-rabbitmq <──┘ (mcp: no amqp) ─────────────────────┘
 ```
 
 - `crates/ferrika-rabbitmq`: the management API client (`client`) and the
@@ -157,9 +157,10 @@ ferrika-cli ──> ferrika-mcp ──> ferrika-ops ──> ferrika-governance �
   gates in `cli/app.rs`. The CLI re-exports the crate as `rabbitmq`.
 - `ferrika-rabbitmq` also holds the RabbitMQ profiles (`profile`) and the
   AMQP redrive (`amqp`, behind the default feature `amqp`, with `lapin`).
-- The Kafka path is untouched. `ferrika-ops` and `ferrika-mcp` do not depend
-  on the new crate; the DLQ redrive lives in `ferrika-rabbitmq::amqp`,
-  called by the CLI.
+- The Kafka path is untouched. `ferrika-ops` does not depend on the new
+  crate; the DLQ redrive lives in `ferrika-rabbitmq::amqp`, called by the
+  CLI. `ferrika-mcp` uses it without the `amqp` feature for its read-only
+  RabbitMQ listings.
 
 New third-party dependency: `lapin` 4.13 (MIT) with its AMQP crates
 (`amq-protocol*`, `async-rs`, `tcp-stream`...), only in `ferrika-rabbitmq`
@@ -391,6 +392,14 @@ Topology writes are undoable and fit the existing model:
    Still open in this phase: pagination; the neutral `GateTarget` type; e2e
    checks against a throw-away `rabbitmq:4-management` container in
    `tools/e2e` (the AMQP move is unit-tested against a fake broker only).
+   MCP read tools `rabbit_queues`, `rabbit_exchanges` and `rabbit_bindings`
+   (metadata only, a RabbitMQ profile by name or the active one, no URL
+   argument) are done. Follow-ups for MCP: `rabbit_peek` and
+   `rabbit_dlq_inspect` as write tools (a peek requeues messages, policy
+   category `messages.peek`, through the write guard with plan, confirmation
+   and the export gate) and `rabbit_dlq_redrive` (`messages.move` plus
+   `produce`); both need the neutral gate target first, since the MCP write
+   guard is built around one Kafka cluster.
 3. Topology writes (declare/delete/purge queues and exchanges, bindings)
    with new policy categories, history and undo; MCP tools; desktop views.
 4. Stream queues (stream protocol or AMQP consumer with offsets).

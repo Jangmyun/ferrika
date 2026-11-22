@@ -1,6 +1,7 @@
-//! The read-only tools: cluster, topic and group inspection, and peeking.
-//! Under a policy with `export: forbidden`, `peek_messages` is not offered:
-//! it would hand records to an outside AI service.
+//! The read-only tools: cluster, topic and group inspection, peeking, the
+//! transform preview and the RabbitMQ listings. Under a policy with
+//! `export: forbidden`, `peek_messages` and `transform_preview` are not
+//! offered: they would hand records to an outside AI service.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -28,8 +29,12 @@ const PEEK_IDLE: Duration = Duration::from_secs(2);
 /// Longest key or value text returned per record.
 const PEEK_TEXT_MAX: usize = 2000;
 
-/// Whether `peek_messages` is offered: not under `export: forbidden`, since
-/// it hands records to an outside AI service.
+/// The read tools that return record data, which pass the export gate and
+/// are hidden under `export: forbidden`.
+const RECORD_TOOLS: [&str; 2] = ["peek_messages", "transform_preview"];
+
+/// Whether `peek_messages` and `transform_preview` are offered: not under
+/// `export: forbidden`, since they hand records to an outside AI service.
 pub(super) fn peek_listed(policy: &EffectivePolicy, context: &ResolvedContext) -> bool {
     // The cluster's own brokers count too (`export_clusters`); a lookup that
     // fails hides the tool, since the rule cannot be checked.
@@ -159,12 +164,39 @@ pub(super) fn tool_definitions(with_peek: bool) -> Value {
                 "required": ["topic"]
             },
             "annotations": read_only
+        },
+        {
+            "name": "transform_preview",
+            "description": "Shows what ferrika transform would write: reads a topic from the beginning (or from_timestamp) up to its current end, applies the steps in order and returns up to max_records transformed records with counts (read, kept, filtered, sampled out, not JSON). Writes nothing and joins no consumer group. Record text is PII-masked unless mask_pii is false; when the company policy enforces masking a mask step is put first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": { "type": "string", "description": "Topic to read" },
+                    "steps": crate::transform_tools::steps_schema(),
+                    "from_beginning": { "type": "boolean", "default": true, "description": "Start at the earliest offset (the default)" },
+                    "from_timestamp": { "type": ["string", "integer"], "description": "Start at the first record at or after this time instead: ISO 8601, epoch ms or a time ago (30m, 2h)" },
+                    "partition": { "type": "integer", "minimum": 0, "description": "Only this partition" },
+                    "max_records": { "type": "integer", "minimum": 1, "maximum": crate::transform_tools::PREVIEW_MAX, "default": 10, "description": "Most transformed records to return" },
+                    "scan_limit": { "type": "integer", "minimum": 1, "maximum": SCAN_MAX, "default": SCAN_DEFAULT, "description": "Most records to read" },
+                    "decode_wire_format": { "type": "boolean", "default": false, "description": "Decode Schema Registry wire-format values (Avro, Protobuf, JSON Schema) to JSON first" },
+                    "mask_pii": { "type": "boolean", "default": true, "description": "Mask emails, card numbers, SSNs and tokens in the returned text" }
+                },
+                "required": ["topic", "steps"]
+            },
+            "annotations": read_only
         }
     ]);
     if !with_peek {
         if let Some(list) = tools.as_array_mut() {
-            list.retain(|tool| tool["name"] != "peek_messages");
+            list.retain(|tool| {
+                !RECORD_TOOLS
+                    .iter()
+                    .any(|name| tool["name"].as_str() == Some(name))
+            });
         }
+    }
+    if let Some(list) = tools.as_array_mut() {
+        list.extend(crate::rabbit_tools::definitions());
     }
     tools
 }
@@ -197,10 +229,17 @@ pub(super) async fn call_tool(
         "consumer_group_lag" => consumer_group_lag(context, &args).await,
         "message_histogram" => message_histogram(context, &args).await,
         "schema_fields" => schema_fields(context, &args).await,
-        "peek_messages" => match authorize_peek(policy, sink, context, &args, actor) {
+        "peek_messages" => match authorize_export(policy, sink, context, name, &args, actor) {
             Ok(()) => peek_messages(context, &args).await,
             Err(e) => Err(e),
         },
+        "transform_preview" => match authorize_export(policy, sink, context, name, &args, actor) {
+            Ok(()) => crate::transform_tools::preview(context, policy, &args).await,
+            Err(e) => Err(e),
+        },
+        rabbit if crate::rabbit_tools::RABBIT_TOOLS.contains(&rabbit) => {
+            crate::rabbit_tools::call(name, &args).await
+        }
         _ => Err(KafkaError::config(format!("Unknown tool '{name}'"))),
     };
     tool_reply(result)
@@ -229,13 +268,15 @@ fn tool_reply(result: KafkaResult<Value>) -> Value {
     }
 }
 
-/// The export gate for `peek_messages`: refused (and recorded) under
-/// `export: forbidden` even when a client calls it without listing it,
-/// recorded under `export: audited`.
-fn authorize_peek(
+/// The export gate for a tool that returns records (`peek_messages`,
+/// `transform_preview`): refused (and recorded) under `export: forbidden`
+/// even when a client calls it without listing it, recorded under
+/// `export: audited`.
+fn authorize_export(
     policy: &EffectivePolicy,
     sink: &impl AuditSink,
     context: &ResolvedContext,
+    label: &str,
     args: &Value,
     actor: Option<&str>,
 ) -> KafkaResult<()> {
@@ -245,7 +286,7 @@ fn authorize_peek(
     let request = ExportRequest {
         source: "mcp",
         channel: ExportChannel::Mcp,
-        label: "peek_messages",
+        label,
         target: str_arg(args, "topic").unwrap_or_default(),
         records: None,
         profile: &profile,
@@ -647,7 +688,7 @@ async fn consumer_group_lag(context: &ResolvedContext, args: &Value) -> KafkaRes
 }
 
 /// Text of a key or value: UTF-8 (masked if asked), else hex; shortened.
-fn record_text(bytes: Option<&[u8]>, mask: bool) -> Value {
+pub(super) fn record_text(bytes: Option<&[u8]>, mask: bool) -> Value {
     let Some(bytes) = bytes else {
         return Value::Null;
     };
@@ -946,6 +987,47 @@ mod tests {
         assert_eq!(result["isError"], true);
         assert_eq!(log.entries.borrow()[0].action, "record.export");
         assert_eq!(log.entries.borrow()[0].actor.as_deref(), Some("mcp:t/1#00"));
+    }
+
+    #[tokio::test]
+    async fn export_forbidden_hides_and_refuses_transform_preview() {
+        use ferrika_governance::test_policy::{self, MemoryLog};
+        let g = context();
+        let forbidden = test_policy::export_forbidden();
+        let listed = tool_definitions(peek_listed(&forbidden, &g));
+        assert!(!listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "transform_preview"));
+        // RabbitMQ listings carry no record data and stay.
+        assert!(listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "rabbit_queues"));
+
+        let log = MemoryLog::default();
+        let call = json!({
+            "name": "transform_preview",
+            "arguments": { "topic": "orders", "steps": [{ "drop": "user.email" }] }
+        });
+        let refused = call_tool(&call, &g, &forbidden, &log, Some("mcp:t/1#00")).await;
+        assert_eq!(refused["isError"], true);
+        let entries = log.entries.take();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, "policy.blocked");
+        assert_eq!(entries[0].target, "export:mcp transform_preview orders");
+
+        // Audited: recorded before reading; bad steps then fail without
+        // connecting.
+        let audited = test_policy::export_audited();
+        let log = MemoryLog::default();
+        let bad =
+            json!({ "name": "transform_preview", "arguments": { "topic": "orders", "steps": [] } });
+        let result = call_tool(&bad, &g, &audited, &log, None).await;
+        assert_eq!(result["isError"], true);
+        assert_eq!(log.entries.borrow()[0].action, "record.export");
     }
 
     #[test]

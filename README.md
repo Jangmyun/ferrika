@@ -180,9 +180,11 @@ processor: no joins, windows or exactly-once delivery. See
   `ferrika history` lists them and `ferrika undo` reverts one after checking
   that nothing changed since.
 - **MCP server.** `ferrika mcp` serves read-only cluster tools to AI assistants
-  over stdin/stdout. `--allow-write` adds a small set of write tools that
-  are planned, confirmed and audited, and still pass the same policy and
-  read-only checks. Their changes land in the operation history, so
+  over stdin/stdout, including a transform preview and (preview) RabbitMQ
+  queue, exchange and binding listings. `--allow-write` adds a small set of
+  write tools (produce, create topic, change config, reset offsets, run a
+  transform within the cluster) that are planned, confirmed and audited, and
+  still pass the same policy and read-only checks. Their changes land in the operation history, so
   `ferrika undo` reverts what an assistant changed.
 
 ```bash

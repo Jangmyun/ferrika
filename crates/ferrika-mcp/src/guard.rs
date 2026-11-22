@@ -19,17 +19,19 @@ use ferrika_governance::policy::{
 };
 
 /// The write tools, in the order `tools/list` shows them.
-pub const WRITE_TOOLS: [&str; 4] = [
+pub const WRITE_TOOLS: [&str; 5] = [
     "produce_messages",
     "create_topic",
     "alter_topic_config",
     "reset_consumer_group_offsets",
+    "transform_execute",
 ];
 
-/// The policy action a write tool performs.
+/// The policy action a write tool performs. A transform writes records to
+/// its destination topic, as `ferrika transform --execute` does: `produce`.
 pub(super) fn policy_action(tool: &str) -> PolicyAction {
     match tool {
-        "produce_messages" => PolicyAction::Produce,
+        "produce_messages" | "transform_execute" => PolicyAction::Produce,
         "create_topic" => PolicyAction::TopicsCreate,
         "alter_topic_config" => PolicyAction::ConfigChange,
         _ => PolicyAction::OffsetsReset,
@@ -352,6 +354,12 @@ impl WriteGuard {
         Ok(())
     }
 
+    /// Gives back records charged with [`Self::charge_produce`] that were
+    /// not written (a transform that wrote fewer than its `max_records`).
+    pub(super) fn refund_produce(&mut self, records: u64) {
+        self.produced = self.produced.saturating_sub(records);
+    }
+
     /// Whether `records` more fit in the session's produce budget.
     pub(super) fn check_produce(&self, records: u64) -> Result<(), ToolError> {
         let max = self.config.limits.produce_records;
@@ -439,6 +447,51 @@ impl WriteGuard {
                 Err(ToolError::new("read_only_profile", m))
             }
         }
+    }
+
+    /// The copy checks of `ferrika transform --execute`
+    /// ([`ferrika_ops::mirror::authorize_copy`]) for a transform from
+    /// `src_topic` to `dst_topic` on this session's cluster: enforced PII
+    /// masking refuses it unless the steps mask first. Source and
+    /// destination are the same cluster, so there is no export; the write
+    /// gate for the destination is [`Self::authorize_with`]. A refusal is
+    /// recorded as `policy.blocked`.
+    pub(super) fn authorize_copy(
+        &self,
+        tool: &str,
+        src_topic: &str,
+        dst_topic: &str,
+        masks_first: bool,
+    ) -> Result<(), ToolError> {
+        use ferrika_ops::mirror::{authorize_copy, CopyCheck, CopyCluster};
+        let cluster = ferrika_core::kafka::config::KafkaClientConfig::new(&self.config.bootstrap);
+        let side = CopyCluster {
+            profile: &self.config.profile,
+            config: &cluster,
+        };
+        let label = format!("mcp {tool}");
+        let check = CopyCheck {
+            source: "mcp",
+            label: &label,
+            src_topic,
+            dst_topic,
+            src: side,
+            dst: side,
+            dst_named_by_brokers: false,
+            check_destination: false,
+            masks_first,
+            masking_hint: " Put {\"mask\": \"partial\"} (or \"redact\") first in steps.",
+            read_only_hint: "",
+            audit_mode: AuditMode::ProbeOnly,
+        };
+        authorize_copy(
+            self.policy,
+            &self.sink,
+            &check,
+            ferrika_core::kafka::admin::known_brokers,
+        )
+        .map(|_| ())
+        .map_err(|reason| ToolError::new("policy_refused", reason))
     }
 
     /// A one-time token for executing the plan just shown, and when it

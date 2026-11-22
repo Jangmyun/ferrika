@@ -12,8 +12,9 @@ use serde_json::{json, Map, Value};
 
 use std::time::Duration;
 
-use super::backend::{KafkaBackend, WriteBackend};
+use super::backend::{KafkaBackend, TransformRun, WriteBackend};
 use super::guard::{args_digest, digest, GuardConfig, Limits, ToolError, WriteGuard, WRITE_TOOLS};
+use super::transform_tools::{self, EXECUTE_MAX};
 use super::transport::{Peer, PeerError};
 use super::{ConfirmMode, WriteOptions};
 use ferrika_core::kafka::context::ResolvedContext;
@@ -91,6 +92,7 @@ enum Work {
         topic: String,
         records: Vec<OwnedProducerRecord>,
     },
+    Transform(TransformRun),
 }
 
 /// What a write did.
@@ -99,6 +101,10 @@ struct Executed {
     /// The audit outcome: a summary without payloads or secrets.
     outcome: String,
     ok: bool,
+    /// Records charged to the session's produce budget that were not
+    /// written, given back (a transform that found fewer than its
+    /// `max_records`).
+    unused_budget: u64,
 }
 
 impl WriteTools {
@@ -197,7 +203,8 @@ impl WriteTools {
                 Change::captured(Reversibility::Reversible, captured).sensitive_limits()
             }
             Work::ResetOffsets { group, plans, .. } => Change::offset_reset(group, plans),
-            Work::Produce { .. } => return (None, None),
+            // Copies, like produce, cannot be taken back.
+            Work::Produce { .. } | Work::Transform(_) => return (None, None),
         };
         let (profile, bootstrap) = self.guard.profile_and_bootstrap();
         let scope = Scope {
@@ -370,8 +377,11 @@ impl WriteTools {
         self.guard.admit(true)?;
         // The confirmation may have taken a while: ask the gate again.
         self.authorize(tool, &planned.target).await?;
-        if let Work::Produce { records, .. } = &planned.work {
-            self.guard.charge_produce(records.len() as u64)?;
+        match &planned.work {
+            Work::Produce { records, .. } => self.guard.charge_produce(records.len() as u64)?,
+            // Charged in full now, the part not written given back after.
+            Work::Transform(run) => self.guard.charge_produce(run.max_records)?,
+            Work::CreateTopic { .. } | Work::AlterConfig { .. } | Work::ResetOffsets { .. } => {}
         }
         let target = planned.target.clone();
         // Refused here as it was inside the run: audited, not recorded.
@@ -390,6 +400,7 @@ impl WriteTools {
         };
         match self.execute(planned.work).await {
             Ok(done) => {
+                self.guard.refund_produce(done.unused_budget);
                 let op = finish(done.ok, &done.outcome);
                 let warning = self
                     .guard
@@ -625,6 +636,7 @@ impl WriteTools {
                 )
                 .await
             }
+            Request::Transform(run) => self.plan_transform(run).await,
         }
     }
 
@@ -650,6 +662,7 @@ impl WriteTools {
                     }),
                     outcome: format!("created ({partitions} partitions, replication factor {rf})"),
                     ok: true,
+                    unused_budget: 0,
                 })
             }
             Work::AlterConfig { topic, changes } => {
@@ -662,6 +675,7 @@ impl WriteTools {
                     result: json!({ "topic": topic, "applied": changes.len(), "changes": shown }),
                     outcome: format!("applied: {shown}"),
                     ok: true,
+                    unused_budget: 0,
                 })
             }
             Work::ResetOffsets {
@@ -682,6 +696,7 @@ impl WriteTools {
                     result: json!({ "group": group, "topic": topic, "partitions": partitions }),
                     outcome: format!("{} partition(s) reset to {strategy}", plans.len()),
                     ok: true,
+                    unused_budget: 0,
                 })
             }
             Work::Produce { topic, records } => {
@@ -735,9 +750,132 @@ impl WriteTools {
                     }),
                     outcome,
                     ok: failed == 0,
+                    unused_budget: 0,
+                })
+            }
+            Work::Transform(run) => {
+                let summary = self
+                    .backend
+                    .transform_copy(&run)
+                    .await
+                    .map_err(ToolError::kafka)?;
+                let attempted = summary.written.saturating_add(summary.failed);
+                let mut result = serde_json::to_value(&summary)
+                    .unwrap_or_else(|e| json!({ "summary_error": e.to_string() }));
+                if let Some(error) = summary.failure() {
+                    result["error"] = json!(error.to_string());
+                }
+                Ok(Executed {
+                    result,
+                    // Counts and the steps' digest only: a step can quote
+                    // a record value.
+                    outcome: summary.audit_detail(),
+                    ok: summary.failed == 0,
+                    unused_budget: run.max_records.saturating_sub(attempted),
                 })
             }
         }
+    }
+
+    /// The plan of a transform: both topics exist, the steps parse, the
+    /// copy passes the policy's copy checks (enforced masking needs a mask
+    /// step first) and fits the session's produce budget. Nothing is read
+    /// or written.
+    async fn plan_transform(&self, run: &TransformRun) -> Result<Planned, ToolError> {
+        let tool = "transform_execute";
+        let (pipeline, _) =
+            transform_tools::build_pipeline(&run.steps, false).map_err(ToolError::invalid)?;
+        self.guard.authorize_copy(
+            tool,
+            &run.src_topic,
+            &run.dst_topic,
+            transform_tools::masks_first(&run.steps),
+        )?;
+        self.guard.check_produce(run.max_records)?;
+        let Some(source) = self
+            .backend
+            .topic(&run.src_topic)
+            .await
+            .map_err(ToolError::kafka)?
+        else {
+            return Err(ToolError::invalid(format!(
+                "Source topic '{}' does not exist",
+                run.src_topic
+            )));
+        };
+        if let Some(p) = run.partition {
+            if p >= source.partitions {
+                return Err(ToolError::invalid(format!(
+                    "partition {p}: '{}' has partitions 0-{}",
+                    run.src_topic,
+                    source.partitions - 1
+                )));
+            }
+        }
+        let Some(destination) = self
+            .backend
+            .topic(&run.dst_topic)
+            .await
+            .map_err(ToolError::kafka)?
+        else {
+            return Err(ToolError::invalid(format!(
+                "Destination topic '{}' does not exist (transform_execute never creates topics; \
+                 create it first, e.g. with create_topic)",
+                run.dst_topic
+            )));
+        };
+        let mut warnings = vec![
+            "Records already in the destination stay; running the same transform again copies \
+             the range again."
+                .to_string(),
+        ];
+        if run.decode {
+            warnings.push(
+                "Decoded values are written as JSON, not in the Schema Registry wire format."
+                    .to_string(),
+            );
+        }
+        let steps: Vec<Value> = run
+            .steps
+            .iter()
+            .map(|(kind, text)| json!({ (kind.name()): text }))
+            .collect();
+        let steps_text = run
+            .steps
+            .iter()
+            .map(|(kind, text)| format!("{} {text}", kind.name()))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let start = run.start.label();
+        Ok(Planned {
+            plan: json!({
+                "action": tool,
+                "source": run.src_topic,
+                "destination": run.dst_topic,
+                "source_partitions": source.partitions,
+                "destination_partitions": destination.partitions,
+                "partition": run.partition,
+                "start": start,
+                "until": "the end each partition has when the run starts",
+                "max_records": run.max_records,
+                "decode_wire_format": run.decode,
+                "steps": steps,
+                "steps_sha256": pipeline.digest(),
+                "warnings": warnings,
+            }),
+            summary: format!(
+                "copy up to {} record(s) from topic '{}' (from {start} to its current end) to \
+                 topic '{}' through {} step(s): {steps_text}",
+                run.max_records,
+                run.src_topic,
+                run.dst_topic,
+                run.steps.len()
+            ),
+            target: format!("{} -> {}", run.src_topic, run.dst_topic),
+            destructive: false,
+            person_only: None,
+            work: Work::Transform(run.clone()),
+        })
     }
 
     async fn plan_produce(
@@ -1214,6 +1352,7 @@ enum Request {
         value_subject: Option<String>,
         key_subject: Option<String>,
     },
+    Transform(TransformRun),
 }
 
 /// One record of a produce_messages call.
@@ -1233,6 +1372,8 @@ impl Request {
             | Request::AlterConfig { topic, .. }
             | Request::ResetOffsets { topic, .. }
             | Request::Produce { topic, .. } => vec![topic.as_str()],
+            // The source is only read.
+            Request::Transform(run) => vec![run.dst_topic.as_str()],
         }
     }
 
@@ -1243,6 +1384,7 @@ impl Request {
             | Request::AlterConfig { topic, .. }
             | Request::Produce { topic, .. } => topic.clone(),
             Request::ResetOffsets { group, topic, .. } => format!("{group}@{topic}"),
+            Request::Transform(run) => format!("{} -> {}", run.src_topic, run.dst_topic),
         }
     }
 }
@@ -1344,11 +1486,88 @@ fn parse(tool: &str, args: &Value) -> Result<Request, ToolError> {
                 key_subject,
             })
         }
+        "transform_execute" => parse_transform(&fields, args),
         _ => Err(ToolError::new(
             "write_disabled",
             format!("{tool} is not available"),
         )),
     }
+}
+
+/// Arguments that would name another cluster: refused with a clear
+/// message rather than as unknown.
+const OTHER_CLUSTER_ARGS: [&str; 6] = [
+    "dst_profile",
+    "dst_bootstrap_servers",
+    "destination_profile",
+    "destination_cluster",
+    "profile",
+    "bootstrap_servers",
+];
+
+/// `transform_execute`'s arguments.
+fn parse_transform(fields: &Fields<'_>, args: &Value) -> Result<Request, ToolError> {
+    if let Some(key) = OTHER_CLUSTER_ARGS
+        .iter()
+        .find(|k| fields.0.contains_key(**k))
+    {
+        return Err(ToolError::new(
+            "cross_cluster_unsupported",
+            format!(
+                "'{key}': transform_execute copies within the cluster this MCP server was \
+                 started with. Copying to another cluster is not offered over MCP; run \
+                 `ferrika transform --dst-profile ... --execute` from the CLI, where the \
+                 export policy applies."
+            ),
+        ));
+    }
+    fields.only(&[
+        "topic",
+        "to",
+        "steps",
+        "from_beginning",
+        "from_timestamp",
+        "partition",
+        "max_records",
+        "decode_wire_format",
+        "mode",
+        "confirmation",
+    ])?;
+    let src_topic = fields.string("topic")?;
+    let dst_topic = fields.string("to")?;
+    if src_topic == dst_topic {
+        return Err(ToolError::invalid(format!(
+            "Source and destination are the same topic '{src_topic}'; the transform would read \
+             its own output. Use a different destination topic."
+        )));
+    }
+    if ferrika_core::kafka::internal_topic::is_internal_topic(&src_topic) {
+        return Err(ToolError::new(
+            "target_not_allowed",
+            format!("'{src_topic}' is an internal topic; MCP tools do not copy those"),
+        ));
+    }
+    if !valid_topic_name(&dst_topic) {
+        return Err(ToolError::invalid(format!(
+            "'{dst_topic}' is not a valid topic name"
+        )));
+    }
+    let Some(max_records) = fields.int("max_records", 1, EXECUTE_MAX as i64)? else {
+        return Err(ToolError::invalid(format!(
+            "'max_records' is required (1 to {EXECUTE_MAX})"
+        )));
+    };
+    Ok(Request::Transform(TransformRun {
+        src_topic,
+        dst_topic,
+        steps: transform_tools::parse_steps(fields.0.get("steps")).map_err(ToolError::invalid)?,
+        // Absolute times only: the plan and the execute must name the same range.
+        start: transform_tools::parse_start(args, None).map_err(ToolError::invalid)?,
+        partition: transform_tools::parse_partition(args).map_err(ToolError::invalid)?,
+        max_records: max_records as u64,
+        decode: transform_tools::parse_flag(args, "decode_wire_format", false)
+            .map_err(ToolError::invalid)?,
+    }))
 }
 
 /// `records[i]` of a produce_messages call.
@@ -1786,6 +2005,27 @@ fn definitions() -> Vec<Value> {
                 "required": ["group", "topic", "to"]
             },
             "annotations": annotations("Reset consumer group offsets", true, true)
+        }),
+        json!({
+            "name": "transform_execute",
+            "title": "Transform records into another topic",
+            "description": "Copies records of a topic into another existing topic on the same cluster through steps (as transform_preview: filter, drop, rename, set, rekey, mask, sample), reading from the beginning (or from_timestamp) up to the end each partition has when it starts, and writing at most max_records. Try the steps with transform_preview first. The plan shows the steps and the range; nothing is read or written until execute. When the company policy enforces PII masking the first step must be mask. Copying to another cluster is not offered over MCP.",
+            "inputSchema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": with_mode(json!({
+                    "topic": { "type": "string", "minLength": 1, "description": "Topic to read" },
+                    "to": { "type": "string", "pattern": "^[A-Za-z0-9._-]{1,249}$", "description": "Existing topic on the same cluster to write to" },
+                    "steps": transform_tools::steps_schema(),
+                    "from_beginning": { "type": "boolean", "default": true, "description": "Start at the earliest offset (the default)" },
+                    "from_timestamp": { "type": ["string", "integer"], "description": "Start at the first record at or after this time instead: ISO 8601 or epoch ms" },
+                    "partition": { "type": "integer", "minimum": 0, "description": "Only this partition of the source" },
+                    "max_records": { "type": "integer", "minimum": 1, "maximum": EXECUTE_MAX, "description": "Most records to write; counts against --max-produce-records" },
+                    "decode_wire_format": { "type": "boolean", "default": false, "description": "Decode Schema Registry wire-format values to JSON first (written as JSON)" }
+                })),
+                "required": ["topic", "to", "steps", "max_records"]
+            },
+            "annotations": annotations("Transform records into another topic", false, false)
         }),
     ]
 }
@@ -2816,5 +3056,191 @@ pub(super) mod tests {
         assert!(shrink_warning("segment.ms", "2", "1").is_none());
         // Tiered storage's local retention deletes too.
         assert!(shrink_warning("local.retention.ms", "-2", "3600000").is_some());
+    }
+
+    fn transform_cluster() -> FakeCluster {
+        FakeCluster {
+            brokers: 1,
+            transform_records: 40,
+            ..Default::default()
+        }
+        .with_topic("orders", 3)
+        .with_topic("orders-clean", 3)
+    }
+
+    fn transform_args() -> Value {
+        json!({
+            "topic": "orders",
+            "to": "orders-clean",
+            "steps": [
+                { "filter": "$.email == \"jane.doe@example.com\"" },
+                { "drop": "card" }
+            ],
+            "max_records": 100
+        })
+    }
+
+    #[tokio::test]
+    async fn transform_plans_then_copies_and_audits_counts_not_steps() {
+        let (mut tools, cluster, log, _) = tools_with(transform_cluster(), config());
+        let args = transform_args();
+        let plan = tools.call_token("transform_execute", &args).await;
+        assert_eq!(plan["isError"], false, "{plan}");
+        let p = &plan["structuredContent"]["plan"];
+        assert_eq!(p["source"], "orders");
+        assert_eq!(p["destination"], "orders-clean");
+        assert_eq!(p["start"], "beginning");
+        assert_eq!(p["max_records"], 100);
+        assert_eq!(p["steps"][1]["drop"], "card");
+        assert!(cluster.changes.borrow().is_empty());
+        assert!(log.entries.borrow().is_empty());
+
+        let done = tools
+            .call_token("transform_execute", &execute(&args, &token(&plan)))
+            .await;
+        assert_eq!(done["structuredContent"]["executed"], true, "{done}");
+        assert_eq!(done["structuredContent"]["result"]["written"], 40);
+        assert_eq!(
+            *cluster.changes.borrow(),
+            ["transform orders -> orders-clean (40 records)"]
+        );
+        let entries = log.entries.borrow();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].action, "mcp transform_execute");
+        assert_eq!(entries[0].target, "orders -> orders-clean");
+        assert!(entries[0].ok);
+        assert!(
+            entries[0].outcome.contains("written 40") && entries[0].outcome.contains("sha256:"),
+            "{}",
+            entries[0].outcome
+        );
+        // The steps can quote values; the audit log has only their digest.
+        let line = serde_json::to_string(&entries[0]).unwrap();
+        assert!(
+            !line.contains("jane.doe") && !line.contains("card"),
+            "{line}"
+        );
+        drop(entries);
+        // 100 were charged, 60 given back: 960 of 1000 are left.
+        assert!(tools.guard.check_produce(960).is_ok());
+        assert_eq!(
+            tools.guard.check_produce(961).unwrap_err().code,
+            "produce_budget_exhausted"
+        );
+    }
+
+    #[tokio::test]
+    async fn transform_refuses_other_clusters_and_bad_ranges() {
+        let (mut tools, cluster, _, _) = tools_with(transform_cluster(), config());
+        let mut other = transform_args();
+        other["dst_profile"] = json!("prod");
+        let refused = tools.call_token("transform_execute", &other).await;
+        assert_eq!(code(&refused), "cross_cluster_unsupported");
+        let text = refused["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("CLI"), "{text}");
+
+        let mut same = transform_args();
+        same["to"] = json!("orders");
+        assert_eq!(
+            code(&tools.call_token("transform_execute", &same).await),
+            "invalid_argument"
+        );
+        let mut no_max = transform_args();
+        no_max.as_object_mut().unwrap().remove("max_records");
+        assert_eq!(
+            code(&tools.call_token("transform_execute", &no_max).await),
+            "invalid_argument"
+        );
+        let mut too_many = transform_args();
+        too_many["max_records"] = json!(EXECUTE_MAX + 1);
+        assert_eq!(
+            code(&tools.call_token("transform_execute", &too_many).await),
+            "invalid_argument"
+        );
+        // A relative start would differ between plan and execute.
+        let mut relative = transform_args();
+        relative["from_timestamp"] = json!("1h");
+        assert_eq!(
+            code(&tools.call_token("transform_execute", &relative).await),
+            "invalid_argument"
+        );
+        let mut missing = transform_args();
+        missing["to"] = json!("nowhere");
+        let result = tools.call_token("transform_execute", &missing).await;
+        assert_eq!(code(&result), "invalid_argument");
+        assert!(result.to_string().contains("never creates topics"));
+        let mut internal = transform_args();
+        internal["topic"] = json!("__consumer_offsets");
+        assert_eq!(
+            code(&tools.call_token("transform_execute", &internal).await),
+            "target_not_allowed"
+        );
+        // More than the session's produce budget.
+        let (mut small, _, _, _) = tools_with(
+            transform_cluster(),
+            GuardConfig {
+                limits: Limits {
+                    produce_records: 50,
+                    ..config().limits
+                },
+                ..config()
+            },
+        );
+        assert_eq!(
+            code(
+                &small
+                    .call_token("transform_execute", &transform_args())
+                    .await
+            ),
+            "produce_budget_exhausted"
+        );
+        assert!(cluster.changes.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transform_destination_must_be_in_the_topics_scope() {
+        let scoped = GuardConfig {
+            topics: vec!["sandbox-*".into()],
+            ..config()
+        };
+        let (mut tools, _, _, _) = tools_with(transform_cluster(), scoped);
+        // The source may be anything; the destination must match --topics.
+        let result = tools
+            .call_token("transform_execute", &transform_args())
+            .await;
+        assert_eq!(code(&result), "target_not_allowed");
+    }
+
+    #[tokio::test]
+    async fn enforced_masking_needs_a_mask_step_first() {
+        use super::super::guard::tests::policy;
+        use ferrika_core::model::policy::{MaskingRule, PolicyRules};
+        let rules = PolicyRules {
+            masking: MaskingRule::Enforced,
+            ..Default::default()
+        };
+        let cluster: &'static FakeCluster = Box::leak(Box::new(transform_cluster()));
+        let (guard, log, _) = guard_with(config(), policy(rules));
+        let mut tools = WriteTools::new(guard, Box::new(cluster));
+        let refused = tools
+            .call_token("transform_execute", &transform_args())
+            .await;
+        assert_eq!(code(&refused), "policy_refused");
+        assert!(refused.to_string().contains("mask"), "{refused}");
+        assert_eq!(log.entries.borrow()[0].action, "policy.blocked");
+
+        let mut masked = transform_args();
+        masked["steps"] = json!([{ "mask": "partial" }, { "drop": "card" }]);
+        let plan = tools.call_token("transform_execute", &masked).await;
+        assert_eq!(plan["isError"], false, "{plan}");
+    }
+
+    #[test]
+    fn transform_is_a_produce_for_the_policy() {
+        assert_eq!(
+            super::super::guard::policy_action("transform_execute"),
+            ferrika_core::model::policy::PolicyAction::Produce
+        );
+        assert!(is_write_tool("transform_execute"));
     }
 }
