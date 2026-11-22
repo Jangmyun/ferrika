@@ -19,7 +19,7 @@ of these vendors tests, endorses or supports Ferrika.
 | Amazon MSK (IAM) | Preset available, not CI-tested | `msk-iam` |
 | Amazon MSK (SASL/SCRAM) | Preset available, not CI-tested | `msk-scram` |
 | WarpStream | Preset available, not CI-tested | `warpstream` |
-| AutoMQ | Preset available, not CI-tested; a compose file for a future E2E run is in [`e2e/automq-compose.yml`](e2e/automq-compose.yml) | `automq` |
+| AutoMQ 1.7.5 | CI-tested (smoke test on every pull request, one node on [`e2e/automq-compose.yml`](e2e/automq-compose.yml)); last checked by hand 2026-11-23, results below | `automq` (plaintext; the same settings as Apache Kafka) |
 
 "Not CI-tested" means no Ferrika test runs against that service. The
 limitations listed for it come from the Kafka protocol and the vendor's
@@ -131,8 +131,32 @@ expected to be refused.
 
 ### AutoMQ
 
-- AutoMQ is a Kafka fork that keeps data in object storage; the Kafka admin
-  APIs are expected to behave as in Apache Kafka.
-- Durability comes from shared storage, so topics commonly have a
-  replication factor of 1; lint findings about low replication can be
-  expected on AutoMQ and may not indicate a risk there.
+Checked on 2026-11-23 against AutoMQ 1.7.5 (`automqinc/automq:1.7.5`), one
+node with broker and controller roles on an S3-compatible store
+([`e2e/automq-compose.yml`](e2e/automq-compose.yml)):
+
+- The smoke test (`tools/e2e/smoke.py`, 45 checks) and the undo check
+  (`e2e/undo.sh`, with `KAFKA_BIN=/opt/automq/kafka/bin`) pass.
+- Also checked by hand: `topics describe`, `topics config`, `topics purge`,
+  `topics elect-leaders`, `health`, `lint`, `topology`, `top -n 1`,
+  `quota list` and `quota set`, `user create`/`list`/`delete` (SCRAM),
+  `reassign plan`. They behave as on Apache Kafka.
+- AutoMQ opens a new topic's partitions in object storage asynchronously:
+  for about a second after `topics create`, offset lookups answer
+  `NotLeaderForPartition`. Ferrika retries such lookups for a few seconds
+  (before 0.2.0 `topics describe` showed `Messages: unknown` and `undo` of a
+  topic creation failed in that second).
+- New topics get a `min.insync.replicas=1` override from AutoMQ, so
+  `topics describe` and `topics config` list it.
+- AutoMQ adds internal topics (`__automq_cluster_events`,
+  `__auto_balancer_metrics`); `topics list -a` shows them.
+- `acl list` fails with `SECURITY_DISABLED` because the test node has no
+  authorizer, as on Apache Kafka without one; ACLs were not checked.
+- Not checked (one node): reassignment and replication factor changes
+  between brokers, and the `T001` lint rule (replication factor 1 with two
+  or more brokers). Durability comes from shared storage, so topics commonly
+  have a replication factor of 1; on a multi-node AutoMQ cluster `T001`
+  findings are expected and may not indicate a risk there. AutoMQ's own
+  self-balancing can also move partitions while a `reassign` runs.
+- Not checked: SASL or TLS listeners, AutoMQ's table topics and other
+  AutoMQ-only features.

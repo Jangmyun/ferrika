@@ -219,6 +219,12 @@ The RabbitMQ entries below are planned for 0.2.0.
   group continues instead of resending. `--execute` without `-g` prints a
   note that a rerun resends the same records. `ferrika_ops::mirror::CommitTracker`
   is now public for this.
+- AutoMQ moves from "preset available, not tested" to tested:
+  `docs/e2e/automq-compose.yml` now runs (AutoMQ 1.7.5 with an
+  S3-compatible store, Kafka API on `localhost:49092`), CI runs the smoke
+  test against it, and `docs/COMPATIBILITY.md` lists the results and the
+  limitations found. `docs/e2e/undo.sh` takes `KAFKA_BIN` for brokers whose
+  Kafka tools are not in `/opt/kafka/bin`.
 
 ### Compatibility
 
@@ -236,6 +242,16 @@ The RabbitMQ entries below are planned for 0.2.0.
 
 ### Fixed
 
+- Watermark lookups (`topics describe` and `list` message counts,
+  `consume`, `monitor`, `undo` of a topic creation, and the other users of
+  `KafkaConsumerClient::fetch_watermarks` and `fetch_watermarks_batch`) are
+  retried for a few seconds when a partition's leader is not ready yet
+  (`NotLeaderForPartition`, `LeaderNotAvailable` and similar). On AutoMQ,
+  which opens a new topic's partitions asynchronously, `topics describe`
+  right after `topics create` showed `Messages: unknown`, and undoing the
+  creation failed. Timeouts and unknown topics are not retried.
+  `ferrika_core::kafka::retry` has the new `is_leader_change` and
+  `retry_leader_change`.
 - `dlq export` saved only a 120-character preview of each value; records
   now carry the whole value as `payload` (or `payload_base64` when it is not
   UTF-8, with `payload` null), masked while the policy enforces masking.
