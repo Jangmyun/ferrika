@@ -1,7 +1,7 @@
 //! Policies for tests of the masking and export paths.
 
 use crate::policy::{EffectivePolicy, PolicyStatus};
-use ferrika_core::model::policy::{ExportRule, MaskingRule};
+use ferrika_core::model::policy::{CopyDownRule, Environment, ExportRule, MaskingRule};
 
 /// No policy installed.
 pub fn none() -> EffectivePolicy {
@@ -33,6 +33,42 @@ pub fn export_audited() -> EffectivePolicy {
 pub fn export_forbidden_for_clusters(clusters: &[&str]) -> EffectivePolicy {
     let mut policy = export_forbidden();
     policy.rules.export_clusters = clusters.iter().map(|c| c.to_string()).collect();
+    policy
+}
+
+/// A verified policy with three environments and `copy_down`:
+/// `prod` (tier 3: profiles `prod-*`, brokers `*.prod.corp`, forbids
+/// `topics.delete`), `staging` (tier 2: brokers `*.staging.corp`,
+/// read-only) and `dev` (tier 1: profiles `dev*`, brokers `localhost`); no
+/// default environment.
+pub fn environments(copy_down: CopyDownRule) -> EffectivePolicy {
+    let mut policy = masking();
+    policy.rules.masking = MaskingRule::Optional;
+    let env = |tier, profiles: &[&str], brokers: &[&str]| Environment {
+        tier,
+        profiles: profiles.iter().map(|s| s.to_string()).collect(),
+        brokers: brokers.iter().map(|s| s.to_string()).collect(),
+        ..Environment::default()
+    };
+    policy.rules.environments.insert(
+        "prod".into(),
+        Environment {
+            forbid: vec!["topics.delete".into()],
+            ..env(3, &["prod-*"], &["*.prod.corp"])
+        },
+    );
+    policy.rules.environments.insert(
+        "staging".into(),
+        Environment {
+            read_only: true,
+            ..env(2, &[], &["*.staging.corp"])
+        },
+    );
+    policy
+        .rules
+        .environments
+        .insert("dev".into(), env(1, &["dev*"], &["localhost"]));
+    policy.rules.copy_down = copy_down;
     policy
 }
 

@@ -12,8 +12,10 @@ use crate::kafka::config::KafkaClientConfig;
 use crate::kafka::filter::MessageFilter;
 use crate::kafka::profile::ProfileStore;
 use crate::ops::mirror::{
-    authorize_copy, run_mirror_pipeline, CopyCheck, CopyCluster, MirrorConfig,
+    authorize_copy, run_copy_pipeline, run_mirror_pipeline, CopyCheck, CopyCluster,
+    CopyDestination, MirrorConfig, MirrorStats,
 };
+use crate::ops::transform::{DecodingTransform, Pipeline, StepKind};
 
 /// Command line arguments for topic mirroring and replication.
 #[derive(Args, Debug, Clone, PartialEq)]
@@ -77,6 +79,22 @@ pub struct MirrorArgs {
     /// ignore case. Repeat it to require several; every one must match
     #[arg(long = "header-filter", value_name = "KEY:VALUE|KEY=VALUE")]
     pub header_filter: Vec<String>,
+
+    /// Mask PII in each record's key, value and header values before it is
+    /// written (partial, the default, or --mask=redact). Allows the copy when
+    /// the company policy requires masked copies (enforced masking, or
+    /// copy_down: masked into a lower environment). Not combined with the
+    /// filters, which would read raw values; use `transform --mask --filter`
+    #[arg(
+        long,
+        value_name = "STRATEGY",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "partial",
+        value_parser = ["partial", "redact"],
+        conflicts_with_all = ["grep", "key_filter", "header_filter"]
+    )]
+    pub mask: Option<String>,
 }
 
 /// Resolves a KafkaClientConfig for a given profile name and bootstrap server override.
@@ -180,10 +198,14 @@ impl CopyRoute for MirrorArgs {
         self.dst_bootstrap_servers.as_deref()
     }
     fn masks_first(&self) -> bool {
-        false
+        // The filters read raw values (clap refuses them with `--mask`).
+        self.mask.is_some()
+            && self.grep.is_none()
+            && self.key_filter.is_none()
+            && self.header_filter.is_empty()
     }
     fn masking_hint(&self) -> &'static str {
-        ""
+        " Add --mask to copy masked records."
     }
 }
 
@@ -315,6 +337,15 @@ fn authorize_checking_brokers(
     Ok(authorized.write_requested)
 }
 
+/// The one-step pipeline `--mask` runs on every record (the transform's
+/// mask step), or `None` without `--mask`.
+fn mask_pipeline(args: &MirrorArgs) -> Result<Option<Pipeline>, String> {
+    args.mask
+        .as_deref()
+        .map(|strategy| Pipeline::parse([(StepKind::Mask, strategy)]))
+        .transpose()
+}
+
 /// Main entry point for `ferrika mirror`.
 pub async fn run(args: MirrorArgs, global: &GlobalOpts) -> KafkaResult<()> {
     let mut src_cfg = resolve_cluster_config(
@@ -405,11 +436,17 @@ pub async fn run(args: MirrorArgs, global: &GlobalOpts) -> KafkaResult<()> {
                 r.to_string().yellow()
             );
         }
+        if let Some(strategy) = &args.mask {
+            println!(
+                "  PII Masking:        {} (keys, values and header values)",
+                strategy.yellow()
+            );
+        }
         println!();
     }
 
     let progress_format = global.format;
-    let result = run_mirror_pipeline(&src_cfg, &dst_cfg, mirror_config, move |stats| {
+    let progress = move |stats: &MirrorStats| {
         if progress_format != OutputFormat::Json {
             print!(
                 "\r{} Mirrored: {} msgs ({:.1} EPS, {:.2} MB/s) | Skipped: {} | Elapsed: {:.1}s    ",
@@ -422,8 +459,22 @@ pub async fn run(args: MirrorArgs, global: &GlobalOpts) -> KafkaResult<()> {
             );
             let _ = std::io::stdout().flush();
         }
-    })
-    .await;
+    };
+    let result = match mask_pipeline(&args).map_err(KafkaError::config)? {
+        // `--mask`: the transform's mask step on every record.
+        Some(pipeline) => {
+            let mut masking = DecodingTransform::new(pipeline, args.dst_topic.clone());
+            run_copy_pipeline(
+                &src_cfg,
+                CopyDestination::Cluster(&dst_cfg),
+                mirror_config,
+                &mut masking,
+                progress,
+            )
+            .await
+        }
+        None => run_mirror_pipeline(&src_cfg, &dst_cfg, mirror_config, progress).await,
+    };
 
     let stats = match result {
         Ok(s) => s,
@@ -850,6 +901,115 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    #[test]
+    fn mirror_mask_parses_and_refuses_the_raw_value_filters() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(flatten)]
+            args: MirrorArgs,
+        }
+        let parse = |extra: &[&str]| {
+            TestCli::try_parse_from(["test", "a", "b"].iter().chain(extra)).map(|c| c.args)
+        };
+        let args = parse(&["--mask"]).unwrap();
+        assert_eq!(args.mask.as_deref(), Some("partial"));
+        assert!(args.masks_first());
+        assert!(mask_pipeline(&args)
+            .unwrap()
+            .is_some_and(|p| p.masks_first()));
+        assert_eq!(
+            parse(&["--mask=redact"]).unwrap().mask.as_deref(),
+            Some("redact")
+        );
+        assert!(parse(&["--mask=hash"]).is_err());
+        for filter in [&["-G", "x"][..], &["-k", "x"], &["--header-filter", "a:b"]] {
+            let mut flags = vec!["--mask"];
+            flags.extend_from_slice(filter);
+            assert!(parse(&flags).is_err(), "{flags:?}");
+        }
+        let plain = parse(&[]).unwrap();
+        assert!(!plain.masks_first());
+        assert!(mask_pipeline(&plain).unwrap().is_none());
+    }
+
+    #[test]
+    fn enforced_masking_allows_mirror_with_mask() {
+        let policy = test_policy::masking();
+        let args = mirror_args(&["--src-profile", "prod-eu", "--dst-profile", "dev", "--mask"]);
+        assert_eq!(
+            authorize_with(&policy, &FakeLog::default(), &store(), &args, &global()),
+            Ok(())
+        );
+        let reason = authorize_with(
+            &policy,
+            &FakeLog::default(),
+            &store(),
+            &mirror_args(&[]),
+            &global(),
+        )
+        .unwrap_err();
+        assert!(
+            reason.ends_with(" Add --mask to copy masked records."),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn copy_down_is_judged_by_environment() {
+        use crate::model::policy::CopyDownRule;
+        // `prod-eu` is prod by its profile name, `dev` is dev.
+        let policy = test_policy::environments(CopyDownRule::Masked);
+        let log = FakeLog::default();
+        let args = mirror_args(&["--src-profile", "prod-eu", "--dst-profile", "dev"]);
+        let reason = authorize_checking_brokers(&policy, &log, &store(), &args, &global(), |c| {
+            Ok(vec![c.bootstrap_servers.clone()])
+        })
+        .unwrap_err();
+        assert!(reason.contains("copy_down: masked"), "{reason}");
+        assert!(
+            reason.ends_with(" Add --mask to copy masked records."),
+            "{reason}"
+        );
+        assert_eq!(log.entries.borrow()[0].action, "policy.blocked");
+
+        let args = mirror_args(&["--src-profile", "prod-eu", "--dst-profile", "dev", "--mask"]);
+        assert!(authorize_checking_brokers(
+            &policy,
+            &FakeLog::default(),
+            &store(),
+            &args,
+            &global(),
+            |c| { Ok(vec![c.bootstrap_servers.clone()]) }
+        )
+        .is_ok());
+        // transform: `--mask` as the first step.
+        let args = transform_args(&["--dst-profile", "dev", "--mask"]);
+        let mut global = global();
+        global.profile = Some("prod-eu".to_string());
+        assert!(authorize_checking_brokers(
+            &policy,
+            &FakeLog::default(),
+            &store(),
+            &args,
+            &global,
+            |c| { Ok(vec![c.bootstrap_servers.clone()]) }
+        )
+        .is_ok());
+        let args = transform_args(&["--dst-profile", "dev", "--drop", "a", "--mask"]);
+        let reason = authorize_checking_brokers(
+            &policy,
+            &FakeLog::default(),
+            &store(),
+            &args,
+            &global,
+            |c| Ok(vec![c.bootstrap_servers.clone()]),
+        )
+        .unwrap_err();
+        assert!(reason.contains("Add --mask as the first step"), "{reason}");
     }
 
     #[test]

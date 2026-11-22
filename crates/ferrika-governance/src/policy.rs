@@ -20,8 +20,8 @@ use ferrika_core::kafka::config::KafkaClientConfig;
 use jiff::Timestamp;
 
 use ferrika_core::model::policy::{
-    ExpiryRule, ExportRule, MaskingRule, PolicyAction, PolicyPayload, PolicyRules, SignedPolicy,
-    UnmaskRule, WatermarkRule, POLICY_FORMAT_V1, POLICY_FORMAT_V2,
+    CopyDownRule, Environment, ExpiryRule, ExportRule, MaskingRule, PolicyAction, PolicyPayload,
+    PolicyRules, SignedPolicy, UnmaskRule, WatermarkRule, POLICY_FORMAT_V1, POLICY_FORMAT_V2,
 };
 
 /// How long before `expires_at` Ferrika starts warning.
@@ -140,6 +140,9 @@ pub fn parse_payload(payload: &str) -> Result<PolicyPayload, PolicyError> {
     if let Some(reason) = parsed.rules.export_rules_error() {
         return Err(PolicyError::Rules(reason));
     }
+    if let Some(reason) = parsed.rules.environment_rules_error() {
+        return Err(PolicyError::Rules(reason));
+    }
     Ok(parsed)
 }
 
@@ -212,7 +215,8 @@ pub fn verify_with(
         return Err(PolicyError::Rules(
             "format 2 fields (expires_at, on_expiry, audit_forward, audit_anchor, \
              anchor_required, read_only_brokers, export, export_clusters, watermark, \
-             watermark_text, screen_capture, mcp_write) need format 2"
+             watermark_text, screen_capture, mcp_write, environments, default_environment,
+             copy_down) need format 2"
                 .to_string(),
         ));
     }
@@ -556,7 +560,25 @@ impl EffectivePolicy {
     /// so the brokers named by cluster metadata matter too. False when no
     /// policy is installed or it sets no such rule: nothing to fetch then.
     pub fn write_needs_broker_metadata(&self) -> bool {
-        self.is_active() && !self.rules_at(Timestamp::now()).read_only_brokers.is_empty()
+        if !self.is_active() {
+            return false;
+        }
+        let rules = self.rules_at(Timestamp::now());
+        !rules.read_only_brokers.is_empty()
+            // An environment with its own read-only or forbid rules, and
+            // environments told apart by broker addresses.
+            || (rules.environments.values().any(Environment::restricts_changes)
+                && rules.environments.values().any(|e| !e.brokers.is_empty()))
+    }
+
+    /// Whether a copy's environments are judged by broker addresses: a
+    /// `copy_down` rule and an environment with `brokers` globs.
+    pub fn copy_down_needs_broker_metadata(&self) -> bool {
+        if !self.is_active() {
+            return false;
+        }
+        let rules = self.rules_at(Timestamp::now());
+        !rules.copy_down.is_allow() && rules.environments.values().any(|e| !e.brokers.is_empty())
     }
 
     /// Whether an export is judged by broker addresses (`export_clusters`
@@ -703,7 +725,111 @@ impl EffectivePolicy {
                 action.id()
             )));
         }
+        // Every environment the cluster is in adds its own rules.
+        for (name, env) in matching_environments(&self.rules, profile, bootstrap) {
+            if env.forbid.iter().any(|f| f == "*" || f == action.id()) {
+                return Err(PolicyRefusal(format!(
+                    "Refused by {}: `{}` is forbidden in the environment '{name}'.",
+                    self.label_at(now),
+                    action.id()
+                )));
+            }
+            if env.read_only {
+                let target = if profile.is_empty() {
+                    bootstrap
+                } else {
+                    profile
+                };
+                return Err(PolicyRefusal(format!(
+                    "Refused by {}: '{target}' is in the read-only environment '{name}', so `{}` is not allowed.",
+                    self.label_at(now),
+                    action.id()
+                )));
+            }
+        }
         Ok(())
+    }
+
+    /// The environment of the cluster `profile` / `bootstrap` (a
+    /// comma-separated broker list): the highest tier among the environments
+    /// it matches, else `default_environment`. `None` when no policy is
+    /// installed, it has no environments, or none applies.
+    pub fn environment(&self, profile: &str, bootstrap: &str) -> Option<EnvironmentMatch> {
+        self.environment_at(Timestamp::now(), profile, bootstrap)
+    }
+
+    /// [`Self::environment`] at `now`.
+    pub fn environment_at(
+        &self,
+        now: Timestamp,
+        profile: &str,
+        bootstrap: &str,
+    ) -> Option<EnvironmentMatch> {
+        if !self.is_active() {
+            return None;
+        }
+        let rules = self.rules_at(now);
+        matching_environments(&rules, profile, bootstrap)
+            .into_iter()
+            .max_by_key(|(_, env)| env.tier)
+            .map(|(name, env)| EnvironmentMatch::new(name, env))
+    }
+
+    /// [`Self::copy_down_at`] now.
+    pub fn copy_down(
+        &self,
+        src_profile: &str,
+        src_bootstrap: &str,
+        dst_profile: &str,
+        dst_bootstrap: &str,
+    ) -> Option<CopyDown> {
+        self.copy_down_at(
+            Timestamp::now(),
+            src_profile,
+            src_bootstrap,
+            dst_profile,
+            dst_bootstrap,
+        )
+    }
+
+    /// Whether copying records from the cluster `src_*` to the cluster
+    /// `dst_*` is a copy down that `copy_down` restricts at `now`: the
+    /// source's environment (its highest tier) is above the destination's
+    /// (its lowest tier), or the destination has no environment at all.
+    /// `None` when `copy_down` is `allow`, the source has no environment, or
+    /// the copy does not go down. The caller decides whether the two are the
+    /// same cluster (`destination_within_source`), which is never a copy down.
+    pub fn copy_down_at(
+        &self,
+        now: Timestamp,
+        src_profile: &str,
+        src_bootstrap: &str,
+        dst_profile: &str,
+        dst_bootstrap: &str,
+    ) -> Option<CopyDown> {
+        if !self.is_active() {
+            return None;
+        }
+        let rules = self.rules_at(now);
+        if rules.copy_down.is_allow() {
+            return None;
+        }
+        let from = matching_environments(&rules, src_profile, src_bootstrap)
+            .into_iter()
+            .max_by_key(|(_, env)| env.tier)
+            .map(|(name, env)| EnvironmentMatch::new(name, env))?;
+        // The destination's lowest tier: a cluster in both `prod` and `dev`
+        // is treated as `dev` here, so the copy is judged the stricter way.
+        let to = matching_environments(&rules, dst_profile, dst_bootstrap)
+            .into_iter()
+            .min_by_key(|(_, env)| env.tier)
+            .map(|(name, env)| EnvironmentMatch::new(name, env));
+        let down = to.as_ref().is_none_or(|to| to.tier < from.tier);
+        down.then(|| CopyDown {
+            from,
+            to,
+            rule: rules.copy_down,
+        })
     }
 
     /// The read-only glob that matches the profile name or one of its
@@ -855,6 +981,81 @@ impl EffectivePolicy {
 pub struct WatermarkSpec {
     /// `watermark_text`, put in front.
     pub text: Option<String>,
+}
+
+/// The environment a cluster is in (policy pack v2 `environments`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentMatch {
+    pub name: String,
+    pub tier: u32,
+}
+
+impl EnvironmentMatch {
+    fn new(name: &str, env: &Environment) -> Self {
+        Self {
+            name: name.to_string(),
+            tier: env.tier,
+        }
+    }
+
+    /// `'prod' (tier 3)`, for messages.
+    pub fn describe(&self) -> String {
+        format!("'{}' (tier {})", self.name, self.tier)
+    }
+}
+
+/// A record copy from a higher environment tier to a lower one, and what
+/// the policy's `copy_down` rule says about it (`masked` or `forbid`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyDown {
+    pub from: EnvironmentMatch,
+    /// `None`: the destination is in no environment.
+    pub to: Option<EnvironmentMatch>,
+    pub rule: CopyDownRule,
+}
+
+impl CopyDown {
+    /// `from 'prod' (tier 3) to 'dev' (tier 1)`, or `… to a cluster in no
+    /// environment`.
+    pub fn describe(&self) -> String {
+        match &self.to {
+            Some(to) => format!("from {} to {}", self.from.describe(), to.describe()),
+            None => format!(
+                "from {} to a cluster in no environment",
+                self.from.describe()
+            ),
+        }
+    }
+}
+
+/// The environments of `rules` the cluster `profile` / `bootstrap` is in:
+/// those whose `profiles` glob matches the profile name or whose `brokers`
+/// glob matches one of its broker addresses; `default_environment` when
+/// none does. Empty when the rules have no environments.
+fn matching_environments<'r>(
+    rules: &'r PolicyRules,
+    profile: &str,
+    bootstrap: &str,
+) -> Vec<(&'r str, &'r Environment)> {
+    let matched: Vec<(&str, &Environment)> = rules
+        .environments
+        .iter()
+        .filter(|(_, env)| {
+            (!profile.is_empty() && env.profiles.iter().any(|g| glob_match(g, profile)))
+                || broker_list(bootstrap)
+                    .any(|b| env.brokers.iter().any(|g| broker_glob_match(g, b)))
+        })
+        .map(|(name, env)| (name.as_str(), env))
+        .collect();
+    if !matched.is_empty() {
+        return matched;
+    }
+    rules
+        .default_environment
+        .as_deref()
+        .and_then(|name| rules.environments.get_key_value(name))
+        .map(|(name, env)| vec![(name.as_str(), env)])
+        .unwrap_or_default()
 }
 
 /// The non-empty, trimmed entries of a comma-separated broker list.
@@ -1376,7 +1577,9 @@ pub fn authorize_write_at(
                 profile: request.audit_profile().to_string(),
                 action: request.label.to_string(),
                 target: request.target.to_string(),
-                outcome: refused.clone().unwrap_or_else(|| "requested".to_string()),
+                outcome: refused
+                    .clone()
+                    .unwrap_or_else(|| requested_outcome(policy, now, request)),
                 ok: refused.is_none(),
                 user: String::new(),
                 actor: request.actor.map(str::to_string),
@@ -1397,6 +1600,22 @@ pub fn authorize_write_at(
                 None => Ok(()),
             }
         }
+    }
+}
+
+/// The outcome of an allowed request entry: `requested`, and the cluster's
+/// environment when the policy names one (`requested (environment prod)`).
+/// The environment goes into this text rather than a new [`AuditEntry`]
+/// field, so the entry layout (and every front end that builds entries)
+/// stays as it is.
+fn requested_outcome(
+    policy: &EffectivePolicy,
+    now: Timestamp,
+    request: &WriteRequest<'_>,
+) -> String {
+    match policy.environment_at(now, request.profile, request.bootstrap) {
+        Some(env) => format!("requested (environment {})", env.name),
+        None => "requested".to_string(),
     }
 }
 
@@ -3050,5 +3269,183 @@ mod tests {
             &config,
             boom
         ));
+    }
+
+    #[test]
+    fn clusters_are_put_in_the_highest_matching_environment() {
+        let policy = crate::test_policy::environments(CopyDownRule::Masked);
+        let env = |profile: &str, bootstrap: &str| {
+            policy
+                .environment(profile, bootstrap)
+                .map(|e| (e.name, e.tier))
+        };
+        assert_eq!(env("prod-eu", "10.0.0.1:9092"), Some(("prod".into(), 3)));
+        // By broker address, whatever the profile is called.
+        assert_eq!(
+            env("dev-copy", "kafka1.prod.corp:9093"),
+            Some(("prod".into(), 3))
+        );
+        assert_eq!(env("", "b.staging.corp"), Some(("staging".into(), 2)));
+        assert_eq!(env("dev", "localhost:9092"), Some(("dev".into(), 1)));
+        assert_eq!(env("laptop", "10.1.1.1:9092"), None);
+
+        // Unmatched clusters fall into the default environment.
+        let mut with_default = policy.clone();
+        with_default.rules.default_environment = Some("staging".into());
+        assert_eq!(
+            with_default
+                .environment("laptop", "10.1.1.1:9092")
+                .map(|e| e.name),
+            Some("staging".into())
+        );
+        // No policy, or an untrusted one: no environment.
+        assert_eq!(
+            crate::test_policy::none().environment("prod-eu", "a.prod.corp"),
+            None
+        );
+        assert_eq!(
+            EffectivePolicy::invalid(PathBuf::new(), "bad".into())
+                .environment("prod-eu", "a.prod.corp"),
+            None
+        );
+    }
+
+    #[test]
+    fn environment_rules_add_to_the_global_ones() {
+        let policy = crate::test_policy::environments(CopyDownRule::Allow);
+        // `prod` forbids deleting topics; `dev` does not.
+        let refusal = policy
+            .check(PolicyAction::TopicsDelete, "prod-eu", "10.0.0.1:9092")
+            .unwrap_err();
+        assert!(
+            refusal.contains("`topics.delete` is forbidden in the environment 'prod'"),
+            "{}",
+            &*refusal
+        );
+        assert!(policy
+            .check(PolicyAction::TopicsDelete, "dev", "localhost:9092")
+            .is_ok());
+        assert!(policy
+            .check(PolicyAction::Produce, "prod-eu", "10.0.0.1:9092")
+            .is_ok());
+        // `staging` is read-only, matched by its brokers.
+        let refusal = policy
+            .check(PolicyAction::Produce, "", "kafka.staging.corp:9092")
+            .unwrap_err();
+        assert!(
+            refusal.contains("in the read-only environment 'staging'"),
+            "{}",
+            &*refusal
+        );
+        // Rules of every matching environment apply, not only the highest.
+        assert!(policy
+            .check(PolicyAction::Produce, "dev", "kafka.staging.corp:9092")
+            .is_err());
+        // A cluster in no environment only has the global rules.
+        assert!(policy
+            .check(PolicyAction::TopicsDelete, "laptop", "10.1.1.1:9092")
+            .is_ok());
+        // Broker-matched environment rules need the brokers the cluster reports.
+        assert!(policy.write_needs_broker_metadata());
+        assert!(!policy.copy_down_needs_broker_metadata());
+        assert!(crate::test_policy::environments(CopyDownRule::Forbid)
+            .copy_down_needs_broker_metadata());
+    }
+
+    #[test]
+    fn copies_down_are_found_by_tier() {
+        let now = Timestamp::now();
+        let policy = crate::test_policy::environments(CopyDownRule::Masked);
+        let down = policy
+            .copy_down_at(now, "prod-eu", "a.prod.corp", "dev", "localhost")
+            .unwrap();
+        assert_eq!(down.rule, CopyDownRule::Masked);
+        assert_eq!(down.describe(), "from 'prod' (tier 3) to 'dev' (tier 1)");
+        // Up or sideways is not down.
+        assert_eq!(
+            policy.copy_down_at(now, "dev", "localhost", "prod-eu", "a.prod.corp"),
+            None
+        );
+        assert_eq!(
+            policy.copy_down_at(now, "prod-eu", "a.prod.corp", "prod-us", "b.prod.corp"),
+            None
+        );
+        // A destination in no environment counts as below every tier.
+        let down = policy
+            .copy_down_at(now, "", "b.staging.corp", "laptop", "10.1.1.1")
+            .unwrap();
+        assert_eq!(down.to, None);
+        assert!(down.describe().ends_with("to a cluster in no environment"));
+        // A source in no environment is not judged.
+        assert_eq!(
+            policy.copy_down_at(now, "laptop", "10.1.1.1", "dev", "localhost"),
+            None
+        );
+        // A destination in two environments counts as the lower one.
+        let down = policy
+            .copy_down_at(
+                now,
+                "",
+                "b.staging.corp",
+                "dev-mixed",
+                "x.staging.corp,localhost",
+            )
+            .unwrap();
+        assert_eq!(down.to.map(|e| e.name), Some("dev".to_string()));
+        // `allow` (the default) never reports a copy down.
+        assert_eq!(
+            crate::test_policy::environments(CopyDownRule::Allow).copy_down_at(
+                now,
+                "prod-eu",
+                "a.prod.corp",
+                "dev",
+                "localhost"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_request_entry_names_the_environment() {
+        let policy = crate::test_policy::environments(CopyDownRule::Allow);
+        let log = FakeLog::new(true);
+        let req = request(PolicyAction::Produce, "dev");
+        authorize_write_with(&policy, &log, &req, AuditMode::RecordRequest, || Ok(())).unwrap();
+        assert_eq!(
+            log.entries.borrow()[0].outcome,
+            "requested (environment dev)"
+        );
+        // Without an environment the entry is as before.
+        let log = FakeLog::new(true);
+        let req = WriteRequest {
+            bootstrap: "10.1.1.1:9092",
+            ..request(PolicyAction::Produce, "laptop")
+        };
+        authorize_write_with(&policy, &log, &req, AuditMode::RecordRequest, || Ok(())).unwrap();
+        assert_eq!(log.entries.borrow()[0].outcome, "requested");
+    }
+
+    #[test]
+    fn environment_rules_sign_as_format_2_and_bad_ones_are_refused() {
+        let (pkcs8, public) = generate_keypair().unwrap();
+        let payload = r#"{"issuer":"x","rules":{"environments":{"prod":{"tier":3,"brokers":["*.prod.corp"]},"dev":{"tier":1}},"default_environment":"dev","copy_down":"forbid"}}"#;
+        let signed = sign(&pkcs8, payload).unwrap();
+        assert_eq!(signed.format, POLICY_FORMAT_V2);
+        let text = serde_json::to_string(&signed).unwrap();
+        let parsed = verify(&text, &public).unwrap();
+        assert_eq!(parsed.rules.copy_down, CopyDownRule::Forbid);
+        for bad in [
+            r#"{"rules":{"copy_down":"masked"}}"#,
+            r#"{"rules":{"environments":{"prod":{"tier":3}},"default_environment":"dev"}}"#,
+            r#"{"rules":{"environments":{"prod":{"tier":3,"forbid":["topics.nuke"]}}}}"#,
+            r#"{"rules":{"environments":{"prod":{"tier":3,"read-only":true}}}}"#,
+        ] {
+            assert!(sign(&pkcs8, bad).is_err(), "{bad}");
+        }
+        // A format 1 file may not carry them.
+        let mut v1 = signed.clone();
+        v1.format = POLICY_FORMAT_V1;
+        let text = serde_json::to_string(&v1).unwrap();
+        assert!(matches!(verify(&text, &public), Err(PolicyError::Rules(_))));
     }
 }

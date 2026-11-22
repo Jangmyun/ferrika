@@ -119,6 +119,31 @@ The RabbitMQ entries below are planned for 0.2.0.
   broker-address rules match both the management and the AMQP
   `host:port`. `PolicyAction` gains `MessagesPeek` and `MessagesMove` (a
   breaking change for code that matches on it).
+- Policy environments (format 2): `rules.environments` names environment
+  tiers (`"prod": {"tier": 3, "brokers": ["*.prod.corp"], "profiles":
+  ["prod-*"]}`), each matched by broker-address and/or profile-name globs,
+  with an optional `default_environment` for unmatched clusters. Each
+  environment can add `read_only: true` and its own `forbid` categories on
+  top of the global ones. `copy_down: allow | masked | forbid` (default
+  `allow`) governs record copies from a higher tier to a lower one (or to a
+  cluster in no environment): `masked` needs `transform --mask` as the
+  first step or `mirror --mask`, `forbid` refuses them. Checked in the
+  shared `authorize_copy` and `EffectivePolicy::check`, so `mirror`,
+  `transform --execute`, MCP write tools and the desktop app apply the same
+  rules. `policy show` lists the environments, `profile list` gains an
+  `ENV` column (and an `environment` JSON field), and an allowed change's
+  audit request entry reads `requested (environment prod)`. See
+  docs/POLICY.md "Environments".
+- `ferrika mirror --mask[=redact]`: masks PII in keys, values and header
+  values (the transform mask step) before writing, so a mirror passes
+  enforced masking and `copy_down: masked`. It cannot be combined with
+  `--grep`, `-k` or `--header-filter`, which read raw values.
+- Library: `ferrika_core::model::policy::{Environment, CopyDownRule}` and
+  the `PolicyRules` fields `environments`, `default_environment` and
+  `copy_down`; `ferrika_governance::policy::{EnvironmentMatch, CopyDown}`
+  with `EffectivePolicy::{environment, copy_down,
+  copy_down_needs_broker_metadata}`. Code that builds `PolicyRules`
+  without `..Default::default()` must add the new fields.
 
 ### Changed
 
@@ -164,6 +189,13 @@ The RabbitMQ entries below are planned for 0.2.0.
   is invalid for builds before 0.2.0 (unknown category), so they fall back
   to the strictest mode. Roll such a policy out only once every client runs
   0.2.0 or later.
+- A signed policy that uses `environments`, `default_environment` or
+  `copy_down` is format 2, and builds without environment support refuse
+  it as having unknown rules (they do not ignore the section), so they run
+  in the strictest mode until updated. Update every client first. Policies
+  without these fields are unchanged and still signed as format 1.
+- Under enforced masking `mirror --mask` is now allowed (plain `mirror`
+  is still refused).
 
 ### Fixed
 
