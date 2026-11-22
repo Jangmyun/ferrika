@@ -33,7 +33,8 @@ python3 tools/e2e/mcp_smoke.py target/debug/ferrika --broker localhost:9092 \
 
 # RabbitMQ: profiles, queues/exchanges/bindings, publish, peek, dead-lettering,
 # dlq inspect and redrive (preview and --execute), read-only profiles, audit.
-docker run -d --name ferrika-rabbit-test -p 15672:15672 -p 5672:5672   -e RABBITMQ_DEFAULT_USER=zz -e RABBITMQ_DEFAULT_PASS=zz-pw rabbitmq:4-management
+docker run -d --name ferrika-rabbit-test -p 15672:15672 -p 5672:5672 \
+  -e RABBITMQ_DEFAULT_USER=zz -e RABBITMQ_DEFAULT_PASS=zz-pw rabbitmq:4-management
 python3 tools/e2e/rabbit_smoke.py target/debug/ferrika --url http://localhost:15672 \
   --user zz --password zz-pw --amqp-url amqp://localhost:5672
 ```
