@@ -9,7 +9,7 @@ The quickest check is the smoke test, which needs one plain broker
 [`tools/e2e/smoke.py`](../../tools/e2e/smoke.py) and the README.
 
 The same smoke test runs against Redpanda, a Kafka API compatible broker
-(CI does both):
+(CI runs it against Kafka, Redpanda and AutoMQ):
 
 ```bash
 docker run -d --name redpanda -p 9092:9092 docker.redpanda.com/redpandadata/redpanda:v26.3.1 \
@@ -52,6 +52,17 @@ private (mode 0600 on POSIX). If the AMQP port is not reachable on
 `localhost` (for example Docker in WSL with 5672 in a reserved Windows port
 range), pass the container host's address in `--amqp-url`.
 
+And against AutoMQ (one node on an S3-compatible store; it starts in under a
+minute once the images are pulled, and needs about 2 GB of memory):
+
+```bash
+docker compose -f docs/e2e/automq-compose.yml up -d
+python3 tools/e2e/smoke.py target/debug/ferrika --broker localhost:49092
+BOOTSTRAP=localhost:49092 KAFKA_CONTAINER=ferrika-automq-automq-1 \
+  KAFKA_BIN=/opt/automq/kafka/bin FERRIKA=./target/debug/ferrika bash docs/e2e/undo.sh
+docker compose -f docs/e2e/automq-compose.yml down -v
+```
+
 | File | What it starts or does |
 | --- | --- |
 | `kafka-sasl-compose.yml` | Three-node KRaft cluster with SASL/PLAIN on `localhost:19092` |
@@ -60,7 +71,7 @@ range), pass the container host's address in `--amqp-url`.
 | `kafka-oauth-compose.yml` | One broker that accepts unsecured JWTs on `localhost:19096`, plus a token endpoint on `localhost:18080` served by `oauth-idp.py` |
 | `oauth-idp.py` | Test-only OAuth 2.0 client-credentials endpoint (standard library only) |
 | `redpanda-compose.yml` | Three-node Redpanda (Kafka API on `localhost:39092`-`39094`, Schema Registry on `localhost:38081`) |
-| `automq-compose.yml` | One-node AutoMQ on MinIO (Kafka API on `localhost:49092`); not run yet, see the file header |
+| `automq-compose.yml` | One-node AutoMQ 1.7.5 on an S3-compatible store (Kafka API on `localhost:49092`); CI runs the smoke test against it |
 | `undo.sh` | Checks `ferrika history` and `ferrika undo` against a broker; the header lists its variables |
 
 Usage, for example (undo check against a plain single-node broker):
