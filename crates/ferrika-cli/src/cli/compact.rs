@@ -144,6 +144,16 @@ async fn fetch_compacted_records(
     Ok(read.records.iter().map(|m| to_record(m, mask)).collect())
 }
 
+/// A record key as compared and shown: its text, or `0x` and hex when it is
+/// not UTF-8 (lossy text would merge binary keys that differ only in their
+/// invalid bytes, e.g. Avro or varint keys).
+fn key_text(key: &[u8]) -> String {
+    match std::str::from_utf8(key) {
+        Ok(text) => text.to_string(),
+        Err(_) => format!("0x{}", crate::model::format::to_hex(key)),
+    }
+}
+
 /// One scanned record. With `mask`, the preview is cut from the masked
 /// payload, so a cut cannot expose part of a value.
 fn to_record(msg: &ConsumedMessage, mask: bool) -> CompactedRecord {
@@ -155,10 +165,7 @@ fn to_record(msg: &ConsumedMessage, mask: bool) -> CompactedRecord {
         msg.payload_str().map(|s| ellipsize(s, 60))
     };
     let record = CompactedRecord::new(
-        msg.key
-            .as_deref()
-            .map(|k| String::from_utf8_lossy(k).into_owned())
-            .unwrap_or_default(),
+        msg.key.as_deref().map(key_text).unwrap_or_default(),
         msg.partition,
         msg.offset,
         msg.timestamp_ms.unwrap_or(0),
@@ -511,6 +518,15 @@ async fn run_tombstones(args: CompactTombstonesArgs, global: &GlobalOpts) -> Kaf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_keys_stay_apart() {
+        assert_eq!(key_text(b"order-1"), "order-1");
+        let a = key_text(&[0x00, 0xff, 0x01]);
+        let b = key_text(&[0x00, 0xfe, 0x01]);
+        assert_ne!(a, b);
+        assert_eq!(a, "0x00ff01");
+    }
 
     #[test]
     fn snapshot_lines_hold_the_whole_value() {
