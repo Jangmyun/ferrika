@@ -381,6 +381,8 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
     // Offsets of processed records that could not be stored (`--group`).
     let mut store_failures = 0usize;
     let mut read_errors = 0usize;
+    // The group permission hint is shown once, at the first refusal.
+    let mut group_hint_shown = false;
     let idle_timeout = args.timeout.map(Duration::from_millis);
     // Buffer terminal output: println! issues one write per message, which dominates
     // the cost of consuming large topics. Buffers are flushed whenever the stream pauses.
@@ -529,9 +531,10 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                     }
                     ReadEvent::Error(err) => {
                         eprintln!("{} Consumer error: {err}", "✖".red());
-                        if read_errors == 0 {
+                        if !group_hint_shown {
                             if let Some(hint) = group_permission_hint(&err, kafka_config.group_id.as_deref()) {
                                 eprintln!("  {} {hint}", "ℹ".cyan());
+                                group_hint_shown = true;
                             }
                         }
                         read_errors += 1;
