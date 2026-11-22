@@ -32,7 +32,12 @@ and 0.2.0 makes it crate-internal.
 - Library: `TaggedDeliveryPipeline`, `KafkaConsumerClient::store_processed_offset`,
   `generate_minimal_move_plan`, `replicas_to_move`, `Endpoint::with_timeout`,
   `SchemaRegistryClient::with_timeout`, `ConnectClient::with_timeout`,
-  `audit::recent_matching`.
+  `audit::recent_matching`, `exporter::scrape_cluster_metrics_checked`,
+  `model::acl::kafka_principal`, `model::quota::{canonical_quota_entity,
+  same_quota_entity}`.
+- `monitor export` serves `ferrika_scrape_success` (0 when a step of the last
+  scrape failed). A failed scrape used to look like a cluster with no brokers
+  and no lag, so other alerts went quiet.
 
 ### Fixed
 
@@ -113,6 +118,28 @@ and 0.2.0 makes it crate-internal.
   troubleshooting hints as `topics` and `consume`.
 - The hint for a GSSAPI (Kerberos) profile that fails to connect had runs of
   spaces in the middle of its sentence.
+- A line of `audit.log` or the operation history cut inside a multi-byte
+  character (a crash) made `audit verify` fail and hid every later entry from
+  `audit`, undo and history; trimming the history then dropped them.
+- Topic create and delete, partition add, group delete and purge waited up to
+  60 s for an unreachable broker whatever `--timeout` said.
+- `lint` B006 proposed setting a broker config to "" when most brokers leave
+  it unset; it now removes that broker's override.
+- `acl create -p Group:devs` created an ACL for `User:Group:devs`, which never
+  applies.
+- `connect list` and `connect status` with `-f json` printed connector
+  secrets that the text view masks.
+- `connect delete` and `schema delete-subject` exited 0 when the
+  confirmation could not be read (no terminal); they now fail.
+- `user create --iterations` is checked against Kafka's 4096 to 16384.
+- `quota set`/`quota remove` could record no earlier value for a user and
+  client-id entity, so `undo` removed the quota instead of restoring it.
+- `health --watch --webhook` lost a change when one post failed; it is sent
+  again on the next poll. Log dir failures on different brokers no longer
+  merge into one finding.
+- `monitor lag` without a group showed every group as Stable with lag 0; it
+  shows their real state, members and lag. `monitor --watch` no longer ends
+  on an error after the first refresh.
 
 ### Changed
 
