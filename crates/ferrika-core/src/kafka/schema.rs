@@ -189,6 +189,29 @@ impl SchemaRegistryClient {
         .map(|_| ())
     }
 
+    /// Whether `schema` is compatible with every registered version of
+    /// `subject` under its compatibility level, as registering checks a
+    /// `*_TRANSITIVE` level (`POST /compatibility/subjects/{s}/versions`).
+    pub async fn is_compatible_with_all_versions(
+        &self,
+        subject: &str,
+        schema: &str,
+        schema_type: &str,
+    ) -> KafkaResult<bool> {
+        let body = schema_body(schema, schema_type);
+        let response = self
+            .http(
+                "POST",
+                &format!("/compatibility/subjects/{}/versions", path_segment(subject)),
+                Some(&body),
+            )
+            .await?;
+        serde_json::from_str::<serde_json::Value>(&response)
+            .ok()
+            .and_then(|v| v.get("is_compatible").and_then(|b| b.as_bool()))
+            .ok_or_else(|| KafkaError::schema("Unexpected compatibility check response"))
+    }
+
     /// Whether `schema` could be registered under `subject` (checked against
     /// the latest version with the subject's compatibility level).
     pub async fn is_compatible(

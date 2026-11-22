@@ -88,9 +88,11 @@ pub enum SchemaSubcommands {
         /// Schema Registry URL (defaults to the profile's, else http://localhost:8081)
         #[arg(short = 'S', long)]
         registry_url: Option<String>,
-        /// Compatibility mode: backward, forward, full, none (or *_transitive)
-        #[arg(short = 'm', long, default_value = "backward")]
-        mode: String,
+        /// Check under this mode instead: backward, forward, full, none (or
+        /// *_transitive), evaluated locally. Without it the registry checks
+        /// the schema under the subject's own level, as `register` will.
+        #[arg(short = 'm', long)]
+        mode: Option<String>,
         /// Fail with non-zero exit code if candidate schema is incompatible
         #[arg(long)]
         fail_on_incompatible: bool,
@@ -347,7 +349,7 @@ pub async fn handle_schema_command(args: SchemaArgs, global: &GlobalOpts) -> Kaf
                 &subject,
                 &schema_file,
                 &registry(registry_url, global),
-                &mode,
+                mode.as_deref(),
                 fail_on_incompatible,
                 global,
             )
@@ -840,11 +842,10 @@ async fn handle_check_schema(
     subject: &str,
     schema_file: &str,
     registry_url: &str,
-    mode_str: &str,
+    mode_str: Option<&str>,
     fail_on_incompatible: bool,
     global: &GlobalOpts,
 ) -> KafkaResult<()> {
-    let (mode, transitive) = parse_compat_mode(mode_str)?;
     let candidate_schema = fs::read_to_string(schema_file).map_err(|e| {
         KafkaError::io(format!(
             "Failed to read candidate schema file '{schema_file}': {e}"
@@ -852,6 +853,17 @@ async fn handle_check_schema(
     })?;
 
     let client = SchemaRegistryClient::new(registry_url).with_timeout(global.http_timeout());
+    let Some(mode_str) = mode_str else {
+        return registry_check(
+            subject,
+            &candidate_schema,
+            &client,
+            fail_on_incompatible,
+            global,
+        )
+        .await;
+    };
+    let (mode, transitive) = parse_compat_mode(mode_str)?;
     // Transitive: the number of registered versions checked.
     let mut checked: Option<usize> = None;
     let report = if transitive {
@@ -889,6 +901,111 @@ async fn handle_check_schema(
         )));
     }
 
+    Ok(())
+}
+
+/// `schema check` without `-m`: the registry's own verdict under the
+/// subject's configured level, against every version for a `*_TRANSITIVE`
+/// level, as `register` applies it (any schema type). The local field-level
+/// comparison against the latest version adds detail when it can read the
+/// schemas; where it disagrees, the registry decides.
+async fn registry_check(
+    subject: &str,
+    candidate: &str,
+    client: &SchemaRegistryClient,
+    fail_on_incompatible: bool,
+    global: &GlobalOpts,
+) -> KafkaResult<()> {
+    let latest = client.get_latest_subject_schema(subject).await?;
+    // The level is only shown: not being allowed to read it does not stop
+    // the check.
+    let level = client
+        .compatibility(subject)
+        .await
+        .unwrap_or_else(|_| "unknown".to_string());
+    // `.../versions` applies the subject's level itself, against every
+    // version when it is transitive. A registry without that endpoint (404,
+    // 405) is asked about the latest version; any other error stops here.
+    let mut latest_only = false;
+    let compatible = match client
+        .is_compatible_with_all_versions(subject, candidate, &latest.schema_type)
+        .await
+    {
+        Ok(compatible) => compatible,
+        Err(e)
+            if ["returned 404", "returned 405"]
+                .iter()
+                .any(|code| e.to_string().contains(code)) =>
+        {
+            latest_only = true;
+            if global.format != OutputFormat::Json {
+                eprintln!(
+                    "{} This registry cannot check every version; checked against the latest only.",
+                    "!".yellow()
+                );
+            }
+            client
+                .is_compatible(subject, candidate, &latest.schema_type)
+                .await?
+        }
+        Err(e) => return Err(e),
+    };
+    let mode = parse_compat_mode(&level).map_or(CompatibilityMode::Backward, |(m, _)| m);
+    let local_report = evaluate_compatibility(Some(subject), &latest.schema, candidate, mode).ok();
+    // `None`: the local comparison could not read the schemas.
+    let local = local_report.as_ref().map(|r| r.is_compatible);
+    let mut report = local_report.unwrap_or_else(|| CompatibilityReport {
+        subject: Some(subject.to_string()),
+        mode,
+        is_compatible: compatible,
+        violations: Vec::new(),
+        added_fields: Vec::new(),
+        deleted_fields: Vec::new(),
+        modified_fields: Vec::new(),
+    });
+    report.is_compatible = compatible;
+    if global.format != OutputFormat::Json {
+        eprintln!(
+            "{}",
+            format!("Checked by the Schema Registry under the subject's level {level}.")
+                .bright_black()
+        );
+        if local.is_some_and(|local| local != compatible) {
+            eprintln!(
+                "{} The field-level comparison below says {}; the registry's verdict decides.",
+                "!".yellow(),
+                if local == Some(true) {
+                    "compatible"
+                } else {
+                    "incompatible"
+                }
+            );
+        }
+    }
+    if global.format == OutputFormat::Json {
+        // Says where the verdict comes from: `violations` are the local
+        // comparison's and may disagree with it.
+        let mut json = serde_json::to_value(&report).map_err(|e| {
+            KafkaError::Serialization(format!("Failed to serialize the report: {e}"))
+        })?;
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert("checked_by".into(), "registry".into());
+            obj.insert("registry_level".into(), level.clone().into());
+            obj.insert("local_is_compatible".into(), local.into());
+            obj.insert(
+                "checked_versions".into(),
+                if latest_only { "latest" } else { "all" }.into(),
+            );
+        }
+        output::print_json(&json)?;
+    } else {
+        render_compatibility_report(&report, None, global)?;
+    }
+    if fail_on_incompatible && !compatible {
+        return Err(KafkaError::Check(format!(
+            "Schema Compatibility Failure: the registry finds the candidate schema for subject '{subject}' incompatible under {level}"
+        )));
+    }
     Ok(())
 }
 
@@ -1022,6 +1139,122 @@ fn render_compatibility_report(
 
 #[cfg(test)]
 mod tests {
+    /// A Schema Registry stand-in answering requests by path.
+    async fn mock_registry(routes: Vec<(String, String)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&request);
+                let path = text.split_whitespace().nth(1).unwrap_or("").to_string();
+                let body = routes
+                    .iter()
+                    .find(|(p, _)| *p == path)
+                    .map_or_else(|| "{}".to_string(), |(_, b)| b.clone());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn without_a_mode_the_registry_verdict_decides() {
+        let latest = serde_json::json!({
+            "subject": "orders-value", "version": 1, "id": 1,
+            "schema": r#"{"type":"record","name":"O","fields":[{"name":"a","type":"string"}]}"#,
+        })
+        .to_string();
+        // Adds a field without a default: the local BACKWARD check calls it
+        // incompatible; this subject's level is NONE, so the registry agrees
+        // to it, and that is what `register` will do.
+        let candidate = r#"{"type":"record","name":"O","fields":[{"name":"a","type":"string"},{"name":"b","type":"int"}]}"#;
+        let routes = |compatible: bool| {
+            vec![
+                (
+                    "/subjects/orders-value/versions/latest".to_string(),
+                    latest.clone(),
+                ),
+                (
+                    "/config/orders-value".to_string(),
+                    r#"{"compatibilityLevel":"NONE"}"#.to_string(),
+                ),
+                (
+                    "/compatibility/subjects/orders-value/versions/latest".to_string(),
+                    format!(r#"{{"is_compatible":{compatible}}}"#),
+                ),
+                (
+                    "/compatibility/subjects/orders-value/versions".to_string(),
+                    format!(r#"{{"is_compatible":{compatible}}}"#),
+                ),
+            ]
+        };
+        let global = super::GlobalOpts {
+            profile: None,
+            bootstrap_servers: None,
+            format: super::OutputFormat::Json,
+            timeout: 5,
+            resolved: None,
+            write: None,
+        };
+        // A level the check may not read does not stop it.
+        let mut no_config = routes(true);
+        no_config.retain(|(path, _)| !path.starts_with("/config"));
+        let url = mock_registry(no_config).await;
+        let client = super::SchemaRegistryClient::new(&url);
+        assert!(
+            super::registry_check("orders-value", candidate, &client, true, &global)
+                .await
+                .is_ok()
+        );
+
+        // A transitive level is checked against every version: compatible
+        // with the latest but not with an older one is incompatible.
+        let mut transitive = routes(true);
+        transitive.retain(|(path, _)| {
+            !path.starts_with("/config") && path != "/compatibility/subjects/orders-value/versions"
+        });
+        transitive.push((
+            "/config/orders-value".to_string(),
+            r#"{"compatibilityLevel":"FULL_TRANSITIVE"}"#.to_string(),
+        ));
+        transitive.push((
+            "/compatibility/subjects/orders-value/versions".to_string(),
+            r#"{"is_compatible":false}"#.to_string(),
+        ));
+        let url = mock_registry(transitive).await;
+        let client = super::SchemaRegistryClient::new(&url);
+        assert!(
+            super::registry_check("orders-value", candidate, &client, true, &global)
+                .await
+                .is_err()
+        );
+
+        for (compatible, expect_ok) in [(true, true), (false, false)] {
+            let url = mock_registry(routes(compatible)).await;
+            let client = super::SchemaRegistryClient::new(&url);
+            let result =
+                super::registry_check("orders-value", candidate, &client, true, &global).await;
+            assert_eq!(
+                result.is_ok(),
+                expect_ok,
+                "registry says {compatible}: {result:?}"
+            );
+        }
+    }
+
     #[test]
     fn printed_registry_urls_carry_no_credentials() {
         for url in [
@@ -1223,7 +1456,7 @@ mod tests {
             } => {
                 assert_eq!(subject, "orders-value");
                 assert_eq!(schema_file, "./schema.json");
-                assert_eq!(mode, "forward");
+                assert_eq!(mode.as_deref(), Some("forward"));
                 assert!(fail_on_incompatible);
             }
             _ => panic!("Expected Check subcommand"),
