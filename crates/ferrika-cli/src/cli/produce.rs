@@ -235,15 +235,29 @@ pub async fn run(args: ProduceArgs, global: &GlobalOpts) -> anyhow::Result<()> {
                 }
             }
         };
-        let ctrl_c = tokio::signal::ctrl_c();
-        tokio::pin!(ctrl_c);
+        let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
+        // The first Ctrl+C stops reading; the records sent so far are still
+        // awaited. Another one stops waiting for them.
+        let mut interrupted = false;
 
-        loop {
+        'read: loop {
+            // Room in the in-flight window first, so that Ctrl+C is heard
+            // while the broker is slow or down and no delivery completes.
+            while pipeline.in_flight() >= STDIN_MAX_IN_FLIGHT {
+                match until_stopped(pipeline.next_outcome(), ctrl_c.as_mut()).await {
+                    Some(Some(outcome)) => on_outcome(outcome),
+                    Some(None) => break,
+                    None => {
+                        interrupted = true;
+                        break 'read;
+                    }
+                }
+            }
             line_buf.clear();
             let read = tokio::select! {
                 read = reader.read_until(b'\n', &mut line_buf) => read,
-                _ = &mut ctrl_c => {
-                    println!("\n{}", "Interrupted by user (Ctrl+C). Flushing pending messages...".yellow());
+                _ = ctrl_c.as_mut() => {
+                    interrupted = true;
                     break;
                 }
             };
@@ -325,8 +339,44 @@ pub async fn run(args: ProduceArgs, global: &GlobalOpts) -> anyhow::Result<()> {
             }
         }
 
-        while let Some(outcome) = pipeline.next_outcome().await {
-            on_outcome(outcome);
+        if interrupted {
+            eprintln!(
+                "\n{}",
+                format!(
+                    "Interrupted by user (Ctrl+C). Waiting for {} pending message(s); press Ctrl+C again to stop now.",
+                    pipeline.in_flight()
+                )
+                .yellow()
+            );
+            // The first press is used up; wait for the next one.
+            ctrl_c = Box::pin(tokio::signal::ctrl_c());
+        }
+        // After EOF, a (first) Ctrl+C stops the wait as well: reading is over.
+        let mut abandoned = false;
+        loop {
+            match until_stopped(pipeline.next_outcome(), ctrl_c.as_mut()).await {
+                Some(Some(outcome)) => on_outcome(outcome),
+                Some(None) => break,
+                None => {
+                    abandoned = true;
+                    break;
+                }
+            }
+        }
+        if abandoned {
+            let unconfirmed = pipeline.in_flight();
+            let report = stop_report(delivered, failed + local_errors, unconfirmed);
+            eprintln!("\n{} Stopped: {report}.", "✖".red());
+            crate::cli::record_audit_result(false, &format!("interrupted (Ctrl+C); {report}"));
+            anyhow::bail!(
+                "interrupted with {unconfirmed} message(s) not confirmed; they may or may not have reached '{}'",
+                args.topic
+            );
+        }
+        if interrupted {
+            crate::cli::set_audit_result_detail(format!(
+                "interrupted (Ctrl+C) after {delivered} delivered message(s)"
+            ));
         }
         let _ = producer.flush(Some(Duration::from_secs(5)));
         println!(
@@ -348,6 +398,31 @@ pub async fn run(args: ProduceArgs, global: &GlobalOpts) -> anyhow::Result<()> {
         }
         Ok(())
     }
+}
+
+/// `work`'s output, or `None` when `stop` (Ctrl+C) completes first.
+async fn until_stopped<T, S>(
+    work: impl std::future::Future<Output = T>,
+    stop: std::pin::Pin<&mut S>,
+) -> Option<T>
+where
+    S: std::future::Future + ?Sized,
+{
+    tokio::select! {
+        biased;
+        _ = stop => None,
+        done = work => Some(done),
+    }
+}
+
+/// What an interrupted stdin run got done: delivered, failed and still
+/// unconfirmed messages (counts only, never record data).
+fn stop_report(delivered: usize, failed: usize, unconfirmed: usize) -> String {
+    let mut report = format!("{delivered} delivered, {unconfirmed} not confirmed");
+    if failed > 0 {
+        report.push_str(&format!(", {failed} failed"));
+    }
+    report
 }
 
 /// Removes a trailing `\n` or `\r\n` from a raw input line.
@@ -395,6 +470,60 @@ fn strip_bom(line: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_stop_signal_ends_a_wait_that_never_completes() {
+        // A full window whose deliveries never complete (broker down).
+        let stop = std::future::ready(());
+        tokio::pin!(stop);
+        let waited = until_stopped(std::future::pending::<u32>(), stop.as_mut()).await;
+        assert_eq!(waited, None);
+    }
+
+    #[tokio::test]
+    async fn a_completed_delivery_is_returned_while_no_stop_came() {
+        let stop = std::future::pending::<()>();
+        tokio::pin!(stop);
+        assert_eq!(until_stopped(async { 7 }, stop.as_mut()).await, Some(7));
+        // The same stop future is still usable for the next wait.
+        assert_eq!(until_stopped(async { 8 }, stop.as_mut()).await, Some(8));
+    }
+
+    #[tokio::test]
+    async fn the_window_waits_for_room_until_stopped() {
+        // A window of two deliveries that complete only when released.
+        let mut window = tokio::task::JoinSet::new();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        window.spawn(async move {
+            let _ = released.await;
+            1
+        });
+        window.spawn(std::future::pending::<i32>());
+        let (press, pressed) = tokio::sync::oneshot::channel::<()>();
+        let stop = async move {
+            let _ = pressed.await;
+        };
+        tokio::pin!(stop);
+        // Waiting for room ends when a delivery completes.
+        release.send(()).unwrap();
+        let first = until_stopped(window.join_next(), stop.as_mut()).await;
+        assert_eq!(first.flatten().map(Result::unwrap), Some(1));
+        // The other delivery never completes; Ctrl+C ends the wait.
+        press.send(()).unwrap();
+        assert!(until_stopped(window.join_next(), stop.as_mut())
+            .await
+            .is_none());
+        assert_eq!(window.len(), 1);
+    }
+
+    #[test]
+    fn the_stop_report_counts_without_record_data() {
+        assert_eq!(stop_report(3, 0, 2), "3 delivered, 2 not confirmed");
+        assert_eq!(
+            stop_report(0, 1, 5),
+            "0 delivered, 5 not confirmed, 1 failed"
+        );
+    }
 
     #[test]
     fn a_byte_order_mark_does_not_reach_the_record() {
