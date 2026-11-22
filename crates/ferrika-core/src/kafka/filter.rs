@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use regex::{Regex, RegexBuilder};
 
 use crate::error::{KafkaError, KafkaResult};
@@ -15,6 +13,36 @@ pub fn parse_header_pair(raw: &str) -> KafkaResult<(&str, &str)> {
         Some((key, value)) if !key.trim().is_empty() => Ok((key.trim(), value.trim())),
         _ => Err(KafkaError::config(format!(
             "Invalid header '{raw}'. Expected KEY:VALUE (e.g. trace_id:abc123)"
+        ))),
+    }
+}
+
+/// One `--header-filter`: the header `key` (compared case-insensitively)
+/// must be present with a value that contains `value` (`KEY:VALUE`,
+/// case-insensitive unless the filter is case-sensitive) or equals it
+/// exactly (`KEY=VALUE`, always case-sensitive).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderFilter {
+    pub key: String,
+    pub value: String,
+    /// `KEY=VALUE`: the whole value must be equal.
+    pub exact: bool,
+}
+
+/// Parses a `--header-filter` argument: `KEY:VALUE` (the value contains
+/// VALUE) or `KEY=VALUE` (the value is exactly VALUE). The first `:` or `=`
+/// splits, so `a=b:c` is an exact match for `b:c`. Both sides are trimmed;
+/// a missing separator or an empty key is an error.
+pub fn parse_header_filter(raw: &str) -> KafkaResult<HeaderFilter> {
+    match raw.find([':', '=']) {
+        Some(at) if !raw[..at].trim().is_empty() => Ok(HeaderFilter {
+            key: raw[..at].trim().to_string(),
+            value: raw[at + 1..].trim().to_string(),
+            exact: raw[at..].starts_with('='),
+        }),
+        _ => Err(KafkaError::config(format!(
+            "Invalid header filter '{raw}'. Expected KEY:VALUE (value contains) or \
+             KEY=VALUE (exact value), e.g. trace_id=abc123"
         ))),
     }
 }
@@ -39,8 +67,8 @@ pub struct MessageFilter {
     grep_regex: Option<Regex>,
     /// Pattern to match against message key (substring search).
     pub key_pattern: Option<String>,
-    /// Map of required header key-value pairs.
-    pub header_filters: HashMap<String, String>,
+    /// Required headers; every one must match.
+    pub header_filters: Vec<HeaderFilter>,
     /// Minimum message timestamp in epoch milliseconds (inclusive).
     pub from_timestamp_ms: Option<i64>,
     /// Maximum message timestamp in epoch milliseconds (inclusive).
@@ -78,9 +106,28 @@ impl MessageFilter {
         self
     }
 
-    /// Adds a required header key-value match.
-    pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.header_filters.insert(key.into(), value.into());
+    /// Adds a required header whose value contains `value`. Every header
+    /// filter added must match, also several for one key.
+    pub fn with_header(self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.with_header_filter(HeaderFilter {
+            key: key.into(),
+            value: value.into(),
+            exact: false,
+        })
+    }
+
+    /// Adds a required header whose value is exactly `value`.
+    pub fn with_header_exact(self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.with_header_filter(HeaderFilter {
+            key: key.into(),
+            value: value.into(),
+            exact: true,
+        })
+    }
+
+    /// Adds a required header (see [`parse_header_filter`]).
+    pub fn with_header_filter(mut self, filter: HeaderFilter) -> Self {
+        self.header_filters.push(filter);
         self
     }
 
@@ -134,25 +181,25 @@ impl MessageFilter {
             }
         }
 
-        // 3. Header checks
-        for (required_k, required_v) in &self.header_filters {
+        // 3. Header checks: every filter must match.
+        for required in &self.header_filters {
             // Find header with case-insensitive key comparison; of a repeated
             // key the last one counts, as when headers were a map.
             let found_val = msg.headers.iter().rev().find_map(|(k, v)| {
-                if k.eq_ignore_ascii_case(required_k) {
+                if k.eq_ignore_ascii_case(&required.key) {
                     Some(String::from_utf8_lossy(v).to_string())
                 } else {
                     None
                 }
             });
 
-            match found_val {
-                Some(val) => {
-                    if !self.str_matches(&val, required_v) {
-                        return false;
-                    }
-                }
-                None => return false,
+            let matched = match found_val {
+                Some(val) if required.exact => val == required.value,
+                Some(val) => self.str_matches(&val, &required.value),
+                None => false,
+            };
+            if !matched {
+                return false;
             }
         }
 
@@ -373,12 +420,89 @@ mod tests {
         assert!(filter.matches(&msg));
         let msg = make_test_message(None, Some("d"), &[("x", "2"), ("x", "1")], None);
         assert!(!filter.matches(&msg));
-        // The last filter for a key replaces earlier ones, as before.
+        // Every filter must match, also several for one key.
         let filter = MessageFilter::new()
             .with_header("x", "1")
             .with_header("x", "2");
-        assert!(filter.matches(&make_test_message(None, Some("d"), &[("x", "2")], None)));
+        assert!(!filter.matches(&make_test_message(None, Some("d"), &[("x", "2")], None)));
         assert!(!filter.matches(&make_test_message(None, Some("d"), &[("x", "1")], None)));
+        assert!(filter.matches(&make_test_message(None, Some("d"), &[("x", "12")], None)));
+    }
+
+    #[test]
+    fn exact_header_filter_needs_the_whole_value() {
+        let filter = MessageFilter::new().with_header_exact("env", "prod");
+        assert!(filter.matches(&make_test_message(
+            None,
+            Some("d"),
+            &[("ENV", "prod")],
+            None
+        )));
+        assert!(!filter.matches(&make_test_message(
+            None,
+            Some("d"),
+            &[("env", "prod-eu")],
+            None
+        )));
+        assert!(!filter.matches(&make_test_message(
+            None,
+            Some("d"),
+            &[("env", "PROD")],
+            None
+        )));
+        // A substring filter still matches the longer value.
+        let filter = MessageFilter::new().with_header("env", "prod");
+        assert!(filter.matches(&make_test_message(
+            None,
+            Some("d"),
+            &[("env", "prod-eu")],
+            None
+        )));
+        // Both kinds together: all must match.
+        let filter = MessageFilter::new()
+            .with_header_exact("env", "prod")
+            .with_header("region", "eu");
+        assert!(filter.matches(&make_test_message(
+            None,
+            Some("d"),
+            &[("env", "prod"), ("region", "eu-west")],
+            None
+        )));
+        assert!(!filter.matches(&make_test_message(
+            None,
+            Some("d"),
+            &[("env", "prod"), ("region", "us")],
+            None
+        )));
+    }
+
+    #[test]
+    fn parse_header_filter_splits_at_the_first_colon_or_equals_sign() {
+        let f = parse_header_filter("env:prod").unwrap();
+        assert_eq!(
+            (f.key.as_str(), f.value.as_str(), f.exact),
+            ("env", "prod", false)
+        );
+        let f = parse_header_filter(" env = prod ").unwrap();
+        assert_eq!(
+            (f.key.as_str(), f.value.as_str(), f.exact),
+            ("env", "prod", true)
+        );
+        let f = parse_header_filter("a=b:c").unwrap();
+        assert_eq!(
+            (f.key.as_str(), f.value.as_str(), f.exact),
+            ("a", "b:c", true)
+        );
+        let f = parse_header_filter("a:b=c").unwrap();
+        assert_eq!(
+            (f.key.as_str(), f.value.as_str(), f.exact),
+            ("a", "b=c", false)
+        );
+        let f = parse_header_filter("empty=").unwrap();
+        assert_eq!((f.value.as_str(), f.exact), ("", true));
+        assert!(parse_header_filter("noSeparator").is_err());
+        assert!(parse_header_filter("=value").is_err());
+        assert!(parse_header_filter(" :value").is_err());
     }
 
     #[test]

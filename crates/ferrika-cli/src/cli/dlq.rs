@@ -79,6 +79,19 @@ pub struct RedriveDlqArgs {
     #[arg(long = "from-offset", value_name = "[P:]N")]
     pub from_offset: Vec<String>,
 
+    /// Consumer group on the DLQ that records progress: a run starts at the
+    /// group's committed offsets and, with --execute, commits a record's
+    /// offset only after it was delivered to its target, so a later run with
+    /// the same group resumes there instead of sending the records again.
+    /// Use a group of its own (no running consumers).
+    #[arg(
+        short = 'g',
+        long,
+        value_name = "GROUP",
+        conflicts_with = "from_offset"
+    )]
+    pub group: Option<String>,
+
     /// Also redrive records that already carry the x-redriven-by marker
     /// (skipped by default so a record is not redriven twice)
     #[arg(long)]
@@ -334,7 +347,10 @@ async fn run_redrive(args: RedriveDlqArgs, global: &GlobalOpts) -> KafkaResult<(
         )));
     }
     let limit = args.limit.unwrap_or(100);
-    let start = RedriveStart::parse(&args.from_offset).map_err(KafkaError::Config)?;
+    let start = match &args.group {
+        Some(group) => group_start(&global.to_kafka_config(), group, &args.topic)?,
+        None => RedriveStart::parse(&args.from_offset).map_err(KafkaError::Config)?,
+    };
     let messages = fetch_redrive_messages(&args.topic, limit, &start, global).await?;
     let examined: Vec<(i32, i64)> = messages.iter().map(|m| (m.partition, m.offset)).collect();
 
@@ -368,13 +384,26 @@ async fn run_redrive(args: RedriveDlqArgs, global: &GlobalOpts) -> KafkaResult<(
         is_simulation,
         !args.include_redriven,
     );
+    if let Some(note) = rerun_note(
+        is_simulation,
+        args.group.as_deref(),
+        !args.from_offset.is_empty(),
+        global.wants_json(args.json),
+    ) {
+        // On stderr: JSON on stdout stays parseable.
+        eprintln!("{note}");
+    }
+    let commit = match (&args.group, is_simulation) {
+        (Some(group), false) => Some(GroupCommit::new(global, group, &args.topic)?),
+        _ => None,
+    };
 
     if global.wants_json(args.json) {
         // JSON mode must still publish with --execute; it only changes the report.
         let outcome = if is_simulation {
             None
         } else {
-            Some(publish_redrive(plan_items, global).await?)
+            Some(publish_redrive(plan_items, &examined, commit.as_ref(), global).await?)
         };
         let mut json = serde_json::to_value(&summary).map_err(|e| {
             KafkaError::Serialization(format!("Failed to serialize redrive summary: {e}"))
@@ -382,8 +411,13 @@ async fn run_redrive(args: RedriveDlqArgs, global: &GlobalOpts) -> KafkaResult<(
         if let (Some(obj), Some(outcome)) = (json.as_object_mut(), &outcome) {
             obj.insert("published".into(), outcome.published.into());
             obj.insert("failed".into(), outcome.failed.into());
-            let next = start.resume_after(&examined, &outcome.failed_positions);
-            obj.insert("next_from_offset".into(), next.to_args().into());
+            if args.group.is_none() {
+                let next = start.resume_after(&examined, &outcome.failed_positions);
+                obj.insert("next_from_offset".into(), next.to_args().into());
+            }
+        }
+        if let (Some(obj), Some(group)) = (json.as_object_mut(), &args.group) {
+            obj.insert("group".into(), group.clone().into());
         }
         output::print_json(&json)?;
         return outcome.map_or(Ok(()), RedriveOutcome::into_result);
@@ -407,6 +441,12 @@ async fn run_redrive(args: RedriveDlqArgs, global: &GlobalOpts) -> KafkaResult<(
         Cell::new("Source DLQ Topic"),
         Cell::new(&args.topic).fg(Color::Yellow),
     ]);
+    if let Some(group) = &args.group {
+        table.add_row(vec![
+            Cell::new("Consumer Group (progress)"),
+            Cell::new(group).fg(Color::Yellow),
+        ]);
+    }
     table.add_row(vec![
         Cell::new("Analyzed DLQ Records"),
         Cell::new(summary.total_examined.to_string()),
@@ -459,16 +499,26 @@ async fn run_redrive(args: RedriveDlqArgs, global: &GlobalOpts) -> KafkaResult<(
                 args.topic
             );
         } else {
-            println!("💡 Run with '--execute' to perform the live redrive:\n   ferrika dlq redrive {} --execute\n", args.topic);
+            let group = args
+                .group
+                .as_ref()
+                .map_or_else(String::new, |g| format!(" -g {g}"));
+            println!("💡 Run with '--execute' to perform the live redrive:\n   ferrika dlq redrive {}{group} --execute\n", args.topic);
         }
         return Ok(());
     }
 
-    let outcome = publish_redrive(plan_items, global).await?;
+    let outcome = publish_redrive(plan_items, &examined, commit.as_ref(), global).await?;
     println!(
         "✅ Redrive Complete: {} messages published successfully, {} failed.",
         outcome.published, outcome.failed
     );
+    if let Some(group) = &args.group {
+        println!(
+            "   Progress is committed to group '{group}': run the same command again to continue.\n"
+        );
+        return outcome.into_result();
+    }
     let next = start.resume_after(&examined, &outcome.failed_positions);
     let next_args: Vec<String> = next
         .to_args()
@@ -510,9 +560,126 @@ impl RedriveOutcome {
     }
 }
 
-/// Publishes every planned message to its destination topic.
+/// The note for a live redrive without `-g`: nothing records how far it
+/// got, so running it again sends the same records again. Left out when the
+/// run already continues from `--from-offset` (the caller tracks progress)
+/// and for JSON output, whose `next_from_offset` says where to continue and
+/// which scripts read from stdout and stderr together.
+fn rerun_note(
+    is_simulation: bool,
+    group: Option<&str>,
+    resumes: bool,
+    json: bool,
+) -> Option<&'static str> {
+    (!is_simulation && group.is_none() && !resumes && !json).then_some(
+        "Note: without -g/--group no progress is recorded; running this redrive again \
+         resends the same records. Pass -g <group> (or the --from-offset value printed \
+         at the end) to continue where it stopped.",
+    )
+}
+
+/// Where a redrive with `-g` starts: per partition of `topic`, the group's
+/// committed offset; partitions without one start at the beginning.
+fn group_start(
+    config: &crate::kafka::config::KafkaClientConfig,
+    group: &str,
+    topic: &str,
+) -> KafkaResult<RedriveStart> {
+    let mut all = crate::kafka::wire::fetch_group_offsets(config, &[group.to_string()])?;
+    let committed = all.remove(group).unwrap_or_default();
+    Ok(start_from_committed(&committed, topic))
+}
+
+/// [`group_start`] from the group's committed offsets.
+fn start_from_committed(
+    committed: &std::collections::HashMap<(String, i32), i64>,
+    topic: &str,
+) -> RedriveStart {
+    RedriveStart {
+        default: None,
+        partitions: committed
+            .iter()
+            .filter(|((t, _), offset)| t == topic && **offset >= 0)
+            .map(|((_, partition), offset)| (*partition, *offset))
+            .collect(),
+    }
+}
+
+/// Commits the progress of `dlq redrive -g` to its consumer group on the
+/// DLQ, without joining the group.
+struct GroupCommit {
+    consumer: crate::kafka::consumer::KafkaConsumerClient,
+    group: String,
+    topic: String,
+}
+
+impl GroupCommit {
+    fn new(global: &GlobalOpts, group: &str, topic: &str) -> KafkaResult<Self> {
+        let config = global.to_kafka_config().with_group_id(group);
+        Ok(Self {
+            consumer: crate::kafka::consumer::KafkaConsumerClient::new(&config)?,
+            group: group.to_string(),
+            topic: topic.to_string(),
+        })
+    }
+
+    /// Commits `next` (partition -> next offset to read).
+    fn commit(&self, next: &std::collections::BTreeMap<i32, i64>) -> KafkaResult<()> {
+        if next.is_empty() {
+            return Ok(());
+        }
+        let mut tpl = rdkafka::TopicPartitionList::new();
+        for (&partition, &offset) in next {
+            tpl.add_partition_offset(&self.topic, partition, rdkafka::Offset::Offset(offset))
+                .map_err(|e| KafkaError::Offset(e.to_string()))?;
+        }
+        self.consumer
+            .commit(&tpl, rdkafka::consumer::CommitMode::Sync)
+            .map_err(|e| {
+                KafkaError::Offset(format!(
+                    "could not commit the redrive progress to group '{}': {e}; records \
+                     delivered since the last commit are sent again by the next run",
+                    self.group
+                ))
+            })
+    }
+}
+
+/// Records sent between two progress commits of `dlq redrive -g`.
+const COMMIT_EVERY: usize = 50;
+
+/// What a redrive with a group commits as it goes: per partition, the
+/// offset after the last record that is delivered (or needed no sending)
+/// with every record before it, never past a record that failed (the
+/// mirror's [`crate::ops::mirror::CommitTracker`] rule).
+#[derive(Default)]
+struct RedriveProgress {
+    tracker: crate::ops::mirror::CommitTracker,
+    /// Next offsets not committed yet.
+    uncommitted: std::collections::BTreeMap<i32, i64>,
+}
+
+impl RedriveProgress {
+    /// The record at `(partition, offset)` is finished: `sent` when it was
+    /// handed to the producer, `done` when it was delivered or needed no
+    /// sending.
+    fn finished(&mut self, (partition, offset): (i32, i64), sent: bool, done: bool) {
+        if sent {
+            self.tracker.sent(partition, offset);
+        }
+        if let Some(last) = self.tracker.finished(partition, offset, done) {
+            self.uncommitted.insert(partition, last + 1);
+        }
+    }
+}
+
+/// Publishes every planned message to its destination topic, in the order
+/// the DLQ records were read (`examined`). With `commit`, the group's
+/// offsets follow the deliveries (see [`RedriveProgress`]).
 async fn publish_redrive(
     plan_items: Vec<RedrivePlanItem>,
+    examined: &[(i32, i64)],
+    commit: Option<&GroupCommit>,
     global: &GlobalOpts,
 ) -> KafkaResult<RedriveOutcome> {
     let config = global.to_kafka_config();
@@ -523,8 +690,20 @@ async fn publish_redrive(
         first_error: None,
         failed_positions: Vec::new(),
     };
+    let mut planned: std::collections::HashMap<(i32, i64), RedrivePlanItem> = plan_items
+        .into_iter()
+        .map(|item| ((item.source_partition, item.source_offset), item))
+        .collect();
+    let mut progress = RedriveProgress::default();
+    let mut since_commit = 0usize;
 
-    for item in plan_items {
+    for &position in examined {
+        // Skipped records (already redriven, no destination) need no
+        // sending; they are finished as they are.
+        let Some(item) = planned.remove(&position) else {
+            progress.finished(position, false, true);
+            continue;
+        };
         let mut record = OwnedProducerRecord::new(&item.target_topic);
         record.key = item.key;
         record.payload = item.payload;
@@ -532,16 +711,33 @@ async fn publish_redrive(
             record = record.with_header(hk, hv);
         }
 
-        match producer.send(&record, Some(Duration::from_secs(5))).await {
-            Ok(_) => outcome.published += 1,
+        let delivered = match producer.send(&record, Some(Duration::from_secs(5))).await {
+            Ok(_) => {
+                outcome.published += 1;
+                true
+            }
             Err(e) => {
                 outcome.failed += 1;
                 outcome.first_error.get_or_insert_with(|| e.to_string());
-                outcome
-                    .failed_positions
-                    .push((item.source_partition, item.source_offset));
+                outcome.failed_positions.push(position);
+                false
+            }
+        };
+        progress.finished(position, true, delivered);
+        since_commit += 1;
+        if let Some(commit) = commit {
+            if since_commit >= COMMIT_EVERY {
+                // A failed commit is retried with the next one.
+                match commit.commit(&progress.uncommitted) {
+                    Ok(()) => progress.uncommitted.clear(),
+                    Err(e) => tracing::warn!("{e}"),
+                }
+                since_commit = 0;
             }
         }
+    }
+    if let Some(commit) = commit {
+        commit.commit(&progress.uncommitted)?;
     }
     Ok(outcome)
 }
@@ -660,6 +856,67 @@ mod tests {
     struct Wrapper {
         #[command(subcommand)]
         cmd: DlqSubcommands,
+    }
+
+    #[test]
+    fn redrive_group_starts_at_the_committed_offsets_of_its_topic() {
+        let committed: std::collections::HashMap<(String, i32), i64> = [
+            (("dlq".to_string(), 0), 7),
+            (("dlq".to_string(), 2), 3),
+            (("other".to_string(), 1), 9),
+        ]
+        .into_iter()
+        .collect();
+        let start = start_from_committed(&committed, "dlq");
+        assert_eq!(start.default, None);
+        assert_eq!(start.offset_for(0), Some(7));
+        assert_eq!(start.offset_for(1), None);
+        assert_eq!(start.offset_for(2), Some(3));
+    }
+
+    #[test]
+    fn redrive_progress_commits_only_delivered_records() {
+        let mut progress = RedriveProgress::default();
+        // 0 skipped, 1 delivered: next read starts at 2.
+        progress.finished((0, 0), false, true);
+        progress.finished((0, 1), true, true);
+        assert_eq!(progress.uncommitted.get(&0), Some(&2));
+        // 2 fails: nothing from 2 on is committed, even after 3 is delivered.
+        progress.finished((0, 2), true, false);
+        progress.finished((0, 3), true, true);
+        assert_eq!(progress.uncommitted.get(&0), Some(&2));
+        // Partitions are kept apart.
+        progress.finished((1, 5), true, true);
+        assert_eq!(progress.uncommitted.get(&1), Some(&6));
+    }
+
+    #[test]
+    fn a_live_redrive_without_a_group_warns_about_reruns() {
+        assert!(rerun_note(false, None, false, false).is_some());
+        assert!(rerun_note(false, Some("redrive"), false, false).is_none());
+        assert!(rerun_note(true, None, false, false).is_none());
+        // Continuing from --from-offset, or JSON output: no note.
+        assert!(rerun_note(false, None, true, false).is_none());
+        assert!(rerun_note(false, None, false, true).is_none());
+    }
+
+    #[test]
+    fn redrive_group_parses_and_excludes_from_offset() {
+        let parsed = Wrapper::parse_from(["dlq", "redrive", "orders-dlq", "-g", "redrive-orders"]);
+        let DlqSubcommands::Redrive(args) = parsed.cmd else {
+            panic!("Expected Redrive subcommand");
+        };
+        assert_eq!(args.group.as_deref(), Some("redrive-orders"));
+        assert!(Wrapper::try_parse_from([
+            "dlq",
+            "redrive",
+            "orders-dlq",
+            "-g",
+            "g",
+            "--from-offset",
+            "3"
+        ])
+        .is_err());
     }
 
     #[test]

@@ -346,9 +346,18 @@ source queue and the destinations, never message bodies.
 ```bash
 ferrika quota list
 ferrika quota set --user billing-svc --key producer_byte_rate --value 1048576
-ferrika quota set --client-id default --key consumer_byte_rate --value 5242880
+ferrika quota set --client-id-default --key consumer_byte_rate --value 5242880
+ferrika quota set --user-default --key producer_byte_rate --value 2097152
 ferrika quota remove --user billing-svc --key producer_byte_rate
 ```
+
+`--user-default`, `--client-id-default` and `--ip-default` name the default
+quota of that kind (it applies to every user, client id or IP without its
+own); listings show it as `<default>`, e.g. `user=<default>`. `--user default`
+and `--client-id default` name a user or client id that is really called
+`default` (earlier releases took them as the default entity; the command
+prints a note when you pass them). `--ip default` still means the default IP
+quota, since `default` is no IP address.
 
 ### SCRAM users (`ferrika user`)
 
@@ -514,6 +523,10 @@ ferrika consume orders-v1 -k "user-" -s matched_users.jsonl
 ferrika consume orders-v1 -b -W '$.amount > 100 && $.status == "PAID"'
 ferrika consume orders-v1 -b -W 'key =~ "^eu-" && headers.source exists'
 
+# Filter by headers: KEY:VALUE = value contains (case-insensitive unless
+# --case-sensitive), KEY=VALUE = exact value; repeat it and every one must match
+ferrika consume orders-v1 -b --header-filter env=prod --header-filter trace_id:abc
+
 # Limit message count or idle timeout
 ferrika consume orders-v1 -n 100 -t 5000
 
@@ -533,7 +546,7 @@ Filter expressions (`-W`/`--where`, expressions that start with
 | `$.a.b`, `$.items[0]`, `$["odd key"]`, `$` | A field of the JSON value; `$` alone is the whole value |
 | `key`, `partition`, `offset`, `timestamp`, `headers.<name>` | Record fields (timestamp in epoch ms) |
 | `== != > >= < <=` | Compare; a number and a numeric string compare as numbers |
-| `=~ "regex"`, `contains "text"` | Case-insensitive match; `contains` also checks array elements |
+| `=~ "regex"`, `contains "text"` | Case-insensitive match (`=~` too: `key =~ "^EU-"` matches `eu-1`); `contains` also checks array elements |
 | `exists`, `&&`/`and`, `\|\|`/`or`, `!`/`not`, `( )` | Presence and logic; a bare field is true unless missing, null, false, 0 or "" |
 
 List the paths a subject's schema gives, e.g. to write `--where`: `ferrika schema fields --topic orders-v1 --plain` (or `ferrika schema fields orders-v1-value` for types, flags and enum values).
@@ -596,6 +609,9 @@ ferrika schema check orders-value -f ./candidate-schema.avsc -m full_transitive
 
 # Offline diff and evolutionary compatibility analysis between two local schema files
 ferrika schema diff-schema ./schemas/order-v1.avsc ./schemas/order-v2.avsc -m full
+
+# Exit 1 when a field was added, deleted or changed (0 when none, 2 on errors)
+ferrika schema diff-schema ./schemas/order-v1.avsc ./schemas/order-v2.avsc --exit-code
 ```
 
 ### 8. Synthetic Mock Event Generator (`ferrika generate`)
@@ -767,6 +783,11 @@ ferrika acl create -p "User:*" -o All -t "audit-log" --deny -H "198.51.100.0"
 # Delete the bindings for exactly this name (without -f it only previews)
 ferrika acl delete -t "orders-v1" -p "User:old-service" -f
 
+# Without a filter, delete needs --all (and still only previews without -f);
+# the preview states how many bindings that is
+ferrika acl delete --all
+ferrika acl delete --all -f
+
 # Run automated security audit to detect wildcards, over-permissive cluster rules, and allow/deny conflicts
 ferrika acl audit
 
@@ -837,6 +858,11 @@ ferrika dlq redrive orders-v1-dlq --execute
 # Override target destination topic during redrive
 ferrika dlq redrive orders-v1-dlq -t orders-v1-retry --execute
 
+# Record progress in a consumer group on the DLQ: an offset is committed only
+# after the record was delivered, so running it again continues instead of
+# resending (without -g a rerun sends the same records again; --execute says so)
+ferrika dlq redrive orders-v1-dlq -g redrive-orders --execute
+
 # Export toxic/failed messages with stacktraces to JSON file for developer debugging
 ferrika dlq export orders-v1-dlq -o ./failed-orders-report.json -n 500
 ```
@@ -866,6 +892,9 @@ ferrika diff staging.payments prod.payments -n 500 --show-identical
 
 # Output full JSON field-level drift tree in machine-readable JSON format
 ferrika diff topic-source topic-mirror --json
+
+# For scripts: exit 1 when the topics differ, 0 when they match, 2 on errors
+ferrika diff topic-source topic-mirror --exit-code
 ```
 
 ### 18. Kafka End-to-End Latency & Heartbeat Sentinel (`ferrika probe`)
@@ -921,6 +950,9 @@ ferrika cluster diff prod-cluster dr-cluster
 
 # Filter topic comparison by regex/prefix and include internal topics
 ferrika cluster diff prod-cluster dr-cluster --filter "orders" --include-internal
+
+# For scripts: exit 1 when a topic is missing or drifted, 0 when in sync, 2 on errors
+ferrika cluster diff prod-cluster dr-cluster --exit-code
 
 # Generate an automated remediation plan to bring destination cluster to 100% parity
 ferrika cluster reconcile-plan prod-cluster dr-cluster
@@ -985,6 +1017,14 @@ with 1, so `&&` and `set -e` work:
 | `probe` | no probe came back; with `--max-latency-ms`, also when any probe was lost or p99 exceeds the limit |
 | `monitor lag <group>` | the consumer group does not exist (no more "0 lag" for a typo) |
 | `crypto audit --fail-on-leak` | PII or a secret was found |
+
+`diff`, `cluster diff` and `schema diff-schema` take `--exit-code` (as
+`git diff --exit-code`): exit 0 when there are no differences, 1 when there
+are, and 2 on any error. Without it they exit 0 unless they fail.
+
+```bash
+ferrika diff orders-v1 orders-v2 --exit-code || echo "topics differ (1) or the diff failed (2)"
+```
 
 A reader that closes the pipe (`ferrika consume ... | head`) ends the command
 quietly with exit 0.

@@ -575,6 +575,49 @@ pub fn unreachable_bootstrap(bootstrap: &str, timeout: std::time::Duration) -> O
     closed_reason(&results)
 }
 
+/// The exit status of a failed command: 1, or 2 for a `diff` command run
+/// with `--exit-code` (where 1 means "differences found").
+static ERROR_EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+/// The exit status of a command that finished without an error: 0, or 1
+/// once a `diff` command run with `--exit-code` found differences.
+static FINISH_EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Switches to the exit statuses of `git diff --exit-code`: 0 for no
+/// differences, 1 for differences, 2 for an error. Set by `main` before the
+/// command runs, so errors before the comparison use 2 too.
+pub fn use_diff_exit_codes() {
+    ERROR_EXIT_CODE.store(2, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The exit status a failed command ends with (see [`use_diff_exit_codes`]).
+pub fn error_exit_code() -> i32 {
+    ERROR_EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The exit status of a `diff` command run with `--exit-code`: 1 when it
+/// found differences, else 0.
+pub fn diff_exit_status(differences: bool) -> i32 {
+    i32::from(differences)
+}
+
+/// Records the result of a comparison for `--exit-code`: the command ends
+/// with exit status 1 when `differences` is set (see [`finish_exit_code`]).
+/// Does nothing without `--exit-code` (`exit_code` false).
+pub fn report_differences(exit_code: bool, differences: bool) {
+    if exit_code {
+        FINISH_EXIT_CODE.store(
+            diff_exit_status(differences),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// The exit status of a command that returned without an error.
+pub fn finish_exit_code() -> i32 {
+    FINISH_EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Ends the process after a failed command. The error is printed unless
 /// [`print_connection_hint`] already showed it.
 pub fn exit_with_error(err: &dyn std::fmt::Display) -> ! {
@@ -593,7 +636,7 @@ pub fn exit_with_error(err: &dyn std::fmt::Display) -> ! {
     if !ERROR_REPORTED.load(std::sync::atomic::Ordering::Relaxed) {
         eprintln!("{} {message}", "Error:".red().bold());
     }
-    std::process::exit(1);
+    std::process::exit(error_exit_code());
 }
 
 pub fn print_connection_hint(config: &crate::kafka::config::KafkaClientConfig, error: &KafkaError) {
@@ -706,6 +749,12 @@ fn hint_kind(error: &KafkaError) -> HintKind {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diff_exit_status_follows_git_diff() {
+        assert_eq!(super::diff_exit_status(false), 0);
+        assert_eq!(super::diff_exit_status(true), 1);
+    }
+
     use super::{connection_hints, hint_kind, read_password_line, HintKind, KERBEROS_HINT};
 
     #[test]

@@ -254,6 +254,14 @@ with 1, so `&&` and `set -e` work:
 | `monitor lag <group>` | the consumer group does not exist (no more "0 lag" for a typo) |
 | `crypto audit --fail-on-leak` | PII or a secret was found |
 
+`diff`, `cluster diff` and `schema diff-schema` take `--exit-code` (as
+`git diff --exit-code`): exit 0 when there are no differences, 1 when there
+are, and 2 on any error. Without it they exit 0 unless they fail.
+
+```bash
+ferrika diff orders-v1 orders-v2 --exit-code || echo "topics differ (1) or the diff failed (2)"
+```
+
 A reader that closes the pipe (`ferrika consume ... | head`) ends the command
 quietly with exit 0.
 

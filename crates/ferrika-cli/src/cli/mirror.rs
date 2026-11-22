@@ -72,8 +72,10 @@ pub struct MirrorArgs {
     #[arg(short = 'k', long = "key-filter")]
     pub key_filter: Option<String>,
 
-    /// Filter messages by required header in KEY:VALUE format
-    #[arg(long = "header-filter")]
+    /// Copy only records with a header: KEY:VALUE (value contains VALUE,
+    /// case-insensitive) or KEY=VALUE (value is exactly VALUE). Header names
+    /// ignore case. Repeat it to require several; every one must match
+    #[arg(long = "header-filter", value_name = "KEY:VALUE|KEY=VALUE")]
     pub header_filter: Vec<String>,
 }
 
@@ -349,9 +351,9 @@ pub async fn run(args: MirrorArgs, global: &GlobalOpts) -> KafkaResult<()> {
         filter = filter.with_key(k);
     }
     for h in &args.header_filter {
-        let (k, v) = crate::kafka::filter::parse_header_pair(h)
+        let header = crate::kafka::filter::parse_header_filter(h)
             .map_err(|e| KafkaError::config(format!("--header-filter: {e}")))?;
-        filter = filter.with_header(k, v);
+        filter = filter.with_header_filter(header);
     }
 
     let mirror_config = MirrorConfig::new(&args.src_topic, &args.dst_topic)
