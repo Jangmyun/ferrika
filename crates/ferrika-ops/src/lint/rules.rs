@@ -778,6 +778,16 @@ fn broker_rules(f: &mut Findings, input: &LintInput, opts: &LintOptions, online:
     }
 }
 
+/// A broker config value for a message; Kafka reports an unset one (such
+/// as log.retention.ms) as empty.
+fn shown(value: &str) -> &str {
+    if value.is_empty() {
+        "not set"
+    } else {
+        value
+    }
+}
+
 /// B006 for one key: brokers whose value differs from the majority.
 fn drift(f: &mut Findings, brokers: &BTreeMap<i32, Configs>, key: &str) {
     let values: Vec<(i32, &str, Option<ConfigOrigin>)> = brokers
@@ -805,6 +815,18 @@ fn drift(f: &mut Findings, brokers: &BTreeMap<i32, Configs>, key: &str) {
             continue;
         }
         let fix = match (majority, source) {
+            // Most brokers leave it unset (Kafka reports no value, as for
+            // log.retention.ms): remove this broker's override. Setting ""
+            // is refused.
+            (Some(""), Some(ConfigOrigin::BrokerDynamic)) => Fix::BrokerConfig {
+                broker: Some(*id),
+                changes: vec![ConfigChange::Delete(key.to_string())],
+            },
+            (Some(""), _) => Fix::Manual {
+                steps: vec![format!(
+                    "In broker {id}'s server.properties: remove {key}, then restart it"
+                )],
+            },
             (Some(m), Some(ConfigOrigin::BrokerDynamic)) => Fix::BrokerConfig {
                 broker: Some(*id),
                 changes: vec![set(key, m)],
@@ -822,12 +844,12 @@ fn drift(f: &mut Findings, brokers: &BTreeMap<i32, Configs>, key: &str) {
         };
         let others = majority.map_or_else(
             || "the others".to_string(),
-            |m| format!("most brokers ({m})"),
+            |m| format!("most brokers ({})", shown(m)),
         );
         f.push(
             "B006",
             HealthTarget::Broker(*id),
-            format!("Broker {id}: {key} is {value}, unlike {others}"),
+            format!("Broker {id}: {key} is {}, unlike {others}", shown(value)),
             vec![(key, value.to_string())],
             fix,
         );
@@ -1499,6 +1521,33 @@ mod tests {
         i.broker_configs
             .insert(3, vec![entry("message.max.bytes", "5000000", BrokerStatic)]);
         assert_eq!(only(&lint(&i, &opts(Env::Prod)), "B006").fix_class, Manual);
+
+        // Most brokers leave log.retention.ms unset (no value): the fix
+        // removes broker 3's override instead of setting it to "".
+        let mut unset = input(3);
+        for b in 1..=2 {
+            unset
+                .broker_configs
+                .insert(b, vec![entry("log.retention.ms", "", Dflt)]);
+        }
+        unset.broker_configs.insert(
+            3,
+            vec![entry("log.retention.ms", "86400000", BrokerDynamic)],
+        );
+        let findings = lint(&unset, &opts(Env::Prod));
+        let b006 = only(&findings, "B006");
+        assert_eq!(
+            b006.fix,
+            Fix::BrokerConfig {
+                broker: Some(3),
+                changes: vec![ConfigChange::Delete("log.retention.ms".into())]
+            }
+        );
+        assert!(
+            b006.message.contains("most brokers (not set)"),
+            "{}",
+            b006.message
+        );
 
         // Two brokers, two values: no majority, both reported, nothing to apply.
         let mut two = input(2);
