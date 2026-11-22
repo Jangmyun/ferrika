@@ -16,6 +16,9 @@ and 0.2.0 makes it crate-internal.
   given.
 - `monitor lag GROUP --topic NAME` with a topic that does not exist printed
   an empty table and a total lag of 0; it is now an error.
+- `monitor export` answered a request whose first line arrived in several
+  TCP segments with 404 (it read once); it now reads the whole line, and a
+  client that stops reading no longer holds a task.
 - `consume -D` applied `--grep` and `-k` to the undecoded bytes, so text of an
   Avro or Protobuf record (such as `"age":41`) was never found; they now look
   at the decoded text.
