@@ -297,7 +297,8 @@ The RabbitMQ entries below are planned for 0.2.0.
 - Library: `Operation::digest` returns the v2 digest; `digest_v1`,
   `verify_digest`, `DigestStatus`, `operation_digest`,
   `Scope::check_undo_target`, `undo::undo_mark_trusted`,
-  `undo::partial_failure`, `Journal::rotated_path` and
+  `undo::execute_steps` with `undo::UndoFailure` (the applied and not-run
+  steps of a failed undo as data), `Journal::rotated_path` and
   `audit::op_digests` are new, and `undo::DigestCheck` has a `Legacy`
   variant.
 

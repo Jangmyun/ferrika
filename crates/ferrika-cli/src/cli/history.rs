@@ -468,7 +468,8 @@ pub async fn run_undo(args: UndoArgs, global: &GlobalOpts) -> KafkaResult<()> {
         None,
         Some(op.id.clone()),
     );
-    let result = undo::execute(
+    // The failure as data; its text is what is shown and recorded.
+    let result = undo::execute_steps(
         &plan,
         &Target {
             config: &config,
@@ -476,7 +477,8 @@ pub async fn run_undo(args: UndoArgs, global: &GlobalOpts) -> KafkaResult<()> {
             op: &op.id,
         },
     )
-    .await;
+    .await
+    .map_err(|failure| failure.to_string());
     let outcome = |text: &str| {
         if forced {
             format!("{text} (forced: state changed since)")

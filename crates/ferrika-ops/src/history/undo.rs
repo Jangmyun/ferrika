@@ -5,7 +5,7 @@
 
 use serde::Serialize;
 
-use ferrika_core::error::KafkaResult;
+use ferrika_core::error::{KafkaError, KafkaResult};
 use ferrika_core::kafka::admin::KafkaAdminClient;
 use ferrika_core::kafka::config::KafkaClientConfig;
 use ferrika_core::kafka::visibility::{await_config, CONFIG_VISIBILITY};
@@ -356,17 +356,26 @@ pub fn redo_reversibility(current: &[State], restored: &[State]) -> (Reversibili
 }
 
 /// Runs the plan's steps in order, stopping at the first failure. Returns
-/// the outcome text, or the error naming exactly which steps were applied
-/// before the failure and which were not run (see [`partial_failure`]).
-/// The applied steps are not rolled back.
+/// the outcome text, or the failure as text (see [`execute_steps`] for the
+/// failure as data). The applied steps are not rolled back.
 pub async fn execute(plan: &UndoPlan, target: &Target<'_>) -> Result<String, String> {
+    execute_steps(plan, target).await.map_err(|e| e.to_string())
+}
+
+/// [`execute`] with the failure as an [`UndoFailure`] (boxed, it is large): which steps were
+/// applied before the failing one (left in place), which were not run, and
+/// the error.
+pub async fn execute_steps(
+    plan: &UndoPlan,
+    target: &Target<'_>,
+) -> Result<String, Box<UndoFailure>> {
     let steps = plan.runnable_steps();
     if steps.is_empty() {
         return Ok("already in its previous state; nothing changed".to_string());
     }
     for (ix, step) in steps.iter().enumerate() {
-        if let Err(e) = apply::run(step, target).await {
-            return Err(partial_failure(steps, ix, &e.to_string()));
+        if let Err(error) = apply::run(step, target).await {
+            return Err(Box::new(UndoFailure::new(steps, ix, error)));
         }
     }
     Ok(format!(
@@ -379,34 +388,69 @@ pub async fn execute(plan: &UndoPlan, target: &Target<'_>) -> Result<String, Str
     ))
 }
 
-/// The outcome of an undo whose step `failed` (from 0) failed with
-/// `error`: the failed step, then every step applied before it (those
-/// changes stay in place) and every step not run.
-pub fn partial_failure(steps: &[Step], failed: usize, error: &str) -> String {
-    let Some(step) = steps.get(failed) else {
-        return error.to_string();
-    };
-    let mut text = format!("{}: {error}", step.describe());
-    let list = |steps: &[Step]| {
-        steps
-            .iter()
-            .map(Step::describe)
-            .collect::<Vec<_>>()
-            .join("; ")
-    };
-    if failed == 0 {
-        text.push_str(". Nothing was changed");
-    } else {
-        text.push_str(&format!(
-            ". Applied before it and left in place ({failed} of {}): {}",
-            steps.len(),
-            list(&steps[..failed])
-        ));
+/// An undo that stopped at a failing step. The steps are their
+/// [`Step::describe`] texts. Its `Display` is the outcome text `ferrika
+/// undo` prints and records: the failed step and error, then the steps
+/// applied before it and the steps not run.
+#[derive(Debug)]
+pub struct UndoFailure {
+    /// The step that failed.
+    pub failed: String,
+    /// Steps applied before it, in order; their changes stay in place.
+    pub applied: Vec<String>,
+    /// Steps after it, never run.
+    pub not_run: Vec<String>,
+    /// Why the failed step failed.
+    pub error: KafkaError,
+}
+
+impl UndoFailure {
+    /// The failure of `steps[failed]` (from 0) with `error`.
+    pub fn new(steps: &[Step], failed: usize, error: KafkaError) -> Self {
+        let describe = |steps: &[Step]| steps.iter().map(Step::describe).collect::<Vec<_>>();
+        let at = failed.min(steps.len());
+        Self {
+            failed: steps.get(failed).map(Step::describe).unwrap_or_default(),
+            applied: describe(&steps[..at]),
+            not_run: describe(steps.get(at + 1..).unwrap_or_default()),
+            error,
+        }
     }
-    if failed + 1 < steps.len() {
-        text.push_str(&format!(". Not run: {}", list(&steps[failed + 1..])));
+
+    /// Whether any step changed the cluster before the failure.
+    pub fn changed_anything(&self) -> bool {
+        !self.applied.is_empty()
     }
-    text
+}
+
+impl std::fmt::Display for UndoFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.failed.is_empty() {
+            return write!(f, "{}", self.error);
+        }
+        write!(f, "{}: {}", self.failed, self.error)?;
+        if self.applied.is_empty() {
+            write!(f, ". Nothing was changed")?;
+        } else {
+            let total = self.applied.len() + 1 + self.not_run.len();
+            write!(
+                f,
+                ". Applied before it and left in place ({} of {total}): {}",
+                self.applied.len(),
+                self.applied.join("; ")
+            )?;
+        }
+        if !self.not_run.is_empty() {
+            write!(f, ". Not run: {}", self.not_run.join("; "))?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UndoFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 #[cfg(test)]
@@ -654,17 +698,32 @@ mod tests {
             delete: vec![],
         };
         let steps = vec![step("a"), step("b"), step("c")];
-        let text = partial_failure(&steps, 1, "denied");
-        assert!(text.contains("denied"), "{text}");
-        assert!(
-            text.contains("Applied before it and left in place (1 of 3)"),
-            "{text}"
+        let denied = || KafkaError::admin("denied");
+        let failure = UndoFailure::new(&steps, 1, denied());
+        assert_eq!(failure.failed, steps[1].describe());
+        assert_eq!(failure.applied, vec![steps[0].describe()]);
+        assert_eq!(failure.not_run, vec![steps[2].describe()]);
+        assert!(failure.changed_anything());
+        assert!(failure.error.to_string().contains("denied"));
+        let text = failure.to_string();
+        assert_eq!(
+            text,
+            format!(
+                "{}: {}. Applied before it and left in place (1 of 3): {}. Not run: {}",
+                steps[1].describe(),
+                denied(),
+                steps[0].describe(),
+                steps[2].describe()
+            )
         );
-        assert!(text.contains("Not run"), "{text}");
-        let first = partial_failure(&steps, 0, "denied");
-        assert!(first.contains("Nothing was changed"), "{first}");
-        let last = partial_failure(&steps, 2, "denied");
-        assert!(!last.contains("Not run"), "{last}");
+        let first = UndoFailure::new(&steps, 0, denied());
+        assert!(first.applied.is_empty() && first.not_run.len() == 2);
+        assert!(!first.changed_anything());
+        assert!(first.to_string().contains("Nothing was changed"));
+        let last = UndoFailure::new(&steps, 2, denied());
+        assert_eq!(last.applied.len(), 2);
+        assert!(last.not_run.is_empty());
+        assert!(!last.to_string().contains("Not run"));
     }
 
     #[test]
