@@ -89,6 +89,57 @@ impl Scope {
         bootstrap_set(&self.bootstrap) == bootstrap_set(&current.bootstrap)
     }
 
+    /// Whether undo may change `current` for an operation recorded with
+    /// `self`, or why not. Stricter than [`Scope::same_cluster`]: an
+    /// operation recorded with a cluster id is only undone on a cluster
+    /// whose id was read and is the same (matching bootstrap servers are not
+    /// enough, they may point at another cluster now).
+    pub fn check_undo_target(&self, current: &Scope) -> Result<(), String> {
+        let refuse = |why: String| {
+            Err(format!(
+                "this operation was recorded on {}, {why}; connect to that one to undo it",
+                self.describe()
+            ))
+        };
+        if !self.registry.is_empty() {
+            if self.registry != current.registry {
+                return refuse(format!(
+                    "but the Schema Registry in use is {}",
+                    or_none(&current.registry)
+                ));
+            }
+            return Ok(());
+        }
+        if !self.connect.is_empty() {
+            if self.connect != current.connect {
+                return refuse(format!(
+                    "but the Kafka Connect in use is {}",
+                    or_none(&current.connect)
+                ));
+            }
+            return Ok(());
+        }
+        if !self.cluster_id.is_empty() {
+            if current.cluster_id.is_empty() {
+                return refuse(format!(
+                    "but the id of the cluster at {} could not be read to confirm it",
+                    current.bootstrap
+                ));
+            }
+            if self.cluster_id != current.cluster_id {
+                return refuse(format!(
+                    "but the brokers in use ({}) belong to cluster {}",
+                    current.bootstrap, current.cluster_id
+                ));
+            }
+            return Ok(());
+        }
+        if bootstrap_set(&self.bootstrap) != bootstrap_set(&current.bootstrap) {
+            return refuse(format!("but the brokers in use are {}", current.bootstrap));
+        }
+        Ok(())
+    }
+
     /// "cluster 4L62… (profile prod-a)" for messages.
     pub fn describe(&self) -> String {
         let place = if !self.registry.is_empty() {
@@ -105,6 +156,14 @@ impl Scope {
         } else {
             format!("{place} (profile {})", self.profile)
         }
+    }
+}
+
+fn or_none(text: &str) -> &str {
+    if text.is_empty() {
+        "none"
+    } else {
+        text
     }
 }
 
@@ -514,10 +573,35 @@ impl Operation {
         self.end.as_ref().map(|e| e.ok)
     }
 
-    /// SHA-256 of the before- and after-state, as the audit log's
-    /// `op_digest` records it; a journal edited afterwards no longer matches.
+    /// The digest the audit log's `op_digest` records for the operation
+    /// (version 2, see [`operation_digest`]); a journal edited afterwards no
+    /// longer matches.
     pub fn digest(&self) -> String {
+        operation_digest(&self.id, &self.begin, self.after(), self.ok())
+    }
+
+    /// The version 1 digest older Ferrika versions recorded: SHA-256 of
+    /// the before- and after-state only (see [`state_digest`]).
+    pub fn digest_v1(&self) -> String {
         state_digest(&self.begin.before, self.after())
+    }
+
+    /// Compares the journal entry with the `op_digest` the audit log holds
+    /// for it. The audit log's digest says which version to check (a `v2:`
+    /// prefix or none), so editing the journal cannot pick the weaker one.
+    pub fn verify_digest(&self, audited: Option<&str>) -> DigestStatus {
+        match audited {
+            None => DigestStatus::Missing,
+            Some(digest) if digest.starts_with(DIGEST_V2_PREFIX) => {
+                if digest == self.digest() {
+                    DigestStatus::Verified
+                } else {
+                    DigestStatus::Mismatch
+                }
+            }
+            Some(digest) if digest == self.digest_v1() => DigestStatus::Legacy,
+            Some(_) => DigestStatus::Mismatch,
+        }
     }
 
     /// Every resource key the operation touched.
@@ -599,11 +683,77 @@ pub struct StateRow {
     pub after: String,
 }
 
-/// See [`Operation::digest`].
+/// The version 1 digest (Ferrika 0.1): SHA-256 of the before- and
+/// after-state, 64 hex digits without a prefix. It does not cover the scope,
+/// action, `undoes` link or reversibility; kept to verify older entries.
 pub fn state_digest(before: &[State], after: &[State]) -> String {
-    let text = serde_json::json!({ "before": before, "after": after }).to_string();
+    sha256_hex(&serde_json::json!({ "before": before, "after": after }).to_string())
+}
+
+/// Prefix of version 2 digests. A reader that only knows version 1
+/// compares the whole string with its 64-digit digest, so an entry
+/// recorded with version 2 never verifies there by mistake: it fails
+/// closed (undo refused as edited) instead.
+pub const DIGEST_V2_PREFIX: &str = "v2:";
+
+/// The version 2 digest of operation `id`: `v2:` and SHA-256 of every field
+/// of its `begin` line (source, user, scope, action, target,
+/// reversibility, limits, info, before-state, `undoes`), the final
+/// after-state and whether it succeeded. Editing anything that changes what
+/// `history` shows or `undo` does (where it runs, what it restores, which
+/// operation it marks undone, whether it is undoable) breaks it.
+pub fn operation_digest(id: &str, begin: &Begin, after: &[State], ok: Option<bool>) -> String {
+    let text = serde_json::json!({
+        "digest": 2,
+        "id": id,
+        "source": begin.source,
+        "user": begin.user,
+        "scope": begin.scope,
+        "action": begin.action,
+        "target": begin.target,
+        "reversibility": begin.reversibility,
+        "limits": begin.limits,
+        "info": begin.info,
+        "before": begin.before,
+        "after": after,
+        "undoes": begin.undoes,
+        "ok": ok,
+    })
+    .to_string();
+    format!("{DIGEST_V2_PREFIX}{}", sha256_hex(&text))
+}
+
+fn sha256_hex(text: &str) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, text.as_bytes());
     crate::model::format::to_hex(digest.as_ref())
+}
+
+/// How a journal entry compares with the audit log's `op_digest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DigestStatus {
+    /// A version 2 digest matches: the whole entry is as recorded.
+    Verified,
+    /// A version 1 digest (Ferrika 0.1) matches: the before- and
+    /// after-state are as recorded, but the scope, action, `undoes` link and
+    /// reversibility are not covered and may have been edited.
+    Legacy,
+    /// No audit entry names a digest for the operation.
+    Missing,
+    /// The entry does not match the audit log: it was edited.
+    Mismatch,
+}
+
+impl DigestStatus {
+    /// How `history`, `undo` and `audit verify` name it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Legacy => "legacy digest (scope not covered)",
+            Self::Missing => "no audit entry",
+            Self::Mismatch => "EDITED (does not match the audit log)",
+        }
+    }
 }
 
 /// Folds journal lines into operations, oldest first. Lines of an id
@@ -798,6 +948,134 @@ mod tests {
             after: Some(vec![config("orders", "retention.ms", Some("3"))]),
         });
         assert_ne!(op.digest(), recorded);
+    }
+
+    fn finished(begin: Begin) -> Operation {
+        fold(vec![
+            event("A", 1, EventBody::Begin(Box::new(begin))),
+            event("A", 2, end(true)),
+        ])
+        .remove(0)
+    }
+
+    type Edit = Box<dyn Fn(&mut Operation)>;
+
+    #[test]
+    fn digest_v2_covers_scope_action_undoes_reversibility_and_result() {
+        let mut original = begin(None);
+        original.scope = Scope {
+            bootstrap: "prod:9092".into(),
+            cluster_id: "PROD".into(),
+            ..Scope::default()
+        };
+        let op = finished(original);
+        let audited = op.digest();
+        assert!(audited.starts_with(DIGEST_V2_PREFIX), "{audited}");
+        assert_eq!(op.verify_digest(Some(&audited)), DigestStatus::Verified);
+        let edits: Vec<(&str, Edit)> = vec![
+            (
+                "scope cluster id",
+                Box::new(|o| o.begin.scope.cluster_id = "DEV".into()),
+            ),
+            (
+                "scope bootstrap",
+                Box::new(|o| o.begin.scope.bootstrap = "dev:9092".into()),
+            ),
+            ("undoes", Box::new(|o| o.begin.undoes = Some("B".into()))),
+            ("action", Box::new(|o| o.begin.action = "acl create".into())),
+            (
+                "reversibility",
+                Box::new(|o| o.begin.reversibility = Reversibility::Partial),
+            ),
+            ("user", Box::new(|o| o.begin.user = "mallory".into())),
+            (
+                "result",
+                Box::new(|o| {
+                    if let Some(end) = o.end.as_mut() {
+                        end.ok = false;
+                    }
+                }),
+            ),
+            ("id", Box::new(|o| o.id = "B".into())),
+            (
+                "before",
+                Box::new(|o| o.begin.before = vec![config("orders", "retention.ms", Some("9"))]),
+            ),
+        ];
+        for (what, edit) in edits {
+            let mut edited = op.clone();
+            edit(&mut edited);
+            assert_eq!(
+                edited.verify_digest(Some(&audited)),
+                DigestStatus::Mismatch,
+                "{what} edit not detected"
+            );
+        }
+    }
+
+    #[test]
+    fn v1_digests_still_verify_but_only_as_legacy() {
+        let op = finished(begin(None));
+        let v1 = op.digest_v1();
+        assert_eq!(v1.len(), 64);
+        assert_eq!(op.verify_digest(Some(&v1)), DigestStatus::Legacy);
+        assert_eq!(op.verify_digest(None), DigestStatus::Missing);
+        assert_eq!(op.verify_digest(Some("x")), DigestStatus::Mismatch);
+        // Version 1 does not cover the scope: the edit stays legacy, which
+        // is why undo asks again for such entries.
+        let mut moved = op.clone();
+        moved.begin.scope.bootstrap = "elsewhere:9092".into();
+        assert_eq!(moved.verify_digest(Some(&v1)), DigestStatus::Legacy);
+        // A version 2 digest is never checked with the version 1 rule, and
+        // a version 1 reader comparing whole strings never accepts it.
+        let v2 = op.digest();
+        assert_ne!(v2, v1);
+        assert_eq!(
+            moved.verify_digest(Some(&v2)),
+            DigestStatus::Mismatch,
+            "no downgrade"
+        );
+    }
+
+    #[test]
+    fn undo_target_needs_the_same_cluster_id_when_one_was_recorded() {
+        let scope = |id: &str, bootstrap: &str| Scope {
+            bootstrap: bootstrap.into(),
+            cluster_id: id.into(),
+            ..Scope::default()
+        };
+        assert!(scope("X", "a:9092")
+            .check_undo_target(&scope("X", "b:9092"))
+            .is_ok());
+        let other = scope("X", "a:9092")
+            .check_undo_target(&scope("Y", "a:9092"))
+            .unwrap_err();
+        assert!(
+            other.contains("cluster X") && other.contains("cluster Y"),
+            "{other}"
+        );
+        // Same brokers, but the id could not be read: not confirmed.
+        let unread = scope("X", "a:9092")
+            .check_undo_target(&scope("", "a:9092"))
+            .unwrap_err();
+        assert!(unread.contains("could not be read"), "{unread}");
+        // Without a recorded id the bootstrap set decides.
+        assert!(scope("", "a:9092,b:9092")
+            .check_undo_target(&scope("Z", "B:9092, a:9092"))
+            .is_ok());
+        assert!(scope("", "a:9092")
+            .check_undo_target(&scope("", "c:9092"))
+            .is_err());
+        let registry = |url: &str| Scope {
+            registry: url.into(),
+            ..Scope::default()
+        };
+        assert!(registry("http://sr:8081")
+            .check_undo_target(&registry("http://sr:8081"))
+            .is_ok());
+        assert!(registry("http://sr:8081")
+            .check_undo_target(&Scope::default())
+            .is_err());
     }
 
     #[test]

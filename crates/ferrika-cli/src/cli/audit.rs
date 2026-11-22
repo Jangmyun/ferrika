@@ -10,7 +10,8 @@ use crate::governance::audit_anchor::{self as anchor, AnchorCheck, AuditAnchor, 
 
 #[derive(clap::Subcommand, Debug, Clone)]
 pub enum AuditCommand {
-    /// Check the log's hash chain; reports the first edited, inserted or removed line
+    /// Check the log's hash chain (reports the first edited, inserted or
+    /// removed line) and the history entries against their `op_digest`
     Verify {
         /// Also compare the log's end with the newest anchor in the OS log
         /// (Windows Event Log) to detect a truncated or replaced log
@@ -127,13 +128,24 @@ fn verify(global: &GlobalOpts, with_anchor: bool) {
             crate::cli::exit_with_error(&format!("could not read {}: {e}", path.display()))
         })
     });
+    let history = history_check(
+        &crate::ops::history::Journal::default().load(),
+        &crate::governance::audit::op_digests(),
+    );
     if global.format == OutputFormat::Json {
         let printed = match &anchor_check {
             Some(check) => output::print_json(&serde_json::json!({
                 "chain": &report,
                 "anchor": check,
+                "history": &history,
             })),
-            None => output::print_json(&report),
+            None => {
+                let mut value = serde_json::to_value(&report).unwrap_or_default();
+                if let Some(map) = value.as_object_mut() {
+                    map.insert("history".into(), serde_json::json!(&history));
+                }
+                output::print_json(&value)
+            }
         };
         if let Err(e) = printed {
             crate::cli::exit_with_error(&e);
@@ -170,10 +182,79 @@ fn verify(global: &GlobalOpts, with_anchor: bool) {
         if let Some(check) = &anchor_check {
             print_anchor_check(&path, check);
         }
+        print_history_check(&history);
     }
-    if report.broken.is_some() || anchor_check.as_ref().is_some_and(AnchorCheck::is_failure) {
+    if report.broken.is_some()
+        || anchor_check.as_ref().is_some_and(AnchorCheck::is_failure)
+        || !history.edited.is_empty()
+    {
         std::process::exit(2);
     }
+}
+
+/// How the history journal's entries compare with the audit log.
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
+struct HistoryCheck {
+    /// Entries whose version 2 digest matches.
+    verified: usize,
+    /// Entries matching a version 1 digest (Ferrika 0.1): their scope,
+    /// action and undo link are not covered.
+    legacy: Vec<String>,
+    /// Entries the audit log has no digest for (unfinished, or the log
+    /// was rotated or kept elsewhere).
+    missing: usize,
+    /// Entries that do not match their digest: edited.
+    edited: Vec<String>,
+}
+
+fn history_check(
+    ops: &[crate::model::history::Operation],
+    digests: &std::collections::HashMap<String, String>,
+) -> HistoryCheck {
+    use crate::model::history::DigestStatus;
+    let mut check = HistoryCheck::default();
+    for op in ops {
+        match op.verify_digest(digests.get(&op.id).map(String::as_str)) {
+            DigestStatus::Verified => check.verified += 1,
+            DigestStatus::Legacy => check.legacy.push(op.id.clone()),
+            DigestStatus::Missing => check.missing += 1,
+            DigestStatus::Mismatch => check.edited.push(op.id.clone()),
+        }
+    }
+    check
+}
+
+fn print_history_check(check: &HistoryCheck) {
+    if !check.edited.is_empty() {
+        eprintln!(
+            "{} {} (they do not match the audit log's op_digest; undo refuses them)",
+            "✖ History entries edited:".red().bold(),
+            check.edited.join(", ")
+        );
+    }
+    let total = check.verified + check.legacy.len() + check.missing + check.edited.len();
+    if total == 0 {
+        return;
+    }
+    println!(
+        "{} {} of {total} entries match the audit log{}{}",
+        "History:".bold(),
+        check.verified + check.legacy.len(),
+        if check.legacy.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; {} with a legacy digest (scope not covered): {}",
+                check.legacy.len(),
+                check.legacy.join(", ")
+            )
+        },
+        if check.missing == 0 {
+            String::new()
+        } else {
+            format!("; {} without an audit entry", check.missing)
+        }
+    );
 }
 
 fn forward_test(to: Option<&str>, global: &GlobalOpts) {
@@ -345,5 +426,66 @@ mod filter_tests {
             ..AuditFilter::default()
         };
         assert!(!failed.keeps(&mcp) && failed.keeps(&cli_failed));
+    }
+
+    #[test]
+    fn verify_sorts_history_entries_into_verified_legacy_missing_and_edited() {
+        use crate::model::history::{
+            fold, Begin, End, EventBody, HistoryEvent, Reversibility, Scope,
+        };
+        let event = |id: &str, body: EventBody| HistoryEvent {
+            v: 1,
+            id: id.into(),
+            time_ms: 1,
+            body,
+        };
+        let begin = || {
+            EventBody::Begin(Box::new(Begin {
+                source: "cli".into(),
+                user: "u".into(),
+                scope: Scope {
+                    bootstrap: "a:9092".into(),
+                    ..Scope::default()
+                },
+                action: "topics config".into(),
+                target: "t".into(),
+                reversibility: Reversibility::Reversible,
+                limits: vec![],
+                before: vec![],
+                after: vec![],
+                info: vec![],
+                undoes: None,
+            }))
+        };
+        let end = || {
+            EventBody::End(End {
+                ok: true,
+                outcome: String::new(),
+                after: None,
+            })
+        };
+        let mut ops = fold(
+            ["NEW", "OLD", "EDIT", "GONE"]
+                .iter()
+                .flat_map(|id| [event(id, begin()), event(id, end())]),
+        );
+        let digests: std::collections::HashMap<String, String> = [
+            ("NEW".to_string(), ops[0].digest()),
+            ("OLD".to_string(), ops[1].digest_v1()),
+            ("EDIT".to_string(), ops[2].digest()),
+        ]
+        .into();
+        // The scope of EDIT is changed after its digest was recorded.
+        ops[2].begin.scope.bootstrap = "prod:9092".into();
+        let check = history_check(&ops, &digests);
+        assert_eq!(
+            check,
+            HistoryCheck {
+                verified: 1,
+                legacy: vec!["OLD".into()],
+                missing: 1,
+                edited: vec!["EDIT".into()],
+            }
+        );
     }
 }

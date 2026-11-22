@@ -600,8 +600,12 @@ direction.
   `config.change`); there is no separate `history.undo` category. It is
   refused on read-only targets, and under `audit: required` like other
   changes. It is also refused when the history entry no longer matches the
-  audit log's `op_digest` (recorded as `history.tampered`), and, with a
-  policy installed, when the audit log has no entry for the operation.
+  audit log's `op_digest` (recorded as `history.tampered`), when the cluster
+  in use is not the one the entry names (same cluster id when one was
+  recorded, else the same bootstrap servers), and, with a policy installed,
+  when the audit log has no entry for the operation. An entry with a legacy
+  digest (recorded by 0.1) is undone only after a second confirmation or
+  with `--accept-legacy`.
 - **MCP**: `mask_pii: false` is ignored under enforced masking. The read
   tools never change the cluster. With `ferrika mcp --allow-write`, every
   write tool call (`produce_messages`, `create_topic`, `alter_topic_config`,
@@ -646,8 +650,8 @@ no file paths). A refused export is a `policy.blocked` entry with an
 `export:` target.
 
 Changes recorded for undo carry two optional fields: `op` (the operation id
-in `history.jsonl`) and `op_digest` (SHA-256 of its recorded before- and
-after-state). In the CLI the request line (outcome `requested`) already
+in `history.jsonl`) and `op_digest` (the digest of its journal entry, see
+[History digests](#history-digests)). In the CLI the request line (outcome `requested`) already
 names the `op`, and a second line with the same action and `op` gives the
 result and adds `op_digest` once the change has run; a command that changes
 several resources (`offset delete-group a b`) names its first operation on
@@ -658,6 +662,51 @@ line) still verify. Lines without an operation leave the fields out, so
 older lines and `audit verify` are unaffected. A refused undo of an edited
 history entry writes `history.tampered`. The history file itself (it holds
 config values) is not forwarded to a SIEM.
+
+### History digests
+
+`op_digest` has two versions; the audit log's value says which one applies,
+so editing the journal cannot select the weaker one.
+
+| Version | Written by | Value | Covers |
+|---|---|---|---|
+| 2 | 0.2.0 and later | `v2:` + SHA-256 (64 hex) | the whole entry: id, source, user, scope (profile, bootstrap servers, cluster id, registry, Connect URL), action, target, reversibility, limits, info, before-state, `undoes`, final after-state, result |
+| 1 (legacy) | 0.1.x | SHA-256 (64 hex), no prefix | before- and after-state only |
+
+The version is a prefix of the digest string rather than a separate field:
+a 0.1 reader compares the whole string with its own 64-digit digest, so it
+can never accept a version 2 entry by mistake (it refuses to undo it as
+edited instead), and older audit lines keep their chain hashes.
+
+- A version 1 entry still verifies, but only its states are protected: its
+  scope, action, `undoes` link and reversibility could have been edited.
+  `ferrika history` (AUDIT column), `history show` and `audit verify` show
+  it as `legacy digest (scope not covered)`; `ferrika undo` prints the
+  cluster the entry names and the one in use and asks again (`-y` needs
+  `--accept-legacy`).
+- An `undoes` link (which marks another operation as undone) counts only
+  when the undoing entry's version 2 digest matches, or, without a policy,
+  when the audit log has no entry for it. Otherwise `undo` warns, ignores
+  the link and lets the current state decide.
+- `ferrika audit verify` also compares every history entry with its
+  `op_digest`: verified, legacy, without an audit entry, or edited (listed,
+  exit code 2). `-f json` adds the counts as `history`.
+- Before undo runs, the cluster in use must be the recorded one. With a
+  recorded cluster id the current cluster's id must be readable and equal
+  (bootstrap servers alone are not enough); without one the set of
+  bootstrap servers must match; Schema Registry and Kafka Connect changes
+  compare those URLs.
+- A failed multi-step undo is not rolled back. Its outcome (shown and kept
+  in the history entry) lists the steps applied before the failure, which
+  stay in place, and the steps not run. Running the undo again plans only
+  what still differs from the recorded before-state (it reports drift, so
+  it needs `--force`).
+
+The journal (`history.jsonl`) is append-only for each change. Once it
+passes 1 MiB it is trimmed to the last 1000 operations of the last 90
+days; if it is still above 512 KiB it is renamed to `history.jsonl.1`,
+replacing the previous one (whose operations and connector secrets are
+dropped). `history` and `undo` read both files.
 
 ### Truncation detection: `seq` and the OS log anchor
 

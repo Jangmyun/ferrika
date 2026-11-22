@@ -452,6 +452,7 @@ ferrika history show 01K9ABCDEF12  # before/after values, limits
 ferrika undo --dry-run             # what undoing your latest change would do
 ferrika undo 01K9AB                # id prefix (6+ characters); asks first
 ferrika undo 01K9AB --force        # even though the state changed since
+ferrika undo 01K9AB -y --accept-legacy   # an entry recorded by 0.1, without the second prompt
 ```
 
 Undo reads the current state first: if someone changed it since, it shows
@@ -459,6 +460,17 @@ before / recorded / current and stops unless `--force`. It is a change like
 any other (company policy, read-only profiles, audit), checked under the
 category of what it does (undoing a topic creation is a topic deletion), and
 it is recorded too, so undoing an undo applies the change again.
+
+Each entry is tied to the audit log by its `op_digest`; the AUDIT column
+of `ferrika history` says whether it matches (`verified`), was recorded by
+0.1 (`legacy digest (scope not covered)`: undo shows the cluster and asks
+again), has no audit entry, or was edited (undo refuses it). Undo also
+refuses to run on another cluster than the recorded one (the same cluster
+id when one was recorded). A failed undo of several steps is not rolled
+back; its message lists the steps it applied and the ones it did not run.
+The journal is rotated to `history.jsonl.1` once it grows past 1 MiB of
+recent operations; both files are read. Details:
+[POLICY.md](POLICY.md#history-digests).
 
 ### 2. Topic Management (`ferrika topics`)
 ```bash
