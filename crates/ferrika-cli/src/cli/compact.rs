@@ -331,21 +331,25 @@ async fn run_snapshot(args: CompactSnapshotArgs, global: &GlobalOpts) -> KafkaRe
     let policy = crate::governance::policy::current();
     crate::cli::note_masking(policy);
     let mask = policy.masking_enforced();
-    let records = fetch_compacted_records(
-        &args.topic,
-        args.partition,
-        args.limit,
-        Scan::All,
-        &kafka_config,
-        mask,
-    )
-    .await?;
+    let opts = BoundedReadOptions::with_max_records(args.limit);
+    let read = read_topic(&kafka_config, &args.topic, args.partition, &opts, |_| true).await?;
+    if let Some(warning) = read.partial_warning(&args.topic, true) {
+        eprintln!("{} {warning}", "⚠".yellow());
+    }
+    let records: Vec<CompactedRecord> = read.records.iter().map(|m| to_record(m, mask)).collect();
 
     let snapshot = shown_snapshot(
         CompactedStateSnapshot::build(&args.topic, &records, args.include_tombstones),
         mask,
     );
-    snapshot.save_jsonl(&args.output)?;
+    // The entries carry 60-character previews; the file gets each kept
+    // record's whole value.
+    let values: std::collections::HashMap<(i32, i64), Option<&[u8]>> = read
+        .records
+        .iter()
+        .map(|m| ((m.partition, m.offset), m.payload.as_deref()))
+        .collect();
+    write_snapshot(&args.output, &snapshot, &values, mask)?;
     crate::cli::export_finished(snapshot.entries.len() as u64);
 
     println!(
@@ -356,6 +360,66 @@ async fn run_snapshot(args: CompactSnapshotArgs, global: &GlobalOpts) -> KafkaRe
     );
 
     Ok(())
+}
+
+/// Writes `snapshot` as JSON Lines (owner-only file) with each entry's whole
+/// value from `values`: `payload` as text, or `payload_base64` when it is not
+/// UTF-8. Masked while the policy enforces masking.
+fn write_snapshot(
+    path: &std::path::Path,
+    snapshot: &CompactedStateSnapshot,
+    values: &std::collections::HashMap<(i32, i64), Option<&[u8]>>,
+    mask: bool,
+) -> KafkaResult<()> {
+    use std::io::Write as _;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            crate::error::KafkaError::Io(format!("Cannot create {}: {e}", parent.display()))
+        })?;
+    }
+    let file = crate::files::open_private_file(path, false).map_err(|e| {
+        crate::error::KafkaError::Io(format!("Cannot write {}: {e}", path.display()))
+    })?;
+    let mut out = std::io::BufWriter::new(file);
+    for entry in &snapshot.entries {
+        let line = snapshot_line(
+            entry,
+            values
+                .get(&(entry.partition, entry.offset))
+                .copied()
+                .flatten(),
+            mask,
+        );
+        writeln!(out, "{line}").map_err(|e| {
+            crate::error::KafkaError::Io(format!("Cannot write {}: {e}", path.display()))
+        })?;
+    }
+    out.flush()
+        .map_err(|e| crate::error::KafkaError::Io(format!("Cannot write {}: {e}", path.display())))
+}
+
+/// One snapshot line: the entry with its whole value in place of the preview.
+fn snapshot_line(
+    entry: &crate::ops::compact::SnapshotEntry,
+    value: Option<&[u8]>,
+    mask: bool,
+) -> serde_json::Value {
+    let mut line = serde_json::to_value(entry).unwrap_or_default();
+    if let Some(obj) = line.as_object_mut() {
+        let (text, base64) = match value {
+            None => (None, None),
+            Some(bytes) if mask => (Some(mask_bytes(bytes, MaskStrategy::Partial)), None),
+            Some(bytes) => match std::str::from_utf8(bytes) {
+                Ok(text) => (Some(text.to_string()), None),
+                Err(_) => (None, Some(crate::codec::base64::encode(bytes))),
+            },
+        };
+        obj.insert("payload".into(), text.into());
+        if let Some(b64) = base64 {
+            obj.insert("payload_base64".into(), b64.into());
+        }
+    }
+    line
 }
 
 /// Handles `ferrika compact tombstones`
@@ -445,6 +509,35 @@ async fn run_tombstones(args: CompactTombstonesArgs, global: &GlobalOpts) -> Kaf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_lines_hold_the_whole_value() {
+        let entry = crate::ops::compact::SnapshotEntry {
+            key: "k".into(),
+            partition: 0,
+            offset: 7,
+            timestamp: 1,
+            payload: Some("cut...".into()),
+            is_tombstone: false,
+        };
+        let long = format!("{{\"note\":\"{}\"}}", "x".repeat(500));
+        let line = snapshot_line(&entry, Some(long.as_bytes()), false);
+        assert_eq!(line["payload"], long.as_str());
+        assert!(line.get("payload_base64").is_none());
+
+        let binary = [0xff, 0x00, 0xfe];
+        let line = snapshot_line(&entry, Some(&binary), false);
+        assert!(line["payload"].is_null());
+        assert_eq!(
+            line["payload_base64"],
+            crate::codec::base64::encode(&binary)
+        );
+
+        let pii = br#"{"email":"alice@example.com"}"#;
+        let line = snapshot_line(&entry, Some(pii), true);
+        let shown = line["payload"].as_str().unwrap_or_default();
+        assert!(!shown.contains("alice@example.com"), "{shown}");
+    }
 
     #[test]
     fn test_clap_compact_args_analyze_parsing() {
