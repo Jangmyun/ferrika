@@ -26,7 +26,7 @@ path = "src/main.rs"
 ferrika-core.workspace = true
 ferrika-governance.workspace = true
 ferrika-ops.workspace = true
-ferrika-mcp.workspace = true
+ferrika-mcp = { workspace = true, features = ["amqp"] }
 ferrika-rabbitmq = { workspace = true, features = ["amqp"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4.5"

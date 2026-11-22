@@ -217,7 +217,7 @@ RabbitMQ profile named by `profile` (default: the active one, see
 [RabbitMQ](#rabbitmq-ferrika-rabbit-preview)), with optional `vhost` and
 `filter` (at most 500 entries). They read no message bodies and take no
 URL, so a profile's stored password only goes to that profile's broker.
-Peeking at a queue and DLQ inspect/redrive are not offered over MCP yet: a
+Peeking at a queue and DLQ inspect/redrive are write tools (below): a
 RabbitMQ peek takes messages and requeues them.
 
 ```bash
@@ -232,11 +232,37 @@ claude mcp add ferrika-prod -- ferrika -p prod mcp
 
 #### Write tools (`--allow-write`)
 
-`--allow-write` adds five write tools: `produce_messages` (up to 100 UTF-8
+`--allow-write` adds the write tools `produce_messages` (up to 100 UTF-8
 records to an existing topic, values and keys optionally encoded with Schema Registry
 subjects: `value_subject`, `key_subject`), `create_topic`, `alter_topic_config` (set or reset keys; others
 stay), `reset_consumer_group_offsets` (the group must be Empty) and
-`transform_execute`.
+`transform_execute`; and four RabbitMQ (preview) write tools on a RabbitMQ
+profile (`profile`, `vhost` arguments as for the listings):
+
+| Tool | What it does | Policy category |
+|---|---|---|
+| `rabbit_peek` | Reads up to 20 messages (`count`, default 5) at the head of `queue` and returns them; they are requeued and marked redelivered (on a quorum queue each read counts towards its delivery-limit). | `messages.peek`, export gate |
+| `rabbit_dlq_inspect` | Reads up to 50 messages (default 20) of a dead-letter queue, groups them by `x-death` (source queue, reason, exchange, routing key) and returns a sample of 10; requeued like a peek. | `messages.peek`, export gate |
+| `rabbit_publish` | Publishes one UTF-8 `body` to an existing `exchange` (`""` or `amq.default`: the default exchange, where `routing_key` names the queue) with optional `headers`, `content_type`, `persistent` (default true). A message no binding routes is an error (`unroutable`). | `produce` |
+| `rabbit_dlq_redrive` | Moves up to `max` (at most 1,000) messages of a dead-letter queue to their original exchange and routing key from `x-death`, or to `to_exchange` / `routing_key`, over AMQP (publish with publisher confirms, then ack), stopping at the first failure. | `messages.move` + `produce` |
+
+Bodies and header values are PII-masked unless `mask_pii` is false (always
+under enforced masking); the plans show sizes, a short hash and header
+names, never a body. The `rabbit_dlq_redrive` plan reads up to 100 messages
+(requeued, and audited as `mcp rabbit_dlq_redrive plan`) to show how many go
+to which destination; that preview is not bound by the confirmation token,
+the rest of the plan is. Each redriven message counts against
+`--max-produce-records` (charged at execute, the unmoved part given back),
+as does each publish. The gates match the RabbitMQ profile name and the
+management and AMQP `host:port`, like `ferrika rabbit`; a read-only
+RabbitMQ profile refuses these tools, a read-only Kafka profile does not.
+`--queues <glob>` limits the queues they read from, move out of or reach
+through the default exchange, `--exchanges <glob>` the exchanges they
+publish to (both repeatable; default: every queue, and every exchange but
+`amq.rabbitmq.*`). With either set, a redrive must name `to_exchange`, since
+each message's original exchange is only known as it moves.
+`rabbit_dlq_redrive` needs a build with AMQP support (the `ferrika` CLI has
+it).
 
 `transform_execute` takes the arguments of `transform_preview` (absolute
 `from_timestamp` only) plus `to`, an existing topic on the same cluster
@@ -253,6 +279,10 @@ and the range; the audit result records the counts and the steps' SHA-256.
 
 ```bash
 claude mcp add ferrika-dev -- ferrika -p dev mcp --allow-write --topics "test-*"
+# RabbitMQ writes limited to test queues and one exchange
+claude mcp add ferrika-rabbit-dev -- ferrika mcp --allow-write \
+  --allow-tools rabbit_peek,rabbit_dlq_inspect,rabbit_dlq_redrive \
+  --queues "test-*" --exchanges "test.events"
 ```
 
 Every write takes two calls. `mode: "plan"` checks the request (the broker
@@ -287,7 +317,8 @@ for a person's confirmation in the client whatever `--confirm` says (see
 docs/POLICY.md). Internal topics (names starting with `_`) are never written; `--topics <glob>`
 (repeatable) narrows the writable topics further. Limits per session:
 `--max-writes-per-minute` (10), `--max-produce-records` (1,000, for
-`produce_messages` and `transform_execute` together), plans at 60
+`produce_messages`, `transform_execute`, `rabbit_publish` and
+`rabbit_dlq_redrive` together), plans at 60
 per minute, and the same refusal 5 times in a row pauses writes for 30 s.
 `--allow-tools create_topic,produce_messages` offers only some tools.
 

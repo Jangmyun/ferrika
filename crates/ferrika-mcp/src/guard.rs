@@ -12,30 +12,64 @@ use std::collections::VecDeque;
 use jiff::{SignedDuration, Timestamp};
 use serde_json::{json, Value};
 
-use ferrika_core::model::policy::{McpWriteRule, PolicyAction};
+use ferrika_core::model::policy::{ExportRule, McpWriteRule, PolicyAction};
 use ferrika_governance::audit::AuditEntry;
 use ferrika_governance::policy::{
-    authorize_write_at, AuditMode, AuditSink, EffectivePolicy, WriteRefusal, WriteRequest,
+    authorize_write_at, AuditMode, AuditSink, EffectivePolicy, ExportChannel, ExportRequest,
+    WriteRefusal, WriteRequest,
 };
 
-/// The write tools, in the order `tools/list` shows them.
-pub const WRITE_TOOLS: [&str; 5] = [
+/// The write tools, in the order `tools/list` shows them. The RabbitMQ
+/// ones (`rabbit_*`) work on a RabbitMQ profile instead of the Kafka
+/// cluster; `rabbit_dlq_redrive` needs the `amqp` feature.
+#[cfg(feature = "amqp")]
+pub const WRITE_TOOLS: [&str; 9] = [
     "produce_messages",
     "create_topic",
     "alter_topic_config",
     "reset_consumer_group_offsets",
     "transform_execute",
+    "rabbit_peek",
+    "rabbit_dlq_inspect",
+    "rabbit_publish",
+    "rabbit_dlq_redrive",
+];
+
+/// The write tools, in the order `tools/list` shows them. The RabbitMQ
+/// ones (`rabbit_*`) work on a RabbitMQ profile instead of the Kafka
+/// cluster; `rabbit_dlq_redrive` needs the `amqp` feature.
+#[cfg(not(feature = "amqp"))]
+pub const WRITE_TOOLS: [&str; 8] = [
+    "produce_messages",
+    "create_topic",
+    "alter_topic_config",
+    "reset_consumer_group_offsets",
+    "transform_execute",
+    "rabbit_peek",
+    "rabbit_dlq_inspect",
+    "rabbit_publish",
 ];
 
 /// The policy action a write tool performs. A transform writes records to
 /// its destination topic, as `ferrika transform --execute` does: `produce`.
+/// The RabbitMQ tools match `ferrika rabbit`: reading messages requeues
+/// them (`messages.peek`), a publish is `produce`, a redrive
+/// `messages.move` (which also needs `produce`).
 pub(super) fn policy_action(tool: &str) -> PolicyAction {
     match tool {
-        "produce_messages" | "transform_execute" => PolicyAction::Produce,
+        "produce_messages" | "transform_execute" | "rabbit_publish" => PolicyAction::Produce,
         "create_topic" => PolicyAction::TopicsCreate,
         "alter_topic_config" => PolicyAction::ConfigChange,
+        "rabbit_peek" | "rabbit_dlq_inspect" => PolicyAction::MessagesPeek,
+        "rabbit_dlq_redrive" => PolicyAction::MessagesMove,
         _ => PolicyAction::OffsetsReset,
     }
+}
+
+/// Whether `tool` is a RabbitMQ write tool (gated on its RabbitMQ profile,
+/// not the Kafka one).
+pub(super) fn is_rabbit_tool(tool: &str) -> bool {
+    tool.starts_with("rabbit_")
 }
 
 /// How long a plan's confirmation token stays valid.
@@ -135,6 +169,13 @@ pub(super) struct GuardConfig {
     pub tools: Vec<&'static str>,
     /// `--topics` globs; empty = every topic but internal ones.
     pub topics: Vec<String>,
+    /// `--queues` globs: RabbitMQ queues the rabbit tools may read from,
+    /// move out of or address through the default exchange; empty = every
+    /// queue.
+    pub queues: Vec<String>,
+    /// `--exchanges` globs: RabbitMQ exchanges the rabbit tools may publish
+    /// to; empty = every exchange but the broker's own `amq.rabbitmq.*`.
+    pub exchanges: Vec<String>,
     pub limits: Limits,
     /// Profile name (may be empty) and brokers, for the policy.
     pub profile: String,
@@ -236,6 +277,9 @@ impl WriteGuard {
     /// is read-only or the policy refuses its action here. A call still
     /// goes through the gate.
     pub(super) fn hidden_reason(&self, tool: &str) -> Option<String> {
+        if is_rabbit_tool(tool) {
+            return self.rabbit_hidden_reason(tool);
+        }
         if let Some(reason) = &self.config.profile_refusal {
             return Some(reason.clone());
         }
@@ -277,6 +321,86 @@ impl WriteGuard {
             ));
         }
         Ok(())
+    }
+
+    /// [`Self::hidden_reason`] for a RabbitMQ tool. Its profile is named
+    /// per call, so only what refuses it everywhere hides it: `mcp_write:
+    /// forbidden`, or the policy refusing its categories with no profile
+    /// and address to match (`forbid`, an invalid policy). A read-only
+    /// Kafka profile says nothing about RabbitMQ.
+    fn rabbit_hidden_reason(&self, tool: &str) -> Option<String> {
+        if let Some(reason) = self.mcp_write_refusal() {
+            return Some(reason);
+        }
+        let action = policy_action(tool);
+        std::iter::once(action)
+            .chain(action.also_requires().iter().copied())
+            .find_map(|a| self.policy.check_at(self.now(), a, "", "").err())
+            .map(String::from)
+    }
+
+    /// Refuses RabbitMQ queues outside `--queues`.
+    pub(super) fn check_queue(&self, queue: &str) -> Result<(), ToolError> {
+        let globs = &self.config.queues;
+        if !globs.is_empty() && !globs.iter().any(|g| topic_glob_match(g, queue)) {
+            return Err(ToolError::new(
+                "target_not_allowed",
+                format!(
+                    "Queue '{queue}' is outside the queues this server may use (--queues {})",
+                    globs.join(", ")
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Refuses publishing to `exchange` (empty: the default exchange) when
+    /// it is the broker's own (`amq.rabbitmq.*`) or outside `--exchanges`.
+    /// Through the default exchange the routing key names the queue, so it
+    /// must pass [`Self::check_queue`]; `None` (each message's own key) is
+    /// refused when `--queues` is set.
+    pub(super) fn check_exchange(
+        &self,
+        exchange: &str,
+        routing_key: Option<&str>,
+    ) -> Result<(), ToolError> {
+        let name = ferrika_rabbitmq::model::exchange_name(exchange);
+        if name.starts_with("amq.rabbitmq.") {
+            return Err(ToolError::new(
+                "target_not_allowed",
+                format!("'{name}' is a RabbitMQ system exchange; MCP tools never publish to those"),
+            ));
+        }
+        let globs = &self.config.exchanges;
+        if !globs.is_empty() && !globs.iter().any(|g| topic_glob_match(g, name)) {
+            return Err(ToolError::new(
+                "target_not_allowed",
+                format!(
+                    "Exchange '{name}' is outside the exchanges this server may publish to \
+                     (--exchanges {})",
+                    globs.join(", ")
+                ),
+            ));
+        }
+        if name == ferrika_rabbitmq::model::DEFAULT_EXCHANGE {
+            match routing_key {
+                Some(queue) => self.check_queue(queue)?,
+                None if !self.config.queues.is_empty() => {
+                    return Err(ToolError::new(
+                        "target_not_allowed",
+                        "Through the default exchange the routing key names the queue; with \
+                         --queues set it must be given so it can be checked",
+                    ))
+                }
+                None => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `--queues` or `--exchanges` limits the RabbitMQ tools.
+    pub(super) fn rabbit_scoped(&self) -> bool {
+        !self.config.queues.is_empty() || !self.config.exchanges.is_empty()
     }
 
     /// Refuses every write during a cooldown.
@@ -449,6 +573,115 @@ impl WriteGuard {
         }
     }
 
+    /// The policy gate for RabbitMQ tool `tool` on `target`, as `ferrika
+    /// rabbit` applies it: the policy rules match the RabbitMQ profile name
+    /// (`profile`, may be empty) and the management and AMQP `host:port`
+    /// (`addresses`); a category the action also needs (`produce` for a
+    /// redrive) must be allowed too; `read_only` is the refusal of a
+    /// RabbitMQ profile marked read-only. `action` is the tool's
+    /// ([`policy_action`]), or `messages.peek` for the messages a redrive
+    /// plan reads for its preview. Refusals are recorded.
+    pub(super) fn authorize_rabbit(
+        &self,
+        tool: &'static str,
+        action: PolicyAction,
+        target: &str,
+        profile: &str,
+        addresses: &str,
+        read_only: Option<String>,
+    ) -> Result<(), ToolError> {
+        let audit_profile = if profile.is_empty() {
+            addresses
+        } else {
+            profile
+        };
+        let label = format!("mcp {tool}");
+        if let Some(reason) = self.mcp_write_refusal() {
+            let _ = self.record_at(audit_profile, label.clone(), target, &reason, false, None);
+            return Err(ToolError::new("policy_refused", reason));
+        }
+        if let Some(reason) = ferrika_governance::policy::extra_category_refusal(
+            self.policy,
+            action,
+            &label,
+            profile,
+            addresses,
+        ) {
+            let _ = self.record_at(
+                audit_profile,
+                "policy.blocked".to_string(),
+                &label,
+                &reason,
+                false,
+                None,
+            );
+            return Err(ToolError::new("policy_refused", reason));
+        }
+        let request = WriteRequest {
+            source: "mcp",
+            action,
+            label: &label,
+            target,
+            profile,
+            bootstrap: addresses,
+            actor: Some(&self.actor),
+            op: None,
+        };
+        let result = authorize_write_at(
+            self.policy,
+            &self.sink,
+            &request,
+            AuditMode::ProbeOnly,
+            self.now(),
+            || read_only.clone().map_or(Ok(()), Err),
+        );
+        match result {
+            Ok(()) => Ok(()),
+            Err(WriteRefusal::Policy(m)) => Err(ToolError::new("policy_refused", m)),
+            Err(WriteRefusal::AuditUnavailable(m)) => Err(ToolError::new("audit_unavailable", m)),
+            Err(WriteRefusal::Profile(m)) => {
+                let _ = self.record_at(audit_profile, label, target, &m, false, None);
+                Err(ToolError::new("read_only_profile", m))
+            }
+        }
+    }
+
+    /// Whether the policy forbids exporting record data from the RabbitMQ
+    /// broker at `addresses` (checked before a plan, without recording).
+    pub(super) fn export_forbidden(&self, addresses: &str) -> bool {
+        self.policy.export_rule_at(self.now(), addresses) == ExportRule::Forbidden
+    }
+
+    /// The export gate for a RabbitMQ tool that returns message bodies to
+    /// the AI client: refused and recorded under `export: forbidden`,
+    /// recorded under `export: audited`.
+    pub(super) fn authorize_rabbit_export(
+        &self,
+        tool: &str,
+        target: &str,
+        profile: &str,
+        addresses: &str,
+    ) -> Result<(), ToolError> {
+        let label = format!("mcp {tool}");
+        let request = ExportRequest {
+            source: "mcp",
+            channel: ExportChannel::Mcp,
+            label: &label,
+            target,
+            records: None,
+            profile,
+            bootstrap: addresses,
+            actor: Some(&self.actor),
+        };
+        ferrika_governance::policy::authorize_export_with(self.policy, &self.sink, &request)
+            .map_err(|refusal| ToolError::new("policy_refused", refusal.to_string()))
+    }
+
+    /// Whether the company policy enforces PII masking now.
+    pub(super) fn masking_enforced(&self) -> bool {
+        self.policy.masking_enforced_at(self.now())
+    }
+
     /// The copy checks of `ferrika transform --execute`
     /// ([`ferrika_ops::mirror::authorize_copy`]) for a transform from
     /// `src_topic` to `dst_topic` on this session's cluster: enforced PII
@@ -594,15 +827,33 @@ impl WriteGuard {
         }
     }
 
+    /// The Kafka profile, or its brokers, as audit entries name it.
+    fn audit_profile(&self) -> &str {
+        if self.config.profile.is_empty() {
+            &self.config.bootstrap
+        } else {
+            &self.config.profile
+        }
+    }
+
     fn entry(&self, action: String, target: &str, outcome: &str, ok: bool) -> AuditEntry {
+        self.entry_at(self.audit_profile(), action, target, outcome, ok)
+    }
+
+    /// An entry naming `profile` (a Kafka or RabbitMQ profile, or an
+    /// address).
+    fn entry_at(
+        &self,
+        profile: &str,
+        action: String,
+        target: &str,
+        outcome: &str,
+        ok: bool,
+    ) -> AuditEntry {
         AuditEntry {
             time_ms: self.now().as_millisecond(),
             source: "mcp".to_string(),
-            profile: if self.config.profile.is_empty() {
-                self.config.bootstrap.clone()
-            } else {
-                self.config.profile.clone()
-            },
+            profile: profile.to_string(),
             action,
             target: target.to_string(),
             outcome: outcome.to_string(),
@@ -630,7 +881,29 @@ impl WriteGuard {
         ok: bool,
         op: Option<(String, String)>,
     ) -> Option<String> {
-        let mut entry = self.entry(format!("mcp {tool}"), target, outcome, ok);
+        self.record_at(
+            self.audit_profile(),
+            format!("mcp {tool}"),
+            target,
+            outcome,
+            ok,
+            op,
+        )
+    }
+
+    /// Records `action` on `target` with `profile` (a RabbitMQ profile, or
+    /// the broker's address) as the entry's profile. Returns a warning when
+    /// the audit log could not be written.
+    pub(super) fn record_at(
+        &self,
+        profile: &str,
+        action: String,
+        target: &str,
+        outcome: &str,
+        ok: bool,
+        op: Option<(String, String)>,
+    ) -> Option<String> {
+        let mut entry = self.entry_at(profile, action, target, outcome, ok);
         if let Some((id, digest)) = op {
             entry.op = id;
             entry.op_digest = digest;
@@ -663,10 +936,24 @@ impl WriteGuard {
         } else {
             self.config.topics.join(", ")
         };
-        let outcome = format!(
+        let mut outcome = format!(
             "confirm {confirm}; {} writes/min, {} records/session, offset delta {}; topics: {topics}",
             limits.writes_per_minute, limits.produce_records, limits.offset_delta
         );
+        if self.config.tools.iter().any(|t| is_rabbit_tool(t)) {
+            let globs = |g: &[String], all: &str| {
+                if g.is_empty() {
+                    all.to_string()
+                } else {
+                    g.join(", ")
+                }
+            };
+            outcome.push_str(&format!(
+                "; rabbit queues: {}; rabbit exchanges: {}",
+                globs(&self.config.queues, "all"),
+                globs(&self.config.exchanges, "all but amq.rabbitmq.*")
+            ));
+        }
         let entry = self.entry(
             "mcp.session_start".to_string(),
             &self.config.tools.join(","),
@@ -883,6 +1170,8 @@ pub(super) mod tests {
         GuardConfig {
             tools: WRITE_TOOLS.to_vec(),
             topics: Vec::new(),
+            queues: Vec::new(),
+            exchanges: Vec::new(),
             limits: Limits {
                 writes_per_minute: 10,
                 produce_records: 1000,
