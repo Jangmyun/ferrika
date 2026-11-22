@@ -424,6 +424,27 @@ fn group_lag_metrics(
 /// How long a client gets to send its request line before the connection is dropped.
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The longest request line read; a longer one is answered as not found.
+const MAX_REQUEST_LINE: usize = 8 * 1024;
+
+/// Reads until the request line is complete (`\n`), the client closes, or
+/// [`MAX_REQUEST_LINE`] bytes: a request line can arrive in several TCP
+/// segments, and one read answered a split `GET /metrics` with 404.
+async fn read_request_line<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !buf.contains(&b'\n') && buf.len() < MAX_REQUEST_LINE {
+        let n = reader.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(buf)
+}
+
 /// The path of an HTTP request target, without `?query` or `#fragment`.
 fn request_path(target: &str) -> &str {
     target.split(['?', '#']).next().unwrap_or(target)
@@ -472,13 +493,13 @@ pub async fn start_exporter_server(
         let cache_ref = Arc::clone(&cached_metrics);
 
         tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            let read = tokio::time::timeout(REQUEST_READ_TIMEOUT, socket.read(&mut buf)).await;
-            if let Ok(Ok(n)) = read {
-                if n == 0 {
+            let read =
+                tokio::time::timeout(REQUEST_READ_TIMEOUT, read_request_line(&mut socket)).await;
+            if let Ok(Ok(buf)) = read {
+                if buf.is_empty() {
                     return;
                 }
-                let request = String::from_utf8_lossy(&buf[..n]);
+                let request = String::from_utf8_lossy(&buf);
                 let first_line = request.lines().next().unwrap_or("");
                 let parts: Vec<&str> = first_line.split_whitespace().collect();
 
@@ -505,7 +526,12 @@ pub async fn start_exporter_server(
                     body
                 );
 
-                let _ = socket.write_all(response.as_bytes()).await;
+                // A client that stops reading does not hold the task.
+                let _ = tokio::time::timeout(
+                    REQUEST_READ_TIMEOUT,
+                    socket.write_all(response.as_bytes()),
+                )
+                .await;
             }
         });
     }
@@ -634,6 +660,33 @@ mod tests {
         assert_eq!(request_path("/metrics#a"), "/metrics");
         assert_eq!(request_path("/healthz"), "/healthz");
         assert_eq!(request_path("/metricsx"), "/metricsx");
+    }
+
+    #[tokio::test]
+    async fn a_request_line_split_across_reads_is_read_whole() {
+        let mut reader =
+            tokio_test_reader(&[b"GE", b"T /met", b"rics HTTP/1.1\r\nHost: x\r\n\r\n"]);
+        let line = read_request_line(&mut reader).await.unwrap();
+        let text = String::from_utf8_lossy(&line);
+        assert!(text.starts_with("GET /metrics HTTP/1.1"), "{text}");
+    }
+
+    /// A reader handing out `parts` one read at a time.
+    fn tokio_test_reader(parts: &[&[u8]]) -> impl tokio::io::AsyncRead + Unpin {
+        struct Parts(std::collections::VecDeque<Vec<u8>>);
+        impl tokio::io::AsyncRead for Parts {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if let Some(part) = self.0.pop_front() {
+                    buf.put_slice(&part);
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        Parts(parts.iter().map(|p| p.to_vec()).collect())
     }
 
     #[test]
