@@ -146,7 +146,7 @@ impl GlobalOpts {
             .clone()
             .or_else(|| store.active_profile.clone())?;
         let ms = store.profiles.get(&name)?.request_timeout_ms?;
-        Some(std::time::Duration::from_millis(ms.max(1)))
+        Some(std::time::Duration::from_millis(ms))
     }
 
     /// Whether to print JSON: a command's own `--json` flag or the global

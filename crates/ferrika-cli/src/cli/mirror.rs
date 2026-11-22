@@ -115,7 +115,11 @@ fn cluster_config(
         config.bootstrap_servers = g_bs.clone();
     }
 
-    config.request_timeout = global.request_timeout();
+    // The cluster's own profile already set its timeout; --timeout, when
+    // given, applies to both sides.
+    if let Some(secs) = global.timeout {
+        config.request_timeout = std::time::Duration::from_secs(secs);
+    }
     config
 }
 
@@ -652,6 +656,31 @@ mod tests {
 
         fn probe(&self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[test]
+    fn each_side_keeps_its_profiles_timeout_unless_timeout_is_given() {
+        let mut store = ProfileStore::default();
+        let mut slow = crate::kafka::profile::ClusterProfile::new("slow", "s:9092");
+        slow.request_timeout_ms = Some(90_000);
+        store.add(slow, false);
+        store.add(
+            crate::kafka::profile::ClusterProfile::new("fast", "f:9092"),
+            false,
+        );
+        let src = cluster_config(&store, Some("slow"), None, &global_without_timeout());
+        assert_eq!(src.request_timeout, std::time::Duration::from_secs(90));
+        let mut explicit = global_without_timeout();
+        explicit.timeout = Some(5);
+        let src = cluster_config(&store, Some("slow"), None, &explicit);
+        assert_eq!(src.request_timeout, std::time::Duration::from_secs(5));
+    }
+
+    fn global_without_timeout() -> GlobalOpts {
+        GlobalOpts {
+            timeout: None,
+            ..global()
         }
     }
 
