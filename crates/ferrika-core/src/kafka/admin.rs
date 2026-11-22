@@ -585,7 +585,33 @@ fn entry_views(entries: Vec<rdkafka::admin::ConfigEntry>) -> Vec<ConfigEntryView
     views
 }
 
+/// How much longer than its timeout the client waits for a write's answer:
+/// the broker's own operation timeout should answer first.
+const WRITE_RESPONSE_MARGIN: Duration = Duration::from_secs(5);
+
+/// The client-side limit of a write that waits up to `timeout` (or the
+/// configured request timeout) on the broker.
+fn write_request_timeout(timeout: Option<Duration>, default: Duration) -> Duration {
+    timeout.unwrap_or(default) + WRITE_RESPONSE_MARGIN
+}
+
 impl KafkaAdminClient {
+    /// Options for a write. The broker waits up to `timeout` for the
+    /// operation to finish when one is given. The client always gives up a
+    /// little after it: without a request timeout librdkafka waits for
+    /// `socket.timeout.ms` (60 s) when no broker answers, whatever
+    /// `--timeout` says.
+    fn write_options(&self, timeout: Option<Duration>) -> AdminOptions {
+        let mut options = AdminOptions::new().request_timeout(Some(write_request_timeout(
+            timeout,
+            self.config.request_timeout,
+        )));
+        if let Some(to) = timeout {
+            options = options.operation_timeout(Some(to));
+        }
+        options
+    }
+
     /// Raises the partition count of `topic` to `total`. Kafka cannot remove partitions,
     /// and keyed records may map to different partitions afterwards.
     pub async fn add_partitions(
@@ -594,10 +620,7 @@ impl KafkaAdminClient {
         total: usize,
         timeout: Option<Duration>,
     ) -> KafkaResult<()> {
-        let mut options = AdminOptions::new();
-        if let Some(to) = timeout {
-            options = options.operation_timeout(Some(to));
-        }
+        let options = self.write_options(timeout);
         let results = self
             .admin
             .create_partitions(&[NewPartitions::new(topic, total)], &options)
@@ -620,10 +643,7 @@ impl KafkaAdminClient {
         group: &str,
         timeout: Option<Duration>,
     ) -> KafkaResult<()> {
-        let mut options = AdminOptions::new();
-        if let Some(to) = timeout {
-            options = options.operation_timeout(Some(to));
-        }
+        let options = self.write_options(timeout);
         let results = self
             .admin
             .delete_groups(&[group], &options)
@@ -715,10 +735,7 @@ impl KafkaAdminClient {
             }
         }
 
-        let mut options = AdminOptions::new().validate_only(validate_only);
-        if let Some(to) = timeout {
-            options = options.operation_timeout(Some(to));
-        }
+        let options = self.write_options(timeout).validate_only(validate_only);
 
         let results = self
             .admin
@@ -785,7 +802,9 @@ impl KafkaAdminClient {
             list.add_partition_offset(topic, p, rdkafka::Offset::End)
                 .map_err(|e| KafkaError::Admin(format!("invalid partition {p}: {e}")))?;
         }
-        let options = AdminOptions::new().operation_timeout(Some(timeout));
+        let options = self
+            .write_options(Some(timeout))
+            .operation_timeout(Some(timeout));
         let result = self
             .admin
             .delete_records(&list, &options)
@@ -822,10 +841,7 @@ impl KafkaAdminClient {
     }
 
     pub async fn delete_topic(&self, name: &str, timeout: Option<Duration>) -> KafkaResult<()> {
-        let mut options = AdminOptions::new();
-        if let Some(to) = timeout {
-            options = options.operation_timeout(Some(to));
-        }
+        let options = self.write_options(timeout);
 
         let results = self
             .admin
@@ -874,6 +890,21 @@ pub fn known_brokers(config: &KafkaClientConfig) -> Result<Vec<String>, String> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn writes_give_up_shortly_after_their_timeout() {
+        use super::write_request_timeout;
+        use std::time::Duration;
+        let configured = Duration::from_secs(30);
+        assert_eq!(
+            write_request_timeout(Some(Duration::from_secs(2)), configured),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            write_request_timeout(None, configured),
+            Duration::from_secs(35)
+        );
+    }
+
     #[test]
     fn per_broker_and_cluster_default_dynamic_configs_stay_apart() {
         use super::{ConfigOrigin, ConfigSource};
