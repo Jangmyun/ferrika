@@ -196,6 +196,17 @@ impl Expr {
         let ctx = Ctx { record, json };
         eval(&self.0, &ctx)
     }
+
+    /// [`Self::matches`] for a record whose value the caller already parsed
+    /// (or changed) as JSON: `$` paths read `value` instead of parsing
+    /// `record.value` again. With `value` `None` the record value is not
+    /// JSON, so paths find nothing and `$` alone is its text.
+    pub fn matches_parsed(&self, record: &RecordView, value: Option<&Value>) -> bool {
+        let json = std::cell::OnceCell::new();
+        let _ = json.set(value.map(std::borrow::Cow::Borrowed));
+        let ctx = Ctx { record, json };
+        eval(&self.0, &ctx)
+    }
 }
 
 fn describe(token: &Token) -> String {
@@ -583,14 +594,19 @@ fn index_of(n: &serde_json::Number) -> Option<usize> {
 
 struct Ctx<'a, 'r> {
     record: &'a RecordView<'r>,
-    json: std::cell::OnceCell<Option<Value>>,
+    json: std::cell::OnceCell<Option<std::borrow::Cow<'a, Value>>>,
 }
 
 impl Ctx<'_, '_> {
     fn value_json(&self) -> Option<&Value> {
         self.json
-            .get_or_init(|| self.record.value.and_then(|v| serde_json::from_str(v).ok()))
-            .as_ref()
+            .get_or_init(|| {
+                self.record
+                    .value
+                    .and_then(|v| serde_json::from_str(v).ok())
+                    .map(std::borrow::Cow::Owned)
+            })
+            .as_deref()
     }
 
     /// The operand's value; `None` when it does not exist.
@@ -958,5 +974,26 @@ mod tests {
         assert!(check("$.x == 2.0", r#"{"x":2}"#));
         assert!(check("$.items[1.0] == 5", r#"{"items":[4,5]}"#));
         assert!(Expr::parse("$.a == 1e999").is_err());
+    }
+
+    #[test]
+    fn matches_parsed_reads_the_given_value_not_the_text() {
+        let headers = Vec::new();
+        let view = RecordView {
+            key: Some("k"),
+            value: Some(r#"{"amount":5}"#),
+            headers: &headers,
+            partition: 0,
+            offset: 0,
+            timestamp_ms: 0,
+        };
+        let changed = serde_json::json!({"amount": 500});
+        let expr = Expr::parse("$.amount > 100").unwrap();
+        assert!(!expr.matches(&view));
+        assert!(expr.matches_parsed(&view, Some(&changed)));
+        // Not JSON: paths find nothing, `$` is the text.
+        assert!(!expr.matches_parsed(&view, None));
+        let text = Expr::parse(r#"$ contains "amount""#).unwrap();
+        assert!(text.matches_parsed(&view, None));
     }
 }
