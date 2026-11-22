@@ -262,7 +262,8 @@ pub async fn snapshot(
     data.cluster_id = admin.cluster_id(timeout).unwrap_or_default();
     data.topics = admin.list_topic_summaries(timeout)?;
     data.quorum = ferrika_core::kafka::wire::describe_quorum(config).unwrap_or_default();
-    let lags = crate::exporter::scrape_cluster_metrics(admin, config).await;
+    // Only offsets are used here: skip the record reads for time lag.
+    let (lags, _) = crate::exporter::scrape(admin, config, false).await;
     data.consumers = admin
         .list_consumer_group_listings(timeout)
         .unwrap_or_default()

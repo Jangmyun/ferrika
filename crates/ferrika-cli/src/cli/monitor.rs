@@ -99,16 +99,20 @@ pub async fn run(args: MonitorArgs, global: &GlobalOpts) -> anyhow::Result<()> {
             println!();
         }
 
-        match &args.command {
+        let result = match &args.command {
             MonitorSubcommands::Lag {
                 group_id, topic, ..
-            } => {
-                handle_lag(global, group_id.as_deref(), topic.as_deref()).await?;
-            }
-            MonitorSubcommands::Brokers { .. } => {
-                handle_brokers(global).await?;
-            }
+            } => handle_lag(global, group_id.as_deref(), topic.as_deref()).await,
+            MonitorSubcommands::Brokers { .. } => handle_brokers(global).await,
             MonitorSubcommands::Export { .. } => unreachable!(),
+        };
+        match result {
+            // A live view outlasts a broker timeout or a restart: show the
+            // error and try again at the next refresh.
+            Err(e) if args.watch => {
+                eprintln!("{} {e}", "✖ Refresh failed:".red());
+            }
+            other => other?,
         }
 
         if !args.watch {
