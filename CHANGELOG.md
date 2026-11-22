@@ -174,6 +174,16 @@ The RabbitMQ entries below are planned for 0.2.0.
 
 ### Changed
 
+- Tests: CI runs two more end-to-end smoke tests (Python, standard library
+  only). `tools/e2e/mcp_smoke.py` drives `ferrika mcp --allow-write` over
+  stdio JSON-RPC in the Kafka job (tools/list, read tools,
+  `transform_preview` masking, `transform_execute` plan, token and execute,
+  the `--topics` scope, audit entries). `tools/e2e/rabbit_smoke.py` runs in
+  a new RabbitMQ job (`rabbitmq:4-management`): profiles and where the
+  password is kept, queues/exchanges/bindings JSON, publish (routed and
+  unroutable), peek, `dlq inspect` grouping, `dlq redrive` preview and
+  `--execute` (x-death kept), read-only profile refusals and an audit log
+  without message bodies. See `docs/e2e/README.md`.
 - `ferrika top`: the refresh interval option is now `--interval` (the old
   `--interval-secs` still works) and defaults to 5 seconds instead of 2.
 - `rabbit peek` is a write: it changes the messages it reads (redelivered

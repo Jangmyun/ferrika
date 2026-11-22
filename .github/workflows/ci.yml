@@ -98,6 +98,8 @@ jobs:
       - run: cargo build -p ferrika-cli
       - name: Smoke test
         run: python3 tools/e2e/smoke.py target/debug/ferrika --broker localhost:9092
+      - name: MCP smoke test
+        run: python3 tools/e2e/mcp_smoke.py target/debug/ferrika --broker localhost:9092
 
   # The same smoke test against Redpanda, a Kafka API compatible broker.
   # (A service container cannot take Redpanda's start arguments.)
@@ -127,6 +129,41 @@ jobs:
           exit 1
       - name: Smoke test
         run: python3 tools/e2e/smoke.py target/debug/ferrika --broker localhost:9092
+
+  # End-to-end smoke test of `ferrika rabbit` against RabbitMQ (management
+  # API and AMQP). The test user comes from the image's default-user env.
+  e2e-rabbitmq:
+    name: End-to-end smoke test (RabbitMQ)
+    runs-on: ubuntu-latest
+    services:
+      rabbitmq:
+        image: rabbitmq:4-management
+        env:
+          RABBITMQ_DEFAULT_USER: ferrika-e2e
+          RABBITMQ_DEFAULT_PASS: ferrika-e2e-pw
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q check_port_connectivity"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake build-essential pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p ferrika-cli
+      - name: RabbitMQ smoke test
+        # No OS credential store on the runner: keep the password in the
+        # profile file, which the test checks is private.
+        env:
+          FERRIKA_SECRET_STORE: file
+        run: |
+          python3 tools/e2e/rabbit_smoke.py target/debug/ferrika --url http://localhost:15672 \
+            --user ferrika-e2e --password ferrika-e2e-pw --amqp-url amqp://localhost:5672
 
   # Dependency licenses, advisories and sources (see deny.toml).
   deny:
