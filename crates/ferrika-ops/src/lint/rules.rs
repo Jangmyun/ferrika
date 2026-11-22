@@ -209,6 +209,9 @@ struct Findings<'a> {
     env: Env,
     bootstrap: &'a str,
     out: Vec<LintFinding>,
+    /// T008 from cluster defaults alone: topic, segment.ms, retention.ms.
+    /// Reported once for the cluster (on Redpanda every topic has it).
+    default_segment_outlives: Vec<(String, i64, i64)>,
 }
 
 impl Findings<'_> {
@@ -301,6 +304,7 @@ pub fn check_all(input: &LintInput, opts: &LintOptions) -> Vec<LintFinding> {
         env: opts.env,
         bootstrap: &input.data.bootstrap_server,
         out: Vec::new(),
+        default_segment_outlives: Vec::new(),
     };
     let online = input.data.brokers.iter().filter(|b| b.is_online).count();
     for topic in input
@@ -314,9 +318,48 @@ pub fn check_all(input: &LintInput, opts: &LintOptions) -> Vec<LintFinding> {
             topic_config_rules(&mut findings, input, topic, &Configs::new(entries));
         }
     }
+    default_segment_rule(&mut findings);
     broker_rules(&mut findings, input, opts, online);
     group_rules(&mut findings, input);
     findings.out
+}
+
+/// T008 for topics whose segment.ms and retention.ms both come from the
+/// cluster defaults: one finding naming them, since the defaults are what
+/// to change (Redpanda's defaults, 14 days over 7, hit every topic).
+fn default_segment_rule(f: &mut Findings) {
+    let topics = std::mem::take(&mut f.default_segment_outlives);
+    let Some((_, segment, ret)) = topics.first().cloned() else {
+        return;
+    };
+    let names: Vec<&str> = topics.iter().map(|(t, _, _)| t.as_str()).collect();
+    let shown = if names.len() > 3 {
+        format!("{}, ... ({} topics)", names[..3].join(", "), names.len())
+    } else {
+        names.join(", ")
+    };
+    let suggested = ret.min(SEGMENT_MS_CAP);
+    f.push(
+        "T008",
+        HealthTarget::Brokers,
+        format!(
+            "The cluster default segment.ms {} is above the default retention.ms {}; records outlive their retention in the active segment of topics without overrides: {shown}",
+            duration(segment),
+            duration(ret)
+        ),
+        vec![
+            ("segment.ms", segment.to_string()),
+            ("retention.ms", ret.to_string()),
+        ],
+        Fix::Manual {
+            steps: vec![
+                format!(
+                    "Lower the cluster default segment roll time to at most {} (Kafka: log.roll.ms; Redpanda: log_segment_ms), or per topic: ferrika topics config <topic> -s segment.ms={suggested}",
+                    duration(suggested)
+                ),
+            ],
+        },
+    );
 }
 
 /// T001 and T014: from metadata alone, so they run without configs.
@@ -475,7 +518,10 @@ fn topic_config_rules(f: &mut Findings, input: &LintInput, topic: &TopicSummary,
             );
         }
         if let (Some(ret), Some(segment)) = (retention.filter(|ms| *ms > 0), c.i64("segment.ms")) {
-            if segment > ret {
+            if segment > ret && !c.is_override("segment.ms") && !c.is_override("retention.ms") {
+                f.default_segment_outlives
+                    .push((name.to_string(), segment, ret));
+            } else if segment > ret {
                 let suggested = ret.min(SEGMENT_MS_CAP);
                 f.push(
                     "T008",
@@ -704,7 +750,7 @@ fn broker_rules(f: &mut Findings, input: &LintInput, opts: &LintOptions, online:
                 vec![("default.replication.factor", "1".to_string())],
                 Fix::Manual {
                     steps: vec![
-                        "In each broker's server.properties: default.replication.factor=3, then restart the brokers one at a time".to_string(),
+                        "In each broker's server.properties: default.replication.factor=3, then restart the brokers one at a time (Redpanda: rpk cluster config set default_topic_replications 3)".to_string(),
                     ],
                 },
             );
@@ -734,7 +780,7 @@ fn broker_rules(f: &mut Findings, input: &LintInput, opts: &LintOptions, online:
                 vec![("auto.create.topics.enable", "true".to_string())],
                 Fix::Manual {
                     steps: vec![
-                        "In each broker's server.properties: auto.create.topics.enable=false, then restart the brokers one at a time".to_string(),
+                        "In each broker's server.properties: auto.create.topics.enable=false, then restart the brokers one at a time (Redpanda: rpk cluster config set auto_create_topics_enabled false)".to_string(),
                     ],
                 },
             );
@@ -1281,6 +1327,24 @@ mod tests {
             only(&findings, "T008").fix,
             topic_set("seg", vec![set("segment.ms", 86_400_000)])
         );
+        // From the defaults alone (Redpanda: 14 days over 7), one finding
+        // for the cluster instead of one per topic.
+        let mut defaults = input(1);
+        for name in ["a", "b", "c", "d"] {
+            with_topic(
+                &mut defaults,
+                topic(name, 1, 1),
+                &[
+                    ("segment.ms", "1209600000", Dflt),
+                    ("retention.ms", "604800000", Dflt),
+                ],
+            );
+        }
+        let from_defaults = lint(&defaults, &opts(Env::Prod));
+        let t008 = only(&from_defaults, "T008");
+        assert_eq!(t008.target, HealthTarget::Brokers);
+        assert!(t008.message.contains("(4 topics)"), "{}", t008.message);
+        assert!(!t008.applicable());
         let t009 = only(&findings, "T009");
         assert_eq!(t009.target, HealthTarget::Topic("tiny".into()));
         assert_eq!(
