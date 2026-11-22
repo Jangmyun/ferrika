@@ -191,7 +191,7 @@ fn ensure_topic_exists<'a>(
         Ok(())
     } else {
         Err(KafkaError::config(format!(
-            "Topic '{topic}' does not exist"
+            "Topic '{topic}' does not exist (or is an internal topic)"
         )))
     }
 }
@@ -231,7 +231,14 @@ async fn handle_lag(
         };
 
         if let Some(filter) = topic_filter {
-            ensure_topic_exists(summaries.iter().map(|t| t.name.as_str()), filter)?;
+            // Internal topics (__consumer_offsets) are left out of lag.
+            ensure_topic_exists(
+                summaries
+                    .iter()
+                    .filter(|t| !t.is_internal)
+                    .map(|t| t.name.as_str()),
+                filter,
+            )?;
         }
 
         let mut consumer_cfg = kafka_config.clone();
