@@ -82,6 +82,7 @@ pub async fn run(args: MonitorArgs, global: &GlobalOpts) -> anyhow::Result<()> {
     };
     let interval = Duration::from_secs(interval_secs.max(1));
 
+    let mut refreshed = false;
     loop {
         if args.watch {
             // Clear screen and reset cursor to (1,1)
@@ -108,12 +109,14 @@ pub async fn run(args: MonitorArgs, global: &GlobalOpts) -> anyhow::Result<()> {
         };
         match result {
             // A live view outlasts a broker timeout or a restart: show the
-            // error and try again at the next refresh.
-            Err(e) if args.watch => {
+            // error and try again at the next refresh. A first refresh that
+            // fails (no such group, wrong address or credentials) ends it.
+            Err(e) if args.watch && refreshed => {
                 eprintln!("{} {e}", "✖ Refresh failed:".red());
             }
             other => other?,
         }
+        refreshed = true;
 
         if !args.watch {
             break;
