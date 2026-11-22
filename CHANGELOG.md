@@ -11,6 +11,9 @@ and 0.2.0 makes it crate-internal.
 
 ### Fixed
 
+- `dlq export` saved only a 120-character preview of each value; records
+  now carry the whole value as `payload` (or `payload_base64` when it is not
+  UTF-8), masked while the policy enforces masking.
 - A profile's request timeout (`request_timeout_ms`) was always replaced
   by `--timeout`'s default of 30 s; it now applies unless `--timeout` is
   given.
