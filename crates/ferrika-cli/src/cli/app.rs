@@ -173,7 +173,39 @@ fn no_command_help() -> String {
 /// command, and prints the help (exit status 0) when there is none.
 pub fn main_cli() {
     exit_quietly_on_broken_pipe();
-    run(Cli::parse());
+    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let brokers_from_env =
+        matches.value_source("bootstrap_servers") == Some(clap::parser::ValueSource::EnvVariable);
+    let cli =
+        <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    if let Some(warning) = env_brokers_warning(
+        cli.global_opts.profile.as_deref(),
+        cli.global_opts.bootstrap_servers.as_deref(),
+        brokers_from_env,
+    ) {
+        eprintln!("{warning}");
+    }
+    run(cli);
+}
+
+/// A warning when `KAFKA_BOOTSTRAP_SERVERS` (often left set by a
+/// docker-compose setup) replaces the brokers of a profile chosen with
+/// `-p`/`FERRIKA_PROFILE`: the command then sends that profile's
+/// credentials to other brokers while its name shows in audit entries.
+fn env_brokers_warning(
+    profile: Option<&str>,
+    brokers: Option<&str>,
+    brokers_from_env: bool,
+) -> Option<String> {
+    let profile = profile.map(str::trim).filter(|p| !p.is_empty())?;
+    let brokers = brokers.map(str::trim).filter(|b| !b.is_empty())?;
+    brokers_from_env.then(|| {
+        format!(
+            "Warning: KAFKA_BOOTSTRAP_SERVERS={brokers} replaces the brokers of profile \
+             '{profile}', and its credentials go there. Unset it to use the profile's \
+             brokers, or pass -b to choose them explicitly."
+        )
+    })
 }
 
 /// Runs a CLI command line: the policy and audit gates, then the command.
@@ -931,6 +963,27 @@ fn write_target(command: &Commands) -> String {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn env_brokers_with_a_chosen_profile_are_flagged() {
+        use super::env_brokers_warning;
+        let warning = env_brokers_warning(Some("staging"), Some("localhost:9092"), true);
+        assert!(
+            warning
+                .as_deref()
+                .is_some_and(|w| w.contains("'staging'") && w.contains("localhost:9092")),
+            "{warning:?}"
+        );
+        // -b on the command line is a choice, not a leftover variable.
+        assert_eq!(
+            env_brokers_warning(Some("staging"), Some("h:9092"), false),
+            None
+        );
+        // Without a chosen profile the variable just names the brokers.
+        assert_eq!(env_brokers_warning(None, Some("h:9092"), true), None);
+        assert_eq!(env_brokers_warning(Some(" "), Some("h:9092"), true), None);
+        assert_eq!(env_brokers_warning(Some("staging"), Some(""), true), None);
+    }
+
     #[test]
     fn empty_profile_and_brokers_mean_not_set() {
         use clap::Parser as _;
