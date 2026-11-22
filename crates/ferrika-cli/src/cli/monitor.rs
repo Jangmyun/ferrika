@@ -9,7 +9,7 @@ use crate::error::KafkaError;
 use crate::kafka::admin::KafkaAdminClient;
 use crate::kafka::consumer::KafkaConsumerClient;
 use crate::kafka::metrics::{calculate_partition_lag, PartitionLag};
-use crate::model::cluster::{BrokerInfo, ConsumerGroupSummary, ConsumerState};
+use crate::model::cluster::{BrokerInfo, ConsumerGroupSummary};
 
 /// Command line arguments for cluster and consumer group monitoring.
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
@@ -343,21 +343,22 @@ async fn handle_lag(
             }
         };
 
-        let group_summaries: Vec<ConsumerGroupSummary> = groups
-            .into_iter()
-            .map(|id| ConsumerGroupSummary {
-                group_id: id,
-                state: ConsumerState::Stable,
-                active_members: 0,
-                target_topics: Vec::new(),
-                current_offset: 0,
-                end_offset: 0,
-                total_lag: 0,
-                coordinator_node: "-".to_string(),
-                consume_rate: None,
-                partitions: Vec::new(),
-            })
-            .collect();
+        // State, members and lag as `health` reads them (this used to show
+        // every group as Stable with no lag).
+        let group_summaries = match crate::cli::health::snapshot(global).await {
+            Ok(snapshot) => snapshot.consumers,
+            Err(err) => {
+                print_connection_hint(&global.to_kafka_config(), &err);
+                return Err(err.into());
+            }
+        };
+        if group_summaries.is_empty() && !groups.is_empty() {
+            return Err(KafkaError::Admin(format!(
+                "Cannot describe the {} consumer group(s) on the cluster",
+                groups.len()
+            ))
+            .into());
+        }
 
         match global.format {
             OutputFormat::Table => {
@@ -567,14 +568,20 @@ pub fn render_group_list_table(groups: &[ConsumerGroupSummary]) -> String {
     let mut table = output::table(vec![
         Cell::new("CONSUMER GROUP ID").fg(Color::Cyan),
         Cell::new("STATE").fg(Color::Green),
-        Cell::new("COORDINATOR").fg(Color::Blue),
+        Cell::new("MEMBERS"),
+        Cell::new("TOTAL LAG").fg(Color::Yellow),
     ]);
 
     for g in groups {
         table.add_row(vec![
             Cell::new(&g.group_id).fg(Color::Cyan),
             Cell::new(g.state.as_str()).fg(Color::Green),
-            Cell::new(&g.coordinator_node).fg(Color::Blue),
+            Cell::new(g.active_members),
+            Cell::new(g.total_lag).fg(if g.total_lag > 0 {
+                Color::Yellow
+            } else {
+                Color::White
+            }),
         ]);
     }
 
@@ -596,6 +603,29 @@ fn chrono_or_simple_time() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_overview_shows_members_and_lag() {
+        let group = ConsumerGroupSummary {
+            group_id: "billing".into(),
+            state: crate::model::cluster::ConsumerState::Empty,
+            active_members: 0,
+            target_topics: vec!["orders".into()],
+            current_offset: 10,
+            end_offset: 52,
+            total_lag: 42,
+            coordinator_node: "-".into(),
+            consume_rate: None,
+            partitions: Vec::new(),
+        };
+        let table = render_group_list_table(&[group]);
+        assert!(
+            table.contains("TOTAL LAG") && table.contains("MEMBERS"),
+            "{table}"
+        );
+        assert!(table.contains("Empty") && table.contains("42"), "{table}");
+        assert!(!table.contains("COORDINATOR"), "{table}");
+    }
 
     #[test]
     fn lag_for_a_missing_group_is_an_error() {
