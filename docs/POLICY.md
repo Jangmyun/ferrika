@@ -508,7 +508,7 @@ does not trust what it finds there:
   grant their own accounts write access to `%TEMP%`; a spool folder there
   is then refused for the same reason.
 - Files are `0600`, so on Unix the log collector has to run as root or as
-  the same account. The files written by Ferrika 0.2.0 and earlier
+  the same account. The files written by Ferrika 0.1
   (`ferrika-audit-<host>-<user>.jsonl`, no random part) are no longer
   appended to.
 

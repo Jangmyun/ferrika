@@ -19,11 +19,9 @@
 //!
 //! # Semver notes
 //!
-//! - A few consumer-group offset functions still take or return
-//!   `rdkafka::TopicPartitionList` (rdkafka 0.39): the committed-offset reads
-//!   and `commit` of [`kafka::consumer::KafkaConsumerClient`], and
-//!   `group_lag` in `ferrika-ops`. They change with rdkafka; plain maps are
-//!   planned for 0.3.
+//! - No public signature names an `rdkafka` type; committed offsets are
+//!   plain `(topic, partition)` maps, so an rdkafka upgrade does not change
+//!   this crate's API.
 //! - `jiff` 1 [`jiff::Timestamp`] and `serde_json` 1 [`serde_json::Value`]
 //!   appear in public signatures, so a major version change of either is a
 //!   breaking change here too.

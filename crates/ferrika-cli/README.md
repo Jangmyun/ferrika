@@ -19,10 +19,12 @@ Documentation: <https://github.com/Jangmyun/ferrika>.
 
 ## As a library
 
-This crate is the command line. Its Rust `cli` module (argument structs,
-the command enum) is not a stable API: options added to commands change it
-in patch versions, and 0.2.0 makes it crate-internal. Use `ferrika-core`,
-`ferrika-governance`, `ferrika-ops` and `ferrika-mcp` as libraries.
+This crate is the command line. Since 0.2.0 its command modules, argument
+structs and command enum are crate-internal; the public `cli` items are the
+entry points (`cli::app::{Cli, run, init_tracing,
+exit_quietly_on_broken_pipe}`, `cli::GlobalOpts`) and a few RabbitMQ and
+transform helpers for front ends. Use `ferrika-core`, `ferrika-governance`,
+`ferrika-ops`, `ferrika-mcp` and `ferrika-rabbitmq` as libraries.
 
 ## License
 

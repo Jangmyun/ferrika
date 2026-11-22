@@ -4,7 +4,7 @@
 #   irm https://github.com/Jangmyun/ferrika/releases/latest/download/install.ps1 | iex
 #
 # Environment:
-#   FERRIKA_VERSION       release tag to install, for example v0.1.1 (default: latest)
+#   FERRIKA_VERSION       release tag to install, for example v0.2.0 (default: latest)
 #   FERRIKA_INSTALL_DIR   target folder (default: %LOCALAPPDATA%\Programs\ferrika\bin)
 #   FERRIKA_NO_MODIFY_PATH=1   leave the user PATH alone
 #

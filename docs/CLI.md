@@ -117,7 +117,7 @@ first 16 hex digits of the SHA-256 of the directory's absolute, canonical
 path (on Windows without the `\\?\` prefix, with `\` separators, in lower case). So a
 test directory with a `prod` profile never overwrites the password of `prod`
 in `~/.ferrika`. When a profile in another directory has no entry of its own
-yet (saved by Ferrika 0.2.0 or earlier), Ferrika reads `<profile>/<field>`
+yet (saved by Ferrika 0.1), Ferrika reads `<profile>/<field>`
 once and copies it to the directory's own account; the old entry stays.
 
 ### Health checks (`ferrika health`)
