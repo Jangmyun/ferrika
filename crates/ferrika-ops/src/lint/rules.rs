@@ -209,6 +209,9 @@ struct Findings<'a> {
     env: Env,
     bootstrap: &'a str,
     out: Vec<LintFinding>,
+    /// T008 from cluster defaults alone: topic, segment.ms, retention.ms.
+    /// Reported once for the cluster (on Redpanda every topic has it).
+    default_segment_outlives: Vec<(String, i64, i64)>,
 }
 
 impl Findings<'_> {
@@ -301,6 +304,7 @@ pub fn check_all(input: &LintInput, opts: &LintOptions) -> Vec<LintFinding> {
         env: opts.env,
         bootstrap: &input.data.bootstrap_server,
         out: Vec::new(),
+        default_segment_outlives: Vec::new(),
     };
     let online = input.data.brokers.iter().filter(|b| b.is_online).count();
     for topic in input
@@ -314,9 +318,66 @@ pub fn check_all(input: &LintInput, opts: &LintOptions) -> Vec<LintFinding> {
             topic_config_rules(&mut findings, input, topic, &Configs::new(entries));
         }
     }
+    default_segment_rule(&mut findings, opts);
     broker_rules(&mut findings, input, opts, online);
     group_rules(&mut findings, input);
     findings.out
+}
+
+/// T008 for topics whose segment.ms and retention.ms both come from the
+/// cluster defaults: one finding naming them, since the defaults are what
+/// to change (Redpanda's defaults, 14 days over 7, hit every topic).
+fn default_segment_rule(f: &mut Findings, opts: &LintOptions) {
+    // `--skip T008:GLOB` names topics; the cluster finding leaves them out.
+    let skipped = |topic: &str| {
+        opts.skip.iter().any(|(rule, glob)| {
+            rule.eq_ignore_ascii_case("T008")
+                && glob
+                    .as_ref()
+                    .is_some_and(|g| ferrika_governance::policy::glob_match(g, topic))
+        })
+    };
+    // One finding per pair of default values (brokers may differ).
+    let mut by_values: BTreeMap<(i64, i64), Vec<String>> = BTreeMap::new();
+    for (topic, segment, ret) in std::mem::take(&mut f.default_segment_outlives) {
+        if !skipped(&topic) {
+            by_values.entry((segment, ret)).or_default().push(topic);
+        }
+    }
+    for ((segment, ret), topics) in by_values {
+        default_segment_finding(f, segment, ret, &topics);
+    }
+}
+
+fn default_segment_finding(f: &mut Findings, segment: i64, ret: i64, topics: &[String]) {
+    let names: Vec<&str> = topics.iter().map(String::as_str).collect();
+    let shown = if names.len() > 3 {
+        format!("{}, ... ({} topics)", names[..3].join(", "), names.len())
+    } else {
+        names.join(", ")
+    };
+    let suggested = ret.min(SEGMENT_MS_CAP);
+    f.push(
+        "T008",
+        HealthTarget::Brokers,
+        format!(
+            "The cluster default segment.ms {} is above the default retention.ms {}; records outlive their retention in the active segment of topics without overrides: {shown}",
+            duration(segment),
+            duration(ret)
+        ),
+        vec![
+            ("segment.ms", segment.to_string()),
+            ("retention.ms", ret.to_string()),
+        ],
+        Fix::Manual {
+            steps: vec![
+                format!(
+                    "Lower the cluster default segment roll time to at most {} (Kafka: log.roll.ms; Redpanda: log_segment_ms), or per topic: ferrika topics config <topic> -s segment.ms={suggested}",
+                    duration(suggested)
+                ),
+            ],
+        },
+    );
 }
 
 /// T001 and T014: from metadata alone, so they run without configs.
@@ -475,7 +536,10 @@ fn topic_config_rules(f: &mut Findings, input: &LintInput, topic: &TopicSummary,
             );
         }
         if let (Some(ret), Some(segment)) = (retention.filter(|ms| *ms > 0), c.i64("segment.ms")) {
-            if segment > ret {
+            if segment > ret && !c.is_override("segment.ms") && !c.is_override("retention.ms") {
+                f.default_segment_outlives
+                    .push((name.to_string(), segment, ret));
+            } else if segment > ret {
                 let suggested = ret.min(SEGMENT_MS_CAP);
                 f.push(
                     "T008",
@@ -704,7 +768,7 @@ fn broker_rules(f: &mut Findings, input: &LintInput, opts: &LintOptions, online:
                 vec![("default.replication.factor", "1".to_string())],
                 Fix::Manual {
                     steps: vec![
-                        "In each broker's server.properties: default.replication.factor=3, then restart the brokers one at a time".to_string(),
+                        "In each broker's server.properties: default.replication.factor=3, then restart the brokers one at a time (Redpanda: rpk cluster config set default_topic_replications 3)".to_string(),
                     ],
                 },
             );
@@ -734,7 +798,7 @@ fn broker_rules(f: &mut Findings, input: &LintInput, opts: &LintOptions, online:
                 vec![("auto.create.topics.enable", "true".to_string())],
                 Fix::Manual {
                     steps: vec![
-                        "In each broker's server.properties: auto.create.topics.enable=false, then restart the brokers one at a time".to_string(),
+                        "In each broker's server.properties: auto.create.topics.enable=false, then restart the brokers one at a time (Redpanda: rpk cluster config set auto_create_topics_enabled false)".to_string(),
                     ],
                 },
             );
@@ -1281,6 +1345,32 @@ mod tests {
             only(&findings, "T008").fix,
             topic_set("seg", vec![set("segment.ms", 86_400_000)])
         );
+        // From the defaults alone (Redpanda: 14 days over 7), one finding
+        // for the cluster instead of one per topic.
+        let mut defaults = input(1);
+        for name in ["a", "b", "c", "d"] {
+            with_topic(
+                &mut defaults,
+                topic(name, 1, 1),
+                &[
+                    ("segment.ms", "1209600000", Dflt),
+                    ("retention.ms", "604800000", Dflt),
+                ],
+            );
+        }
+        let from_defaults = lint(&defaults, &opts(Env::Prod));
+        let t008 = only(&from_defaults, "T008");
+        assert_eq!(t008.target, HealthTarget::Brokers);
+        assert!(t008.message.contains("(4 topics)"), "{}", t008.message);
+        assert!(!t008.applicable());
+        // --skip T008:GLOB still leaves those topics out.
+        let mut skipping = opts(Env::Prod);
+        skipping.skip.push(("T008".into(), Some("a".into())));
+        let t008 = lint(&defaults, &skipping)
+            .into_iter()
+            .find(|f| f.rule == "T008")
+            .expect("T008 for b, c, d");
+        assert!(t008.message.ends_with(": b, c, d"), "{}", t008.message);
         let t009 = only(&findings, "T009");
         assert_eq!(t009.target, HealthTarget::Topic("tiny".into()));
         assert_eq!(
