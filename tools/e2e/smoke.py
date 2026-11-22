@@ -90,7 +90,8 @@ def check(name, ok, detail=""):
 
 
 def crashed(rc):
-    return rc in (-6, -11, 134, 137, -9, "timeout")
+    # POSIX signals, and Windows' access violation / stack overflow / abort.
+    return rc in (-6, -11, 134, 137, -9, "timeout", 0xC0000005, 0xC00000FD, 0xC0000409)
 
 
 def tail(s, n=240):
@@ -297,7 +298,10 @@ def scenarios():
     # --- local ACL deletion only removes the named binding --------------
     home = tmp / "home"
     home.mkdir()
-    env = {"HOME": str(home), "FERRIKA_SECRET_STORE": "file"}
+    # USERPROFILE too: on Windows it comes before HOME, and the test must not
+    # touch the user's own ~/.ferrika.
+    env = {"HOME": str(home), "USERPROFILE": str(home), "FERRIKA_CONFIG_DIR": str(home / ".ferrika"),
+           "FERRIKA_SECRET_STORE": "file"}
     run(["acl", "create", "--local", "-p", "User:x", "-o", "Read", "-t", "*"], env=env, broker=False)
     run(["acl", "create", "--local", "-p", "User:x", "-o", "Read", "-t", "billing"], env=env, broker=False)
     run(["acl", "delete", "--local", "-p", "User:x", "-t", "billing", "-f"], env=env, broker=False)

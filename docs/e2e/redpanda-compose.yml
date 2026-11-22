@@ -1,0 +1,44 @@
+# Three-node Redpanda cluster for testing the ferrika CLI against Redpanda
+# (reassignment between brokers, offline brokers). Test use only.
+#
+#   docker compose -f docs/e2e/redpanda-compose.yml up -d
+#   ferrika -b localhost:39092 topics list
+#
+# Kafka API on localhost:39092-39094, Schema Registry on localhost:38081.
+# SASL is off; to try SCRAM, see docs/REDPANDA.md.
+name: ferrika-redpanda
+
+x-node: &node
+  image: docker.redpanda.com/redpandadata/redpanda:v26.3.1
+
+services:
+  redpanda-0:
+    <<: *node
+    command: >-
+      redpanda start --smp 1 --memory 512M --overprovisioned --node-id 0
+      --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:39092
+      --advertise-kafka-addr internal://redpanda-0:9092,external://localhost:39092
+      --rpc-addr redpanda-0:33145 --advertise-rpc-addr redpanda-0:33145
+      --schema-registry-addr 0.0.0.0:38081
+      --seeds redpanda-0:33145
+    ports: ["39092:39092", "38081:38081"]
+  redpanda-1:
+    <<: *node
+    command: >-
+      redpanda start --smp 1 --memory 512M --overprovisioned --node-id 1
+      --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:39093
+      --advertise-kafka-addr internal://redpanda-1:9092,external://localhost:39093
+      --rpc-addr redpanda-1:33145 --advertise-rpc-addr redpanda-1:33145
+      --seeds redpanda-0:33145
+    ports: ["39093:39093"]
+    depends_on: [redpanda-0]
+  redpanda-2:
+    <<: *node
+    command: >-
+      redpanda start --smp 1 --memory 512M --overprovisioned --node-id 2
+      --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:39094
+      --advertise-kafka-addr internal://redpanda-2:9092,external://localhost:39094
+      --rpc-addr redpanda-2:33145 --advertise-rpc-addr redpanda-2:33145
+      --seeds redpanda-0:33145
+    ports: ["39094:39094"]
+    depends_on: [redpanda-0]

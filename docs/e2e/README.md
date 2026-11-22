@@ -12,7 +12,9 @@ The same smoke test runs against Redpanda, a Kafka API compatible broker
 (CI does both):
 
 ```bash
-docker run -d --name redpanda -p 9092:9092 docker.redpanda.com/redpandadata/redpanda:v26.3.1   redpanda start --mode dev-container --smp 1 --memory 1G --overprovisioned   --kafka-addr 0.0.0.0:9092 --advertise-kafka-addr localhost:9092
+docker run -d --name redpanda -p 9092:9092 docker.redpanda.com/redpandadata/redpanda:v26.3.1 \
+  redpanda start --mode dev-container --smp 1 --memory 1G --overprovisioned \
+  --kafka-addr 0.0.0.0:9092 --advertise-kafka-addr localhost:9092
 python3 tools/e2e/smoke.py target/debug/ferrika --broker localhost:9092
 ```
 
