@@ -34,6 +34,8 @@ pub mod top;
 pub mod topics;
 pub mod topology;
 pub mod trace;
+#[cfg(feature = "tui")]
+pub mod tui;
 pub mod user;
 
 use clap::{Args, ValueEnum};

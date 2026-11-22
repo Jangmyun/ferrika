@@ -27,6 +27,25 @@ and 0.2.0 makes it crate-internal.
 - `docs/COMPATIBILITY.md`: what is tested against which Kafka-compatible
   broker, the presets and known limitations; `docs/e2e/automq-compose.yml`
   (not run yet) for a later AutoMQ end-to-end test.
+- `ferrika top` (new alias `ferrika tui`) opens an interactive, read-only
+  terminal dashboard when run at a terminal: Overview (brokers online and
+  offline, controller, under-replicated and leaderless partitions, health
+  findings), Topics (replication, records, produce rate from watermark
+  deltas), Consumer groups (state, members, lag with a trend arrow) and
+  Findings, with keys to switch views, filter (`/`), sort (`s`), refresh
+  (`r`) and quit (`q`). The cluster is read on a background thread, so a
+  slow cluster does not freeze the screen; the status line shows the age of
+  the data and the last error. The terminal is restored on exit and on a
+  panic. It is the default-on `tui` feature of `ferrika-cli` (ratatui 0.30,
+  crossterm 0.29). `--plain` keeps the previous printed view, which is also
+  used with `-n`, `--json` or when stdout is not a terminal.
+
+### Changed
+
+- `ferrika top`: the refresh interval option is now `--interval` (the old
+  `--interval-secs` still works) and defaults to 5 seconds instead of 2.
+- Building `ferrika-cli` with default features needs Rust 1.88 (ratatui's
+  minimum).
 
 ### Fixed
 

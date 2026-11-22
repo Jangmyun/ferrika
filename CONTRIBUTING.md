@@ -53,7 +53,7 @@ new command must be classified there.
 
 ### Build requirements
 
-- Rust 1.85 or newer (the project is tested on a recent stable toolchain).
+- Rust 1.88 or newer (the project is tested on a recent stable toolchain).
 - CMake and a C compiler, because `rdkafka` builds the bundled `librdkafka`.
 - On Windows, MSVC build tools with `rc.exe` on `PATH`.
 
