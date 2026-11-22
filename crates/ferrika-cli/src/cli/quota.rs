@@ -181,7 +181,7 @@ fn quota_change(
     let before = wire::describe_client_quotas(config).map(|quotas| {
         quotas
             .into_iter()
-            .find(|q| &q.entity == entity && q.key == key)
+            .find(|q| crate::model::quota::same_quota_entity(&q.entity, entity) && q.key == key)
             .map(|q| q.value)
     });
     record::change_from_capture(
