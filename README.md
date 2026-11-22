@@ -265,7 +265,8 @@ ferrika diff orders-v1 orders-v2 --exit-code || echo "topics differ (1) or the d
 ```
 
 A reader that closes the pipe (`ferrika consume ... | head`) ends the command
-quietly with exit 0.
+quietly with exit 0; with `-g` the offsets of the records it was given are
+committed first.
 
 ## Contributing and security
 

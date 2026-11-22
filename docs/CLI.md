@@ -179,7 +179,9 @@ findings, with the command for each fix), `list_brokers`, `list_topics`,
 `describe_topic`, `list_consumer_groups`, `consumer_group_lag`,
 `message_histogram` (records per time bucket from offsets), `schema_fields`
 (the field paths of a topic's Schema Registry schema, ready for a `where`
-filter; needs the profile's registry URL),
+filter; `topic` with `key` for the key subject, or `subject`, and `version`
+for an older one; needs the profile's registry URL and reads no records, so
+it is offered under `export: forbidden` too),
 `peek_messages` and `transform_preview`. None of them changes the cluster.
 `peek_messages` reads without a consumer group and masks emails, card
 numbers and tokens unless `mask_pii` is false. A broken `profiles.json` or
@@ -542,6 +544,12 @@ cat events.txt | ferrika produce raw-logs
 echo "user-42:login_success" | ferrika produce user-logins -s ":"
 ```
 
+From stdin, Ctrl+C stops reading and waits for the messages already sent to
+be confirmed; a second Ctrl+C (or a first one after the input ended) stops
+waiting, reports how many were delivered and how many are not confirmed,
+and exits with an error (audited as interrupted). Unconfirmed messages may
+still reach the topic.
+
 ### 4. Message Consumer (`ferrika consume`)
 ```bash
 # Consume from latest offsets
@@ -588,6 +596,13 @@ Filter expressions (`-W`/`--where`, expressions that start with
 | `== != > >= < <=` | Compare; a number and a numeric string compare as numbers |
 | `=~ "regex"`, `contains "text"` | Case-insensitive match (`=~` too: `key =~ "^EU-"` matches `eu-1`); `contains` also checks array elements |
 | `exists`, `&&`/`and`, `\|\|`/`or`, `!`/`not`, `( )` | Presence and logic; a bare field is true unless missing, null, false, 0 or "" |
+
+With `-g`, the group's offsets are committed for the records the command
+handled. When the reader of stdout goes away (`ferrika consume orders-v1 -g
+audit -b | head -3`), only records whose whole line reached stdout count:
+their offsets are committed (per partition, the last such record + 1), the
+command exits 0, and the next run with the group starts after them. Records
+read but not written yet are read again by that run.
 
 List the paths a subject's schema gives, e.g. to write `--where`: `ferrika schema fields --topic orders-v1 --plain` (or `ferrika schema fields orders-v1-value` for types, flags and enum values).
 
@@ -1072,4 +1087,5 @@ ferrika diff orders-v1 orders-v2 --exit-code || echo "topics differ (1) or the d
 ```
 
 A reader that closes the pipe (`ferrika consume ... | head`) ends the command
-quietly with exit 0.
+quietly with exit 0; with `-g` the offsets of the records it was given are
+committed first.

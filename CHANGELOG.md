@@ -226,6 +226,21 @@ The RabbitMQ entries below are planned for 0.2.0.
 
 ### Fixed
 
+- `consume --group` whose reader closed the pipe (`| head`) ended without
+  committing, so the next run read the same records again. It now commits,
+  per partition, the offset after the last record whose whole line reached
+  stdout (records filtered out before it count as handled; records read but
+  not written are not committed and come again), still exits 0, and the
+  audit result says how many records' offsets were committed. Offsets are
+  now stored as records reach stdout rather than when they are read, so the
+  periodic auto-commit no longer covers records still in the output buffer.
+- `produce` from stdin could not be stopped while the broker was down: with
+  the in-flight window (10,000 messages) full, it waited for a delivery
+  without listening for Ctrl+C, and after the first Ctrl+C it waited for
+  every pending delivery. Waiting for window space now also ends on Ctrl+C,
+  and a second Ctrl+C (or one after the input ended) stops waiting: the
+  command reports how many messages were delivered and how many are not
+  confirmed, exits with an error and is audited as interrupted.
 - `dlq export` saved only a 120-character preview of each value; records
   now carry the whole value as `payload` (or `payload_base64` when it is not
   UTF-8, with `payload` null), masked while the policy enforces masking.
