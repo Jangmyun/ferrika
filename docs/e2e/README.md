@@ -25,6 +25,7 @@ python3 tools/e2e/smoke.py target/debug/ferrika --broker localhost:9092
 | `kafka-scram-compose.yml` | One broker with SASL SCRAM-SHA-256/512 on `localhost:19392`; the file lists how to create the users |
 | `kafka-oauth-compose.yml` | One broker that accepts unsecured JWTs on `localhost:19096`, plus a token endpoint on `localhost:18080` served by `oauth-idp.py` |
 | `oauth-idp.py` | Test-only OAuth 2.0 client-credentials endpoint (standard library only) |
+| `redpanda-compose.yml` | Three-node Redpanda (Kafka API on `localhost:39092`-`39094`, Schema Registry on `localhost:38081`) |
 | `undo.sh` | Checks `ferrika history` and `ferrika undo` against a broker; the header lists its variables |
 
 Usage, for example (undo check against a plain single-node broker):
