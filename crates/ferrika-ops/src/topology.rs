@@ -68,7 +68,7 @@ pub struct ClusterTopologyReport {
 
 /// Raw representation of a broker for topology evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RawBrokerInput {
+pub(crate) struct RawBrokerInput {
     pub id: i32,
     pub host: String,
     pub port: u16,
@@ -78,7 +78,7 @@ pub struct RawBrokerInput {
 
 /// Raw representation of a partition for topology evaluation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RawPartitionInput {
+pub(crate) struct RawPartitionInput {
     pub topic: String,
     pub partition_id: i32,
     pub leader: i32,
@@ -87,7 +87,7 @@ pub struct RawPartitionInput {
 }
 
 /// Evaluates cluster topology, rack distribution, and partition health.
-pub fn build_topology_report(
+pub(crate) fn build_topology_report(
     raw_brokers: &[RawBrokerInput],
     raw_partitions: &[RawPartitionInput],
 ) -> ClusterTopologyReport {

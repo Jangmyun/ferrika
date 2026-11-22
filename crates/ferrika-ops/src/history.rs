@@ -22,7 +22,7 @@ pub mod inverse;
 pub mod undo;
 
 /// File name of the journal.
-pub const HISTORY_FILE: &str = "history.jsonl";
+pub(crate) const HISTORY_FILE: &str = "history.jsonl";
 
 /// Operations kept when the journal is trimmed.
 pub const KEEP_OPERATIONS: usize = 1000;

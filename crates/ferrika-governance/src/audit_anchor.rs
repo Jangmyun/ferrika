@@ -45,7 +45,7 @@ impl AuditAnchor for NoAnchor {
 
 /// Whether a failed anchor write refuses the change when the policy does not
 /// say (`anchor_required`). Product decision pending; until then it warns.
-pub const ANCHOR_REQUIRED_DEFAULT: bool = false;
+pub(crate) const ANCHOR_REQUIRED_DEFAULT: bool = false;
 
 /// Whether [`OsLogAnchor::latest`] can read anchors back on this OS.
 pub const OS_LOG_READABLE: bool = cfg!(windows);

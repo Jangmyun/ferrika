@@ -368,7 +368,7 @@ impl DlqAnalysis {
 }
 
 /// Normalizes common stacktrace / error messages into concise categorized buckets
-pub fn classify_error_reason(msg: &str) -> String {
+pub(crate) fn classify_error_reason(msg: &str) -> String {
     let lower = msg.to_lowercase();
     if lower.contains("deserializ")
         || lower.contains("serde")
@@ -423,12 +423,9 @@ pub struct RedriveSummary {
     pub target_topic_distribution: Vec<(String, usize)>,
 }
 
-/// Prepares a redrive execution plan from dead-letter messages.
-///
-/// Keys, payloads and headers are carried byte-for-byte. With
-/// `skip_redriven`, records that already carry [`REDRIVEN_BY_HEADER`] are
-/// left out so a record is not redriven twice.
-pub fn build_redrive_plan(
+/// [`build_redrive_plan_from`] without a source topic.
+#[cfg(test)]
+fn build_redrive_plan(
     messages: &[DlqMessage],
     target_topic_override: Option<&str>,
     dry_run: bool,
@@ -443,9 +440,14 @@ pub fn build_redrive_plan(
     )
 }
 
-/// [`build_redrive_plan`] for records read from `source_topic`. A record whose
-/// destination is `source_topic` itself would only land back in the DLQ (and be
-/// found again by the next redrive), so it counts as unresolved and is skipped.
+/// Prepares a redrive execution plan from dead-letter messages read from
+/// `source_topic`.
+///
+/// Keys, payloads and headers are carried byte-for-byte. With
+/// `skip_redriven`, records that already carry [`REDRIVEN_BY_HEADER`] are
+/// left out so a record is not redriven twice. A record whose destination is
+/// `source_topic` itself would only land back in the DLQ (and be found again
+/// by the next redrive), so it counts as unresolved and is skipped.
 pub fn build_redrive_plan_from(
     source_topic: Option<&str>,
     messages: &[DlqMessage],

@@ -31,7 +31,7 @@ use ferrika_core::model::policy::{AuditForward, SyslogEndpoint, SyslogFacility, 
 pub const ENV_VAR: &str = "FERRIKA_AUDIT_FORWARD";
 
 /// RFC 5424 MSGID of every entry.
-pub const MSGID: &str = "audit";
+pub(crate) const MSGID: &str = "audit";
 
 /// Severity of a successful operation (notice) and of a failed or refused
 /// one (warning).
@@ -187,7 +187,8 @@ pub fn settings() -> Option<&'static ForwardSettings> {
 static FAILURES: AtomicU64 = AtomicU64::new(0);
 
 /// Failed sends (one per target) in this process so far.
-pub fn failure_count() -> u64 {
+#[cfg(test)]
+fn failure_count() -> u64 {
     FAILURES.load(Ordering::Relaxed)
 }
 
@@ -311,7 +312,7 @@ fn wait(rx: &JobResult, deadline: Instant, timeout: Duration) -> Result<(), Stri
 /// `<PRI>1 TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG`,
 /// with no structured data (`-`) and the JSON line as MSG (no BOM, so JSON
 /// parsers on the collector side read it as is).
-pub fn rfc5424(
+pub(crate) fn rfc5424(
     facility: SyslogFacility,
     severity: u8,
     time_ms: i64,
@@ -353,7 +354,7 @@ fn header_field(value: &str, max: usize) -> String {
 }
 
 /// RFC 6587 octet counting: `MSG-LEN SP SYSLOG-MSG`, the length in bytes.
-pub fn octet_frame(message: &str) -> Vec<u8> {
+pub(crate) fn octet_frame(message: &str) -> Vec<u8> {
     let mut frame = format!("{} ", message.len()).into_bytes();
     frame.extend_from_slice(message.as_bytes());
     frame

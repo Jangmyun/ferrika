@@ -54,7 +54,7 @@ pub const KEY_PATH: &str = "(key)";
 pub const TOMBSTONE: &str = "(tombstone)";
 
 /// Shown for an empty payload.
-pub const EMPTY: &str = "(empty)";
+pub(crate) const EMPTY: &str = "(empty)";
 
 /// One record to compare, at its partition and offset.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,7 +338,7 @@ fn diff_payloads(bytes_a: &[u8], bytes_b: &[u8]) -> Vec<FieldDiff> {
 }
 
 /// Recursively traverses two JSON trees to detect added, removed, or modified fields
-pub fn diff_json_values(
+pub(crate) fn diff_json_values(
     path: &str,
     a: &serde_json::Value,
     b: &serde_json::Value,

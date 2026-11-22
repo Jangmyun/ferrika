@@ -245,7 +245,7 @@ impl TrustedKey {
 /// Parses a `policy.keys`: one `<64 hex digits> [label]` per line; `#`
 /// starts a comment and blank lines are skipped. Any other line makes the
 /// whole file (and so the policy) invalid. `path` is for messages.
-pub fn parse_key_list(text: &str, path: &str) -> Result<Vec<TrustedKey>, PolicyError> {
+pub(crate) fn parse_key_list(text: &str, path: &str) -> Result<Vec<TrustedKey>, PolicyError> {
     let file = Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -392,14 +392,15 @@ pub const POLICY_DIR_ENV: &str = "FERRIKA_POLICY_DIR";
 /// Whether this build honours [`POLICY_DIR_ENV`]: debug builds and builds
 /// with the `dev-policy-dir` feature (tests, demos). A release build ignores
 /// it, so a user cannot point Ferrika at a policy they signed themselves.
-pub const DIR_OVERRIDE_ALLOWED: bool = cfg!(any(debug_assertions, feature = "dev-policy-dir"));
+pub(crate) const DIR_OVERRIDE_ALLOWED: bool =
+    cfg!(any(debug_assertions, feature = "dev-policy-dir"));
 
 /// The policy directory from its inputs: the override (the value of
 /// [`POLICY_DIR_ENV`]) when `allow_override` and it is not empty, otherwise
 /// `Ferrika` in the ProgramData known folder on Windows (`C:\ProgramData`
 /// when the folder cannot be resolved; never the `%ProgramData%` variable)
 /// and `/etc/ferrika` elsewhere.
-pub fn policy_dir_from(
+pub(crate) fn policy_dir_from(
     override_dir: Option<&OsStr>,
     allow_override: bool,
     known_folder: Option<PathBuf>,
@@ -418,7 +419,7 @@ pub fn policy_dir_from(
 }
 
 /// Whether an override was given that this build ignores.
-pub fn override_ignored(override_dir: Option<&OsStr>, allow_override: bool) -> bool {
+pub(crate) fn override_ignored(override_dir: Option<&OsStr>, allow_override: bool) -> bool {
     !allow_override && override_dir.is_some_and(|d| !d.is_empty())
 }
 
@@ -871,7 +872,7 @@ struct ReadOnlyHit {
 }
 
 /// Kafka's port, assumed for a broker address that names none.
-pub const DEFAULT_BROKER_PORT: &str = "9092";
+pub(crate) const DEFAULT_BROKER_PORT: &str = "9092";
 
 /// A broker address split into lowercase host and port, the way
 /// `read_only_brokers` compares them: surrounding spaces, a
@@ -956,7 +957,7 @@ pub fn with_known_brokers(bootstrap: &str, known: &[String]) -> String {
 /// is false (no request is made), otherwise `bootstrap` plus the brokers
 /// `fetch` learns from cluster metadata. A failed fetch is an error, so the
 /// caller refuses: a rule that cannot be checked is not waived.
-pub fn resolve_brokers(
+pub(crate) fn resolve_brokers(
     bootstrap: &str,
     needed: bool,
     fetch: impl FnOnce() -> Result<Vec<String>, String>,
@@ -976,7 +977,7 @@ pub fn resolve_brokers(
 /// A `read_only_brokers` glob against one broker address. Both are
 /// normalized first. A pattern without a port matches the host on any port
 /// (`*.prod.corp`); one with a port matches host and port (`10.0.0.*:9093`).
-pub fn broker_glob_match(pattern: &str, address: &str) -> bool {
+pub(crate) fn broker_glob_match(pattern: &str, address: &str) -> bool {
     let (Some((pattern_host, pattern_port)), Some((host, port))) =
         (split_broker(pattern), split_broker(address))
     else {

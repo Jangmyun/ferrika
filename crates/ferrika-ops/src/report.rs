@@ -23,9 +23,9 @@ use ferrika_governance::audit::AuditEntry;
 use ferrika_governance::policy::EffectivePolicy;
 
 /// Audit entries kept when no window is given (the most recent ones).
-pub const AUDIT_DEFAULT_LIMIT: usize = 100;
+pub(crate) const AUDIT_DEFAULT_LIMIT: usize = 100;
 /// Audit entries kept inside a window; older ones in it are counted, not listed.
-pub const AUDIT_WINDOW_LIMIT: usize = 500;
+pub(crate) const AUDIT_WINDOW_LIMIT: usize = 500;
 /// Audit lines read before filtering to the cluster and the window.
 pub const AUDIT_SCAN: usize = 100_000;
 /// Groups listed in the lag tables; the rest are counted.
@@ -74,7 +74,7 @@ pub fn parse_window(text: &str) -> Result<Duration, String> {
 }
 
 /// `30m`, `2h`, `1d 6h`: a window for display.
-pub fn format_window(window: Duration) -> String {
+pub(crate) fn format_window(window: Duration) -> String {
     let parts = ferrika_core::model::format::duration_parts(
         i64::try_from(window.as_secs()).unwrap_or(i64::MAX),
         " ",
@@ -88,7 +88,7 @@ pub fn format_window(window: Duration) -> String {
 
 /// Bootstrap servers without credentials: `user:pass@host` loses the user
 /// part and `scheme://user:pass@host` its password.
-pub fn mask_bootstrap(bootstrap: &str) -> String {
+pub(crate) fn mask_bootstrap(bootstrap: &str) -> String {
     bootstrap
         .split(',')
         .map(str::trim)
@@ -397,7 +397,7 @@ pub fn build(
 }
 
 /// Per-group lag over `samples`; `None` with fewer than two samples.
-pub fn lag_trend(samples: &[LagSample], source: TrendSource) -> Option<LagTrend> {
+pub(crate) fn lag_trend(samples: &[LagSample], source: TrendSource) -> Option<LagTrend> {
     let (first, last) = (samples.first()?, samples.last()?);
     if samples.len() < 2 {
         return None;
@@ -449,7 +449,7 @@ fn concerns(entry: &AuditEntry, profile: &str, bootstrap: &str) -> bool {
 /// first. Without `from_ms` only the latest [`AUDIT_DEFAULT_LIMIT`] are kept.
 /// Targets and outcomes are PII-masked: they are names and messages, never
 /// payloads, but an unmask reason or an error text may quote a value.
-pub fn audit_timeline(
+pub(crate) fn audit_timeline(
     entries: &[AuditEntry],
     profile: &str,
     bootstrap: &str,

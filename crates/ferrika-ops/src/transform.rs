@@ -25,7 +25,7 @@ use crate::mirror::{MirrorStats, RecordTransform};
 use ferrika_core::model::expr::{expression_text, Expr, RecordView};
 
 /// The most steps one pipeline may hold.
-pub const MAX_STEPS: usize = 64;
+pub(crate) const MAX_STEPS: usize = 64;
 /// The most segments a field path may have.
 const MAX_PATH_DEPTH: usize = 64;
 
@@ -333,7 +333,7 @@ impl Pipeline {
     }
 
     /// Whether any step reads or changes value fields.
-    pub fn uses_fields(&self) -> bool {
+    pub(crate) fn uses_fields(&self) -> bool {
         self.steps.iter().any(Step::uses_fields)
     }
 

@@ -182,12 +182,12 @@ impl UndoPlan {
 
 /// How long after an operation ended its change may still be on its way
 /// to every broker (KRaft applies configs through the metadata log).
-pub const RECENT_MS: i64 = 5_000;
+pub(crate) const RECENT_MS: i64 = 5_000;
 
 /// Whether reading `op`'s resources at `now_ms` may still see the state
 /// before it: it succeeded moments ago and recorded the state it left, so
 /// there is a state to wait for. Otherwise one read is authoritative.
-pub fn may_be_settling(op: &Operation, now_ms: i64) -> bool {
+pub(crate) fn may_be_settling(op: &Operation, now_ms: i64) -> bool {
     op.ok() == Some(true)
         && !op.after().is_empty()
         && op.after().len() == op.begin.before.len()
@@ -211,7 +211,7 @@ async fn read_states(
 /// Reads the current state of `op`'s resources. Right after the operation
 /// ended, the state it left may not be visible yet: the read is repeated
 /// (with backoff, for at most [`CONFIG_VISIBILITY`]'s deadline) until it is.
-pub async fn read_current(
+pub(crate) async fn read_current(
     op: &Operation,
     config: &KafkaClientConfig,
     admin: &KafkaAdminClient,

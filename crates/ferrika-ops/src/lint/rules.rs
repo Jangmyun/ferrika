@@ -145,7 +145,7 @@ pub const DIRTY_RATIO_MAX: f64 = 0.9;
 /// warns.
 pub const PREFERRED_LEADER_WARN_PCT: f64 = 10.0;
 /// Keys B006 compares across brokers.
-pub const DRIFT_KEYS: &[&str] = &[
+pub(crate) const DRIFT_KEYS: &[&str] = &[
     "default.replication.factor",
     "min.insync.replicas",
     "unclean.leader.election.enable",
@@ -272,7 +272,7 @@ impl Findings<'_> {
 
 /// Whether `bootstrap` points at a managed service (Confluent Cloud, Amazon
 /// MSK), which does not take broker config changes from clients.
-pub fn is_managed(bootstrap: &str) -> bool {
+pub(crate) fn is_managed(bootstrap: &str) -> bool {
     bootstrap.split(',').any(|address| {
         let host = address
             .trim()

@@ -350,7 +350,7 @@ pub trait RecordTransform {
 
 /// Copies every record unchanged ([`mirror_record`]) to `dst_topic`.
 #[derive(Debug, Clone)]
-pub struct Verbatim {
+pub(crate) struct Verbatim {
     pub dst_topic: String,
 }
 
