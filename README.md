@@ -56,7 +56,6 @@ The archives the scripts and Homebrew install are on the
 [releases page](https://github.com/Jangmyun/ferrika/releases). They are built
 with the `ssl` feature (TLS and SCRAM, see [Building](#building)).
 
-From crates.io, with a recent stable Rust toolchain (1.88 or newer), CMake and
 From crates.io, with a recent stable Rust toolchain (1.89 or newer), CMake and
 a C compiler:
 
@@ -208,7 +207,6 @@ The crates are published on [crates.io](https://crates.io/crates/ferrika-core); 
 
 Requirements:
 
-- Rust 1.88 or newer
 - Rust 1.89 or newer
 - CMake and a C compiler (the bundled `librdkafka` is built from source)
 - Windows: MSVC build tools with `rc.exe` on `PATH`

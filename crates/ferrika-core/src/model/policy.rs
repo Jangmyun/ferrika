@@ -727,6 +727,9 @@ mod tests {
         assert_eq!(PolicyAction::from_cli("produce"), PolicyAction::Produce);
         assert_eq!(
             PolicyAction::from_cli("transform --execute"),
+            PolicyAction::Produce
+        );
+        assert_eq!(
             PolicyAction::from_cli("rabbit publish"),
             PolicyAction::Produce
         );

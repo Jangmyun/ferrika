@@ -59,14 +59,6 @@ The RabbitMQ entries below are planned for 0.2.0.
 - `ferrika-core`: `Expr::matches_parsed` (evaluate an expression on an
   already parsed JSON value) and `DriverError::partition_eof`.
 
-### Changed
-
-- `ferrika top`: the refresh interval option is now `--interval` (the old
-  `--interval-secs` still works) and defaults to 5 seconds instead of 2.
-- Building `ferrika-cli` with default features needs Rust 1.88 (ratatui's
-  minimum).
-- Preview: RabbitMQ support through the management HTTP API, in the new
-  crate `ferrika-rabbitmq` and the command `ferrika rabbit`: `queues`,
 - Preview: RabbitMQ support in the new crate `ferrika-rabbitmq` and the
   command `ferrika rabbit`, through the management HTTP API: `queues`,
   `exchanges` and `bindings` of a vhost, `peek <queue> -n N` (reads and
@@ -104,6 +96,8 @@ The RabbitMQ entries below are planned for 0.2.0.
 
 ### Changed
 
+- `ferrika top`: the refresh interval option is now `--interval` (the old
+  `--interval-secs` still works) and defaults to 5 seconds instead of 2.
 - `rabbit peek` is a write: it changes the messages it reads (redelivered
   flag, quorum-queue delivery count), so read-only rules and profiles refuse
   it and it is audited like other writes, besides being a record export.
