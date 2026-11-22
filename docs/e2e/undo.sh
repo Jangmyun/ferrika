@@ -19,6 +19,8 @@
 #              (default: docker exec "$KAFKA_CONTAINER")
 # INTERNAL_BOOTSTRAP  brokers as seen from inside that container
 #              (default: localhost:9092)
+# KAFKA_BIN    directory of the Kafka tools in that container
+#              (default: /opt/kafka/bin; AutoMQ: /opt/automq/kafka/bin)
 # KAFKA_CONFIGS_ARGS  extra kafka-configs.sh arguments, e.g.
 #              "--command-config /etc/kafka/admin.properties"
 # TOPIC_PREFIX prefix of the topics and group created (default undo-e2e)
@@ -33,6 +35,7 @@ BOOTSTRAP=${BOOTSTRAP:-localhost:9092}
 KAFKA_CONTAINER=${KAFKA_CONTAINER:-kafka}
 KAFKA_EXEC=${KAFKA_EXEC:-docker exec $KAFKA_CONTAINER}
 INTERNAL_BOOTSTRAP=${INTERNAL_BOOTSTRAP:-localhost:9092}
+KAFKA_BIN=${KAFKA_BIN:-/opt/kafka/bin}
 KAFKA_CONFIGS_ARGS=${KAFKA_CONFIGS_ARGS:-}
 PROFILE=${PROFILE:-}
 TIMEOUT=${TIMEOUT:-90}
@@ -91,7 +94,7 @@ pass "undoing the undo re-applies the change"
 f topics config "$TOPIC" -s retention.ms=2000 >/dev/null
 OP=$(latest)
 # shellcheck disable=SC2086 # KAFKA_EXEC and KAFKA_CONFIGS_ARGS are word lists
-MSYS_NO_PATHCONV=1 timeout "$TIMEOUT" $KAFKA_EXEC /opt/kafka/bin/kafka-configs.sh \
+MSYS_NO_PATHCONV=1 timeout "$TIMEOUT" $KAFKA_EXEC "$KAFKA_BIN/kafka-configs.sh" \
   --bootstrap-server "$INTERNAL_BOOTSTRAP" $KAFKA_CONFIGS_ARGS \
   --entity-type topics --entity-name "$TOPIC" --alter --add-config retention.ms=3000 \
   < /dev/null >/dev/null

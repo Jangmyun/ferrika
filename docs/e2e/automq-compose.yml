@@ -1,35 +1,40 @@
-# One-node AutoMQ (broker + controller) on MinIO object storage, for a
-# future end-to-end run of the ferrika CLI against AutoMQ. Test use only;
-# the MinIO credentials are public test values.
+# One-node AutoMQ (broker + controller) on MinIO-compatible object storage,
+# for end-to-end runs of the ferrika CLI against AutoMQ. Test use only; the
+# object-store credentials are public test values.
 #
-# UNTESTED: this file has not been run yet. The image name, start command
-# and s3.* settings follow AutoMQ's open-source docker-compose example as
-# far as known; check them against the AutoMQ release you use and pin its
-# tag (instead of `latest`) once it works.
+# Follows the single-node quick start in AutoMQ's repository
+# (docker/docker-compose.yaml), with an extra EXTERNAL listener so clients on
+# the host reach the broker as localhost:49092. Last run: AutoMQ 1.7.5,
+# 2026-11-23 (see docs/COMPATIBILITY.md).
 #
 #   docker compose -f docs/e2e/automq-compose.yml up -d
 #   ferrika -b localhost:49092 topics list
 #   python3 tools/e2e/smoke.py target/debug/ferrika --broker localhost:49092
+#   docker compose -f docs/e2e/automq-compose.yml down -v
 #
-# Kafka API on localhost:49092, MinIO console on localhost:49001.
+# Kafka API on localhost:49092, object-store console on localhost:49001.
+# The broker needs about 1.5 GB of memory.
 name: ferrika-automq
 
 services:
+  # S3-compatible object store. MinIO no longer publishes images, so this
+  # uses the community build that AutoMQ's own quick start uses.
   minio:
-    image: minio/minio:latest
+    image: pgsty/silo:RELEASE.2026-09-03T13-18-01Z
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
-    command: server /data --console-address ":9001"
+    command: ["server", "/data", "--console-address", ":9001"]
     ports: ["49001:9001"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
 
+  # Creates the data and ops buckets, then exits.
   mc:
-    image: minio/mc:latest
+    image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
     depends_on:
       minio:
         condition: service_healthy
@@ -41,14 +46,15 @@ services:
       "
 
   automq:
-    image: automqinc/automq:latest
+    image: automqinc/automq:1.7.5
+    stop_grace_period: 1m
     depends_on:
       mc:
         condition: service_completed_successfully
     environment:
       KAFKA_S3_ACCESS_KEY: minioadmin
       KAFKA_S3_SECRET_KEY: minioadmin
-      KAFKA_HEAP_OPTS: -Xms1g -Xmx1g -XX:MaxDirectMemorySize=1G
+      KAFKA_HEAP_OPTS: -Xms1g -Xmx1g -XX:MetaspaceSize=96m -XX:MaxDirectMemorySize=1G
       CLUSTER_ID: 3D4fXN-yS1-vsQ8aJ_q4Mg
     command:
       - bash
