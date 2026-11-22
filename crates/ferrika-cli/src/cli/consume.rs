@@ -170,11 +170,25 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
         .with_case_sensitive(args.case_sensitive)
         .with_timestamp_range(args.from_timestamp, args.to_timestamp);
 
-    if let Some(ref g) = args.grep {
-        filter = filter.with_grep(g)?;
-    }
-    if let Some(ref k) = args.key_filter {
-        filter = filter.with_key(k);
+    // With -D, --grep and -k look at the decoded text (an Avro or Protobuf
+    // value is binary before decoding), so they run after the decode.
+    let mut text_filter = None;
+    if args.decode_wire_format && (args.grep.is_some() || args.key_filter.is_some()) {
+        let mut tf = MessageFilter::new().with_case_sensitive(args.case_sensitive);
+        if let Some(ref g) = args.grep {
+            tf = tf.with_grep(g)?;
+        }
+        if let Some(ref k) = args.key_filter {
+            tf = tf.with_key(k);
+        }
+        text_filter = Some(tf);
+    } else {
+        if let Some(ref g) = args.grep {
+            filter = filter.with_grep(g)?;
+        }
+        if let Some(ref k) = args.key_filter {
+            filter = filter.with_key(k);
+        }
     }
     for h in &args.header_filter {
         let (k, v) = crate::kafka::filter::parse_header_pair(h)
@@ -480,6 +494,12 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                         } else {
                             (decoded, decoded_key)
                         };
+                        if let Some(tf) = &text_filter {
+                            if !tf.matches(&decoded_view(filtered, decoded.as_ref(), decoded_key.as_ref())) {
+                                stats.record_skip();
+                                continue;
+                            }
+                        }
                         if let Some(expr) = &where_expr {
                             if !crate::kafka::filter::expression_matches(expr, filtered, decoded.as_ref(), decoded_key.as_ref()) {
                                 stats.record_skip();
@@ -625,6 +645,23 @@ fn group_permission_hint(err: &crate::error::KafkaError, group: Option<&str>) ->
              ferrika acl create -p <user> -o read -g {group}, and -o describe -g {group}"
         )
     })
+}
+
+/// `msg` with its key and value replaced by their decoded text where `-D`
+/// decoded them, for `--grep` and `-k`.
+fn decoded_view(
+    msg: &ConsumedMessage,
+    value: Option<&crate::codec::schema::DecodedPayload>,
+    key: Option<&crate::codec::schema::DecodedPayload>,
+) -> ConsumedMessage {
+    let mut view = msg.clone();
+    if let Some(value) = value {
+        view.payload = Some(value.text.clone().into_bytes());
+    }
+    if let Some(key) = key {
+        view.key = Some(crate::codec::schema::key_text(&key.text).into_bytes());
+    }
+    view
 }
 
 /// Adds `-D`'s decoded value and key to a JSON line (`decoded`,
@@ -1026,6 +1063,30 @@ mod tests {
             Code::TopicAuthorizationFailed,
         ));
         assert_eq!(group_permission_hint(&other, Some("billing")), None);
+    }
+
+    #[test]
+    fn grep_sees_the_decoded_text() {
+        use crate::codec::schema::DecodedPayload;
+        let msg = ConsumedMessage {
+            topic: "t".into(),
+            partition: 0,
+            offset: 0,
+            key: Some(vec![0, 0, 0, 0, 1, 2]),
+            payload: Some(vec![0, 0, 0, 0, 7, 0x0a, 0xff]),
+            timestamp_ms: None,
+            headers: Vec::new(),
+        };
+        let decoded = DecodedPayload {
+            text: r#"{"name":"alice"}"#.into(),
+            label: "AVRO schema 7".into(),
+            schema_ref: None,
+        };
+        let grep = MessageFilter::new().with_grep("alice").unwrap();
+        assert!(!grep.matches(&msg));
+        assert!(grep.matches(&decoded_view(&msg, Some(&decoded), None)));
+        // Undecoded parts stay as they were.
+        assert_eq!(decoded_view(&msg, Some(&decoded), None).key, msg.key);
     }
 
     #[test]

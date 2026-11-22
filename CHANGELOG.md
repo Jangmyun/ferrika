@@ -7,6 +7,14 @@ module is the command line's own code (argument structs, the command enum),
 not a library API; options added to commands change it in patch versions,
 and 0.2.0 makes it crate-internal.
 
+## Unreleased
+
+### Fixed
+
+- `consume -D` applied `--grep` and `-k` to the undecoded bytes, so text of an
+  Avro or Protobuf record (such as `"age":41`) was never found; they now look
+  at the decoded text.
+
 ## 0.1.1
 
 ### Added
