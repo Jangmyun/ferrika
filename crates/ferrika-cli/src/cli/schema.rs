@@ -147,6 +147,12 @@ pub enum SchemaSubcommands {
         /// Fail with non-zero exit code if incompatible
         #[arg(long)]
         fail_on_incompatible: bool,
+        /// Exit like `git diff --exit-code`: 1 when the files differ in a
+        /// field (added, deleted or changed) or in compatibility, 0 when
+        /// they do not, 2 on errors (an incompatible schema under
+        /// --fail-on-incompatible is an error too)
+        #[arg(long)]
+        exit_code: bool,
     },
 }
 
@@ -360,7 +366,15 @@ pub async fn handle_schema_command(args: SchemaArgs, global: &GlobalOpts) -> Kaf
             new_file,
             mode,
             fail_on_incompatible,
-        } => handle_diff_schema(&old_file, &new_file, &mode, fail_on_incompatible, global),
+            exit_code,
+        } => handle_diff_schema(
+            &old_file,
+            &new_file,
+            &mode,
+            fail_on_incompatible,
+            exit_code,
+            global,
+        ),
     }
 }
 
@@ -1014,6 +1028,7 @@ fn handle_diff_schema(
     new_file: &str,
     mode_str: &str,
     fail_on_incompatible: bool,
+    exit_code: bool,
     global: &GlobalOpts,
 ) -> KafkaResult<()> {
     // With a single base file, a transitive check is the plain check.
@@ -1031,6 +1046,7 @@ fn handle_diff_schema(
         .map_err(|e| KafkaError::schema(format!("Compatibility evaluation failed: {e}")))?;
 
     render_compatibility_report(&report, None, global)?;
+    crate::cli::report_differences(exit_code, schema_has_differences(&report));
 
     if fail_on_incompatible && !report.is_compatible {
         return Err(KafkaError::Check(format!(
@@ -1040,6 +1056,15 @@ fn handle_diff_schema(
     }
 
     Ok(())
+}
+
+/// Whether two schema files differ for `diff-schema --exit-code`: a field
+/// added, deleted or changed, or a compatibility violation.
+fn schema_has_differences(report: &CompatibilityReport) -> bool {
+    !report.added_fields.is_empty()
+        || !report.deleted_fields.is_empty()
+        || !report.modified_fields.is_empty()
+        || !report.violations.is_empty()
 }
 
 /// The mode as the registry names it: `BACKWARD`, or `BACKWARD_TRANSITIVE`
@@ -1476,14 +1501,26 @@ mod tests {
                 new_file,
                 mode,
                 fail_on_incompatible,
+                exit_code,
             } => {
                 assert_eq!(old_file, "./v1.json");
                 assert_eq!(new_file, "./v2.json");
                 assert_eq!(mode, "full");
                 assert!(!fail_on_incompatible);
+                assert!(!exit_code);
             }
             _ => panic!("Expected DiffSchema subcommand"),
         }
+    }
+
+    #[test]
+    fn diff_schema_differences_follow_the_fields() {
+        let v1 = r#"{"type":"record","name":"Order","fields":[{"name":"id","type":"string"}]}"#;
+        let v2 = r#"{"type":"record","name":"Order","fields":[{"name":"id","type":"string"},{"name":"note","type":["null","string"],"default":null}]}"#;
+        let same = evaluate_compatibility(None, v1, v1, CompatibilityMode::Backward).unwrap();
+        assert!(!schema_has_differences(&same));
+        let added = evaluate_compatibility(None, v1, v2, CompatibilityMode::Backward).unwrap();
+        assert!(schema_has_differences(&added));
     }
 
     #[test]

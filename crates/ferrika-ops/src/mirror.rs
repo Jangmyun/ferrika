@@ -250,9 +250,10 @@ type SourcePosition = (i32, i64);
 /// only those whose copy was delivered (or that the filter skipped), and
 /// never past a record whose copy failed. The mirror thereby copies each
 /// record at least once across restarts; records after a failure may be
-/// copied again.
+/// copied again. `dlq redrive --group` uses it the same way for the DLQ
+/// records it sends one by one.
 #[derive(Debug, Default)]
-struct CommitTracker {
+pub struct CommitTracker {
     partitions: HashMap<i32, PartitionProgress>,
 }
 
@@ -271,7 +272,7 @@ struct PartitionProgress {
 
 impl CommitTracker {
     /// A copy of the record at `offset` was handed to the producer.
-    fn sent(&mut self, partition: i32, offset: i64) {
+    pub fn sent(&mut self, partition: i32, offset: i64) {
         self.partitions
             .entry(partition)
             .or_default()
@@ -283,7 +284,7 @@ impl CommitTracker {
     /// it failed, or the filter skipped it (`done` without [`Self::sent`]).
     /// Returns the offset of the last record that may now be marked
     /// processed, when that moved forward.
-    fn finished(&mut self, partition: i32, offset: i64, done: bool) -> Option<i64> {
+    pub fn finished(&mut self, partition: i32, offset: i64, done: bool) -> Option<i64> {
         let progress = self.partitions.entry(partition).or_default();
         progress.pending.remove(&offset);
         if done {

@@ -17,41 +17,90 @@ pub struct QuotaArgs {
     pub command: QuotaSubcommands,
 }
 
-/// Who a quota applies to. Give a name, or `default` for the default
-/// quota of that kind.
+/// Who a quota applies to. Give a name, or the `--*-default` flag for the
+/// default quota of that kind (shown as `<default>` in listings).
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct EntityArgs {
-    /// User principal name (or `default`)
-    #[arg(long)]
+    /// User principal name (`--user default` is the user named "default";
+    /// the default quota of all users is --user-default)
+    #[arg(long, conflicts_with = "user_default")]
     pub user: Option<String>,
-    /// Client id (or `default`)
-    #[arg(long = "client-id")]
-    pub client_id: Option<String>,
-    /// Client IP address (or `default`), for connection_creation_rate
+    /// The default user quota: applies to every user without its own
     #[arg(long)]
+    pub user_default: bool,
+    /// Client id (`--client-id default` is the client id "default"; the
+    /// default quota of all client ids is --client-id-default)
+    #[arg(long = "client-id", conflicts_with = "client_id_default")]
+    pub client_id: Option<String>,
+    /// The default client-id quota: applies to every client id without its
+    /// own
+    #[arg(long = "client-id-default")]
+    pub client_id_default: bool,
+    /// Client IP address (or `default`, same as --ip-default), for
+    /// connection_creation_rate
+    #[arg(long, conflicts_with = "ip_default")]
     pub ip: Option<String>,
+    /// The default IP quota: applies to every IP address without its own
+    #[arg(long)]
+    pub ip_default: bool,
 }
 
 impl EntityArgs {
     pub fn entity(&self) -> KafkaResult<QuotaEntity> {
-        let part = |kind: &str, name: &Option<String>| {
-            name.as_ref()
-                .map(|n| (kind.to_string(), (n != "default").then(|| n.clone())))
+        // A named entity, or with `default` set the type's default (`None`).
+        let part = |kind: &str, name: Option<String>, default: bool| {
+            if default {
+                Some((kind.to_string(), None))
+            } else {
+                name.map(|n| (kind.to_string(), Some(n)))
+            }
         };
+        // "default" is no IP address, so `--ip default` keeps naming the
+        // default entity.
+        let ip = self.ip.clone().filter(|ip| ip != "default");
+        let ip_default = self.ip_default || self.ip.as_deref() == Some("default");
         let entity: QuotaEntity = [
-            part("user", &self.user),
-            part("client-id", &self.client_id),
-            part("ip", &self.ip),
+            part("user", self.user.clone(), self.user_default),
+            part("client-id", self.client_id.clone(), self.client_id_default),
+            part("ip", ip, ip_default),
         ]
         .into_iter()
         .flatten()
         .collect();
         if entity.is_empty() {
             return Err(KafkaError::config(
-                "Name who the quota is for: --user, --client-id and/or --ip",
+                "Name who the quota is for: --user, --client-id and/or --ip (or \
+                 --user-default, --client-id-default, --ip-default for the default quotas)",
             ));
         }
         Ok(entity)
+    }
+
+    /// A note for `--user default` / `--client-id default`, which named the
+    /// default entity in earlier releases and now name a user or client id
+    /// called "default".
+    pub fn default_name_hint(&self) -> Option<String> {
+        let mut hints = Vec::new();
+        if self.user.as_deref() == Some("default") {
+            hints.push(
+                "--user default now means the user named 'default'; \
+                 for the default quota of all users use --user-default",
+            );
+        }
+        if self.client_id.as_deref() == Some("default") {
+            hints.push(
+                "--client-id default now means the client id 'default'; \
+                 for the default quota of all client ids use --client-id-default",
+            );
+        }
+        (!hints.is_empty()).then(|| hints.join(". "))
+    }
+}
+
+/// Prints the [`EntityArgs::default_name_hint`] note on stderr, if any.
+fn print_default_name_hint(entity: &EntityArgs) {
+    if let Some(hint) = entity.default_name_hint() {
+        eprintln!("{} {hint}.", "Note:".yellow().bold());
     }
 }
 
@@ -129,6 +178,7 @@ pub fn run(args: QuotaArgs, global: &GlobalOpts) -> KafkaResult<()> {
             Ok(())
         }
         QuotaSubcommands::Set { entity, key, value } => {
+            print_default_name_hint(&entity);
             let entity = entity.entity()?;
             let pending = record::start(
                 global,
@@ -146,6 +196,7 @@ pub fn run(args: QuotaArgs, global: &GlobalOpts) -> KafkaResult<()> {
             Ok(())
         }
         QuotaSubcommands::Remove { entity, key } => {
+            print_default_name_hint(&entity);
             let entity = entity.entity()?;
             let pending = record::start(
                 global,
@@ -202,5 +253,59 @@ mod tests {
         for bad in ["NaN", "nan", "inf", "-inf", "infinity", "-1", "abc", ""] {
             assert!(parse_quota_value(bad).is_err(), "{bad}");
         }
+    }
+
+    fn parse_entity(args: &[&str]) -> Result<EntityArgs, clap::Error> {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            entity: EntityArgs,
+        }
+        Wrapper::try_parse_from(std::iter::once("quota").chain(args.iter().copied()))
+            .map(|w| w.entity)
+    }
+
+    #[test]
+    fn user_default_names_a_real_user_and_the_flag_the_default_entity() {
+        let named = parse_entity(&["--user", "default"]).unwrap();
+        assert_eq!(
+            named.entity().unwrap(),
+            vec![("user".to_string(), Some("default".to_string()))]
+        );
+        assert!(named.default_name_hint().is_some());
+
+        let default = parse_entity(&["--user-default"]).unwrap();
+        assert_eq!(default.entity().unwrap(), vec![("user".to_string(), None)]);
+        assert!(default.default_name_hint().is_none());
+        assert_eq!(
+            quota_entity_label(&default.entity().unwrap()),
+            "user=<default>"
+        );
+
+        let client = parse_entity(&["--user", "alice", "--client-id-default"]).unwrap();
+        assert_eq!(
+            client.entity().unwrap(),
+            vec![
+                ("user".to_string(), Some("alice".to_string())),
+                ("client-id".to_string(), None)
+            ]
+        );
+        let named_client = parse_entity(&["--client-id", "default"]).unwrap();
+        assert_eq!(
+            named_client.entity().unwrap(),
+            vec![("client-id".to_string(), Some("default".to_string()))]
+        );
+        assert!(named_client.default_name_hint().is_some());
+
+        // "default" is no IP address: both spellings name the default entity.
+        for args in [&["--ip", "default"][..], &["--ip-default"][..]] {
+            let ip = parse_entity(args).unwrap();
+            assert_eq!(ip.entity().unwrap(), vec![("ip".to_string(), None)]);
+        }
+
+        assert!(parse_entity(&["--user", "a", "--user-default"]).is_err());
+        assert!(parse_entity(&["--client-id", "a", "--client-id-default"]).is_err());
+        assert!(parse_entity(&[]).unwrap().entity().is_err());
     }
 }

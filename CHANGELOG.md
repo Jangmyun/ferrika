@@ -129,6 +129,34 @@ The RabbitMQ entries below are planned for 0.2.0.
   it and it is audited like other writes, besides being a record export.
 - Building now needs Rust 1.89 or newer (`lapin` and its AMQP crates);
   the crates declare `rust-version = "1.89"` and CI checks it.
+- **Breaking:** `acl delete` without a filter (which removes every binding)
+  now needs `--all`; `-f/--force` alone is refused. `--all` cannot be
+  combined with a filter, still only previews without `-f`, and its preview
+  says that it covers all bindings and how many. As before, only the
+  previewed bindings are deleted and recorded for undo.
+- **Breaking:** `quota set/remove --user default` names a user called
+  `default` (likewise `--client-id default`); the default quota entity is
+  now `--user-default` / `--client-id-default` (and `--ip-default`;
+  `--ip default` keeps its meaning). Passing `--user default` or
+  `--client-id default` prints a note about the change. Listings show the
+  default entity as `<default>`.
+- **Breaking (library):** `ferrika_core::kafka::filter::MessageFilter::header_filters`
+  is a `Vec<HeaderFilter>` instead of a map, and `with_header` adds a filter
+  instead of replacing an earlier one for the same key.
+- `consume`/`mirror --header-filter`: `KEY=VALUE` matches the exact
+  (case-sensitive) value besides `KEY:VALUE` (value contains, unchanged).
+  Repeated filters must all match; before, a repeated key kept only the
+  last filter. New `parse_header_filter`, `HeaderFilter` and
+  `MessageFilter::{with_header_exact, with_header_filter}`.
+- `diff`, `cluster diff` and `schema diff-schema` take `--exit-code`: exit 0
+  without differences, 1 with differences, 2 on errors (like
+  `git diff --exit-code`). Without it the exit codes are unchanged.
+- `dlq redrive` takes `-g/--group <GROUP>`: the run starts at the group's
+  committed offsets on the DLQ and commits a record's offset only after it
+  was delivered to its target (as `mirror -g`), so a later run with the same
+  group continues instead of resending. `--execute` without `-g` prints a
+  note that a rerun resends the same records. `ferrika_ops::mirror::CommitTracker`
+  is now public for this.
 
 ### Compatibility
 

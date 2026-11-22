@@ -70,6 +70,11 @@ pub struct ClusterDiffArgs {
     /// Output diff analysis as JSON
     #[arg(long)]
     pub json: bool,
+
+    /// Exit like `git diff --exit-code`: 1 when a topic is missing on
+    /// either side or drifted, 0 when all are in sync, 2 on errors
+    #[arg(long)]
+    pub exit_code: bool,
 }
 
 #[derive(Debug, Args)]
@@ -292,7 +297,14 @@ async fn handle_diff(args: ClusterDiffArgs, global: &GlobalOpts) -> KafkaResult<
         args.include_internal,
     );
 
+    crate::cli::report_differences(args.exit_code, cluster_has_differences(&summary));
     output::emit(global.wants_json(args.json), &summary, render_diff_summary)
+}
+
+/// Whether the clusters differ: a topic missing on either side, or with
+/// another partition count or replication factor.
+fn cluster_has_differences(summary: &ClusterDiffSummary) -> bool {
+    summary.drifted_count + summary.missing_in_dst_count + summary.missing_in_src_count > 0
 }
 
 fn render_diff_summary(diff: &ClusterDiffSummary) {
@@ -504,6 +516,30 @@ mod tests {
         } else {
             panic!("Expected ClusterCommands::Diff");
         }
+    }
+
+    #[test]
+    fn cluster_diff_differences_drive_the_exit_code() {
+        let topics = |entries: &[(&str, usize, usize)]| {
+            entries
+                .iter()
+                .map(|(n, p, rf)| (n.to_string(), (*p, *rf)))
+                .collect::<HashMap<_, _>>()
+        };
+        let src = topics(&[("orders", 3, 3), ("payments", 6, 3)]);
+        let same = compute_cluster_diff("a", &src, "b", &src, false);
+        assert!(!cluster_has_differences(&same));
+        let drifted = topics(&[("orders", 3, 3), ("payments", 3, 3)]);
+        assert!(cluster_has_differences(&compute_cluster_diff(
+            "a", &src, "b", &drifted, false
+        )));
+        let missing = topics(&[("orders", 3, 3)]);
+        assert!(cluster_has_differences(&compute_cluster_diff(
+            "a", &src, "b", &missing, false
+        )));
+        assert!(cluster_has_differences(&compute_cluster_diff(
+            "a", &missing, "b", &src, false
+        )));
     }
 
     #[test]

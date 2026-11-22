@@ -214,6 +214,11 @@ pub fn main_cli() {
         }
     }
     run(cli);
+    // `diff ... --exit-code` that found differences ends with status 1.
+    let code = cli::finish_exit_code();
+    if code != 0 {
+        std::process::exit(code);
+    }
 }
 
 /// A warning when `KAFKA_BOOTSTRAP_SERVERS` (often left set by a
@@ -245,6 +250,11 @@ pub fn run(mut cli: Cli) {
         return;
     }
     cli.global_opts.ignore_empty_values();
+    // `--exit-code` on a diff command: errors exit with 2 (1 means
+    // "differences found"), from the first check on.
+    if cli.command.as_ref().is_some_and(wants_diff_exit_codes) {
+        cli::use_diff_exit_codes();
+    }
     // Reads nothing and changes nothing: no policy, profile or audit.
     if let Some(Commands::Completions { shell }) = &cli.command {
         let mut command = <Cli as clap::CommandFactory>::command();
@@ -544,10 +554,31 @@ where
         Err(e) => {
             eprintln!("Failed to initialize async runtime: {e}");
             cli::record_audit_result(false, "failed (see the command's output)");
-            std::process::exit(1);
+            std::process::exit(cli::error_exit_code());
         }
     };
     exit_on_error(rt.block_on(command));
+}
+
+/// Whether `command` is a comparison run with `--exit-code` (`diff`,
+/// `cluster diff`, `schema diff-schema`): it then exits like
+/// `git diff --exit-code`, 0 without and 1 with differences, 2 on errors.
+fn wants_diff_exit_codes(command: &Commands) -> bool {
+    match command {
+        Commands::Diff(args) => args.exit_code,
+        Commands::Cluster(args) => matches!(
+            &args.command,
+            cli::cluster_sync::ClusterCommands::Diff(diff) if diff.exit_code
+        ),
+        Commands::Schema(args) => matches!(
+            &args.command,
+            cli::schema::SchemaSubcommands::DiffSchema {
+                exit_code: true,
+                ..
+            }
+        ),
+        _ => false,
+    }
 }
 
 /// Exits with the command's error (see [`cli::exit_with_error`]) if it
@@ -1022,6 +1053,7 @@ fn write_target(command: &Commands) -> String {
                 resource(&c.topic, &c.group, c.cluster),
                 c.principal
             ),
+            AclSubcommands::Delete(d) if d.all => "all ACL bindings".to_string(),
             AclSubcommands::Delete(d) => format!(
                 "{} for {}",
                 resource(&d.topic, &d.group, d.cluster),

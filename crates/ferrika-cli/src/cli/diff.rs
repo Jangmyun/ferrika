@@ -34,6 +34,12 @@ pub struct DiffArgs {
     /// Output full comparison results in JSON format
     #[arg(long)]
     pub json: bool,
+
+    /// Exit like `git diff --exit-code`: 1 when the topics differ in the
+    /// compared range, 0 when they match, 2 on errors (without it: 0
+    /// unless an error, then 1)
+    #[arg(long)]
+    pub exit_code: bool,
 }
 
 /// `--limit` must be at least 1: comparing 0 records proves nothing.
@@ -51,6 +57,7 @@ pub async fn run(args: DiffArgs, global: &GlobalOpts) -> KafkaResult<()> {
     let policy = crate::governance::policy::current();
     crate::cli::note_masking(policy);
     let summary = shown(&args, &records_a, &records_b, policy);
+    crate::cli::report_differences(args.exit_code, has_differences(&summary));
 
     if global.wants_json(args.json) {
         output::print_json(&summary)?;
@@ -221,6 +228,12 @@ pub async fn run(args: DiffArgs, global: &GlobalOpts) -> KafkaResult<()> {
     Ok(())
 }
 
+/// Whether the compared range differs: a record modified or missing on
+/// either side.
+fn has_differences(summary: &TopicDiffSummary) -> bool {
+    summary.modified_count + summary.missing_in_a_count + summary.missing_in_b_count > 0
+}
+
 /// The diff as this command may show it: masked while the company policy
 /// enforces masking, unchanged otherwise.
 fn shown(
@@ -320,6 +333,7 @@ mod tests {
             limit: 10,
             show_identical: true,
             json: true,
+            exit_code: false,
         };
         let rec = |partition, offset, key: &str, payload: Vec<u8>| DiffRecord {
             partition,
@@ -366,5 +380,18 @@ mod tests {
             .find(|r| r.field_diffs.iter().any(|f| f.path.contains('n')))
             .map(|r| r.diff_type);
         assert_eq!(modified, Some(RecordDiffType::Modified));
+        assert!(has_differences(&plain));
+        let same = shown(&args, &a[2..3], &a[2..3], &none());
+        assert!(!has_differences(&same));
+    }
+
+    #[test]
+    fn exit_code_is_off_by_default() {
+        let parsed = Wrapper::parse_from(["ferrika", "diff", "a", "b"]);
+        let Subcommands::Diff(args) = parsed.cmd;
+        assert!(!args.exit_code);
+        let parsed = Wrapper::parse_from(["ferrika", "diff", "a", "b", "--exit-code"]);
+        let Subcommands::Diff(args) = parsed.cmd;
+        assert!(args.exit_code);
     }
 }

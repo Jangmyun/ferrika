@@ -109,6 +109,7 @@ pub enum AclSubcommands {
     /// Create a new Kafka ACL authorization grant or denial rule
     Create(AclCreateArgs),
     /// Delete matching ACL bindings from the cluster authorization store
+    /// (without a filter only with --all)
     Delete(AclDeleteArgs),
     /// Run automated security audit across ACL rules to detect vulnerabilities
     Audit(AclAuditArgs),
@@ -217,9 +218,52 @@ pub struct AclDeleteArgs {
     #[arg(long)]
     pub permission: Option<String>,
 
-    /// Force deletion without interactive prompt
+    /// Delete every ACL binding (needed when no filter is given; still only
+    /// a preview without --force)
+    #[arg(
+        long,
+        conflicts_with_all = ["principal", "topic", "group", "cluster", "operation", "permission"]
+    )]
+    pub all: bool,
+
+    /// Delete the previewed bindings (without it, only list them)
     #[arg(short = 'f', long)]
     pub force: bool,
+}
+
+impl AclDeleteArgs {
+    /// Whether no filter option is given: the delete would match every
+    /// binding.
+    pub fn has_no_filter(&self) -> bool {
+        self.principal.is_none()
+            && self.topic.is_none()
+            && self.group.is_none()
+            && !self.cluster
+            && self.operation.is_none()
+            && self.permission.is_none()
+    }
+}
+
+/// Refuses a filter-less delete without `--all`: it would remove every
+/// binding, which `-f/--force` alone must not do.
+fn check_delete_scope(args: &AclDeleteArgs) -> KafkaResult<()> {
+    if args.has_no_filter() && !args.all {
+        return Err(KafkaError::acl(
+            "'acl delete' without a filter would delete every ACL binding. Give a filter              (--principal, --topic, --group, --cluster, --operation, --permission), or pass              --all to delete them all (it still only previews without --force)."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The preview's heading: the number of bindings `delete` removes, and for
+/// `--all` that it is every binding in `place`.
+fn delete_preview_heading(count: usize, all: bool, place: &str) -> String {
+    if all {
+        format!("Found {count} ACL binding(s) to delete: ALL bindings in the {place}")
+    } else {
+        format!("Found {count} matching ACL binding(s) to delete:")
+    }
 }
 
 /// Arguments for `ferrika acl audit`.
@@ -469,6 +513,8 @@ fn run_delete(
     mut backend: AclBackend,
     global: &GlobalOpts,
 ) -> KafkaResult<()> {
+    check_delete_scope(&args)?;
+    let all = args.all;
     let filter = build_filter(
         args.principal,
         args.topic,
@@ -488,9 +534,14 @@ fn run_delete(
         return Ok(());
     }
 
+    let heading = delete_preview_heading(matching.len(), all, backend.where_label());
     println!(
-        "Found {} matching ACL binding(s) to delete:",
-        matching.len().to_string().cyan().bold()
+        "{}",
+        if all {
+            heading.red().bold()
+        } else {
+            heading.normal()
+        }
     );
     for b in &matching {
         println!(
@@ -726,6 +777,28 @@ mod tests {
             _ => panic!("Expected Delete subcommand"),
         }
 
+        // A filter-less delete needs --all; -f alone is refused.
+        let AclSubcommands::Delete(args) = Wrapper::parse_from(["acl", "delete", "-f"]).cmd else {
+            panic!("Expected Delete subcommand");
+        };
+        assert!(args.has_no_filter());
+        assert!(check_delete_scope(&args).is_err());
+        let AclSubcommands::Delete(args) =
+            Wrapper::parse_from(["acl", "delete", "--all", "-f"]).cmd
+        else {
+            panic!("Expected Delete subcommand");
+        };
+        assert!(args.all && args.force);
+        assert!(check_delete_scope(&args).is_ok());
+        let AclSubcommands::Delete(args) = Wrapper::parse_from(["acl", "delete", "-t", "x"]).cmd
+        else {
+            panic!("Expected Delete subcommand");
+        };
+        assert!(!args.has_no_filter());
+        assert!(check_delete_scope(&args).is_ok());
+        // --all with a filter is contradictory.
+        assert!(Wrapper::try_parse_from(["acl", "delete", "--all", "-p", "alice"]).is_err());
+
         let parsed_audit = Wrapper::parse_from(["acl", "audit", "--json"]);
         match parsed_audit.cmd {
             AclSubcommands::Audit(args) => {
@@ -733,5 +806,45 @@ mod tests {
             }
             _ => panic!("Expected Audit subcommand"),
         }
+    }
+
+    #[test]
+    fn delete_all_preview_states_the_total() {
+        let heading = delete_preview_heading(42, true, "cluster");
+        assert!(
+            heading.contains("42") && heading.contains("ALL"),
+            "{heading}"
+        );
+        let heading = delete_preview_heading(3, false, "cluster");
+        assert!(
+            heading.contains('3') && !heading.contains("ALL"),
+            "{heading}"
+        );
+    }
+
+    #[test]
+    fn local_delete_all_removes_exactly_the_previewed_bindings() {
+        let binding = |name: &str| {
+            AclBinding::new(
+                AclResourceType::Topic,
+                name.to_string(),
+                AclResourcePatternType::Literal,
+                "User:alice".to_string(),
+                "*".to_string(),
+                AclOperation::Read,
+                AclPermissionType::Allow,
+            )
+        };
+        let mut store = AclStore {
+            acls: Vec::new(),
+            storage_path: None,
+        };
+        store.add(binding("a"));
+        store.add(binding("b"));
+        let filter = AclFilter::default();
+        let previewed = store.list_exact(&filter);
+        assert_eq!(previewed.len(), 2);
+        assert_eq!(store.delete_exact(&filter), previewed.len());
+        assert!(store.list(&filter).is_empty());
     }
 }

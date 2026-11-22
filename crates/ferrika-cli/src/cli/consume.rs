@@ -72,8 +72,11 @@ pub struct ConsumeArgs {
     #[arg(short = 'W', long = "where", value_name = "EXPR")]
     pub where_expr: Option<String>,
 
-    /// Filter by required header in KEY:VALUE format
-    #[arg(long = "header-filter")]
+    /// Keep records with a header: KEY:VALUE (value contains VALUE,
+    /// case-insensitive unless --case-sensitive) or KEY=VALUE (value is
+    /// exactly VALUE). Header names ignore case. Repeat it to require
+    /// several; every one must match
+    #[arg(long = "header-filter", value_name = "KEY:VALUE|KEY=VALUE")]
     pub header_filter: Vec<String>,
 
     /// Start each partition at its first record on or after this epoch
@@ -194,9 +197,9 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
         }
     }
     for h in &args.header_filter {
-        let (k, v) = crate::kafka::filter::parse_header_pair(h)
+        let header = crate::kafka::filter::parse_header_filter(h)
             .map_err(|e| anyhow::anyhow!("--header-filter: {e}"))?;
-        filter = filter.with_header(k, v);
+        filter = filter.with_header_filter(header);
     }
     let where_expr = match &args.where_expr {
         Some(text) => Some(
