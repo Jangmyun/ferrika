@@ -1110,7 +1110,21 @@ pub fn delete_acl_bindings(
         false,
         &encode_delete_acl_bindings(bindings),
     )?;
-    decode_delete_acls(&body)
+    let (deleted, errors) = decode_delete_acls_partial(&body)?;
+    if errors.is_empty() {
+        return Ok(deleted);
+    }
+    let detail = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(KafkaError::admin(format!(
+        "DeleteAcls: {} of {} binding(s) were deleted, {} failed: {detail}",
+        deleted.len(),
+        bindings.len(),
+        errors.len()
+    )))
 }
 
 fn encode_delete_acl_bindings(bindings: &[AclBinding]) -> Vec<u8> {
@@ -1123,14 +1137,26 @@ fn encode_delete_acl_bindings(bindings: &[AclBinding]) -> Vec<u8> {
 }
 
 fn decode_delete_acls(body: &[u8]) -> KafkaResult<Vec<AclBinding>> {
+    let (deleted, errors) = decode_delete_acls_partial(body)?;
+    match errors.into_iter().next() {
+        Some(error) => Err(error),
+        None => Ok(deleted),
+    }
+}
+
+/// What DeleteAcls removed, and the error of each filter or binding it
+/// could not delete. One request carries several filters; a failed one
+/// does not undo the others.
+fn decode_delete_acls_partial(body: &[u8]) -> KafkaResult<(Vec<AclBinding>, Vec<KafkaError>)> {
     let mut r = Reader::new(body);
     let _throttle_ms = r.i32()?;
     let mut deleted = Vec::new();
+    let mut errors = Vec::new();
     for _ in 0..r.array_len()? {
         let code = r.i16()?;
         let message = r.nullable_string()?;
         if code != 0 {
-            return Err(error_for_code(code, message.as_deref()));
+            errors.push(error_for_code(code, message.as_deref()));
         }
         for _ in 0..r.array_len()? {
             let code = r.i16()?;
@@ -1144,12 +1170,13 @@ fn decode_delete_acls(body: &[u8]) -> KafkaResult<Vec<AclBinding>> {
             };
             let entry = read_acl_entry(&mut r, resource)?;
             if code != 0 {
-                return Err(error_for_code(code, message.as_deref()));
+                errors.push(error_for_code(code, message.as_deref()));
+                continue;
             }
             deleted.extend(entry);
         }
     }
-    Ok(deleted)
+    Ok((deleted, errors))
 }
 
 /// Outcome of a preferred-leader election.
@@ -2442,6 +2469,35 @@ mod tests {
         w.i16(54);
         w.nullable_string(Some("No Authorizer is configured"));
         assert!(decode_describe_acls(&w.0).is_err());
+    }
+
+    #[test]
+    fn a_failed_filter_does_not_hide_the_bindings_deleted_by_others() {
+        let mut w = Writer::default();
+        w.i32(0);
+        w.i32(2);
+        // First filter: one binding deleted.
+        w.i16(0);
+        w.nullable_string(None);
+        w.i32(1);
+        w.i16(0);
+        w.nullable_string(None);
+        w.i8(2); // topic
+        w.string("orders");
+        w.i8(3); // literal
+        w.string("User:svc");
+        w.string("*");
+        w.i8(3); // read
+        w.i8(3); // allow
+                 // Second filter: refused.
+        w.i16(31);
+        w.nullable_string(Some("Cluster authorization failed"));
+        w.i32(0);
+        let (deleted, errors) = decode_delete_acls_partial(&w.0).unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].resource_name, "orders");
+        assert_eq!(errors.len(), 1);
+        assert!(decode_delete_acls(&w.0).is_err());
     }
 
     #[test]
