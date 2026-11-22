@@ -763,7 +763,8 @@ impl KafkaConsumerClient {
         Ok(owned_message(&msg))
     }
 
-    /// Fetches low and high watermarks for a given topic partition.
+    /// Fetches low and high watermarks for a given topic partition, retrying
+    /// for a few seconds while its leader is not ready yet.
     pub fn fetch_watermarks(
         &self,
         topic: &str,
@@ -771,15 +772,18 @@ impl KafkaConsumerClient {
         timeout: Option<Duration>,
     ) -> KafkaResult<(i64, i64)> {
         let to = timeout.unwrap_or(self.config.request_timeout);
-        let (low, high) = self.consumer.fetch_watermarks(topic, partition, to)?;
-        Ok((low, high))
+        crate::kafka::retry::retry_leader_change(|| {
+            Ok(self.consumer.fetch_watermarks(topic, partition, to)?)
+        })
     }
 
     /// Fetches low and high watermarks for many partitions at once.
     ///
     /// Uses two ListOffsets lookups (earliest and latest) that librdkafka batches
     /// per partition leader, instead of one round trip per partition.
-    /// Partitions whose offsets could not be resolved are omitted.
+    /// Partitions whose offsets could not be resolved are omitted. A
+    /// partition whose leader is not ready yet (a topic created a moment ago)
+    /// is retried for a few seconds first.
     pub fn fetch_watermarks_batch(
         &self,
         partitions: &[(&str, i32)],
@@ -831,8 +835,11 @@ impl KafkaConsumerClient {
             }
             Ok(self.consumer.offsets_for_times(tpl, to)?)
         };
-        let low = lookup(Offset::Beginning)?;
-        let high = lookup(Offset::End)?;
+        // Right after a topic is created (or while a leader moves) the
+        // lookup can fail with NotLeaderForPartition for a moment.
+        let (low, high) = crate::kafka::retry::retry_leader_change(|| {
+            Ok((lookup(Offset::Beginning)?, lookup(Offset::End)?))
+        })?;
 
         let mut watermarks = HashMap::with_capacity(partitions.len());
         for elem in high.elements() {
