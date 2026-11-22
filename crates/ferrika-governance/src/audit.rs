@@ -1235,7 +1235,7 @@ mod tests {
         let line = append(&path, &entry(1)).unwrap();
         forward_appended(&line, &entry(1), Some(&to_spool), true).unwrap();
         // The spool gets the exact chained line, prev and hash included.
-        let spooled = std::fs::read_to_string(spool_file(&spool)).unwrap();
+        let spooled = std::fs::read_to_string(spool_file(&spool).unwrap()).unwrap();
         assert_eq!(spooled, format!("{line}\n"));
         assert!(line.contains("\"prev\"") && line.contains("\"hash\""));
 

@@ -501,7 +501,7 @@ pub struct AuditForward {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub syslog: Option<String>,
     /// A folder a log collector watches; each entry is appended as a JSON
-    /// line to `ferrika-audit-<host>-<user>.jsonl` in it.
+    /// line to `ferrika-audit-<host>-<user>.<random>.jsonl` in it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spool_dir: Option<String>,
     #[serde(default)]

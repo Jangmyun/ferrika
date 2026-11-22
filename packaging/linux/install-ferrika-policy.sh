@@ -8,7 +8,10 @@
 # Result: /etc/ferrika root:root 0755, files root:root 0644. An existing
 # /etc/ferrika (or file in it) gets its owner and mode reset; a symlink is
 # refused. A policy.keys missing from <source-dir> is removed from /etc/ferrika
-# so a retired key stops being trusted. FERRIKA_POLICY_TARGET overrides the
+# so a retired key stops being trusted. The result is verified: the directory
+# and everything in it must be owned by root and not writable by group or
+# others (anyone who could write there could force strictest mode with a
+# broken policy.keys), or the script fails. FERRIKA_POLICY_TARGET overrides the
 # target directory for packaging tests (release builds read only /etc/ferrika).
 set -eu
 
@@ -84,6 +87,43 @@ if [ -d "$TARGET" ]; then
     find "$TARGET" -mindepth 1 -type l -exec sh -c 'echo "symbolic link in policy directory: $1" >&2' _ {} \;
     run find "$TARGET" -mindepth 1 ! -type l -exec chown "root:$GROUP" {} +
     run find "$TARGET" -mindepth 1 ! -type l -exec chmod go-w {} +
+fi
+
+# "<uid> <octal mode>" of a path (GNU stat, then BSD/macOS stat).
+owner_mode() {
+    stat -c '%u %a' "$1" 2>/dev/null || stat -f '%u %Lp' "$1"
+}
+
+# Fails when the directory or anything in it is not owned by root or may be
+# written by group or others.
+verify_locked() {
+    bad=0
+    # One path per line, so names with spaces stay whole.
+    old_ifs=$IFS
+    IFS='
+'
+    for path in "$TARGET" $(find "$TARGET" -mindepth 1 ! -type l); do
+        om=$(owner_mode "$path")
+        uid=${om%% *}
+        mode=${om##* }
+        if [ "$uid" != 0 ]; then
+            echo "not owned by root: $path (uid $uid)" >&2
+            bad=1
+        fi
+        if [ $(( 0$mode & 022 )) -ne 0 ]; then
+            echo "writable by group or others: $path (mode $mode)" >&2
+            bad=1
+        fi
+    done
+    IFS=$old_ifs
+    if [ "$bad" -ne 0 ]; then
+        echo "the policy directory is still writable by non-root accounts; fix the above and run again" >&2
+        exit 1
+    fi
+}
+
+if [ "$DRY_RUN" -eq 0 ]; then
+    verify_locked
 fi
 
 if [ "$DRY_RUN" -eq 1 ]; then

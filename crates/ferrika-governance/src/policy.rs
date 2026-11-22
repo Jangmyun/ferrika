@@ -427,6 +427,8 @@ pub(crate) fn override_ignored(override_dir: Option<&OsStr>, allow_override: boo
     !allow_override && override_dir.is_some_and(|d| !d.is_empty())
 }
 
+pub use crate::policy_dir_perm::dir_write_warnings;
+
 /// The machine-wide policy directory. A release build ignores
 /// [`POLICY_DIR_ENV`] and says so (see [`ferrika_core::notice`]), once per process.
 pub fn policy_dir() -> PathBuf {
@@ -860,7 +862,7 @@ impl EffectivePolicy {
         let rules = self.rules_at(now);
         let brokers = || broker_list(bootstrap);
         if let Some(pattern) = rules.read_only.iter().find(|pattern| {
-            glob_match(pattern, profile) || brokers().any(|b| glob_match(pattern, b))
+            glob_match(pattern, profile) || brokers().any(|b| read_only_broker_match(pattern, b))
         }) {
             let target = if profile.is_empty() {
                 bootstrap
@@ -1058,12 +1060,28 @@ fn matching_environments<'r>(
         .unwrap_or_default()
 }
 
-/// The non-empty, trimmed entries of a comma-separated broker list.
+/// The non-empty entries of a broker list separated by commas and/or
+/// whitespace (`a:9092, b:9092`, `a:9092 b:9092`). Each entry is still raw:
+/// compare them through [`normalize_broker`] or [`broker_glob_match`].
 fn broker_list(bootstrap: &str) -> impl Iterator<Item = &str> {
     bootstrap
-        .split(',')
-        .map(str::trim)
+        .split(|c: char| c == ',' || c.is_whitespace())
         .filter(|b| !b.is_empty())
+}
+
+/// Whether a `read_only` glob (profile name or broker) matches broker
+/// `address`: as written, or in its normalized forms (lowercase host without
+/// a trailing dot, with and without the default port), so `KAFKA1.prod.corp.`
+/// is caught by `kafka1.prod.corp:*` as well as by `kafka1.prod.corp`.
+fn read_only_broker_match(pattern: &str, address: &str) -> bool {
+    if glob_match(pattern, address) {
+        return true;
+    }
+    let Some((host, port)) = split_broker(address) else {
+        return false;
+    };
+    let port = port.unwrap_or_else(|| DEFAULT_BROKER_PORT.to_string());
+    glob_match(pattern, &host) || glob_match(pattern, &format!("{host}:{port}"))
 }
 
 /// A read-only rule that matched, and the profile or broker it matched.
@@ -1121,7 +1139,7 @@ fn broker_set(list: &str) -> std::collections::HashSet<String> {
     broker_list(list).filter_map(normalize_broker).collect()
 }
 
-/// Whether two comma-separated broker lists share at least one broker
+/// Whether two broker lists (commas and/or whitespace) share at least one broker
 /// address once normalized (see [`normalize_broker`]). The safe test for
 /// "might be the same cluster": `mirror` uses it to refuse reading its own
 /// output, where a false "different" is the dangerous answer. Do NOT use it
@@ -2065,6 +2083,76 @@ mod tests {
         assert!(!destination_within_source("a:9092", ""));
         assert_eq!(with_known_brokers("a:1", &[]), "a:1");
         assert_eq!(with_known_brokers("", &["b:2".into()]), "b:2");
+    }
+
+    #[test]
+    fn broker_lists_are_normalized_before_comparing() {
+        // Commas, spaces, tabs and newlines all separate entries.
+        assert_eq!(
+            broker_list(" a:1 ,b:2\tc:3\n, ,d:4 ").collect::<Vec<_>>(),
+            ["a:1", "b:2", "c:3", "d:4"]
+        );
+        assert_eq!(
+            broker_set("Kafka1.Prod.Corp.:9092  kafka1.prod.corp kafka1.prod.corp:9092,"),
+            ["kafka1.prod.corp:9092".to_string()].into_iter().collect()
+        );
+        // Spaces instead of commas, case, a trailing dot, the default port
+        // and duplicates do not change the set.
+        assert!(destination_within_source(
+            "prod1:9092, prod2:9092",
+            "PROD2.  prod1 prod1:9092"
+        ));
+        assert!(destination_within_source("prod1:9092 prod2:9092", "prod2"));
+        // A second broker after a space is still checked.
+        assert!(!destination_within_source(
+            "prod1:9092",
+            "prod1:9092 mine:9092"
+        ));
+        assert!(shares_broker("prod1:9092", "mine:9092 PROD1"));
+        // IPv6 with and without brackets and port.
+        assert_eq!(
+            normalize_broker("[::1]:9092").as_deref(),
+            Some("[::1]:9092")
+        );
+        assert_eq!(normalize_broker("[::1]").as_deref(), Some("[::1]:9092"));
+        assert_eq!(normalize_broker("::1").as_deref(), Some("[::1]:9092"));
+        assert!(destination_within_source("[::1]:9092", "[::1]"));
+        assert!(!destination_within_source("[::1]:9092", "[::1]:9093"));
+        assert!(destination_within_source(
+            "[FE80::1]:9092 localhost",
+            "[fe80::1]:9092,LOCALHOST:9092"
+        ));
+    }
+
+    #[test]
+    fn read_only_globs_see_normalized_brokers() {
+        let rules = PolicyRules {
+            read_only: vec!["kafka1.prod.corp:*".into()],
+            read_only_brokers: vec!["*.prod.corp:9092".into(), "[::1]".into()],
+            ..PolicyRules::default()
+        };
+        let policy = verified(rules);
+        let now = Timestamp::now();
+        // Case, trailing dot, missing port, space-separated lists.
+        for bootstrap in [
+            "KAFKA1.prod.corp.",
+            "dev:9092 kafka1.prod.corp",
+            "kafka2.PROD.corp.",
+            "dev:9092\tkafka2.prod.corp:9092",
+            "[::1]:9093",
+            "dev:9092 ::1",
+        ] {
+            assert!(
+                policy.read_only_match_at(now, "", bootstrap).is_some(),
+                "{bootstrap}"
+            );
+        }
+        for bootstrap in ["dev:9092", "kafka2.prod.corp:9093", "dev:9092 other:9092"] {
+            assert!(
+                policy.read_only_match_at(now, "", bootstrap).is_none(),
+                "{bootstrap}"
+            );
+        }
     }
 
     #[test]
