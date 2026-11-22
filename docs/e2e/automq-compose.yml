@@ -1,0 +1,70 @@
+# One-node AutoMQ (broker + controller) on MinIO object storage, for a
+# future end-to-end run of the ferrika CLI against AutoMQ. Test use only;
+# the MinIO credentials are public test values.
+#
+# UNTESTED: this file has not been run yet. The image name, start command
+# and s3.* settings follow AutoMQ's open-source docker-compose example as
+# far as known; check them against the AutoMQ release you use and pin its
+# tag (instead of `latest`) once it works.
+#
+#   docker compose -f docs/e2e/automq-compose.yml up -d
+#   ferrika -b localhost:49092 topics list
+#   python3 tools/e2e/smoke.py target/debug/ferrika --broker localhost:49092
+#
+# Kafka API on localhost:49092, MinIO console on localhost:49001.
+name: ferrika-automq
+
+services:
+  minio:
+    image: minio/minio:latest
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    ports: ["49001:9001"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  mc:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >-
+      /bin/sh -c "
+      mc alias set minio http://minio:9000 minioadmin minioadmin &&
+      mc mb --ignore-existing minio/automq-data &&
+      mc mb --ignore-existing minio/automq-ops
+      "
+
+  automq:
+    image: automqinc/automq:latest
+    depends_on:
+      mc:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_S3_ACCESS_KEY: minioadmin
+      KAFKA_S3_SECRET_KEY: minioadmin
+      KAFKA_HEAP_OPTS: -Xms1g -Xmx1g -XX:MaxDirectMemorySize=1G
+      CLUSTER_ID: 3D4fXN-yS1-vsQ8aJ_q4Mg
+    command:
+      - bash
+      - -c
+      - |
+        /opt/automq/kafka/bin/kafka-server-start.sh \
+          /opt/automq/kafka/config/kraft/server.properties \
+          --override cluster.id=$$CLUSTER_ID \
+          --override node.id=0 \
+          --override process.roles=broker,controller \
+          --override controller.quorum.voters=0@automq:9093 \
+          --override controller.quorum.bootstrap.servers=automq:9093 \
+          --override listeners=PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:49092 \
+          --override listener.security.protocol.map=PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT \
+          --override advertised.listeners=PLAINTEXT://automq:9092,EXTERNAL://localhost:49092 \
+          --override s3.data.buckets='0@s3://automq-data?region=us-east-1&endpoint=http://minio:9000&pathStyle=true' \
+          --override s3.ops.buckets='1@s3://automq-ops?region=us-east-1&endpoint=http://minio:9000&pathStyle=true' \
+          --override s3.wal.path='0@s3://automq-data?region=us-east-1&endpoint=http://minio:9000&pathStyle=true'
+    ports: ["49092:49092"]

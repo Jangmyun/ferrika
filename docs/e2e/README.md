@@ -26,6 +26,7 @@ python3 tools/e2e/smoke.py target/debug/ferrika --broker localhost:9092
 | `kafka-oauth-compose.yml` | One broker that accepts unsecured JWTs on `localhost:19096`, plus a token endpoint on `localhost:18080` served by `oauth-idp.py` |
 | `oauth-idp.py` | Test-only OAuth 2.0 client-credentials endpoint (standard library only) |
 | `redpanda-compose.yml` | Three-node Redpanda (Kafka API on `localhost:39092`-`39094`, Schema Registry on `localhost:38081`) |
+| `automq-compose.yml` | One-node AutoMQ on MinIO (Kafka API on `localhost:49092`); not run yet, see the file header |
 | `undo.sh` | Checks `ferrika history` and `ferrika undo` against a broker; the header lists its variables |
 
 Usage, for example (undo check against a plain single-node broker):

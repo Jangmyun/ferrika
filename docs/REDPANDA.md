@@ -5,7 +5,10 @@ it like to any Kafka cluster: give its Kafka address (`-b host:9092`) and, for
 schemas, its built-in Schema Registry (`-S http://host:8081`).
 
 This page lists what has been checked and what differs. It is updated as more
-setups are tested.
+setups are tested. Other Kafka-compatible brokers are covered in
+[COMPATIBILITY.md](COMPATIBILITY.md); for Redpanda Cloud,
+`ferrika profile add --preset redpanda-cloud` sets SASL_SSL with
+SCRAM-SHA-256.
 
 ## Checked setup
 
