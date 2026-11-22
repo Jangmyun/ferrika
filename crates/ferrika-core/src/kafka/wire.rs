@@ -321,7 +321,7 @@ fn read_quota_entity(r: &mut Reader<'_>) -> KafkaResult<QuotaEntity> {
         let name = r.nullable_string()?;
         entity.push((kind, name));
     }
-    Ok(entity)
+    Ok(crate::model::quota::canonical_quota_entity(entity))
 }
 
 fn decode_describe_client_quotas(body: &[u8]) -> KafkaResult<Vec<ClientQuota>> {

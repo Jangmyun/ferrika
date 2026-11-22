@@ -285,7 +285,9 @@ pub async fn quota(
     blocking(move || {
         let value = wire::describe_client_quotas(&cfg)?
             .into_iter()
-            .find(|q| q.entity == entity && q.key == key)
+            .find(|q| {
+                ferrika_core::model::quota::same_quota_entity(&q.entity, &entity) && q.key == key
+            })
             .map(|q| q.value);
         Ok(State::Quota { entity, key, value })
     })
