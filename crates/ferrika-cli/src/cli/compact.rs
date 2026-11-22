@@ -44,8 +44,10 @@ pub struct CompactAnalyzeArgs {
     #[arg(short = 'n', long, default_value_t = 10000)]
     pub limit: usize,
 
-    /// Read from the beginning of the topic (Default)
-    #[arg(short = 'b', long, default_value_t = true)]
+    /// Read from the beginning of the topic (default);
+    /// `--from-beginning=false` reads only what arrives from now
+    #[arg(short = 'b', long, default_value_t = true, num_args = 0..=1, require_equals = true,
+          default_missing_value = "true", action = clap::ArgAction::Set)]
     pub from_beginning: bool,
 
     /// Output report in JSON format
@@ -568,6 +570,32 @@ mod tests {
             }
             _ => panic!("Expected Analyze subcommand"),
         }
+    }
+
+    #[test]
+    fn analyze_can_skip_the_existing_records() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        struct Wrapper {
+            #[command(subcommand)]
+            cmd: CompactSubcommands,
+        }
+
+        let from_beginning = |args: &[&str]| match Wrapper::parse_from(args).cmd {
+            CompactSubcommands::Analyze(a) => a.from_beginning,
+            _ => panic!("Expected Analyze subcommand"),
+        };
+        assert!(from_beginning(&["compact", "analyze", "t"]));
+        assert!(from_beginning(&["compact", "analyze", "t", "-b"]));
+        // `-b` before the topic still leaves the topic alone.
+        assert!(from_beginning(&["compact", "analyze", "-b", "t"]));
+        assert!(!from_beginning(&[
+            "compact",
+            "analyze",
+            "t",
+            "--from-beginning=false"
+        ]));
     }
 
     #[test]

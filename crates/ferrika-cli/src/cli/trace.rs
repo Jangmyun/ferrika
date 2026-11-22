@@ -72,8 +72,10 @@ pub struct AuditTraceArgs {
 
 #[derive(Debug, Args)]
 pub struct InjectTraceArgs {
-    /// Whether the generated trace has the sampled flag set (01)
-    #[arg(long, default_value_t = true)]
+    /// Whether the generated trace has the sampled flag set (01);
+    /// `--sampled false` generates unsampled ones (00)
+    #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true",
+          action = clap::ArgAction::Set)]
     pub sampled: bool,
 
     /// Number of fresh traceparent headers to generate
@@ -398,6 +400,17 @@ mod tests {
             }
             _ => panic!("Expected Inspect subcommand"),
         }
+    }
+
+    #[test]
+    fn inject_can_generate_unsampled_traces() {
+        let sampled = |args: &[&str]| match Wrapper::parse_from(args).cmd {
+            TraceSubcommands::Inject(a) => a.sampled,
+            _ => panic!("Expected Inject subcommand"),
+        };
+        assert!(sampled(&["trace", "inject"]));
+        assert!(sampled(&["trace", "inject", "--sampled"]));
+        assert!(!sampled(&["trace", "inject", "--sampled", "false"]));
     }
 
     #[test]
