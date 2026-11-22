@@ -464,10 +464,9 @@ fn tls_connect(
     Ok(stream)
 }
 
-/// `ferrika-audit-<host>-<user>.jsonl` in the spool folder: one file per
-/// machine and account, so accounts never need write access to each other's
-/// files and the collector can tell sources apart by name.
-pub fn spool_file(dir: &Path) -> PathBuf {
+/// The start of this account's spool file names,
+/// `ferrika-audit-<host>-<user>.`; a random suffix and `.jsonl` follow.
+fn spool_stem() -> String {
     let safe = |s: &str| -> String {
         let s: String = s
             .chars()
@@ -485,26 +484,362 @@ pub fn spool_file(dir: &Path) -> PathBuf {
             s
         }
     };
-    dir.join(format!(
-        "ferrika-audit-{}-{}.jsonl",
+    format!(
+        "ferrika-audit-{}-{}.",
         safe(hostname()),
         safe(&crate::audit::os_user())
-    ))
+    )
+}
+
+/// Hex digits of the random part of a spool file name.
+const SPOOL_SUFFIX_LEN: usize = 16;
+
+/// Whether `name` is one of this account's spool files: `stem`, 16 lowercase
+/// hex digits, `.jsonl`.
+fn is_spool_name(name: &str, stem: &str) -> bool {
+    name.strip_prefix(stem)
+        .and_then(|rest| rest.strip_suffix(".jsonl"))
+        .is_some_and(|random| {
+            random.len() == SPOOL_SUFFIX_LEN
+                && random
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+}
+
+/// This account's spool files in `dir`, newest first.
+fn spool_candidates(dir: &Path) -> Vec<PathBuf> {
+    let stem = spool_stem();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(Option<std::time::SystemTime>, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| is_spool_name(&entry.file_name().to_string_lossy(), &stem))
+        .map(|entry| {
+            // Not following links: a link's own time is enough to order it.
+            let modified = std::fs::symlink_metadata(entry.path())
+                .and_then(|m| m.modified())
+                .ok();
+            (modified, entry.path())
+        })
+        .collect();
+    found.sort_by(|a, b| b.cmp(a));
+    found.into_iter().map(|(_, path)| path).collect()
+}
+
+/// The spool file in `dir` that this process would append to now: the newest
+/// of this account's files (`ferrika-audit-<host>-<user>.<random>.jsonl`)
+/// that passes the ownership checks. `None` before the first entry is
+/// spooled (a new file is then created).
+pub fn spool_file(dir: &Path) -> Option<PathBuf> {
+    spool_candidates(dir)
+        .into_iter()
+        .find(|path| open_existing_spool(path).is_ok())
+}
+
+/// Opens an existing spool file for appending, refusing a symbolic link (or
+/// any non-regular file) and, on Unix, a file another account owns, one
+/// that group or others may write, or one with more than one hard link.
+/// On Windows the owner must be the current account (or the default owner
+/// of the objects it creates, e.g. Administrators for an elevated process).
+fn open_existing_spool(path: &Path) -> std::io::Result<std::fs::File> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::other("is a symbolic link"));
+    }
+    if !meta.is_file() {
+        return Err(std::io::Error::other("is not a regular file"));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.append(true);
+    no_follow(&mut options);
+    let file = options.open(path)?;
+    check_spool_file(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn no_follow(options: &mut std::fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.custom_flags(libc::O_NOFOLLOW);
+}
+
+#[cfg(windows)]
+fn no_follow(options: &mut std::fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Opens a link itself instead of its target; the check below then sees
+    // a reparse point and refuses it.
+    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn no_follow(_options: &mut std::fs::OpenOptions) {}
+
+#[cfg(unix)]
+fn check_spool_file(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other("is not a regular file"));
+    }
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid {
+        return Err(std::io::Error::other(format!(
+            "is owned by uid {}, not by this account (uid {uid})",
+            meta.uid()
+        )));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(std::io::Error::other(format!(
+            "may be written by group or others (mode {:o})",
+            meta.mode() & 0o777
+        )));
+    }
+    if meta.nlink() != 1 {
+        return Err(std::io::Error::other(format!(
+            "has {} hard links",
+            meta.nlink()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn check_spool_file(file: &std::fs::File) -> std::io::Result<()> {
+    let meta = file.metadata()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err(std::io::Error::other(
+            "is a junction, symbolic link or not a regular file",
+        ));
+    }
+    if !win_owner::owned_by_current_account(file)? {
+        return Err(std::io::Error::other("is owned by another account"));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn check_spool_file(file: &std::fs::File) -> std::io::Result<()> {
+    if file.metadata()?.is_file() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("is not a regular file"))
+    }
+}
+
+/// Creates a new spool file with a random name (create-new, so an existing
+/// file or link is never opened), owner read/write only on Unix. On Windows
+/// it gets the folder's inherited ACL.
+fn create_spool_file(dir: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    let stem = spool_stem();
+    let mut last = None;
+    for _ in 0..4 {
+        let path = dir.join(format!("{stem}{}.jsonl", random_hex(SPOOL_SUFFIX_LEN / 2)?));
+        let mut options = std::fs::OpenOptions::new();
+        options.append(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("could not create a spool file")))
+}
+
+/// `bytes` random bytes from the OS generator, as lowercase hex.
+fn random_hex(bytes: usize) -> std::io::Result<String> {
+    use ring::rand::SecureRandom;
+    let mut buf = vec![0u8; bytes];
+    ring::rand::SystemRandom::new()
+        .fill(&mut buf)
+        .map_err(|_| std::io::Error::other("the OS random generator failed"))?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Creates the spool folder (owner-only on Unix) or, when it exists, checks
+/// it on Unix: it must be a directory owned by this account or root, and
+/// not writable by group or others unless the sticky bit is set (then no
+/// one can rename or remove another account's files, as in `/tmp`).
+fn prepare_spool_dir(dir: &Path) -> std::io::Result<()> {
+    if !dir.exists() {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        return builder.create(dir);
+    }
+    check_spool_dir(dir)
+}
+
+#[cfg(unix)]
+fn check_spool_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::other(format!(
+            "spool folder {} is not a directory",
+            dir.display()
+        )));
+    }
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    if meta.uid() != uid && meta.uid() != 0 {
+        return Err(std::io::Error::other(format!(
+            "spool folder {} is owned by uid {}, not by this account or root; refusing to use it",
+            dir.display(),
+            meta.uid()
+        )));
+    }
+    let sticky = meta.mode() & 0o1000 != 0;
+    if meta.mode() & 0o022 != 0 && !sticky {
+        return Err(std::io::Error::other(format!(
+            "spool folder {} may be written by group or others (mode {:o}); \
+             refusing to use it (chmod go-w, or set the sticky bit)",
+            dir.display(),
+            meta.mode() & 0o7777
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_spool_dir(dir: &Path) -> std::io::Result<()> {
+    if std::fs::metadata(dir)?.is_dir() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "spool folder {} is not a directory",
+            dir.display()
+        )))
+    }
 }
 
 /// Appends `line` and a newline in one write (append mode, so concurrent
-/// writers never overwrite each other).
+/// writers never overwrite each other) to this account's newest spool file
+/// that passes the checks, or to a new one. A file that fails them is left
+/// alone and reported.
 fn append_spool(dir: &Path, line: &str) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(spool_file(dir))?;
+    prepare_spool_dir(dir)?;
+    let mut chosen = None;
+    for path in spool_candidates(dir) {
+        match open_existing_spool(&path) {
+            Ok(file) => {
+                chosen = Some(file);
+                break;
+            }
+            Err(e) => ferrika_core::notice::warn(&format!(
+                "audit forwarding: skipping spool file {} ({e}); writing to another file",
+                path.display()
+            )),
+        }
+    }
+    let mut file = match chosen {
+        Some(file) => file,
+        None => create_spool_file(dir)?.1,
+    };
     let mut out = String::with_capacity(line.len() + 1);
     out.push_str(line);
     out.push('\n');
     file.write_all(out.as_bytes())?;
     file.flush()
+}
+
+/// The owner check of spool files on Windows.
+#[cfg(windows)]
+mod win_owner {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        EqualSid, GetTokenInformation, TokenOwner, TokenUser, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    /// Whether `file`'s owner is this process's user, or the default owner
+    /// the token gives new objects (Administrators when elevated).
+    pub(super) fn owned_by_current_account(file: &std::fs::File) -> std::io::Result<bool> {
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: a valid file handle; only the owner is requested, and the
+        // descriptor it points into is freed below with LocalFree.
+        let rc = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle() as HANDLE,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc as i32));
+        }
+        let result = token_matches(owner);
+        // SAFETY: allocated by GetSecurityInfo; `owner` is not used after this.
+        unsafe { LocalFree(descriptor as _) };
+        result
+    }
+
+    fn token_matches(owner: PSID) -> std::io::Result<bool> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: the pseudo handle of this process and an out pointer.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let result = (|| {
+            let user = token_info(token, TokenUser)?;
+            // SAFETY: the buffer holds a TOKEN_USER; its SID points into the
+            // same buffer. read_unaligned: a Vec<u8> has no alignment guarantee.
+            let user_sid = unsafe { std::ptr::read_unaligned(user.as_ptr().cast::<TOKEN_USER>()) }
+                .User
+                .Sid;
+            // SAFETY: both SIDs are valid for the duration of the call.
+            if unsafe { EqualSid(owner, user_sid) } != 0 {
+                return Ok(true);
+            }
+            let default_owner = token_info(token, TokenOwner)?;
+            // SAFETY: as above, for TOKEN_OWNER.
+            let owner_sid =
+                unsafe { std::ptr::read_unaligned(default_owner.as_ptr().cast::<TOKEN_OWNER>()) }
+                    .Owner;
+            // SAFETY: both SIDs are valid for the duration of the call.
+            Ok(unsafe { EqualSid(owner, owner_sid) } != 0)
+        })();
+        // SAFETY: opened above, closed once.
+        unsafe { CloseHandle(token) };
+        result
+    }
+
+    fn token_info(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> std::io::Result<Vec<u8>> {
+        let mut len = 0u32;
+        // SAFETY: a size query with no buffer.
+        unsafe { GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut len) };
+        if len == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut buf = vec![0u8; len as usize];
+        // SAFETY: `buf` has `len` bytes.
+        let ok =
+            unsafe { GetTokenInformation(token, class, buf.as_mut_ptr().cast(), len, &mut len) };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(buf)
+    }
 }
 
 /// This machine's name for the syslog HOSTNAME field.
@@ -748,12 +1083,162 @@ mod tests {
         let s = settings(AuditForward::new(None, Some(dir.display().to_string())));
         assert!(send(&s, LINE, true, 0).iter().all(|r| r.ok));
         assert!(send(&s, r#"{"second":true}"#, true, 0).iter().all(|r| r.ok));
-        let file = spool_file(&dir);
+        let file = spool_file(&dir).unwrap();
         let name = file.file_name().unwrap().to_string_lossy().to_string();
         assert!(name.starts_with("ferrika-audit-") && name.ends_with(".jsonl"));
         let text = std::fs::read_to_string(&file).unwrap();
         assert_eq!(text, format!("{LINE}\n{{\"second\":true}}\n"));
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    fn spool_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn spool_file_names_are_random_and_strictly_matched() {
+        let stem = spool_stem();
+        assert!(stem.starts_with("ferrika-audit-") && stem.ends_with('.'));
+        let ok = format!("{stem}0123456789abcdef.jsonl");
+        assert!(is_spool_name(&ok, &stem));
+        for bad in [
+            format!("{stem}jsonl"),
+            format!("{stem}0123456789ABCDEF.jsonl"),
+            format!("{stem}0123456789abcde.jsonl"),
+            format!("{stem}0123456789abcdef.jsonl.tmp"),
+            format!("{}jsonl", stem.trim_end_matches('.')),
+        ] {
+            assert!(!is_spool_name(&bad, &stem), "{bad}");
+        }
+        let a = random_hex(8).unwrap();
+        assert_eq!(a.len(), 16);
+        assert_ne!(a, random_hex(8).unwrap());
+
+        // Create-new: every file gets its own random name.
+        let dir = temp_dir("spool-names");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (first, _) = create_spool_file(&dir).unwrap();
+        let (second, _) = create_spool_file(&dir).unwrap();
+        assert_ne!(first, second);
+        for path in [&first, &second] {
+            assert!(is_spool_name(
+                &path.file_name().unwrap().to_string_lossy(),
+                &stem
+            ));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn spool_reuses_this_accounts_file_and_ignores_other_names() {
+        let dir = temp_dir("spool-reuse");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The old fixed name and foreign files are never written to.
+        let legacy = dir.join(format!("{}jsonl", spool_stem()));
+        std::fs::write(&legacy, "").unwrap();
+        std::fs::write(dir.join("other.jsonl"), "").unwrap();
+        append_spool(&dir, "one").unwrap();
+        append_spool(&dir, "two").unwrap();
+        assert_eq!(spool_names(&dir).len(), 3);
+        let file = spool_file(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "one\ntwo\n");
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    mod unix_spool {
+        use super::super::*;
+        use super::{spool_names, temp_dir};
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        fn mode(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+        }
+
+        fn private_dir(name: &str) -> PathBuf {
+            let dir = temp_dir(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            dir
+        }
+
+        #[test]
+        fn new_folder_and_files_are_owner_only() {
+            let dir = temp_dir("spool-mode").join("nested");
+            append_spool(&dir, "x").unwrap();
+            assert_eq!(mode(&dir), 0o700);
+            assert_eq!(mode(&spool_file(&dir).unwrap()), 0o600);
+            let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+        }
+
+        #[test]
+        fn a_symlinked_spool_file_is_skipped_not_followed() {
+            let dir = private_dir("spool-link");
+            let target = dir.join("victim.txt");
+            std::fs::write(&target, "keep").unwrap();
+            let link = dir.join(format!("{}ffffffffffffffff.jsonl", spool_stem()));
+            symlink(&target, &link).unwrap();
+            append_spool(&dir, "entry").unwrap();
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+            // The link is left in place; the entry went to a new file.
+            assert!(std::fs::symlink_metadata(&link).is_ok());
+            let file = spool_file(&dir).unwrap();
+            assert_ne!(file, link);
+            assert_eq!(std::fs::read_to_string(file).unwrap(), "entry\n");
+            assert_eq!(spool_names(&dir).len(), 3);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn a_group_writable_or_hard_linked_spool_file_is_skipped() {
+            let dir = private_dir("spool-perm");
+            let open = dir.join(format!("{}aaaaaaaaaaaaaaaa.jsonl", spool_stem()));
+            std::fs::write(&open, "").unwrap();
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o666)).unwrap();
+            let linked = dir.join(format!("{}bbbbbbbbbbbbbbbb.jsonl", spool_stem()));
+            std::fs::write(&linked, "").unwrap();
+            std::fs::set_permissions(&linked, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::hard_link(&linked, dir.join("second-name")).unwrap();
+            append_spool(&dir, "entry").unwrap();
+            assert_eq!(std::fs::read_to_string(&open).unwrap(), "");
+            assert_eq!(std::fs::read_to_string(&linked).unwrap(), "");
+            let file = spool_file(&dir).unwrap();
+            assert!(file != open && file != linked);
+            assert_eq!(std::fs::read_to_string(file).unwrap(), "entry\n");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn a_world_writable_folder_is_refused_unless_sticky() {
+            let dir = temp_dir("spool-shared");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+            let err = append_spool(&dir, "entry").unwrap_err().to_string();
+            assert!(err.contains("group or others"), "{err}");
+            assert!(spool_names(&dir).is_empty());
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+            append_spool(&dir, "entry").unwrap();
+            assert_eq!(spool_names(&dir).len(), 1);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn own_spool_files_pass_the_windows_owner_check() {
+        let dir = temp_dir("spool-owner");
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, file) = create_spool_file(&dir).unwrap();
+        assert!(win_owner::owned_by_current_account(&file).unwrap());
+        drop(file);
+        assert!(open_existing_spool(&path).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -774,7 +1259,7 @@ mod tests {
         let mut buf = [0u8; 4096];
         let (n, _) = server.recv_from(&mut buf).unwrap();
         assert!(std::str::from_utf8(&buf[..n]).unwrap().ends_with(LINE));
-        assert!(std::fs::read_to_string(spool_file(&dir))
+        assert!(std::fs::read_to_string(spool_file(&dir).unwrap())
             .unwrap()
             .contains(LINE));
         let _ = std::fs::remove_dir_all(dir);

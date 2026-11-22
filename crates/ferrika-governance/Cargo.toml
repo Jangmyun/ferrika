@@ -24,8 +24,9 @@ tracing.workspace = true
 [target.'cfg(windows)'.dependencies]
 # Audit log: the signed-in account (GetUserNameW) and the profile folder
 # (known folder, not %USERPROFILE%), the Event Log audit anchor, and the
-# policy's ProgramData known folder (SHGetKnownFolderPath, freed with CoTaskMemFree).
-windows-sys = { version = "0.61", features = ["Win32_System_WindowsProgramming", "Win32_System_EventLog", "Win32_Security", "Win32_UI_Shell", "Win32_System_Com", "Win32_Foundation"] }
+# policy's ProgramData known folder (SHGetKnownFolderPath, freed with CoTaskMemFree),
+# and the owner of audit spool files (GetSecurityInfo, the process token).
+windows-sys = { version = "0.61", features = ["Win32_System_WindowsProgramming", "Win32_System_EventLog", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_UI_Shell", "Win32_System_Com", "Win32_Foundation"] }
 dirs = "5"
 
 # Audit log: the account and home directory from getuid + passwd

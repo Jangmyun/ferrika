@@ -7,6 +7,7 @@ pub mod audit;
 pub mod audit_anchor;
 pub mod audit_forward;
 pub mod policy;
+mod policy_dir_perm;
 // `test-util` is for tests: test_policy builds policies that claim to be
 // verified without a signature. An optimized build must not carry it, so the
 // feature fails to compile without debug assertions.

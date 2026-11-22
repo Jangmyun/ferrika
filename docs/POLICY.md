@@ -125,10 +125,17 @@ typo cannot silently weaken it.
 - Matched against every bootstrap address of the profile (or `--bootstrap`),
   never against the profile name, so a production profile renamed to `dev`
   is still read-only.
+- A broker list may be separated by commas and/or whitespace
+  (`a:9092, b:9092` or `a:9092 b:9092`); every entry is checked.
 - Addresses and patterns are normalized before matching: surrounding spaces
-  and a `SASL_SSL://`-style scheme are dropped, the host is lowercase, and
+  and a `SASL_SSL://`-style scheme are dropped, the host is lowercase
+  without a trailing dot (`Kafka1.Prod.Corp.` is `kafka1.prod.corp`), and
   an address without a port is on 9092. IPv6 hosts are compared in brackets
-  (`[fd00::5]:9092`).
+  (`[fd00::5]:9092`, `::1` is `[::1]:9092`). Duplicates do not matter: the
+  lists are compared as sets of `host:port`. `read_only` globs (which also
+  match the profile name) see each broker both as written and normalized,
+  and `environments.*.brokers`, `export_clusters` and the `mirror` /
+  `transform` same-cluster check use the same normalization.
 - A pattern without a port matches the host on any port (`*.prod.corp`
   covers `kafka1.prod.corp:9093`); a pattern with a port also matches the
   port (`10.20.*:9092`).
@@ -411,7 +418,7 @@ to the local hash-chained log, to syslog and/or a spool folder:
 | Field | Values |
 |---|---|
 | `syslog` | `udp://host[:port]` (RFC 5426, default port 514), `tcp://host[:port]` (RFC 6587 octet counting, default 514) or `tls://host[:port]` (RFC 5425, default 6514). IPv6 as `[::1]`. |
-| `spool_dir` | A folder a log collector (Splunk Universal Forwarder, Filebeat, NXLog…) watches. Each entry is appended as one JSON line to `ferrika-audit-<host>-<user>.jsonl`, one file per machine and account. |
+| `spool_dir` | A folder a log collector (Splunk Universal Forwarder, Filebeat, NXLog…) watches. Each entry is appended as one JSON line to `ferrika-audit-<host>-<user>.<random>.jsonl` (16 hex digits), files per machine and account; see [Spool folder security](#spool-folder-security). Point the collector at `ferrika-audit-*.jsonl`. |
 | `facility` | Syslog facility name, default `auth` (`kern`, `user`, `daemon`, `auth`, `authpriv`, `security`, `local0`…`local7`, …). |
 | `app_name` | RFC 5424 APP-NAME, default `ferrika` (1–48 printable ASCII, no spaces). |
 | `timeout_ms` | Longest a command or desktop app action waits for one forward, default 1000, allowed 50–10000. |
@@ -454,6 +461,37 @@ connection; over UDP it is one datagram.
   failed to forward is only in the local log (and in the spool, if both are
   configured).
 
+### Spool folder security
+
+A spool folder is often shared by every account on a machine, so Ferrika
+does not trust what it finds there:
+
+- A new spool file gets an unpredictable name (`.<16 random hex digits>.jsonl`)
+  and is created with create-new semantics, so an existing file or link is
+  never opened by mistake. On Unix it is created `0600`; on Windows it gets
+  the folder's inherited ACL (with the `-SpoolDir` folder of
+  `Install-FerrikaPolicy.ps1`: the creator may modify it, other users only
+  read it; a folder under the user profile is the user's own).
+- Ferrika keeps appending to the newest of its own files
+  (`ferrika-audit-<host>-<user>.<random>.jsonl`) only when it passes these
+  checks: not a symbolic link, junction or other non-regular file (opened
+  without following links), and owned by the current account (Windows: the
+  account, or the default owner of its new objects, e.g. Administrators for
+  an elevated process). On Unix it must also not be writable by group or
+  others and have a single hard link. A file that fails is left alone (not
+  deleted), a warning names it (`audit forwarding: skipping spool file …`),
+  and the entry goes to a new file.
+- Ferrika creates a missing spool folder owner-only (`0700`) on Unix. An
+  existing folder on Unix must be owned by the current account or root and
+  must not be writable by group or others, unless the sticky bit is set
+  (`1777` / `1733`, like `/tmp`: no one can rename or delete another
+  account's files). Otherwise forwarding to it fails with a clear error
+  (`spool folder … may be written by group or others`).
+- Files are `0600`, so on Unix the log collector has to run as root or as
+  the same account. The files written by Ferrika 0.2.0 and earlier
+  (`ferrika-audit-<host>-<user>.jsonl`, no random part) are no longer
+  appended to.
+
 **Without a policy (individual use).** `FERRIKA_AUDIT_FORWARD` sets
 forwarding for one user: `udp://host:514`, `tcp://host:514`,
 `tls://host:6514`, `spool:C:\path\to\folder`, or the JSON of an
@@ -491,6 +529,16 @@ ferrika -f json policy show
 `policy verify` without `--pub` checks against every trusted key of the
 policy directory; `policy show` lists them and marks the one that signed
 the policy.
+
+`policy show` also warns when the policy directory or a policy file in it
+may be written by accounts other than administrators (`-f json`:
+`dir_warnings`, a list of messages). Anyone who can add a broken
+`policy.keys` there can at least force strictest mode. The check is best
+effort: on Unix the directory and files must be owned by root and not
+writable by group or others; on Windows the owner and every allow entry
+that grants write, create, delete or permission-change rights (inherit-only
+entries aside) must be Administrators, SYSTEM or TrustedInstaller. The
+install scripts in `packaging/` set these permissions and verify them.
 
 ## Deployment
 
