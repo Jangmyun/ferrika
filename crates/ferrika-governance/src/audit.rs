@@ -495,11 +495,7 @@ pub fn verify() -> std::io::Result<ChainReport> {
 /// that, a line that is not JSON is accepted as torn (see `append`) only if
 /// it is the last line or the next line's `prev` is its SHA-256.
 pub fn verify_chain(path: &Path) -> std::io::Result<ChainReport> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
-    };
+    let text = read_lossy(path)?;
     // Editors (and PowerShell's Set-Content) may add a byte order mark.
     let text = text.trim_start_matches('\u{feff}');
     let mut report = ChainReport {
@@ -607,13 +603,38 @@ pub fn recent_matching(limit: usize, keep: impl Fn(&AuditEntry) -> bool) -> Vec<
     read_recent(&audit_path(), limit, keep)
 }
 
-fn read_recent(path: &Path, limit: usize, keep: impl Fn(&AuditEntry) -> bool) -> Vec<AuditEntry> {
-    let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
-    let mut entries: Vec<AuditEntry> = std::io::BufReader::new(file)
-        .lines()
+/// The log as text, invalid UTF-8 replaced (a line torn inside a multi-byte
+/// character by a crash), so one such line does not hide the lines after
+/// it. `append` chains to the same replaced text (see `read_tail`). A
+/// missing file is empty.
+pub(crate) fn read_lossy(path: &Path) -> std::io::Result<String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Each line of the log at `path`, invalid UTF-8 replaced (see
+/// [`read_lossy`]). Nothing when it cannot be opened.
+fn lossy_lines(path: &Path) -> impl Iterator<Item = String> {
+    std::fs::File::open(path)
+        .ok()
+        .into_iter()
+        .flat_map(|file| std::io::BufReader::new(file).split(b'\n'))
         .map_while(Result::ok)
+        .map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .trim_end_matches('\r')
+                .to_string()
+        })
+}
+
+fn read_recent(path: &Path, limit: usize, keep: impl Fn(&AuditEntry) -> bool) -> Vec<AuditEntry> {
+    let mut entries: Vec<AuditEntry> = lossy_lines(path)
         .filter_map(|line| serde_json::from_str(&line).ok())
         .filter(|entry| keep(entry))
         .collect();
@@ -674,11 +695,8 @@ pub fn op_digest(op: &str) -> Option<String> {
 }
 
 fn op_digest_in(path: &Path, op: &str) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
     let mut found: Option<String> = None;
-    for entry in std::io::BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
+    for entry in lossy_lines(path)
         .filter_map(|line| serde_json::from_str::<AuditEntry>(&line).ok())
         .filter(|entry| entry.op == op && !entry.op_digest.is_empty())
     {
@@ -1056,6 +1074,35 @@ mod tests {
             .map(|e| e.target)
             .collect();
         assert_eq!(targets, ["t1", "t2", "t4", "t5"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_line_torn_inside_a_character_does_not_hide_the_rest() {
+        let (dir, path) = temp_log("torn-utf8");
+        append(&path, &entry(1)).unwrap();
+        // A crash cut the line after the first byte of a three-byte
+        // character: the file is no longer valid UTF-8.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(br#"{"time_ms":2,"target":""#);
+        bytes.push(0xED);
+        std::fs::write(&path, &bytes).unwrap();
+        append(&path, &entry(3)).unwrap();
+        let mut last = entry(4);
+        last.op = "op-4".into();
+        last.op_digest = "d4".into();
+        append(&path, &last).unwrap();
+
+        let report = verify_chain(&path).unwrap();
+        assert_eq!(report.broken, None);
+        assert_eq!(report.torn, vec![2]);
+        assert_eq!(report.chained, 3);
+        let targets: Vec<String> = read_recent(&path, 10, |_| true)
+            .into_iter()
+            .map(|e| e.target)
+            .collect();
+        assert_eq!(targets, ["t1", "t3", "t4"]);
+        assert_eq!(op_digest_in(&path, "op-4").as_deref(), Some("d4"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
