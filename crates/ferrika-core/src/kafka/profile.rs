@@ -442,9 +442,17 @@ impl ProfileStore {
                 .filter(|name| self.profiles.contains_key(*name))
                 .cloned()
                 .collect();
-            let kept = stored.keep_os_secrets_out(previous, |name, field| {
-                secrets::get(name, field).ok().flatten()
-            });
+            let kept = stored.keep_os_secrets_out(
+                previous,
+                |name, field| secrets::get(name, field).ok().flatten(),
+                |name, field| {
+                    if let Err(e) = secrets::delete(name, field) {
+                        tracing::warn!(
+                            "Cannot remove the old {field} of profile '{name}' from the OS credential store: {e}"
+                        );
+                    }
+                },
+            );
             stored.keyring_profiles.extend(kept);
             return stored;
         }
@@ -496,11 +504,14 @@ impl ProfileStore {
     /// OS store holds (`stored`), so saving does not copy it to the file in
     /// plain text. Returns the profiles that keep secrets there. A secret
     /// changed in this session differs from the stored one and goes to the
-    /// file, as new secrets do in this mode.
+    /// file, as new secrets do in this mode, and the stored one is removed
+    /// (`forget`): it would otherwise come back on the next load, since an
+    /// emptied field matches what the file keeps for a stored password.
     fn keep_os_secrets_out(
         &mut self,
         previous: &BTreeSet<String>,
         stored: impl Fn(&str, &str) -> Option<String>,
+        mut forget: impl FnMut(&str, &str),
     ) -> BTreeSet<String> {
         let mut kept = BTreeSet::new();
         for name in previous {
@@ -513,6 +524,7 @@ impl ProfileStore {
                 };
                 let current = secret_field(profile, field);
                 if current.as_deref() != Some(value.as_str()) {
+                    forget(name, field);
                     continue;
                 }
                 if let Some(public) = public_part(field, &value) {
@@ -939,13 +951,24 @@ mod tests {
         dev.sasl_password = Some("new-password".into());
         store.profiles.insert("dev".into(), dev);
         let previous: BTreeSet<String> = ["prod".to_string(), "dev".to_string()].into();
-        let kept = store.keep_os_secrets_out(&previous, |name, field| match (name, field) {
-            ("prod", "sasl_password") => Some("from-keyring".into()),
-            ("prod", "schema_registry_url") => Some("https://KEY:url-secret@sr.example.com".into()),
-            ("dev", "sasl_password") => Some("old-password".into()),
-            _ => None,
-        });
+        let mut forgotten = Vec::new();
+        let kept = store.keep_os_secrets_out(
+            &previous,
+            |name, field| match (name, field) {
+                ("prod", "sasl_password") => Some("from-keyring".into()),
+                ("prod", "schema_registry_url") => {
+                    Some("https://KEY:url-secret@sr.example.com".into())
+                }
+                ("prod", "connect_url") => Some("https://KEY:old@connect".into()),
+                ("dev", "sasl_password") => Some("old-password".into()),
+                _ => None,
+            },
+            |name, field| forgotten.push(format!("{name}/{field}")),
+        );
         assert_eq!(kept, ["prod".to_string()].into());
+        // Changed or cleared in this session: the stored value must not
+        // come back on the next load.
+        assert_eq!(forgotten, ["dev/sasl_password", "prod/connect_url"]);
         let prod = &store.profiles["prod"];
         assert_eq!(prod.sasl_password, None);
         let url = prod.schema_registry_url.as_deref().unwrap_or_default();

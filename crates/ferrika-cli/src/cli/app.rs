@@ -173,25 +173,37 @@ fn no_command_help() -> String {
 /// command, and prints the help (exit status 0) when there is none.
 pub fn main_cli() {
     exit_quietly_on_broken_pipe();
-    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let mut command = <Cli as clap::CommandFactory>::command();
+    let matches = command.get_matches_mut();
     let brokers_from_env =
         matches.value_source("bootstrap_servers") == Some(clap::parser::ValueSource::EnvVariable);
-    let cli =
-        <Cli as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
-    if let Some(warning) = env_brokers_warning(
-        cli.global_opts.profile.as_deref(),
-        cli.global_opts.bootstrap_servers.as_deref(),
-        brokers_from_env,
-    ) {
-        eprintln!("{warning}");
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
+        .map_err(|e| e.format(&mut command))
+        .unwrap_or_else(|e| e.exit());
+    if brokers_from_env {
+        // The profile the command uses: the chosen one, else the active one.
+        let profile = cli
+            .global_opts
+            .profile
+            .clone()
+            .filter(|p| !p.trim().is_empty())
+            .or_else(|| crate::kafka::profile::ProfileStore::load_or_default().active_profile);
+        if let Some(warning) = env_brokers_warning(
+            profile.as_deref(),
+            cli.global_opts.bootstrap_servers.as_deref(),
+            brokers_from_env,
+        ) {
+            eprintln!("{warning}");
+        }
     }
     run(cli);
 }
 
 /// A warning when `KAFKA_BOOTSTRAP_SERVERS` (often left set by a
-/// docker-compose setup) replaces the brokers of a profile chosen with
-/// `-p`/`FERRIKA_PROFILE`: the command then sends that profile's
-/// credentials to other brokers while its name shows in audit entries.
+/// docker-compose setup) replaces the brokers of the profile in use (chosen
+/// with `-p`/`FERRIKA_PROFILE`, or the active one): the command then sends
+/// that profile's credentials to other brokers while its name shows in
+/// audit entries.
 fn env_brokers_warning(
     profile: Option<&str>,
     brokers: Option<&str>,
