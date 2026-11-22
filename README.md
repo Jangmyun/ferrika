@@ -56,7 +56,7 @@ The archives the scripts and Homebrew install are on the
 [releases page](https://github.com/Jangmyun/ferrika/releases). They are built
 with the `ssl` feature (TLS and SCRAM, see [Building](#building)).
 
-From crates.io, with a recent stable Rust toolchain (1.85 or newer), CMake and
+From crates.io, with a recent stable Rust toolchain (1.88 or newer), CMake and
 a C compiler:
 
 ```bash
@@ -113,6 +113,36 @@ still starting can answer.
 
 Examples for each are in the [command reference](docs/CLI.md).
 
+## Terminal dashboard
+
+`ferrika top` (alias `ferrika tui`) opens a live, read-only dashboard in the
+terminal (Windows Terminal, PowerShell and Unix terminals):
+
+```bash
+ferrika -p prod top                 # refresh every 5 s
+ferrika -p prod top --interval 2 --sort-by throughput
+```
+
+| View | Shows |
+| --- | --- |
+| 1 Overview | Cluster id, brokers online and offline, controller, topic and partition counts, under-replicated and leaderless partitions, total lag, produce rate, the first health findings |
+| 2 Topics | Partitions, replication factor, under-replicated and offline partitions, records retained, produce rate (from watermark changes between refreshes) |
+| 3 Consumer groups | State, members, total lag and its trend since the last refresh |
+| 4 Findings | The `ferrika health` findings, most severe first |
+
+Keys: Tab or Left/Right switch views (or 1-4), Up/Down or j/k move, `/`
+filters by name, `s` sorts by the next column and `S` reverses it, `r`
+refreshes now, `?` lists the keys, `q` or Esc quits. The cluster is read in
+the background, so a slow or unreachable cluster leaves the last data on
+screen with its age and the error in the status line. The dashboard reads
+metadata, watermarks and committed offsets only; it never changes the cluster
+and shows no record contents.
+
+Without a terminal, or with `--plain`, `-n <count>` or `--json`, `top` prints
+a refreshing text view or one JSON snapshot instead. The dashboard is the
+default-on `tui` cargo feature of `ferrika-cli` (ratatui and crossterm);
+build with `--no-default-features` to leave it out.
+
 ## Policy, audit and MCP
 
 - **Read-only profiles and an audit log.** `ferrika profile read-only prod`
@@ -157,7 +187,7 @@ The crates are published on [crates.io](https://crates.io/crates/ferrika-core); 
 
 Requirements:
 
-- Rust 1.85 or newer
+- Rust 1.88 or newer
 - CMake and a C compiler (the bundled `librdkafka` is built from source)
 - Windows: MSVC build tools with `rc.exe` on `PATH`
 - Optional `ssl` feature: Perl, to build OpenSSL from source (on Windows a

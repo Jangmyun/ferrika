@@ -19,14 +19,25 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, Args)]
 #[command(
     name = "top",
-    about = "Kafka Cluster Top: interactive real-time terminal process monitor with throughput deltas and lag leaderboards"
+    about = "Live read-only dashboard: brokers, topics, consumer group lag and health findings",
+    long_about = concat!(
+        "Live read-only dashboard: brokers, topics, consumer group lag and health findings.\n\n",
+        "On a terminal this opens an interactive dashboard (Tab switches views, / filters, ",
+        "s sorts, r refreshes, ? shows the keys, q quits). With --plain, --iterations, --json, ",
+        "or when stdout is not a terminal, it prints a refreshing text view instead."
+    )
 )]
 pub struct TopArgs {
     /// Refresh interval in seconds
-    #[arg(short = 'i', long, default_value = "2")]
+    #[arg(
+        short = 'i',
+        long = "interval",
+        alias = "interval-secs",
+        default_value = "5"
+    )]
     pub interval_secs: u64,
 
-    /// Number of refresh iterations before exiting (0 = continuous)
+    /// Number of refresh iterations before exiting (0 = continuous); prints the text view
     #[arg(short = 'n', long, default_value = "0")]
     pub iterations: usize,
 
@@ -37,14 +48,54 @@ pub struct TopArgs {
     /// Output a single-shot cluster snapshot in JSON format
     #[arg(long)]
     pub json: bool,
+
+    /// Print the refreshing text view instead of the interactive dashboard
+    #[arg(long)]
+    pub plain: bool,
 }
 
-pub async fn run(args: TopArgs, global: &GlobalOpts) -> KafkaResult<()> {
-    let sort_order = match args.sort_by.to_lowercase().as_str() {
+/// Whether to open the interactive dashboard: only for a person at a
+/// terminal who asked for neither text, JSON nor a fixed number of refreshes.
+pub fn wants_dashboard(args: &TopArgs, json: bool, terminal: bool) -> bool {
+    terminal && !json && !args.plain && args.iterations == 0
+}
+
+fn parse_sort(sort_by: &str) -> TopSortOrder {
+    match sort_by.to_lowercase().as_str() {
         "throughput" | "tps" => TopSortOrder::Throughput,
         "name" => TopSortOrder::Name,
         _ => TopSortOrder::Lag,
-    };
+    }
+}
+
+/// The dashboard's starting sort for `--sort-by`.
+#[cfg(feature = "tui")]
+fn dashboard_sort(order: TopSortOrder) -> crate::cli::tui::InitialSort {
+    use crate::cli::tui::state::{GroupColumn, Sort, TopicColumn};
+    let mut sort = crate::cli::tui::InitialSort::default();
+    match order {
+        TopSortOrder::Lag => {}
+        TopSortOrder::Throughput => sort.topics = Sort::by(TopicColumn::Rate),
+        TopSortOrder::Name => sort.groups = Sort::by(GroupColumn::Name),
+    }
+    sort
+}
+
+pub async fn run(args: TopArgs, global: &GlobalOpts) -> KafkaResult<()> {
+    let sort_order = parse_sort(&args.sort_by);
+
+    #[cfg(feature = "tui")]
+    {
+        use std::io::IsTerminal;
+        let terminal = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+        if wants_dashboard(&args, global.wants_json(args.json), terminal) {
+            return crate::cli::tui::run(
+                global,
+                Duration::from_secs(args.interval_secs.max(1)),
+                dashboard_sort(sort_order),
+            );
+        }
+    }
 
     let mut rate_tracker = RateTracker::new();
     let mut iteration_count = 0;
@@ -345,7 +396,51 @@ mod tests {
                 assert_eq!(args.iterations, 3);
                 assert_eq!(args.sort_by, "throughput");
                 assert!(args.json);
+                assert!(!args.plain);
             }
         }
+    }
+
+    fn parse(extra: &[&str]) -> TopArgs {
+        let mut argv = vec!["ferrika", "top"];
+        argv.extend_from_slice(extra);
+        match Wrapper::parse_from(argv).cmd {
+            Subcommands::Top(args) => args,
+        }
+    }
+
+    #[test]
+    fn interval_defaults_to_five_seconds_and_keeps_its_old_name() {
+        assert_eq!(parse(&[]).interval_secs, 5);
+        assert_eq!(parse(&["--interval", "7"]).interval_secs, 7);
+        assert_eq!(parse(&["--interval-secs", "3"]).interval_secs, 3);
+    }
+
+    #[test]
+    fn dashboard_only_for_an_open_ended_run_on_a_terminal() {
+        assert!(wants_dashboard(&parse(&[]), false, true));
+        assert!(!wants_dashboard(&parse(&[]), false, false));
+        assert!(!wants_dashboard(&parse(&[]), true, true));
+        assert!(!wants_dashboard(&parse(&["--plain"]), false, true));
+        assert!(!wants_dashboard(&parse(&["-n", "3"]), false, true));
+    }
+
+    #[test]
+    fn sort_by_maps_to_the_order() {
+        assert_eq!(parse_sort("TPS"), TopSortOrder::Throughput);
+        assert_eq!(parse_sort("name"), TopSortOrder::Name);
+        assert_eq!(parse_sort("anything"), TopSortOrder::Lag);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn sort_by_sets_the_dashboard_sort() {
+        use crate::cli::tui::state::{GroupColumn, TopicColumn};
+        let sort = dashboard_sort(TopSortOrder::Throughput);
+        assert_eq!(sort.topics.column, TopicColumn::Rate);
+        assert_eq!(sort.groups.column, GroupColumn::Lag);
+        let sort = dashboard_sort(TopSortOrder::Name);
+        assert_eq!(sort.topics.column, TopicColumn::Name);
+        assert_eq!(sort.groups.column, GroupColumn::Name);
     }
 }

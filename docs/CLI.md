@@ -756,18 +756,28 @@ ferrika probe -c 20 --max-latency-ms 25.0
 ferrika probe -c 5 --json
 ```
 
-### 19. Kafka Cluster Top & Terminal Process Monitor (`ferrika top`)
+### 19. Terminal dashboard (`ferrika top`, alias `ferrika tui`)
+
+At a terminal, `top` opens a live, read-only dashboard with four views:
+Overview, Topics, Consumer groups and health Findings. Keys: Tab or
+Left/Right (or 1-4) switch views, Up/Down or j/k move, `/` filters by name,
+`s` sorts by the next column and `S` reverses it, `r` refreshes now, `?`
+shows the keys, `q` or Esc quits.
+
 ```bash
-# Launch interactive real-time cluster monitor (default 2s refresh, auto-sorted by consumer lag)
+# Dashboard, refreshed every 5 s (default)
 ferrika top
 
-# Monitor with 1s refresh interval and sort topics by throughput (msg/s)
-ferrika top -i 1 -s throughput
+# Refresh every 2 s; topics start sorted by produce rate
+ferrika top --interval 2 --sort-by throughput
 
-# Run 5 iterations and exit
+# Printed text view instead of the dashboard (also used when stdout is not a terminal)
+ferrika top --plain
+
+# Print the text view 5 times and exit
 ferrika top -i 2 -n 5
 
-# Capture a single-shot JSON snapshot of cluster health and activity
+# One JSON snapshot of brokers, topics and group lag
 ferrika top --json
 ```
 

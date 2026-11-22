@@ -62,7 +62,8 @@ pub enum Commands {
     Diff(cli::diff::DiffArgs),
     /// Measure produce-to-consume latency with canary records
     Probe(cli::probe::ProbeArgs),
-    /// Live terminal view of throughput, lag and brokers
+    /// Live read-only dashboard: brokers, topics, group lag, health findings
+    #[command(visible_alias = "tui")]
     Top(cli::top::TopArgs),
     /// Ping several clusters, compare their topics and plan reconciliation
     Cluster(cli::cluster_sync::ClusterArgs),
