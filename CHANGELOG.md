@@ -14,6 +14,14 @@ and 0.2.0 makes it crate-internal.
 - `consume -D` applied `--grep` and `-k` to the undecoded bytes, so text of an
   Avro or Protobuf record (such as `"age":41`) was never found; they now look
   at the decoded text.
+- With an unreachable Schema Registry, `consume -D` waited for every record
+  (30 s each, ignoring `--timeout`); a failed lookup is now remembered for a
+  minute and `--timeout` applies.
+- `trace inject --sampled` and `compact analyze --from-beginning` could not
+  be turned off (`--sampled false`, `--from-beginning=false`).
+- `consume --save` says when it appends to a file that already has records.
+- `reassign verify` called a partition that no move was running for "in
+  progress" forever; it now reports it as not moving.
 
 ## 0.1.1
 
