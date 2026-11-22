@@ -585,7 +585,37 @@ fn entry_views(entries: Vec<rdkafka::admin::ConfigEntry>) -> Vec<ConfigEntryView
     views
 }
 
+/// How much longer than its timeout the client waits for a write's answer:
+/// the broker's own operation timeout should answer first.
+const WRITE_RESPONSE_MARGIN: Duration = Duration::from_secs(5);
+
+/// librdkafka refuses admin timeouts above one hour.
+const MAX_ADMIN_TIMEOUT: Duration = Duration::from_secs(3600);
+
+/// The broker-side and client-side limits of a write: the broker waits up
+/// to `timeout` (or the configured request timeout) for the operation, the
+/// client a little longer, both within librdkafka's range.
+fn write_timeouts(timeout: Option<Duration>, default: Duration) -> (Duration, Duration) {
+    let operation = timeout
+        .unwrap_or(default)
+        .min(MAX_ADMIN_TIMEOUT - WRITE_RESPONSE_MARGIN);
+    (operation, operation + WRITE_RESPONSE_MARGIN)
+}
+
 impl KafkaAdminClient {
+    /// Options for a write (see [`write_timeouts`]). Both limits are set:
+    /// without a request timeout librdkafka waits `socket.timeout.ms` (60 s)
+    /// when no broker answers, whatever `--timeout` says, and an operation
+    /// timeout longer than the request timeout (it defaults to
+    /// `socket.timeout.ms`) would report a write the broker then finishes
+    /// as timed out.
+    fn write_options(&self, timeout: Option<Duration>) -> AdminOptions {
+        let (operation, request) = write_timeouts(timeout, self.config.request_timeout);
+        AdminOptions::new()
+            .operation_timeout(Some(operation))
+            .request_timeout(Some(request))
+    }
+
     /// Raises the partition count of `topic` to `total`. Kafka cannot remove partitions,
     /// and keyed records may map to different partitions afterwards.
     pub async fn add_partitions(
@@ -594,10 +624,7 @@ impl KafkaAdminClient {
         total: usize,
         timeout: Option<Duration>,
     ) -> KafkaResult<()> {
-        let mut options = AdminOptions::new();
-        if let Some(to) = timeout {
-            options = options.operation_timeout(Some(to));
-        }
+        let options = self.write_options(timeout);
         let results = self
             .admin
             .create_partitions(&[NewPartitions::new(topic, total)], &options)
@@ -620,10 +647,7 @@ impl KafkaAdminClient {
         group: &str,
         timeout: Option<Duration>,
     ) -> KafkaResult<()> {
-        let mut options = AdminOptions::new();
-        if let Some(to) = timeout {
-            options = options.operation_timeout(Some(to));
-        }
+        let options = self.write_options(timeout);
         let results = self
             .admin
             .delete_groups(&[group], &options)
@@ -715,10 +739,7 @@ impl KafkaAdminClient {
             }
         }
 
-        let mut options = AdminOptions::new().validate_only(validate_only);
-        if let Some(to) = timeout {
-            options = options.operation_timeout(Some(to));
-        }
+        let options = self.write_options(timeout).validate_only(validate_only);
 
         let results = self
             .admin
@@ -785,7 +806,7 @@ impl KafkaAdminClient {
             list.add_partition_offset(topic, p, rdkafka::Offset::End)
                 .map_err(|e| KafkaError::Admin(format!("invalid partition {p}: {e}")))?;
         }
-        let options = AdminOptions::new().operation_timeout(Some(timeout));
+        let options = self.write_options(Some(timeout));
         let result = self
             .admin
             .delete_records(&list, &options)
@@ -822,10 +843,7 @@ impl KafkaAdminClient {
     }
 
     pub async fn delete_topic(&self, name: &str, timeout: Option<Duration>) -> KafkaResult<()> {
-        let mut options = AdminOptions::new();
-        if let Some(to) = timeout {
-            options = options.operation_timeout(Some(to));
-        }
+        let options = self.write_options(timeout);
 
         let results = self
             .admin
@@ -874,6 +892,20 @@ pub fn known_brokers(config: &KafkaClientConfig) -> Result<Vec<String>, String> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn writes_give_up_shortly_after_their_timeout() {
+        use super::write_timeouts;
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        let configured = s(30);
+        assert_eq!(write_timeouts(Some(s(2)), configured), (s(2), s(7)));
+        // Without a timeout the broker still answers before the client
+        // gives up (its own default would be 60 s).
+        assert_eq!(write_timeouts(None, configured), (s(30), s(35)));
+        // librdkafka refuses more than an hour; huge values do not overflow.
+        assert_eq!(write_timeouts(None, s(u64::MAX)), (s(3595), s(3600)));
+    }
+
     #[test]
     fn per_broker_and_cluster_default_dynamic_configs_stay_apart() {
         use super::{ConfigOrigin, ConfigSource};

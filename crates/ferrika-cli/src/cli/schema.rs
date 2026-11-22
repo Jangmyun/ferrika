@@ -238,20 +238,13 @@ async fn handle_delete_subject(
     global: &GlobalOpts,
 ) -> KafkaResult<()> {
     if !yes {
-        use std::io::Write as _;
-        print!(
-            "Delete subject '{}' and all its versions? [y/N]: ",
-            subject.red().bold()
-        );
-        std::io::stdout().flush().ok();
-        let mut input = String::new();
-        std::io::stdin()
-            .read_line(&mut input)
-            .map_err(|e| KafkaError::io(e.to_string()))?;
-        if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
-            println!("{}", "Aborted.".yellow());
-            return Ok(());
-        }
+        crate::cli::offset::confirm(
+            &format!(
+                "Delete subject '{}' and all its versions? [y/N]: ",
+                subject.red().bold()
+            ),
+            "Aborted subject deletion.",
+        )?;
     }
     let client = SchemaRegistryClient::new(registry_url).with_timeout(global.http_timeout());
     let captured = capture::subject_versions(&client, subject, true)

@@ -467,8 +467,12 @@ fn definition_body(def: &SchemaDefinition) -> String {
 }
 
 /// Percent-encodes a subject for use as one URL path segment (subjects
-/// such as `common/money.proto` contain slashes).
+/// such as `common/money.proto` contain slashes). A name that is only dots
+/// (`.`, `..`) is encoded too, or the URL would point at a parent path.
 pub(crate) fn path_segment(text: &str) -> String {
+    if !text.is_empty() && text.bytes().all(|b| b == b'.') {
+        return "%2E".repeat(text.len());
+    }
     text.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
@@ -833,6 +837,9 @@ mod tests {
     fn subjects_are_encoded_as_one_path_segment() {
         assert_eq!(path_segment("orders-value"), "orders-value");
         assert_eq!(path_segment("common/money.proto"), "common%2Fmoney.proto");
+        assert_eq!(path_segment(".."), "%2E%2E");
+        assert_eq!(path_segment("."), "%2E");
+        assert_eq!(path_segment("a..b"), "a..b");
     }
 }
 

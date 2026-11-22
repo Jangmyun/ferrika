@@ -185,6 +185,17 @@ pub struct AclBinding {
     pub permission_type: AclPermissionType,
 }
 
+/// A principal as Kafka stores it: a bare name is a user (`alice` →
+/// `User:alice`); one that names its type (`User:alice`, `Group:devs`) is
+/// kept as given.
+pub fn kafka_principal(principal: &str) -> String {
+    if principal.contains(':') {
+        principal.to_string()
+    } else {
+        format!("User:{principal}")
+    }
+}
+
 impl AclBinding {
     pub fn new(
         resource_type: AclResourceType,
@@ -195,12 +206,7 @@ impl AclBinding {
         operation: AclOperation,
         permission_type: AclPermissionType,
     ) -> Self {
-        let principal_str = principal.into();
-        let formatted_principal = if principal_str.starts_with("User:") {
-            principal_str
-        } else {
-            format!("User:{principal_str}")
-        };
+        let formatted_principal = kafka_principal(&principal.into());
 
         Self {
             resource_type,
@@ -275,11 +281,7 @@ impl AclFilter {
         }
 
         if let Some(ref p) = self.principal {
-            let target_p = if p.starts_with("User:") {
-                p.to_string()
-            } else {
-                format!("User:{p}")
-            };
+            let target_p = kafka_principal(p);
             if binding.principal != "*"
                 && !binding.principal.eq_ignore_ascii_case(&target_p)
                 && !binding.principal.eq_ignore_ascii_case(p)
@@ -331,11 +333,7 @@ impl AclFilter {
             return false;
         }
         if let Some(p) = &self.principal {
-            let target = if p.contains(':') {
-                p.clone()
-            } else {
-                format!("User:{p}")
-            };
+            let target = kafka_principal(p);
             if binding.principal != target {
                 return false;
             }
@@ -353,5 +351,27 @@ impl AclFilter {
             return false;
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod principal_tests {
+    use super::*;
+
+    #[test]
+    fn principals_that_name_their_type_are_kept() {
+        assert_eq!(kafka_principal("alice"), "User:alice");
+        assert_eq!(kafka_principal("User:alice"), "User:alice");
+        assert_eq!(kafka_principal("Group:devs"), "Group:devs");
+        let binding = AclBinding::new(
+            AclResourceType::Topic,
+            "orders",
+            AclResourcePatternType::Literal,
+            "Group:devs",
+            "*",
+            AclOperation::Read,
+            AclPermissionType::Allow,
+        );
+        assert_eq!(binding.principal, "Group:devs");
     }
 }

@@ -164,17 +164,10 @@ pub async fn run(args: ConnectArgs, global: &GlobalOpts) -> KafkaResult<()> {
         }
         ConnectSubcommands::Delete { name, yes } => {
             if !yes {
-                use std::io::Write as _;
-                print!("Delete connector '{}'? [y/N]: ", name.red().bold());
-                std::io::stdout().flush().ok();
-                let mut input = String::new();
-                std::io::stdin()
-                    .read_line(&mut input)
-                    .map_err(|e| KafkaError::io(e.to_string()))?;
-                if !matches!(input.trim().to_lowercase().as_str(), "y" | "yes") {
-                    println!("{}", "Aborted.".yellow());
-                    return Ok(());
-                }
+                crate::cli::offset::confirm(
+                    &format!("Delete connector '{}'? [y/N]: ", name.red().bold()),
+                    "Aborted connector deletion.",
+                )?;
             }
             let captured = capture::connector(&client, name).await.map(|before| {
                 let after = State::Connector {
@@ -250,7 +243,7 @@ pub async fn run(args: ConnectArgs, global: &GlobalOpts) -> KafkaResult<()> {
         _ => connectors,
     };
     if global.format == OutputFormat::Json {
-        output::print_json(&only)?;
+        output::print_json(&masked(only))?;
         return Ok(());
     }
     if let ConnectSubcommands::Status { .. } = args.command {
@@ -308,5 +301,52 @@ fn state_text(state: &str) -> colored::ColoredString {
         "RUNNING" => state.green(),
         "FAILED" => state.red(),
         _ => state.yellow(),
+    }
+}
+
+/// `connectors` with sensitive config values masked, as the text view shows
+/// them: JSON output goes to logs and tickets as readily as the screen.
+fn masked(
+    mut connectors: Vec<crate::kafka::connect::ConnectorView>,
+) -> Vec<crate::kafka::connect::ConnectorView> {
+    for c in &mut connectors {
+        for (k, v) in c.config.iter_mut() {
+            *v = crate::kafka::connect::display_value(k, v);
+        }
+    }
+    connectors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_output_masks_connector_secrets() {
+        let view = crate::kafka::connect::ConnectorView {
+            name: "jdbc-sink".into(),
+            kind: "sink".into(),
+            state: "RUNNING".into(),
+            worker: "w1".into(),
+            class: "JdbcSink".into(),
+            config: [
+                ("connection.password", "hunter2"),
+                ("connection.user", "app"),
+                ("sasl.jaas.config", "... password=\"s3cret\";"),
+                ("db.password", "${file:/secrets:db}"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            tasks: Vec::new(),
+        };
+        let json = serde_json::to_string(&masked(vec![view])).unwrap();
+        assert!(
+            !json.contains("hunter2") && !json.contains("s3cret"),
+            "{json}"
+        );
+        assert!(json.contains("\"connection.user\":\"app\""), "{json}");
+        // Config provider references are not secrets.
+        assert!(json.contains("${file:/secrets:db}"), "{json}");
     }
 }

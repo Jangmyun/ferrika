@@ -321,7 +321,7 @@ fn read_quota_entity(r: &mut Reader<'_>) -> KafkaResult<QuotaEntity> {
         let name = r.nullable_string()?;
         entity.push((kind, name));
     }
-    Ok(entity)
+    Ok(crate::model::quota::canonical_quota_entity(entity))
 }
 
 fn decode_describe_client_quotas(body: &[u8]) -> KafkaResult<Vec<ClientQuota>> {
@@ -916,11 +916,7 @@ fn acl_permission_from(code: i8) -> Option<AclPermissionType> {
 
 /// Principal as Kafka stores it: `User:alice` for a bare `alice`.
 fn acl_principal(p: &str) -> String {
-    if p.contains(':') {
-        p.to_string()
-    } else {
-        format!("User:{p}")
-    }
+    crate::model::acl::kafka_principal(p)
 }
 
 /// Writes an ACL binding filter. `default_pattern` applies when the filter
