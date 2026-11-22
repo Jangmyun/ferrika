@@ -608,7 +608,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "ferrika-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -634,7 +634,7 @@ dependencies = [
 
 [[package]]
 name = "ferrika-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "jiff",
  "keyring",
@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "ferrika-governance"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dirs",
  "ferrika-core",
@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "ferrika-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ferrika-core",
  "ferrika-governance",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "ferrika-ops"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ferrika-core",
  "ferrika-governance",
