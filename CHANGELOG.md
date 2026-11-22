@@ -37,7 +37,10 @@ and 0.2.0 makes it crate-internal.
   same_quota_entity}`, `wire::delete_acl_bindings`,
   `reassign::ensure_not_moving`,
   `SchemaRegistryClient::is_compatible_with_all_versions`,
-  `dlq::names_original_topic`.
+  `dlq::names_original_topic`, `wire::reassign_or_set_replication`.
+- Works with Redpanda: checked on Redpanda 26.3 (one and three nodes,
+  with SASL); CI runs the end-to-end smoke test against it. See
+  `docs/REDPANDA.md`.
 - `dlq` reads the origin and error headers of Spring Kafka
   (`kafka_dlt-*`) and Kafka Connect (`__connect.errors.*`) dead-letter
   topics.
@@ -174,6 +177,19 @@ and 0.2.0 makes it crate-internal.
   level (`-m` keeps the local what-if).
 - `dlq redrive --execute` sent records without an origin header to a topic
   guessed from the DLQ's name; that now needs `-t`.
+- On a cluster without the ElectLeaders API (Redpanda), `topics
+  elect-leaders` failed with a broken-connection error; it now says the
+  cluster does not support it.
+- Replication factor changes (`topics set-replication`, lint fix, undo)
+  failed on Redpanda, which refuses them through reassignment; the topic's
+  `replication.factor` is set there instead.
+- `lint` reported T008 on every topic when only the cluster defaults put
+  segment.ms above retention.ms (Redpanda's defaults); it is one cluster
+  finding now. B003 and B005 name the Redpanda settings too.
+- `consume` says which permissions a refused consumer group needs (Redpanda
+  needs Describe on the group as well as Read).
+- `acl --local` used `~/.ferrika/acls.json` even when `FERRIKA_CONFIG_DIR`
+  moved the configuration; it sits next to `profiles.json` now.
 
 ### Changed
 
