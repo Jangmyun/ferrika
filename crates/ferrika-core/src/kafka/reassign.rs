@@ -480,6 +480,45 @@ pub fn pre_move_replicas(
     }
 }
 
+/// Refuses when a partition of `topics` is being moved. Its metadata then
+/// lists the old and the new replicas together, so a plan built from it
+/// would take that combined set (a higher replication factor) as the
+/// partition's replicas.
+pub fn ensure_not_moving(
+    config: &crate::kafka::config::KafkaClientConfig,
+    topics: &[String],
+) -> KafkaResult<()> {
+    // A cluster that cannot list moves (an old broker, no permission) is
+    // not blocked: the check only guards against a known move.
+    let moving = match crate::kafka::wire::list_partition_reassignments(config) {
+        Ok(moving) => moving,
+        Err(e) => {
+            tracing::warn!("Cannot check ongoing partition moves: {e}");
+            return Ok(());
+        }
+    };
+    match moving_partitions(&moving, topics) {
+        None => Ok(()),
+        Some(list) => Err(KafkaError::config(format!(
+            "Partition(s) {list} are being moved: wait for the move to finish \
+             (`ferrika reassign status`) or cancel it before planning another"
+        ))),
+    }
+}
+
+/// `topic-partition` names of the moves in `ongoing` on `topics`, or `None`.
+fn moving_partitions(
+    ongoing: &[crate::model::cluster::OngoingReassignment],
+    topics: &[String],
+) -> Option<String> {
+    let names: Vec<String> = ongoing
+        .iter()
+        .filter(|m| topics.contains(&m.topic))
+        .map(|m| format!("{}-{}", m.topic, m.partition))
+        .collect();
+    (!names.is_empty()).then(|| names.join(", "))
+}
+
 /// Status of partition reassignment execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReassignmentStatus {
@@ -575,6 +614,7 @@ pub fn plan_replication_change(
     topic: &str,
     replication: usize,
 ) -> KafkaResult<Vec<PartitionAssignment>> {
+    ensure_not_moving(admin.config(), &[topic.to_string()])?;
     // The profile's request timeout, like every other admin read.
     let timeout = None;
     let brokers: Vec<i32> = admin
@@ -777,6 +817,24 @@ mod tests {
         assert!(generate_minimal_move_plan(&now, &[1, 2], Some(0)).is_err());
         // A repeated broker id counts once.
         assert!(generate_minimal_move_plan(&now, &[1, 1], None).is_err());
+    }
+
+    #[test]
+    fn moves_on_other_topics_do_not_block_a_plan() {
+        let m = crate::model::cluster::OngoingReassignment {
+            topic: "orders".into(),
+            partition: 3,
+            replicas: vec![1, 2, 3, 4],
+            adding: vec![4],
+            removing: vec![3],
+        };
+        let topics = |t: &[&str]| t.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            moving_partitions(std::slice::from_ref(&m), &topics(&["orders", "x"])).as_deref(),
+            Some("orders-3")
+        );
+        assert_eq!(moving_partitions(&[m], &topics(&["payments"])), None);
+        assert_eq!(moving_partitions(&[], &topics(&["orders"])), None);
     }
 
     #[test]

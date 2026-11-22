@@ -168,6 +168,15 @@ pub fn replicas(
     partitions: Option<&[i32]>,
 ) -> KafkaResult<State> {
     let summary = admin.describe_topic(topic, None)?;
+    // A partition being moved lists its old and new replicas together; the
+    // state to return to is the old set.
+    let moving = match ferrika_core::kafka::wire::list_partition_reassignments(admin.config()) {
+        Ok(moves) => moves,
+        Err(e) => {
+            tracing::warn!("Cannot check ongoing partition moves: {e}");
+            Vec::new()
+        }
+    };
     Ok(State::Replicas {
         partitions: summary
             .partitions
@@ -176,7 +185,12 @@ pub fn replicas(
             .map(|p| PartitionReplicas {
                 topic: topic.to_string(),
                 partition: p.partition_id,
-                replicas: p.replicas.clone(),
+                replicas: ferrika_core::kafka::reassign::pre_move_replicas(
+                    &p.replicas,
+                    moving
+                        .iter()
+                        .find(|m| m.topic == topic && m.partition == p.partition_id),
+                ),
             })
             .collect(),
     })
