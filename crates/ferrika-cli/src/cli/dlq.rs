@@ -585,7 +585,9 @@ async fn run_export(args: ExportDlqArgs, global: &GlobalOpts) -> KafkaResult<()>
 
 /// One exported record: the message (masked while the policy enforces
 /// masking) with its whole value, `payload` as text or `payload_base64` when
-/// it is not UTF-8. The preview alone cut values at 120 characters.
+/// it is not UTF-8 (`payload` is then null, as for a record without a
+/// value). Masked, a binary value becomes a "hidden" placeholder text. The
+/// preview alone cut values at 120 characters.
 fn export_record(message: &DlqMessage, mask: bool) -> serde_json::Value {
     use crate::codec::pii::{mask_bytes, MaskStrategy};
     let shown = if mask {
@@ -830,6 +832,9 @@ mod tests {
 
         let record = export_record(&with_payload(None), false);
         assert!(record["payload"].is_null());
+        assert!(record.get("payload_base64").is_none());
+        let record = export_record(&with_payload(Some(b"")), false);
+        assert_eq!(record["payload"], "");
 
         let record = export_record(&with_payload(Some(long.as_bytes())), true);
         let masked = record["payload"].as_str().unwrap();
