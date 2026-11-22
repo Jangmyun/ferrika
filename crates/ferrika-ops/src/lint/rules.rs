@@ -757,52 +757,89 @@ fn broker_rules(f: &mut Findings, input: &LintInput, opts: &LintOptions, online:
         );
     }
 
-    let first = brokers.values().next();
-    if let Some(c) = first {
-        let default_rf = c.i64("default.replication.factor");
-        if default_rf == Some(1) && online >= 3 {
-            f.push(
-                "B003",
-                HealthTarget::Brokers,
-                format!("default.replication.factor is 1 with {online} brokers online; new topics get no redundancy"),
-                vec![("default.replication.factor", "1".to_string())],
-                Fix::Manual {
-                    steps: vec![
-                        "In each broker's server.properties: default.replication.factor=3, then restart the brokers one at a time (Redpanda: rpk cluster config set default_topic_replications 3)".to_string(),
-                    ],
-                },
-            );
-        }
-        if let (Some(rf), Some(min_isr)) = (default_rf, c.i64(MIN_ISR)) {
+    // Each broker is checked: these are per-broker settings, and the broker
+    // that creates a topic may not be the first one.
+    let rf1: Vec<i32> = brokers
+        .iter()
+        .filter(|(_, c)| c.i64("default.replication.factor") == Some(1))
+        .map(|(id, _)| *id)
+        .collect();
+    if !rf1.is_empty() && online >= 3 {
+        f.push(
+            "B003",
+            HealthTarget::Brokers,
+            format!(
+                "default.replication.factor is 1{} with {online} brokers online; new topics get no redundancy",
+                on_brokers(&rf1, brokers.len())
+            ),
+            vec![("default.replication.factor", "1".to_string())],
+            Fix::Manual {
+                steps: vec![
+                    "In each broker's server.properties: default.replication.factor=3, then restart the brokers one at a time (Redpanda: rpk cluster config set default_topic_replications 3)".to_string(),
+                ],
+            },
+        );
+    }
+
+    let mut min_isr_too_high: BTreeMap<(i64, i64), Vec<i32>> = BTreeMap::new();
+    for (id, c) in &brokers {
+        if let (Some(rf), Some(min_isr)) = (c.i64("default.replication.factor"), c.i64(MIN_ISR)) {
             if rf > 1 && min_isr >= rf {
-                f.push(
-                    "B004",
-                    HealthTarget::Brokers,
-                    format!("The default {MIN_ISR} {min_isr} is not below default.replication.factor {rf}; new topics stop acks=all writes when one broker is down"),
-                    vec![
-                        (MIN_ISR, min_isr.to_string()),
-                        ("default.replication.factor", rf.to_string()),
-                    ],
-                    Fix::BrokerConfig {
-                        broker: None,
-                        changes: vec![set(MIN_ISR, rf - 1)],
-                    },
-                );
+                min_isr_too_high.entry((rf, min_isr)).or_default().push(*id);
             }
         }
-        if c.is_true("auto.create.topics.enable") {
-            f.push(
-                "B005",
-                HealthTarget::Brokers,
-                "auto.create.topics.enable is on; a client typo creates a topic".to_string(),
-                vec![("auto.create.topics.enable", "true".to_string())],
-                Fix::Manual {
-                    steps: vec![
-                        "In each broker's server.properties: auto.create.topics.enable=false, then restart the brokers one at a time (Redpanda: rpk cluster config set auto_create_topics_enabled false)".to_string(),
-                    ],
-                },
-            );
-        }
+    }
+    // One cluster-wide fix only when every flagged broker has the same
+    // values; otherwise the brokers disagree (see the drift findings).
+    let one_fix = min_isr_too_high.len() == 1;
+    for ((rf, min_isr), ids) in &min_isr_too_high {
+        let fix = if one_fix {
+            Fix::BrokerConfig {
+                broker: None,
+                changes: vec![set(MIN_ISR, rf - 1)],
+            }
+        } else {
+            Fix::Manual {
+                steps: vec![format!(
+                    "Make default.replication.factor and {MIN_ISR} the same on every broker, with {MIN_ISR} below the replication factor"
+                )],
+            }
+        };
+        f.push(
+            "B004",
+            HealthTarget::Brokers,
+            format!(
+                "The default {MIN_ISR} {min_isr} is not below default.replication.factor {rf}{}; new topics stop acks=all writes when one broker is down",
+                on_brokers(ids, brokers.len())
+            ),
+            vec![
+                (MIN_ISR, min_isr.to_string()),
+                ("default.replication.factor", rf.to_string()),
+            ],
+            fix,
+        );
+    }
+
+    let auto_create: Vec<i32> = brokers
+        .iter()
+        .filter(|(_, c)| c.is_true("auto.create.topics.enable"))
+        .map(|(id, _)| *id)
+        .collect();
+    if !auto_create.is_empty() {
+        f.push(
+            "B005",
+            HealthTarget::Brokers,
+            format!(
+                "auto.create.topics.enable is on{}; a client typo creates a topic",
+                on_brokers(&auto_create, brokers.len())
+            ),
+            vec![("auto.create.topics.enable", "true".to_string())],
+            Fix::Manual {
+                steps: vec![
+                    "In each broker's server.properties: auto.create.topics.enable=false, then restart the brokers one at a time (Redpanda: rpk cluster config set auto_create_topics_enabled false)".to_string(),
+                ],
+            },
+        );
     }
 
     if brokers.len() >= 2 {
@@ -853,6 +890,17 @@ fn shown(value: &str) -> &str {
 }
 
 /// B006 for one key: brokers whose value differs from the majority.
+/// ` on brokers 1, 3` when only some of the `total` brokers have a setting;
+/// nothing when all do.
+fn on_brokers(ids: &[i32], total: usize) -> String {
+    if ids.len() >= total {
+        return String::new();
+    }
+    let list: Vec<String> = ids.iter().map(i32::to_string).collect();
+    let noun = if ids.len() == 1 { "broker" } else { "brokers" };
+    format!(" on {noun} {}", list.join(", "))
+}
+
 fn drift(f: &mut Findings, brokers: &BTreeMap<i32, Configs>, key: &str) {
     let values: Vec<(i32, &str, Option<ConfigOrigin>)> = brokers
         .iter()
@@ -1584,6 +1632,42 @@ mod tests {
             }
         );
         assert!(findings.iter().all(|f| f.rule != "B003"));
+    }
+
+    #[test]
+    fn broker_defaults_are_checked_on_every_broker() {
+        let mut i = input(3);
+        for id in 1..=3 {
+            let bad = id == 3;
+            let entries = vec![
+                entry(
+                    "default.replication.factor",
+                    if bad { "1" } else { "3" },
+                    BrokerStatic,
+                ),
+                entry(MIN_ISR, "2", Dflt),
+                entry(
+                    "auto.create.topics.enable",
+                    if bad { "true" } else { "false" },
+                    Dflt,
+                ),
+            ];
+            i.broker_configs.insert(id, entries);
+        }
+        let findings = lint(&i, &opts(Env::Prod));
+        assert!(only(&findings, "B003").message.contains("1 on broker 3"));
+        assert!(only(&findings, "B005").message.contains("on on broker 3"));
+        assert!(findings.iter().all(|f| f.rule != "B004"));
+
+        // Brokers that disagree get one finding each and no cluster-wide fix.
+        i.broker_configs.get_mut(&2).unwrap()[1] = entry(MIN_ISR, "3", Dflt);
+        i.broker_configs.get_mut(&3).unwrap()[0] =
+            entry("default.replication.factor", "2", BrokerStatic);
+        i.broker_configs.get_mut(&3).unwrap()[1] = entry(MIN_ISR, "2", Dflt);
+        let findings = lint(&i, &opts(Env::Prod));
+        let b004: Vec<_> = findings.iter().filter(|f| f.rule == "B004").collect();
+        assert_eq!(b004.len(), 2, "{b004:?}");
+        assert!(b004.iter().all(|f| f.fix_class == Manual));
     }
 
     #[test]
