@@ -183,7 +183,8 @@ processor: no joins, windows or exactly-once delivery. See
   over stdin/stdout, including a transform preview and (preview) RabbitMQ
   queue, exchange and binding listings. `--allow-write` adds a small set of
   write tools (produce, create topic, change config, reset offsets, run a
-  transform within the cluster) that are planned, confirmed and audited, and
+  transform within the cluster; for RabbitMQ peek, DLQ inspect, publish and
+  DLQ redrive) that are planned, confirmed and audited, and
   still pass the same policy and read-only checks. Their changes land in the operation history, so
   `ferrika undo` reverts what an assistant changed.
 

@@ -3,7 +3,7 @@ name = "ferrika-mcp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Ferrika MCP server: Kafka (and RabbitMQ listing) tools for AI agents, read-only by default, policy-gated writes"
+description = "Ferrika MCP server: Kafka and RabbitMQ tools for AI agents, read-only by default, policy-gated writes"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -22,6 +22,13 @@ serde_json.workspace = true
 jiff.workspace = true
 ring.workspace = true
 tracing.workspace = true
+
+[features]
+# The `rabbit_dlq_redrive` write tool, which moves messages over AMQP
+# (pulls in ferrika-rabbitmq's AMQP client, lapin). Without it the server
+# reaches RabbitMQ through the management HTTP API only. ferrika-cli turns
+# it on.
+amqp = ["ferrika-rabbitmq/amqp"]
 
 [dev-dependencies]
 ferrika-governance = { path = "../ferrika-governance", features = ["test-util"] }

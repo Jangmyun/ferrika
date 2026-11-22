@@ -10,8 +10,10 @@ use crate::error::KafkaResult;
 #[derive(Args, Debug, Clone, Default)]
 pub struct McpArgs {
     /// Offer the write tools: produce_messages, create_topic, alter_topic_config,
-    /// reset_consumer_group_offsets, transform_execute. Each write is planned,
-    /// confirmed and audited; company policy and a read-only profile still apply
+    /// reset_consumer_group_offsets, transform_execute, and for RabbitMQ
+    /// profiles rabbit_peek, rabbit_dlq_inspect, rabbit_publish,
+    /// rabbit_dlq_redrive. Each write is planned, confirmed and audited;
+    /// company policy and a read-only profile still apply
     #[arg(long)]
     pub allow_write: bool,
 
@@ -29,6 +31,18 @@ pub struct McpArgs {
     /// topic except internal ones (`__*`)
     #[arg(long = "topics", value_name = "GLOB", requires = "allow_write")]
     pub topics: Vec<String>,
+
+    /// RabbitMQ queues the rabbit_* write tools may read from, move out of
+    /// or publish to through the default exchange (glob, repeatable).
+    /// Default: every queue
+    #[arg(long = "queues", value_name = "GLOB", requires = "allow_write")]
+    pub queues: Vec<String>,
+
+    /// RabbitMQ exchanges rabbit_publish and rabbit_dlq_redrive may publish
+    /// to (glob, repeatable; amq.default is the default exchange). Default:
+    /// every exchange except amq.rabbitmq.*
+    #[arg(long = "exchanges", value_name = "GLOB", requires = "allow_write")]
+    pub exchanges: Vec<String>,
 
     /// How a write is confirmed before it runs: elicit asks the user through
     /// the client (MCP elicitation), token takes the token from the plan,
@@ -84,6 +98,8 @@ impl McpArgs {
         self.allow_write.then(|| ferrika_mcp::WriteOptions {
             allow_tools: self.allow_tools.clone(),
             topics: self.topics.clone(),
+            queues: self.queues.clone(),
+            exchanges: self.exchanges.clone(),
             confirm: self.confirm.into(),
             max_writes_per_minute: self.max_writes_per_minute,
             max_produce_records: self.max_produce_records,
@@ -129,6 +145,23 @@ mod tests {
             (10, 1000, 1_000_000)
         );
         assert!(parse(&["--topics", "test-*"]).is_err());
+        assert!(parse(&["--queues", "test-*"]).is_err());
+        assert!(parse(&["--exchanges", "test.*"]).is_err());
+        let rabbit = parse(&[
+            "--allow-write",
+            "--allow-tools",
+            "rabbit_peek,rabbit_dlq_redrive",
+            "--queues",
+            "test-*",
+            "--exchanges",
+            "test.*",
+        ])
+        .unwrap();
+        assert_eq!(rabbit.queues, ["test-*"]);
+        assert_eq!(rabbit.exchanges, ["test.*"]);
+        let options = rabbit.write_options().unwrap();
+        assert_eq!(options.queues, ["test-*"]);
+        assert_eq!(options.allow_tools, ["rabbit_peek", "rabbit_dlq_redrive"]);
         assert!(parse(&["--allow-tools", "create_topic"]).is_err());
         assert!(parse(&["--max-writes-per-minute", "3"]).is_err());
         assert!(parse(&["--confirm", "token"]).is_err());

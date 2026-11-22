@@ -13,13 +13,21 @@ inspect a Kafka cluster. It is what `ferrika mcp` runs; see
   cluster.
 - RabbitMQ (preview): `rabbit_queues`, `rabbit_exchanges` and
   `rabbit_bindings` list a RabbitMQ profile's virtual host, without message
-  bodies.
+  bodies. With writes enabled, `rabbit_peek` and `rabbit_dlq_inspect` read
+  messages (masked; reading requeues them, so they are write tools),
+  `rabbit_publish` publishes one message and `rabbit_dlq_redrive` moves
+  dead-lettered messages back over AMQP (feature `amqp`).
 - Write tools are opt-in. Each write is planned, confirmed, then run, and
   passes the same company policy, read-only profile and audit gate as the
   command line.
 
 The entry point is `McpServer`: build it from a resolved cluster context,
 optionally with `WriteOptions`, and call `serve_stdio()`.
+
+## Features
+
+- `amqp` (off by default): the `rabbit_dlq_redrive` write tool, which needs
+  `ferrika-rabbitmq`'s AMQP client (lapin). The `ferrika` CLI enables it.
 
 ## Stability
 
