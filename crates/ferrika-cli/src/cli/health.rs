@@ -158,7 +158,8 @@ fn finding_key(issue: &HealthIssue) -> String {
             continue;
         }
         let word: String = chars[start..i].iter().collect();
-        let count = word.chars().all(|c| c.is_ascii_digit() || c == '.') && !key.ends_with("node ");
+        let count = word.chars().all(|c| c.is_ascii_digit() || c == '.')
+            && !key.to_ascii_lowercase().ends_with("node ");
         key.push_str(if count { "#" } else { &word });
     }
     key
@@ -188,6 +189,8 @@ const UNREACHABLE_KEY: &str = "unreachable";
 async fn watch(args: &HealthArgs, global: &GlobalOpts, every: Duration) -> KafkaResult<()> {
     let cluster = cluster_name(global);
     let mut before: BTreeMap<String, HealthIssue> = BTreeMap::new();
+    // The findings as the webhook last reported them.
+    let mut notified: BTreeMap<String, HealthIssue> = BTreeMap::new();
     println!(
         "Watching {} every {}s (Ctrl+C to stop)…",
         cluster.cyan(),
@@ -223,11 +226,19 @@ async fn watch(args: &HealthArgs, global: &GlobalOpts, every: Duration) -> Kafka
             println!("{stamp} {} {}", "CLEARED ".green().bold(), issue.message);
         }
         if let Some(url) = &args.webhook {
-            if !appeared.is_empty() || !cleared.is_empty() {
-                if let Err(e) =
-                    post_webhook(url, global.http_timeout(), &cluster, &appeared, &cleared).await
+            // Against what the webhook last delivered, so a failed post is
+            // sent again on the next poll instead of lost.
+            let (appeared, cleared) = diff_findings(&notified, &now);
+            if appeared.is_empty() && cleared.is_empty() {
+                notified = now.clone();
+            } else {
+                match post_webhook(url, global.http_timeout(), &cluster, &appeared, &cleared).await
                 {
-                    eprintln!("{stamp} {} {e}", "Webhook failed:".yellow());
+                    Ok(()) => notified = now.clone(),
+                    Err(e) => eprintln!(
+                        "{stamp} {} {e} (will retry on the next poll)",
+                        "Webhook failed:".yellow()
+                    ),
                 }
             }
         }
@@ -372,6 +383,17 @@ mod tests {
         assert_ne!(
             finding_key(&issue(Severity::Critical, "Broker offline: node 2")),
             finding_key(&issue(Severity::Critical, "Broker offline: node 3"))
+        );
+        // Log dir failures start with a capital "Node".
+        assert_ne!(
+            finding_key(&issue(
+                Severity::Critical,
+                "Node 1: log dir /var/lib/kafka failed (KafkaStorageException)"
+            )),
+            finding_key(&issue(
+                Severity::Critical,
+                "Node 2: log dir /var/lib/kafka failed (KafkaStorageException)"
+            ))
         );
         assert_eq!(
             finding_key(&issue(

@@ -209,32 +209,62 @@ fn escape_label(val: &str) -> String {
         .replace('\n', "\\n")
 }
 
-/// Collects live metrics from the Kafka cluster.
+/// Collects live metrics from the Kafka cluster. A step that fails leaves
+/// its metrics empty; [`scrape_cluster_metrics_checked`] also says which.
 pub async fn scrape_cluster_metrics(
     admin: &KafkaAdminClient,
     config: &KafkaClientConfig,
 ) -> ScrapedMetrics {
+    scrape(admin, config, true).await.0
+}
+
+/// [`scrape_cluster_metrics`] and the steps that failed (`brokers`,
+/// `topics`, `groups`, `watermarks`), whose metrics are missing or partial:
+/// an unreachable cluster otherwise looks like one with no brokers and no
+/// lag.
+pub async fn scrape_cluster_metrics_checked(
+    admin: &KafkaAdminClient,
+    config: &KafkaClientConfig,
+) -> (ScrapedMetrics, Vec<&'static str>) {
+    scrape(admin, config, true).await
+}
+
+pub(crate) async fn scrape(
+    admin: &KafkaAdminClient,
+    config: &KafkaClientConfig,
+    with_time_lag: bool,
+) -> (ScrapedMetrics, Vec<&'static str>) {
     let start = Instant::now();
     let mut metrics = ScrapedMetrics::default();
+    let mut failed = Vec::new();
 
     // 1. Brokers
-    if let Ok(brokers) = admin.list_brokers(Some(Duration::from_secs(5))) {
-        metrics.brokers_total = brokers.len();
-        metrics.brokers_online = brokers.iter().filter(|b| b.is_online).count();
-        metrics.broker_statuses = brokers.iter().map(|b| (b.id, b.is_online)).collect();
+    match admin.list_brokers(Some(Duration::from_secs(5))) {
+        Ok(brokers) => {
+            metrics.brokers_total = brokers.len();
+            metrics.brokers_online = brokers.iter().filter(|b| b.is_online).count();
+            metrics.broker_statuses = brokers.iter().map(|b| (b.id, b.is_online)).collect();
+        }
+        Err(_) => failed.push("brokers"),
     }
 
     // 2. Topics & Partitions
     let summaries = admin
         .list_topic_summaries(Some(Duration::from_secs(5)))
-        .unwrap_or_default();
+        .unwrap_or_else(|_| {
+            failed.push("topics");
+            Vec::new()
+        });
     metrics.topic_count = summaries.len();
     metrics.partition_count = summaries.iter().map(|t| t.partition_count).sum();
 
     // 3. Consumer Groups & Lag
     let groups = admin
         .list_consumer_groups(Some(Duration::from_secs(5)))
-        .unwrap_or_default();
+        .unwrap_or_else(|_| {
+            failed.push("groups");
+            Vec::new()
+        });
     if !groups.is_empty() {
         // Watermarks are shared by all groups: one batched lookup per scrape.
         let partitions: Vec<(&str, i32)> = summaries
@@ -248,7 +278,10 @@ pub async fn scrape_cluster_metrics(
             .collect();
         let watermarks = KafkaConsumerClient::lookup(config)
             .and_then(|c| c.fetch_watermarks_batch(&partitions, Some(Duration::from_secs(5))))
-            .unwrap_or_default();
+            .unwrap_or_else(|_| {
+                failed.push("watermarks");
+                Default::default()
+            });
         // One OffsetFetch per coordinator for all groups; librdkafka needs a
         // client per group, so that path is only the fallback.
         let committed = match wire::fetch_group_offsets(config, &groups) {
@@ -277,7 +310,7 @@ pub async fn scrape_cluster_metrics(
         .filter(|l| l.lag > 0)
         .map(|l| (l.topic.clone(), l.partition, l.current_offset.max(-1)))
         .collect();
-    if !positions.is_empty() {
+    if with_time_lag && !positions.is_empty() {
         let now = jiff::Timestamp::now().as_millisecond();
         let times = timestamps_at(config, &positions).await;
         metrics.lag_seconds = metrics
@@ -297,7 +330,24 @@ pub async fn scrape_cluster_metrics(
     }
 
     metrics.scrape_duration_secs = start.elapsed().as_secs_f64();
-    metrics
+    (metrics, failed)
+}
+
+/// The exporter's page: the metrics and whether the scrape fully worked
+/// (alert on `ferrika_scrape_success == 0`: a failed scrape reports no
+/// brokers and drops lag series, which other alerts read as healthy).
+fn render_exporter_page(metrics: &ScrapedMetrics, failed: &[&str]) -> String {
+    let mut text = render_prometheus_metrics(metrics);
+    text.push_str("\n# HELP ferrika_scrape_success 1 when every step of the last scrape worked; 0 when one failed and metrics are missing or partial.\n");
+    text.push_str("# TYPE ferrika_scrape_success gauge\n");
+    text.push_str(&format!(
+        "ferrika_scrape_success {}\n",
+        u8::from(failed.is_empty())
+    ));
+    if !failed.is_empty() {
+        tracing::warn!(steps = ?failed, "Metrics scrape incomplete");
+    }
+    text
 }
 
 /// Committed offsets of `groups`, read with one librdkafka client per group.
@@ -392,8 +442,8 @@ pub async fn start_exporter_server(
         .await
         .map_err(|e| KafkaError::io(format!("cannot listen on {bind_addr}: {e}")))?;
 
-    let initial_metrics = scrape_cluster_metrics(&admin, &config).await;
-    let initial_text = render_prometheus_metrics(&initial_metrics);
+    let (initial_metrics, failed) = scrape_cluster_metrics_checked(&admin, &config).await;
+    let initial_text = render_exporter_page(&initial_metrics, &failed);
     let cached_metrics = Arc::new(RwLock::new(initial_text));
 
     // Background scrape loop
@@ -405,8 +455,9 @@ pub async fn start_exporter_server(
         let mut interval = tokio::time::interval(scrape_interval);
         loop {
             interval.tick().await;
-            let snapshot = scrape_cluster_metrics(&background_admin, &background_config).await;
-            let rendered = render_prometheus_metrics(&snapshot);
+            let (snapshot, failed) =
+                scrape_cluster_metrics_checked(&background_admin, &background_config).await;
+            let rendered = render_exporter_page(&snapshot, &failed);
             let mut writer = background_cache.write().await;
             *writer = rendered;
         }
@@ -583,6 +634,16 @@ mod tests {
         assert_eq!(request_path("/metrics#a"), "/metrics");
         assert_eq!(request_path("/healthz"), "/healthz");
         assert_eq!(request_path("/metricsx"), "/metricsx");
+    }
+
+    #[test]
+    fn the_page_says_whether_the_scrape_worked() {
+        let metrics = ScrapedMetrics::default();
+        let ok = render_exporter_page(&metrics, &[]);
+        assert!(ok.contains("# TYPE ferrika_scrape_success gauge"), "{ok}");
+        assert!(ok.contains("ferrika_scrape_success 1\n"), "{ok}");
+        let failed = render_exporter_page(&metrics, &["brokers", "groups"]);
+        assert!(failed.contains("ferrika_scrape_success 0\n"), "{failed}");
     }
 
     #[test]
