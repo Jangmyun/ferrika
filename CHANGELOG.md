@@ -14,6 +14,10 @@ and 0.2.0 makes it crate-internal.
 - `dlq export` saved only a 120-character preview of each value; records
   now carry the whole value as `payload` (or `payload_base64` when it is not
   UTF-8, with `payload` null), masked while the policy enforces masking.
+- lint B003, B004 and B005 looked at the first broker's settings only, so
+  a default replication factor of 1 or automatic topic creation on another
+  broker went unreported; every broker is now checked and the finding names
+  the brokers when only some have the setting.
 - A profile's request timeout (`request_timeout_ms`) was always replaced
   by `--timeout`'s default of 30 s; it now applies unless `--timeout` is
   given.
