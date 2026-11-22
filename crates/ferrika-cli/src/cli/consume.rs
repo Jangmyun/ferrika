@@ -159,7 +159,10 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
         args.schema_registry
             .clone()
             .or_else(|| kafka_config.schema_registry_url.clone())
-            .map(|url| crate::kafka::schema::PayloadDecoder::new(Some(&url)))
+            .map(|url| {
+                crate::kafka::schema::PayloadDecoder::new(Some(&url))
+                    .with_timeout(global.http_timeout())
+            })
     } else {
         None
     };

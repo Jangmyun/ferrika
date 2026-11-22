@@ -560,7 +560,14 @@ pub struct PayloadDecoder {
     avro: HashMap<u32, AvroWithReferences>,
     /// Parsed Protobuf schemas (or why one could not be used), by schema id.
     proto: HashMap<u32, KafkaResult<crate::codec::proto_schema::ProtoSchema>>,
+    /// Schema ids whose lookup failed, with the error and when: asked again
+    /// only after [`LOOKUP_RETRY_AFTER`], so an unreachable registry does
+    /// not cost a timeout on every record.
+    failed: HashMap<u32, (String, std::time::Instant)>,
 }
+
+/// How long a failed schema lookup is remembered.
+const LOOKUP_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl PayloadDecoder {
     pub fn new(registry_url: Option<&str>) -> Self {
@@ -570,7 +577,14 @@ impl PayloadDecoder {
                 .map(SchemaRegistryClient::new),
             avro: HashMap::new(),
             proto: HashMap::new(),
+            failed: HashMap::new(),
         }
+    }
+
+    /// Gives every Schema Registry request at most `timeout` (`--timeout`).
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.registry = self.registry.map(|r| r.with_timeout(timeout));
+        self
     }
 
     /// `None` when `bytes` has no wire-format header.
@@ -585,14 +599,26 @@ impl PayloadDecoder {
                 schema_ref: None,
             });
         };
+        let failed = |error: &str| DecodedPayload {
+            text: text_body(),
+            label: format!("schema {id} (lookup failed: {error})"),
+            schema_ref: None,
+        };
+        if let Some((error, at)) = self.failed.get(&id) {
+            if at.elapsed() < LOOKUP_RETRY_AFTER {
+                return Some(failed(error));
+            }
+        }
         let def = match registry.get_schema_by_id(id).await {
-            Ok(def) => def,
+            Ok(def) => {
+                self.failed.remove(&id);
+                def
+            }
             Err(e) => {
-                return Some(DecodedPayload {
-                    text: text_body(),
-                    label: format!("schema {id} (lookup failed: {e})"),
-                    schema_ref: None,
-                })
+                let error = e.to_string();
+                let payload = failed(&error);
+                self.failed.insert(id, (error, std::time::Instant::now()));
+                return Some(payload);
             }
         };
         match def.schema_type.to_ascii_uppercase().as_str() {
@@ -872,6 +898,21 @@ mod decoder_tests {
     use crate::codec::schema::encode_confluent_wire_format;
 
     #[tokio::test]
+    async fn a_failed_schema_lookup_is_not_repeated_for_every_record() {
+        // Nothing listens on port 1: every lookup fails.
+        let mut decoder = PayloadDecoder::new(Some("http://127.0.0.1:1"))
+            .with_timeout(std::time::Duration::from_secs(2));
+        let bytes = encode_confluent_wire_format(9, b"{}");
+        let first = decoder.decode(&bytes).await.unwrap();
+        assert!(first.label.contains("lookup failed"), "{}", first.label);
+        let (_, at) = decoder.failed[&9].clone();
+        let second = decoder.decode(&bytes).await.unwrap();
+        assert_eq!(second.label, first.label);
+        // Answered from the remembered failure, not a new request.
+        assert_eq!(decoder.failed[&9].1, at);
+    }
+
+    #[tokio::test]
     async fn payload_decoder_renders_avro_from_a_cached_schema() {
         let def = SchemaDefinition {
             id: 7,
@@ -887,6 +928,7 @@ mod decoder_tests {
             registry: Some(SchemaRegistryClient::new("http://unused").with_cached_schema(def)),
             avro: HashMap::new(),
             proto: HashMap::new(),
+            failed: HashMap::new(),
         };
         // zig-zag 21 = 42
         let bytes = encode_confluent_wire_format(7, &[84]);
@@ -910,6 +952,7 @@ mod decoder_tests {
             registry: Some(SchemaRegistryClient::new("http://unused").with_cached_schema(proto)),
             avro: HashMap::new(),
             proto: HashMap::new(),
+            failed: HashMap::new(),
         };
         // Message index list [0], then field 1 = 42.
         let bytes = encode_confluent_wire_format(8, &[0x00, 0x08, 42]);
