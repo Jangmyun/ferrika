@@ -30,7 +30,11 @@ import http.server
 import json
 import os
 import re
-import resource
+
+try:
+    import resource  # POSIX only: caps the binary's memory below
+except ImportError:
+    resource = None
 import shutil
 import signal
 import subprocess
@@ -60,14 +64,18 @@ def limit():
     resource.setrlimit(resource.RLIMIT_AS, (4 << 30, 4 << 30))
 
 
+# Without `resource` (Windows) the binary runs without the memory cap.
+LIMIT = limit if resource else None
+
+
 def run(args, env=None, timeout=30, stdin=None, broker=True):
     e = dict(os.environ)
     if env:
         e.update(env)
     cmd = [F] + (["-b", BROKER] if broker else []) + args
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                           timeout=timeout, env=e, input=stdin, preexec_fn=limit)
+        p = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout, env=e, input=stdin, preexec_fn=LIMIT)
         return p.returncode, p.stdout + p.stderr
     except subprocess.TimeoutExpired as ex:
         out = (ex.stdout or b"") + (ex.stderr or b"")
@@ -334,7 +342,7 @@ def scenarios():
     po, wo = os.pipe()
     pe, we = os.pipe()
     pr = subprocess.Popen([F, "-b", BROKER, "consume", p, "-b", "-n", "3", "-t", "3000", "-g", f"{p}-pipe"],
-                          stdout=wo, stderr=we, preexec_fn=limit)
+                          stdout=wo, stderr=we, preexec_fn=LIMIT)
     for fd in (po, pe, wo, we):
         os.close(fd)
     try:
@@ -347,7 +355,7 @@ def scenarios():
     # --- monitor export: /metrics without duplicate series --------------
     port = free_port()
     ex = subprocess.Popen([F, "-b", BROKER, "monitor", "export", "-P", str(port), "-i", "2"],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=limit)
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=LIMIT)
     try:
         body, code = None, None
         for _ in range(40):
