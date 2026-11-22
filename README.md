@@ -56,7 +56,7 @@ The archives the scripts and Homebrew install are on the
 [releases page](https://github.com/Jangmyun/ferrika/releases). They are built
 with the `ssl` feature (TLS and SCRAM, see [Building](#building)).
 
-From crates.io, with a recent stable Rust toolchain (1.88 or newer), CMake and
+From crates.io, with a recent stable Rust toolchain (1.89 or newer), CMake and
 a C compiler:
 
 ```bash
@@ -201,12 +201,13 @@ the crate with `-p`:
 | `crates/ferrika-ops` | Backup, mirror, DLQ, diff, lint, health, reports and change history with undo. |
 | `crates/ferrika-mcp` | The MCP server behind `ferrika mcp`. |
 | `crates/ferrika-cli` | The `ferrika` command line. |
+| `crates/ferrika-rabbitmq` | Preview: RabbitMQ management API client, RabbitMQ profiles and AMQP dead-letter redrive behind `ferrika rabbit`. |
 
 The crates are published on [crates.io](https://crates.io/crates/ferrika-core); until 1.0 their API can change.
 
 Requirements:
 
-- Rust 1.88 or newer
+- Rust 1.89 or newer
 - CMake and a C compiler (the bundled `librdkafka` is built from source)
 - Windows: MSVC build tools with `rc.exe` on `PATH`
 - Optional `ssl` feature: Perl, to build OpenSSL from source (on Windows a

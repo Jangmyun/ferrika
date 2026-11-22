@@ -2,6 +2,7 @@
 name = "ferrika-governance"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Ferrika governance: signed company policy, hash-chained audit log, audit anchors and SIEM forwarding"
 license.workspace = true
 repository.workspace = true

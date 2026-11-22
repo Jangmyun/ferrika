@@ -2,6 +2,7 @@
 name = "ferrika-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 description = "Ferrika engine: Kafka clients, record formats and domain model"
 license.workspace = true
 repository.workspace = true
