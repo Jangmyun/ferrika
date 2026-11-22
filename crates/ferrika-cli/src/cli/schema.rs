@@ -905,10 +905,10 @@ async fn handle_check_schema(
 }
 
 /// `schema check` without `-m`: the registry's own verdict under the
-/// subject's configured level (what `register` will apply, references and
-/// all schema types included). The local field-level comparison against the
-/// latest version adds detail when it can read the schemas; where it
-/// disagrees, the registry decides.
+/// subject's configured level, against every version for a `*_TRANSITIVE`
+/// level, as `register` applies it (any schema type). The local field-level
+/// comparison against the latest version adds detail when it can read the
+/// schemas; where it disagrees, the registry decides.
 async fn registry_check(
     subject: &str,
     candidate: &str,
@@ -917,10 +917,35 @@ async fn registry_check(
     global: &GlobalOpts,
 ) -> KafkaResult<()> {
     let latest = client.get_latest_subject_schema(subject).await?;
-    let level = client.compatibility(subject).await?;
-    let compatible = client
-        .is_compatible(subject, candidate, &latest.schema_type)
-        .await?;
+    // The level is shown and picks the endpoint; not being allowed to read
+    // it does not stop the check.
+    let level = client
+        .compatibility(subject)
+        .await
+        .unwrap_or_else(|_| "unknown".to_string());
+    let transitive = level.to_ascii_uppercase().ends_with("_TRANSITIVE");
+    let compatible = if transitive {
+        match client
+            .is_compatible_with_all_versions(subject, candidate, &latest.schema_type)
+            .await
+        {
+            Ok(compatible) => compatible,
+            // An older registry without the endpoint: the latest version only.
+            Err(_) => {
+                eprintln!(
+                    "{} The registry could not check every version; checked against the latest only.",
+                    "!".yellow()
+                );
+                client
+                    .is_compatible(subject, candidate, &latest.schema_type)
+                    .await?
+            }
+        }
+    } else {
+        client
+            .is_compatible(subject, candidate, &latest.schema_type)
+            .await?
+    };
     let mode = parse_compat_mode(&level).map_or(CompatibilityMode::Backward, |(m, _)| m);
     let mut report = evaluate_compatibility(Some(subject), &latest.schema, candidate, mode)
         .unwrap_or_else(|_| CompatibilityReport {
@@ -948,7 +973,21 @@ async fn registry_check(
             );
         }
     }
-    render_compatibility_report(&report, None, global)?;
+    if global.format == OutputFormat::Json {
+        // Says where the verdict comes from: `violations` are the local
+        // comparison's and may disagree with it.
+        let mut json = serde_json::to_value(&report).map_err(|e| {
+            KafkaError::Serialization(format!("Failed to serialize the report: {e}"))
+        })?;
+        if let Some(obj) = json.as_object_mut() {
+            obj.insert("checked_by".into(), "registry".into());
+            obj.insert("registry_level".into(), level.clone().into());
+            obj.insert("local_is_compatible".into(), local.into());
+        }
+        output::print_json(&json)?;
+    } else {
+        render_compatibility_report(&report, None, global)?;
+    }
     if fail_on_incompatible && !compatible {
         return Err(KafkaError::Check(format!(
             "Schema Compatibility Failure: the registry finds the candidate schema for subject '{subject}' incompatible under {level}"
@@ -1153,6 +1192,37 @@ mod tests {
             resolved: None,
             write: None,
         };
+        // A level the check may not read does not stop it.
+        let mut no_config = routes(true);
+        no_config.retain(|(path, _)| !path.starts_with("/config"));
+        let url = mock_registry(no_config).await;
+        let client = super::SchemaRegistryClient::new(&url);
+        assert!(
+            super::registry_check("orders-value", candidate, &client, true, &global)
+                .await
+                .is_ok()
+        );
+
+        // A transitive level is checked against every version: compatible
+        // with the latest but not with an older one is incompatible.
+        let mut transitive = routes(true);
+        transitive.retain(|(path, _)| !path.starts_with("/config"));
+        transitive.push((
+            "/config/orders-value".to_string(),
+            r#"{"compatibilityLevel":"FULL_TRANSITIVE"}"#.to_string(),
+        ));
+        transitive.push((
+            "/compatibility/subjects/orders-value/versions".to_string(),
+            r#"{"is_compatible":false}"#.to_string(),
+        ));
+        let url = mock_registry(transitive).await;
+        let client = super::SchemaRegistryClient::new(&url);
+        assert!(
+            super::registry_check("orders-value", candidate, &client, true, &global)
+                .await
+                .is_err()
+        );
+
         for (compatible, expect_ok) in [(true, true), (false, false)] {
             let url = mock_registry(routes(compatible)).await;
             let client = super::SchemaRegistryClient::new(&url);
