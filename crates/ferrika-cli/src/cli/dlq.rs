@@ -550,9 +550,13 @@ async fn run_export(args: ExportDlqArgs, global: &GlobalOpts) -> KafkaResult<()>
     let messages = sample_dlq_messages(&args.topic, None, args.limit, global).await?;
     let policy = crate::governance::policy::current();
     crate::cli::note_masking(policy);
-    let messages = shown(messages, policy);
+    let mask = policy.masking_enforced();
+    let records: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|message| export_record(message, mask))
+        .collect();
 
-    let json = serde_json::to_string_pretty(&messages).map_err(|e| {
+    let json = serde_json::to_string_pretty(&records).map_err(|e| {
         KafkaError::Serialization(format!("Failed to serialize DLQ export records: {e}"))
     })?;
 
@@ -577,6 +581,37 @@ async fn run_export(args: ExportDlqArgs, global: &GlobalOpts) -> KafkaResult<()>
     );
 
     Ok(())
+}
+
+/// One exported record: the message (masked while the policy enforces
+/// masking) with its whole value, `payload` as text or `payload_base64` when
+/// it is not UTF-8 (`payload` is then null, as for a record without a
+/// value). Masked, a binary value becomes a "hidden" placeholder text. The
+/// preview alone cut values at 120 characters.
+fn export_record(message: &DlqMessage, mask: bool) -> serde_json::Value {
+    use crate::codec::pii::{mask_bytes, MaskStrategy};
+    let shown = if mask {
+        message.masked()
+    } else {
+        message.clone()
+    };
+    let mut record = serde_json::to_value(&shown).unwrap_or_default();
+    if let Some(obj) = record.as_object_mut() {
+        let bytes = (!message.payload_is_null).then_some(message.raw_payload.as_slice());
+        let (text, base64) = match bytes {
+            None => (None, None),
+            Some(bytes) if mask => (Some(mask_bytes(bytes, MaskStrategy::Partial)), None),
+            Some(bytes) => match std::str::from_utf8(bytes) {
+                Ok(text) => (Some(text.to_string()), None),
+                Err(_) => (None, Some(crate::codec::base64::encode(bytes))),
+            },
+        };
+        obj.insert("payload".into(), text.into());
+        if let Some(b64) = base64 {
+            obj.insert("payload_base64".into(), b64.into());
+        }
+    }
+    record
 }
 
 /// Keeps the messages whose exception message contains `filter`
@@ -765,6 +800,46 @@ mod tests {
             )],
         };
         DlqMessage::from_consumed_message(&consumed, "t-dlq")
+    }
+
+    fn with_payload(payload: Option<&[u8]>) -> DlqMessage {
+        let consumed = crate::kafka::consumer::ConsumedMessage {
+            topic: "t-dlq".into(),
+            partition: 0,
+            offset: 1,
+            timestamp_ms: None,
+            key: None,
+            payload: payload.map(<[u8]>::to_vec),
+            headers: Vec::new(),
+        };
+        DlqMessage::from_consumed_message(&consumed, "t-dlq")
+    }
+
+    #[test]
+    fn export_keeps_the_whole_value() {
+        let long = format!(
+            "{{\"note\":\"{}\",\"email\":\"kim@example.com\"}}",
+            "x".repeat(500)
+        );
+        let record = export_record(&with_payload(Some(long.as_bytes())), false);
+        assert_eq!(record["payload"], long.as_str());
+        assert!(record.get("payload_base64").is_none());
+
+        let binary = [0xff, 0x00, 0xfe];
+        let record = export_record(&with_payload(Some(&binary)), false);
+        assert!(record["payload"].is_null());
+        assert_eq!(record["payload_base64"], "/wD+");
+
+        let record = export_record(&with_payload(None), false);
+        assert!(record["payload"].is_null());
+        assert!(record.get("payload_base64").is_none());
+        let record = export_record(&with_payload(Some(b"")), false);
+        assert_eq!(record["payload"], "");
+
+        let record = export_record(&with_payload(Some(long.as_bytes())), true);
+        let masked = record["payload"].as_str().unwrap();
+        assert!(!masked.contains("kim@example.com"), "{masked}");
+        assert!(masked.len() > 400, "the masked value is whole too");
     }
 
     #[test]
