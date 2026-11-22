@@ -8,6 +8,16 @@ The quickest check is the smoke test, which needs one plain broker
 (`apache/kafka:3.9.0`) and no files from this folder; see
 [`tools/e2e/smoke.py`](../../tools/e2e/smoke.py) and the README.
 
+The same smoke test runs against Redpanda, a Kafka API compatible broker
+(CI does both):
+
+```bash
+docker run -d --name redpanda -p 9092:9092 docker.redpanda.com/redpandadata/redpanda:v26.3.1 \
+  redpanda start --mode dev-container --smp 1 --memory 1G --overprovisioned \
+  --kafka-addr 0.0.0.0:9092 --advertise-kafka-addr localhost:9092
+python3 tools/e2e/smoke.py target/debug/ferrika --broker localhost:9092
+```
+
 | File | What it starts or does |
 | --- | --- |
 | `kafka-sasl-compose.yml` | Three-node KRaft cluster with SASL/PLAIN on `localhost:19092` |
