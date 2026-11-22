@@ -318,7 +318,7 @@ pub fn check_all(input: &LintInput, opts: &LintOptions) -> Vec<LintFinding> {
             topic_config_rules(&mut findings, input, topic, &Configs::new(entries));
         }
     }
-    default_segment_rule(&mut findings);
+    default_segment_rule(&mut findings, opts);
     broker_rules(&mut findings, input, opts, online);
     group_rules(&mut findings, input);
     findings.out
@@ -327,12 +327,30 @@ pub fn check_all(input: &LintInput, opts: &LintOptions) -> Vec<LintFinding> {
 /// T008 for topics whose segment.ms and retention.ms both come from the
 /// cluster defaults: one finding naming them, since the defaults are what
 /// to change (Redpanda's defaults, 14 days over 7, hit every topic).
-fn default_segment_rule(f: &mut Findings) {
-    let topics = std::mem::take(&mut f.default_segment_outlives);
-    let Some((_, segment, ret)) = topics.first().cloned() else {
-        return;
+fn default_segment_rule(f: &mut Findings, opts: &LintOptions) {
+    // `--skip T008:GLOB` names topics; the cluster finding leaves them out.
+    let skipped = |topic: &str| {
+        opts.skip.iter().any(|(rule, glob)| {
+            rule.eq_ignore_ascii_case("T008")
+                && glob
+                    .as_ref()
+                    .is_some_and(|g| ferrika_governance::policy::glob_match(g, topic))
+        })
     };
-    let names: Vec<&str> = topics.iter().map(|(t, _, _)| t.as_str()).collect();
+    // One finding per pair of default values (brokers may differ).
+    let mut by_values: BTreeMap<(i64, i64), Vec<String>> = BTreeMap::new();
+    for (topic, segment, ret) in std::mem::take(&mut f.default_segment_outlives) {
+        if !skipped(&topic) {
+            by_values.entry((segment, ret)).or_default().push(topic);
+        }
+    }
+    for ((segment, ret), topics) in by_values {
+        default_segment_finding(f, segment, ret, &topics);
+    }
+}
+
+fn default_segment_finding(f: &mut Findings, segment: i64, ret: i64, topics: &[String]) {
+    let names: Vec<&str> = topics.iter().map(String::as_str).collect();
     let shown = if names.len() > 3 {
         format!("{}, ... ({} topics)", names[..3].join(", "), names.len())
     } else {
@@ -1345,6 +1363,14 @@ mod tests {
         assert_eq!(t008.target, HealthTarget::Brokers);
         assert!(t008.message.contains("(4 topics)"), "{}", t008.message);
         assert!(!t008.applicable());
+        // --skip T008:GLOB still leaves those topics out.
+        let mut skipping = opts(Env::Prod);
+        skipping.skip.push(("T008".into(), Some("a".into())));
+        let t008 = lint(&defaults, &skipping)
+            .into_iter()
+            .find(|f| f.rule == "T008")
+            .expect("T008 for b, c, d");
+        assert!(t008.message.ends_with(": b, c, d"), "{}", t008.message);
         let t009 = only(&findings, "T009");
         assert_eq!(t009.target, HealthTarget::Topic("tiny".into()));
         assert_eq!(
