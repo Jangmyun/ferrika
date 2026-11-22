@@ -248,7 +248,10 @@ pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
         } => {
             let text = std::fs::read_to_string(&file)
                 .map_err(|e| anyhow::anyhow!("Cannot read '{file}': {e}"))?;
-            let (profile, notes) = ClusterProfile::from_properties(&name, &text)?;
+            let (mut profile, notes) = ClusterProfile::from_properties(&name, &text)?;
+            if let Some(existing) = store.profiles.get(&name) {
+                report_replaced(&name, &carry_over(existing, &mut profile));
+            }
             let summary = format!(
                 "{} · {}{}",
                 profile.bootstrap_servers,
@@ -725,6 +728,9 @@ fn handle_add(
     apply_oauth(&mut profile, oauth_method, oauth)?;
 
     let is_new = !store.profiles.contains_key(&name);
+    if let Some(existing) = store.profiles.get(&name) {
+        report_replaced(&name, &carry_over(existing, &mut profile));
+    }
     store.add(profile, set_active);
     store.save()?;
 
@@ -747,6 +753,87 @@ fn handle_add(
     }
 
     Ok(())
+}
+
+/// What replacing `existing` with `new` (same name) keeps and drops.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Replaced {
+    /// `existing` was read-only, so `new` stays read-only.
+    kept_read_only: bool,
+    /// Settings `existing` had and `new` does not.
+    dropped: Vec<&'static str>,
+}
+
+/// Keeps what an update must not lose silently: the read-only mark (only
+/// `profile read-only --off` lifts it) and the SSL key password, which no
+/// flag sets, while the key file is the same. Lists the other settings the
+/// new profile leaves out, which `add` and `import` replace.
+fn carry_over(existing: &ClusterProfile, new: &mut ClusterProfile) -> Replaced {
+    let mut replaced = Replaced::default();
+    if existing.read_only && !new.read_only {
+        new.read_only = true;
+        replaced.kept_read_only = true;
+    }
+    if new.ssl_key_password.is_none()
+        && new.ssl_key_location.is_some()
+        && new.ssl_key_location == existing.ssl_key_location
+    {
+        new.ssl_key_password = existing.ssl_key_password.clone();
+    }
+    let settings: [(&'static str, bool, bool); 6] = [
+        (
+            "SASL password",
+            existing.sasl_password.is_some(),
+            new.sasl_password.is_some(),
+        ),
+        (
+            "OAuth client secret",
+            existing.oauth_client_secret.is_some(),
+            new.oauth_client_secret.is_some(),
+        ),
+        (
+            "SSL key password",
+            existing.ssl_key_password.is_some(),
+            new.ssl_key_password.is_some(),
+        ),
+        (
+            "Schema Registry URL",
+            existing.schema_registry_url.is_some(),
+            new.schema_registry_url.is_some(),
+        ),
+        (
+            "Connect URL",
+            existing.connect_url.is_some(),
+            new.connect_url.is_some(),
+        ),
+        (
+            "description",
+            existing.description.is_some(),
+            new.description.is_some(),
+        ),
+    ];
+    replaced.dropped = settings
+        .into_iter()
+        .filter(|(_, had, has)| *had && !*has)
+        .map(|(what, _, _)| what)
+        .collect();
+    replaced
+}
+
+fn report_replaced(name: &str, replaced: &Replaced) {
+    if replaced.kept_read_only {
+        eprintln!(
+            "  {} '{name}' stays read-only (`ferrika profile read-only {name} --off` lifts it).",
+            "!".yellow()
+        );
+    }
+    if !replaced.dropped.is_empty() {
+        eprintln!(
+            "  {} The new settings replace the old ones; not given, so removed: {}.",
+            "!".yellow(),
+            replaced.dropped.join(", ")
+        );
+    }
 }
 
 fn handle_use(store: &mut ProfileStore, name: &str) -> anyhow::Result<()> {
@@ -779,6 +866,35 @@ fn handle_remove(store: &mut ProfileStore, name: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn updating_a_profile_keeps_read_only_and_names_what_it_drops() {
+        let mut old = ClusterProfile::new("prod", "a:9092");
+        old.read_only = true;
+        old.sasl_password = Some("pw".into());
+        old.schema_registry_url = Some("https://sr".into());
+        old.ssl_key_location = Some("/k.pem".into());
+        old.ssl_key_password = Some("keypw".into());
+        let mut new = ClusterProfile::new("prod", "b:9092");
+        new.ssl_key_location = Some("/k.pem".into());
+        let replaced = carry_over(&old, &mut new);
+        assert!(new.read_only);
+        assert_eq!(new.ssl_key_password.as_deref(), Some("keypw"));
+        assert_eq!(
+            replaced,
+            Replaced {
+                kept_read_only: true,
+                dropped: vec!["SASL password", "Schema Registry URL"],
+            }
+        );
+
+        // Another key file: its old password is not carried over.
+        let mut other_key = ClusterProfile::new("prod", "b:9092");
+        other_key.ssl_key_location = Some("/new.pem".into());
+        let replaced = carry_over(&old, &mut other_key);
+        assert_eq!(other_key.ssl_key_password, None);
+        assert!(replaced.dropped.contains(&"SSL key password"));
+    }
 
     #[test]
     fn debug_output_redacts_the_password_and_client_secret() {
