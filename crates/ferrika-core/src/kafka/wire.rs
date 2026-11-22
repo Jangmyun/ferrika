@@ -1090,15 +1090,78 @@ pub fn delete_acls(config: &KafkaClientConfig, filter: &AclFilter) -> KafkaResul
     decode_delete_acls(&body)
 }
 
+/// Deletes exactly `bindings` (DeleteAcls v1, one exact filter each) and
+/// returns what the broker removed. Unlike a filter with unset fields, this
+/// cannot remove bindings the caller did not list: ones of kinds this client
+/// does not model (User resources, token operations), or ones added since
+/// the caller read them.
+pub fn delete_acl_bindings(
+    config: &KafkaClientConfig,
+    bindings: &[AclBinding],
+) -> KafkaResult<Vec<AclBinding>> {
+    if bindings.is_empty() {
+        return Ok(Vec::new());
+    }
+    check_supported_security(config)?;
+    let mut conn = connect_bootstrap(config)?;
+    let body = conn.request(
+        API_DELETE_ACLS,
+        1,
+        false,
+        &encode_delete_acl_bindings(bindings),
+    )?;
+    let (deleted, mut errors) = decode_delete_acls_partial(&body)?;
+    if errors.is_empty() {
+        return Ok(deleted);
+    }
+    // Nothing deleted: the broker's own error keeps its kind and hint (an
+    // authorization failure, for example).
+    if deleted.is_empty() {
+        return Err(errors.swap_remove(0));
+    }
+    let detail = errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(KafkaError::admin(format!(
+        "DeleteAcls: {} of {} binding(s) were deleted, {} failed: {detail}",
+        deleted.len(),
+        bindings.len(),
+        errors.len()
+    )))
+}
+
+fn encode_delete_acl_bindings(bindings: &[AclBinding]) -> Vec<u8> {
+    let mut w = Writer::default();
+    w.i32(bindings.len() as i32);
+    for b in bindings {
+        write_acl_filter(&mut w, &AclFilter::exact(b), 1);
+    }
+    w.0
+}
+
 fn decode_delete_acls(body: &[u8]) -> KafkaResult<Vec<AclBinding>> {
+    let (deleted, errors) = decode_delete_acls_partial(body)?;
+    match errors.into_iter().next() {
+        Some(error) => Err(error),
+        None => Ok(deleted),
+    }
+}
+
+/// What DeleteAcls removed, and the error of each filter or binding it
+/// could not delete. One request carries several filters; a failed one
+/// does not undo the others.
+fn decode_delete_acls_partial(body: &[u8]) -> KafkaResult<(Vec<AclBinding>, Vec<KafkaError>)> {
     let mut r = Reader::new(body);
     let _throttle_ms = r.i32()?;
     let mut deleted = Vec::new();
+    let mut errors = Vec::new();
     for _ in 0..r.array_len()? {
         let code = r.i16()?;
         let message = r.nullable_string()?;
         if code != 0 {
-            return Err(error_for_code(code, message.as_deref()));
+            errors.push(error_for_code(code, message.as_deref()));
         }
         for _ in 0..r.array_len()? {
             let code = r.i16()?;
@@ -1112,12 +1175,13 @@ fn decode_delete_acls(body: &[u8]) -> KafkaResult<Vec<AclBinding>> {
             };
             let entry = read_acl_entry(&mut r, resource)?;
             if code != 0 {
-                return Err(error_for_code(code, message.as_deref()));
+                errors.push(error_for_code(code, message.as_deref()));
+                continue;
             }
             deleted.extend(entry);
         }
     }
-    Ok(deleted)
+    Ok((deleted, errors))
 }
 
 /// Outcome of a preferred-leader election.
@@ -2413,6 +2477,35 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_filter_does_not_hide_the_bindings_deleted_by_others() {
+        let mut w = Writer::default();
+        w.i32(0);
+        w.i32(2);
+        // First filter: one binding deleted.
+        w.i16(0);
+        w.nullable_string(None);
+        w.i32(1);
+        w.i16(0);
+        w.nullable_string(None);
+        w.i8(2); // topic
+        w.string("orders");
+        w.i8(3); // literal
+        w.string("User:svc");
+        w.string("*");
+        w.i8(3); // read
+        w.i8(3); // allow
+                 // Second filter: refused.
+        w.i16(31);
+        w.nullable_string(Some("Cluster authorization failed"));
+        w.i32(0);
+        let (deleted, errors) = decode_delete_acls_partial(&w.0).unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].resource_name, "orders");
+        assert_eq!(errors.len(), 1);
+        assert!(decode_delete_acls(&w.0).is_err());
+    }
+
+    #[test]
     fn test_decode_delete_acls_returns_deleted_bindings() {
         let mut w = Writer::default();
         w.i32(0);
@@ -2431,6 +2524,31 @@ mod tests {
         w.i8(2); // deny
         let deleted = decode_delete_acls(&w.0).unwrap();
         assert_eq!(deleted.len(), 1);
+
+        // Deleting listed bindings sends one exact filter each: no field is
+        // ANY, so nothing unlisted can match.
+        let listed = [deleted[0].clone(), {
+            let mut topic = deleted[0].clone();
+            topic.resource_type = AclResourceType::Topic;
+            topic.resource_name = "orders".into();
+            topic.pattern_type = AclResourcePatternType::Prefixed;
+            topic
+        }];
+        let body = encode_delete_acl_bindings(&listed);
+        let mut r = Reader::new(&body);
+        assert_eq!(r.array_len().unwrap(), 2);
+        for expected in &listed {
+            assert_eq!(r.i8().unwrap(), acl_resource_code(&expected.resource_type));
+            assert_eq!(
+                r.nullable_string().unwrap().as_deref(),
+                Some(expected.resource_name.as_str())
+            );
+            assert_eq!(r.i8().unwrap(), acl_pattern_code(&expected.pattern_type));
+            assert_eq!(r.nullable_string().unwrap().as_deref(), Some("User:svc"));
+            assert_eq!(r.nullable_string().unwrap().as_deref(), Some("*"));
+            assert_eq!(r.i8().unwrap(), acl_operation_code(&expected.operation));
+            assert_eq!(r.i8().unwrap(), 2);
+        }
         assert_eq!(deleted[0].resource_type, AclResourceType::Group);
         assert_eq!(deleted[0].permission_type, AclPermissionType::Deny);
     }
