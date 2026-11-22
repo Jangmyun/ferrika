@@ -448,7 +448,9 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
 
                         // Decoded before --where so expressions see Avro and
                         // Protobuf records as JSON.
-                        let decode = !args.hex && (where_expr.is_some() || !json_lines);
+                        // (`decoder` exists only with -D; JSON lines carry the
+                        // decoded record next to the raw one.)
+                        let decode = !args.hex;
                         let decoded = match (&mut decoder, msg.payload.as_deref()) {
                             (Some(decoder), Some(payload)) if decode => {
                                 decoder.decode(payload).await
@@ -496,7 +498,9 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                         }
 
                         if json_lines {
-                            writeln!(out, "{}", jsonl_record(&msg))?;
+                            let mut record = jsonl_record(&msg);
+                            add_decoded(&mut record, decoded.as_ref(), decoded_key.as_ref());
+                            writeln!(out, "{record}")?;
                         } else {
                             let shown;
                             let msg_ref = match decoded_key {
@@ -596,6 +600,39 @@ fn read_outcome(errors: usize, received: u64) -> anyhow::Result<()> {
         anyhow::bail!("nothing was read and the consumer reported {errors} error(s) (see above)");
     }
     Ok(())
+}
+
+/// Adds `-D`'s decoded value and key to a JSON line (`decoded`,
+/// `decoded_key`, and `decoded_with` naming the schema), as JSON when the
+/// text is JSON. The raw fields stay, so the line still restores. Text that
+/// is neither JSON nor decoded with a schema (a failed lookup of an Avro or
+/// Protobuf schema leaves the raw bytes) is left out.
+fn add_decoded(
+    record: &mut serde_json::Value,
+    value: Option<&crate::codec::schema::DecodedPayload>,
+    key: Option<&crate::codec::schema::DecodedPayload>,
+) {
+    let as_json = |d: &crate::codec::schema::DecodedPayload| {
+        serde_json::from_str::<serde_json::Value>(&d.text)
+            .ok()
+            .or_else(|| {
+                d.schema_ref
+                    .is_some()
+                    .then(|| serde_json::Value::from(d.text.clone()))
+            })
+    };
+    let Some(obj) = record.as_object_mut() else {
+        return;
+    };
+    if let Some(d) = value {
+        if let Some(v) = as_json(d) {
+            obj.insert("decoded".into(), v);
+            obj.insert("decoded_with".into(), d.label.clone().into());
+        }
+    }
+    if let Some(k) = key.and_then(as_json) {
+        obj.insert("decoded_key".into(), k);
+    }
 }
 
 /// `Err` when `consume --group` could not commit where it got to: the next
@@ -956,6 +993,27 @@ mod tests {
         assert!(read_outcome(3, 10).is_ok());
         // An empty topic read without errors is fine.
         assert!(read_outcome(0, 0).is_ok());
+    }
+
+    #[test]
+    fn json_lines_carry_the_decoded_record() {
+        use crate::codec::schema::DecodedPayload;
+        let decoded = DecodedPayload {
+            text: r#"{"amount":42}"#.into(),
+            label: "AVRO schema 12".into(),
+            schema_ref: None,
+        };
+        let failed = DecodedPayload {
+            text: "not decoded".into(),
+            label: "schema 12 (lookup failed: timeout)".into(),
+            schema_ref: None,
+        };
+        let mut record = serde_json::json!({"payload_base64": "AAAA"});
+        add_decoded(&mut record, Some(&decoded), Some(&failed));
+        assert_eq!(record["decoded"]["amount"], 42);
+        assert_eq!(record["decoded_with"], "AVRO schema 12");
+        assert_eq!(record["payload_base64"], "AAAA");
+        assert!(record.get("decoded_key").is_none(), "{record}");
     }
 
     #[test]
