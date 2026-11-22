@@ -206,6 +206,10 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
     // --to-timestamp finishes a partition at its first record past it; the
     // command ends once all are finished.
     let mut time_stop = TimestampStop::new(args.to_timestamp, &[]);
+    // With a --to-timestamp already past, each partition's current end: the
+    // command finishes a partition there even when no later record arrives
+    // (it used to wait for one forever).
+    let mut ends: std::collections::HashMap<i32, i64> = std::collections::HashMap::new();
     let timestamps = args.from_timestamp.is_some() || args.to_timestamp.is_some();
     if args.partition.is_some() || args.offset.is_some() || timestamps || !use_group {
         let existing = consumer.topic_partitions(&args.topic, None)?;
@@ -224,7 +228,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                     .iter()
                     .map(|&p| (args.topic.as_str(), p))
                     .collect();
-                let lookup = consumer.offsets_for_timestamp(&keys, ts, None)?;
+                let lookup = time_lookup_offsets(consumer.offsets_at_time(&keys, ts, None)?)?;
                 let starts = timestamp_start_offsets(&args.topic, &partitions, &lookup);
                 // Nothing at or after --from-timestamp, and --to-timestamp
                 // has passed: the window is empty.
@@ -246,6 +250,24 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                 partitions.iter().map(|&p| (p, start)).collect()
             }
         };
+        if args
+            .to_timestamp
+            .is_some_and(|to| to < jiff::Timestamp::now().as_millisecond())
+        {
+            let keys: Vec<(&str, i32)> = partitions
+                .iter()
+                .map(|&p| (args.topic.as_str(), p))
+                .collect();
+            for ((_, p), (low, high)) in consumer.fetch_watermarks_batch(&keys, None)? {
+                if starts
+                    .iter()
+                    .any(|&(sp, start)| sp == p && starts_at_end(start, low, high))
+                {
+                    time_stop.finish(p);
+                }
+                ends.insert(p, high);
+            }
+        }
         let assignments: Vec<(&str, i32, Offset)> = starts
             .iter()
             .map(|&(p, start)| (args.topic.as_str(), p, start))
@@ -259,7 +281,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                     topic,
                     partition,
                     start,
-                    end: None,
+                    end: ends.get(&partition).copied(),
                 })
                 .collect();
             let keep = filter.clone();
@@ -350,7 +372,11 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                 eprintln!("\n{}", "Consumer interrupted by user (Ctrl+C).".yellow());
                 break;
             }
-            event = next_event(&consumer, reader.as_mut()) => {
+            event = next_event(&consumer, reader.as_mut(), !ends.is_empty()) => {
+                let Some(event) = event else {
+                    // Every partition was read to its end.
+                    break;
+                };
                 match event {
                     ReadEvent::Skipped(count) => {
                         idle_deadline = idle_timeout.map(|d| tokio::time::Instant::now() + d);
@@ -362,6 +388,9 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                         if !time_stop.admit(msg.partition, msg.timestamp_ms) {
                             stats.record_skip();
                             continue;
+                        }
+                        if ends.get(&msg.partition).is_some_and(|&end| msg.offset + 1 >= end) {
+                            time_stop.finish(msg.partition);
                         }
                         if use_group {
                             if let Err(e) = consumer.store_processed(&msg) {
@@ -536,20 +565,57 @@ fn group_outcome(committed: bool, store_failures: usize) -> anyhow::Result<()> {
 }
 
 /// The next record from `reader` when there is one, else from `consumer`.
+/// `None` when the reader read every partition to its end (`bounded`: each
+/// was given one).
 async fn next_event(
     consumer: &KafkaConsumerClient,
     reader: Option<&mut ParallelReader>,
-) -> ReadEvent {
+    bounded: bool,
+) -> Option<ReadEvent> {
     match reader {
-        // Every reader thread has stopped; the idle timeout or Ctrl+C ends the command.
         Some(reader) => match reader.recv().await {
-            Some(event) => event,
+            Some(event) => Some(event),
+            None if bounded => None,
+            // Every reader thread has stopped; the idle timeout or Ctrl+C ends the command.
             None => std::future::pending().await,
         },
-        None => match consumer.recv().await {
+        None => Some(match consumer.recv().await {
             Ok(msg) => ReadEvent::Record(msg),
             Err(err) => ReadEvent::Error(err),
-        },
+        }),
+    }
+}
+
+/// Start offsets from a `--from-timestamp` lookup. A partition the broker
+/// could not answer for (a moving leader, a timeout) is an error: starting
+/// it at the end would leave its records out without a word.
+fn time_lookup_offsets(
+    lookups: std::collections::HashMap<(String, i32), crate::kafka::consumer::Lookup>,
+) -> anyhow::Result<std::collections::HashMap<(String, i32), Offset>> {
+    use crate::kafka::consumer::Lookup;
+    lookups
+        .into_iter()
+        .map(|(key, lookup)| match lookup {
+            Lookup::At(offset) => Ok((key, Offset::Offset(offset))),
+            Lookup::End => Ok((key, Offset::End)),
+            Lookup::Failed(failure) => Err(anyhow::anyhow!(
+                "cannot find where partition {} starts at --from-timestamp: {}",
+                key.1,
+                failure.message
+            )),
+        })
+        .collect()
+}
+
+/// Whether reading from `start` finds nothing before `high` (an empty
+/// partition, or a start at its end).
+fn starts_at_end(start: Offset, low: i64, high: i64) -> bool {
+    match start {
+        Offset::Beginning => low >= high,
+        Offset::End => true,
+        Offset::Offset(o) => o >= high,
+        Offset::OffsetTail(n) => n <= 0 || low >= high,
+        _ => false,
     }
 }
 
@@ -788,6 +854,50 @@ pub fn format_message_display(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partitions_with_nothing_to_read_are_recognised() {
+        assert!(starts_at_end(Offset::Beginning, 5, 5));
+        assert!(!starts_at_end(Offset::Beginning, 0, 5));
+        assert!(starts_at_end(Offset::End, 0, 5));
+        assert!(starts_at_end(Offset::Offset(5), 0, 5));
+        assert!(!starts_at_end(Offset::Offset(4), 0, 5));
+        assert!(!starts_at_end(Offset::OffsetTail(3), 0, 5));
+        assert!(starts_at_end(Offset::OffsetTail(3), 5, 5));
+        // A group's stored position is not known here.
+        assert!(!starts_at_end(Offset::Stored, 5, 5));
+    }
+
+    #[test]
+    fn a_failed_time_lookup_stops_instead_of_starting_at_the_end() {
+        use crate::kafka::consumer::{Lookup, LookupFailure};
+        let ok = time_lookup_offsets(
+            [
+                (("t".to_string(), 0), Lookup::At(7)),
+                (("t".to_string(), 1), Lookup::End),
+            ]
+            .into(),
+        )
+        .unwrap();
+        assert_eq!(ok[&("t".to_string(), 0)], Offset::Offset(7));
+        assert_eq!(ok[&("t".to_string(), 1)], Offset::End);
+        let failed = time_lookup_offsets(
+            [(
+                ("t".to_string(), 2),
+                Lookup::Failed(LookupFailure::new(
+                    "NotLeaderForPartition",
+                    crate::error::ErrorClass::Retriable,
+                )),
+            )]
+            .into(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            failed.contains("partition 2") && failed.contains("NotLeaderForPartition"),
+            "{failed}"
+        );
+    }
 
     #[test]
     fn group_runs_fail_when_their_position_was_not_saved() {
