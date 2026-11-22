@@ -174,6 +174,7 @@ fn run_plan(mut args: ReassignPlanArgs, global: &GlobalOpts) -> KafkaResult<()> 
 
         check_target_brokers(&admin.list_brokers(timeout)?, &args.brokers)?;
 
+        crate::kafka::reassign::ensure_not_moving(&kafka_config, &args.topics)?;
         let mut current = Vec::new();
         for topic in &args.topics {
             // A missing topic is an error rather than a made-up plan.

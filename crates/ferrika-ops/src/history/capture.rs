@@ -167,6 +167,32 @@ pub fn replicas(
     topic: &str,
     partitions: Option<&[i32]>,
 ) -> KafkaResult<State> {
+    replicas_given_moves(admin, topic, partitions, &ongoing_moves(admin))
+}
+
+/// The partition moves in progress; none when they cannot be listed.
+fn ongoing_moves(
+    admin: &KafkaAdminClient,
+) -> Vec<ferrika_core::model::cluster::OngoingReassignment> {
+    match ferrika_core::kafka::wire::list_partition_reassignments(admin.config()) {
+        Ok(moves) => moves,
+        Err(e) => {
+            tracing::warn!("Cannot check ongoing partition moves: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// [`replicas`] with the moves in progress already listed. A partition being
+/// moved lists its old and new replicas together; the state to return to is
+/// the old set. (Its order is not known during a move, so the first replica,
+/// the preferred leader, may differ from the one before the move.)
+fn replicas_given_moves(
+    admin: &KafkaAdminClient,
+    topic: &str,
+    partitions: Option<&[i32]>,
+    moving: &[ferrika_core::model::cluster::OngoingReassignment],
+) -> KafkaResult<State> {
     let summary = admin.describe_topic(topic, None)?;
     Ok(State::Replicas {
         partitions: summary
@@ -176,7 +202,12 @@ pub fn replicas(
             .map(|p| PartitionReplicas {
                 topic: topic.to_string(),
                 partition: p.partition_id,
-                replicas: p.replicas.clone(),
+                replicas: ferrika_core::kafka::reassign::pre_move_replicas(
+                    &p.replicas,
+                    moving
+                        .iter()
+                        .find(|m| m.topic == topic && m.partition == p.partition_id),
+                ),
             })
             .collect(),
     })
@@ -187,6 +218,7 @@ pub fn replicas_of(admin: &KafkaAdminClient, partitions: &[(String, i32)]) -> Ka
     let mut topics: Vec<&str> = partitions.iter().map(|(t, _)| t.as_str()).collect();
     topics.sort_unstable();
     topics.dedup();
+    let moving = ongoing_moves(admin);
     let mut out = Vec::new();
     for topic in topics {
         let only: Vec<i32> = partitions
@@ -194,7 +226,9 @@ pub fn replicas_of(admin: &KafkaAdminClient, partitions: &[(String, i32)]) -> Ka
             .filter(|(t, _)| t == topic)
             .map(|(_, p)| *p)
             .collect();
-        if let State::Replicas { partitions } = replicas(admin, topic, Some(&only))? {
+        if let State::Replicas { partitions } =
+            replicas_given_moves(admin, topic, Some(&only), &moving)?
+        {
             out.extend(partitions);
         }
     }
