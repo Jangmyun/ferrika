@@ -5,10 +5,10 @@ use std::time::{Duration, Instant};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use comfy_table::{Cell, Color};
-use rdkafka::Offset;
 
 use crate::cli::{output, print_connection_hint, GlobalOpts, OutputFormat};
 use crate::kafka::config::AutoOffsetReset;
+use crate::kafka::consumer::StartOffset;
 use crate::kafka::consumer::{KafkaConsumerClient, ParallelReader, PartitionRead, ReadEvent};
 use crate::kafka::producer::{
     DeliveryOutcome, DeliveryPipeline, KafkaProducerClient, OwnedProducerRecord,
@@ -188,7 +188,7 @@ async fn handle_consume(global: &GlobalOpts, args: BenchConsumeArgs) -> anyhow::
         .map(|&partition| PartitionRead {
             topic: &args.topic,
             partition,
-            start: Offset::Beginning,
+            start: StartOffset::Beginning,
             end: None,
         })
         .collect();

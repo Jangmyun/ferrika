@@ -223,6 +223,9 @@ impl std::error::Error for DriverError {
     }
 }
 
+// Public so the workspace crates (and their tests) can build errors from the
+// driver's; not part of the documented API, which does not name rdkafka.
+#[doc(hidden)]
 impl From<rdkafka::error::KafkaError> for KafkaError {
     fn from(e: rdkafka::error::KafkaError) -> Self {
         Self::Driver(DriverError(e))

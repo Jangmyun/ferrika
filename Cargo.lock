@@ -1120,7 +1120,6 @@ dependencies = [
  "ferrika-ops",
  "ferrika-rabbitmq",
  "jiff",
- "rdkafka",
  "ring",
  "serde_json",
  "tokio",

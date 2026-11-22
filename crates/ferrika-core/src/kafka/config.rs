@@ -473,7 +473,7 @@ impl KafkaClientConfig {
     }
 
     /// Converts this high-level configuration into a low-level `rdkafka::ClientConfig`.
-    pub fn to_rdkafka_config(&self) -> KafkaResult<ClientConfig> {
+    pub(crate) fn to_rdkafka_config(&self) -> KafkaResult<ClientConfig> {
         self.validate()?;
         if self.uses_oauth() && !cfg!(feature = "ssl") {
             return Err(KafkaError::config(

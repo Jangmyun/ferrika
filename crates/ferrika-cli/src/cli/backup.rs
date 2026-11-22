@@ -7,13 +7,12 @@ use std::time::{Duration, Instant};
 use clap::Args;
 use colored::Colorize;
 use comfy_table::{Cell, Color};
-use rdkafka::consumer::Consumer as _;
-use rdkafka::Offset;
 use serde_json::json;
 
 use crate::cli::{output, print_connection_hint, GlobalOpts, OutputFormat};
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::config::AutoOffsetReset;
+use crate::kafka::consumer::StartOffset;
 use crate::kafka::consumer::{timestamp_start_offsets, KafkaConsumerClient, TimestampStop};
 use crate::kafka::filter::MessageFilter;
 use crate::kafka::producer::{
@@ -131,7 +130,7 @@ pub async fn run_dump(args: DumpArgs, global: &GlobalOpts) -> KafkaResult<()> {
     };
     // --from-timestamp starts each partition at its first record at or after
     // the timestamp instead of scanning (or skipping) everything before it.
-    let starts: Vec<(i32, Offset)> = match args.from_timestamp {
+    let starts: Vec<(i32, StartOffset)> = match args.from_timestamp {
         Some(ts) => {
             let keys: Vec<(&str, i32)> = partitions
                 .iter()
@@ -140,10 +139,13 @@ pub async fn run_dump(args: DumpArgs, global: &GlobalOpts) -> KafkaResult<()> {
             let lookup = consumer.offsets_for_timestamp(&keys, ts, None)?;
             timestamp_start_offsets(&args.topic, &partitions, &lookup)
         }
-        None if args.from_beginning => partitions.iter().map(|&p| (p, Offset::Beginning)).collect(),
-        None => partitions.iter().map(|&p| (p, Offset::End)).collect(),
+        None if args.from_beginning => partitions
+            .iter()
+            .map(|&p| (p, StartOffset::Beginning))
+            .collect(),
+        None => partitions.iter().map(|&p| (p, StartOffset::End)).collect(),
     };
-    let assignments: Vec<(&str, i32, Offset)> = starts
+    let assignments: Vec<(&str, i32, StartOffset)> = starts
         .iter()
         .map(|&(p, start)| (args.topic.as_str(), p, start))
         .collect();
@@ -160,8 +162,8 @@ pub async fn run_dump(args: DumpArgs, global: &GlobalOpts) -> KafkaResult<()> {
         }
         let (low, high) = consumer.fetch_watermarks(&args.topic, p, None)?;
         let first = match start {
-            Offset::Offset(o) => o,
-            Offset::End => high,
+            StartOffset::At(o) => o,
+            StartOffset::End => high,
             _ => low,
         };
         if high > first {
@@ -324,10 +326,10 @@ pub async fn run_dump(args: DumpArgs, global: &GlobalOpts) -> KafkaResult<()> {
     // script must not take the file for a complete backup.
     if must_check_completeness(stopped_idle, interrupted, !end_offsets.is_empty()) {
         let mut positions = next_offsets.clone();
-        if let Ok(tpl) = consumer.inner().position() {
-            for elem in tpl.elements_for_topic(&args.topic) {
-                if let Offset::Offset(o) = elem.offset() {
-                    let pos = positions.entry(elem.partition()).or_insert(o);
+        if let Ok(read) = consumer.positions() {
+            for ((topic, partition), o) in read {
+                if topic == args.topic {
+                    let pos = positions.entry(partition).or_insert(o);
                     *pos = (*pos).max(o);
                 }
             }
@@ -802,16 +804,17 @@ mod tests {
             .with_property("acks", "1")
             .with_property("max.in.flight.requests.per.connection", "100")
             .with_property("linger.ms", "5");
-        let rd = restore_config(config).to_rdkafka_config().unwrap();
-        assert_eq!(rd.get("enable.idempotence"), Some("true"));
-        assert_eq!(rd.get("acks"), Some("all"));
-        assert_eq!(rd.get("max.in.flight.requests.per.connection"), Some("5"));
-        assert_eq!(rd.get("linger.ms"), Some("5"));
-        // librdkafka accepts it as an idempotent producer.
-        let rd = restore_config(crate::kafka::config::KafkaClientConfig::new("b:9092"))
-            .to_rdkafka_config()
-            .unwrap();
-        assert!(rd.create::<rdkafka::producer::FutureProducer>().is_ok());
+        let restore = restore_config(config);
+        let props = &restore.extra_properties;
+        let get = |key: &str| props.get(key).map(String::as_str);
+        assert_eq!(get("enable.idempotence"), Some("true"));
+        assert_eq!(get("acks"), Some("all"));
+        assert_eq!(get("max.in.flight.requests.per.connection"), Some("5"));
+        assert_eq!(get("linger.ms"), Some("5"));
+        // librdkafka accepts both as an idempotent producer.
+        assert!(KafkaProducerClient::new(&restore).is_ok());
+        let plain = restore_config(crate::kafka::config::KafkaClientConfig::new("b:9092"));
+        assert!(KafkaProducerClient::new(&plain).is_ok());
     }
 
     #[test]

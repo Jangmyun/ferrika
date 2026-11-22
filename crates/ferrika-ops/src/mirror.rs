@@ -1,5 +1,3 @@
-use rdkafka::consumer::CommitMode;
-use rdkafka::Offset;
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
@@ -7,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use ferrika_core::error::{KafkaError, KafkaResult};
 use ferrika_core::kafka::config::{AutoOffsetReset, KafkaClientConfig};
+use ferrika_core::kafka::consumer::{CommitMode, StartOffset};
 use ferrika_core::kafka::consumer::{ConsumedMessage, KafkaConsumerClient};
 use ferrika_core::kafka::filter::MessageFilter;
 use ferrika_core::kafka::producer::{
@@ -487,9 +486,9 @@ where
         CopyDestination::Preview(sink) => Output::Preview(sink),
     };
     let start = if mirror_config.from_beginning {
-        Offset::Beginning
+        StartOffset::Beginning
     } else {
-        Offset::End
+        StartOffset::End
     };
     let timestamp_starts = match mirror_config.from_timestamp {
         Some(ts) => {
@@ -515,7 +514,7 @@ where
             };
             let first = match (use_group, &timestamp_starts) {
                 (false, Some(starts)) => match starts.iter().find(|(sp, _)| *sp == p) {
-                    Some((_, Offset::Offset(o))) => *o,
+                    Some((_, StartOffset::At(o))) => *o,
                     _ => high,
                 },
                 (false, None) if !mirror_config.from_beginning => high,
@@ -532,7 +531,7 @@ where
 
     match (mirror_config.partition, use_group, &timestamp_starts) {
         (_, false, Some(starts)) => {
-            let assignments: Vec<(&str, i32, Offset)> =
+            let assignments: Vec<(&str, i32, StartOffset)> =
                 starts.iter().map(|&(p, o)| (topic, p, o)).collect();
             consumer.assign_with_offsets(&assignments)?
         }

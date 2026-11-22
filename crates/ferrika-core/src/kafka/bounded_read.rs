@@ -10,12 +10,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-use rdkafka::Offset;
-
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::config::KafkaClientConfig;
 use crate::kafka::consumer::{
-    ConsumedMessage, KafkaConsumerClient, ParallelReader, PartitionRead, ReadEvent,
+    ConsumedMessage, KafkaConsumerClient, ParallelReader, PartitionRead, ReadEvent, StartOffset,
 };
 
 /// One partition to read, from `start` up to (not including) `end`.
@@ -392,7 +390,7 @@ where
         .map(|r| PartitionRead {
             topic: &r.topic,
             partition: r.partition,
-            start: Offset::Offset(r.start),
+            start: StartOffset::At(r.start),
             end: Some(r.end),
         })
         .collect();

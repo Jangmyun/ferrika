@@ -219,23 +219,19 @@ type TopicsMap = (HashMap<String, (usize, usize)>, Vec<String>);
 /// `(0, 1)` and shown as false drift.
 fn fetch_topics_map(profile: &ClusterProfile, filter: Option<&str>) -> KafkaResult<TopicsMap> {
     let client = KafkaAdminClient::new(&profile.to_kafka_config())?;
-    let metadata = client.fetch_raw_metadata(None, None)?;
+    let metadata = client.fetch_metadata(None, None)?;
     let mut map = HashMap::new();
     let mut unreadable = Vec::new();
 
-    for topic in metadata.topics() {
-        let name = topic.name();
+    for topic in &metadata.topics {
+        let name = topic.name.as_str();
         if let Some(f) = filter {
             if !name.contains(f) {
                 continue;
             }
         }
-        let counts: Vec<usize> = topic
-            .partitions()
-            .iter()
-            .map(|p| p.replicas().len())
-            .collect();
-        match (topic.error(), topic_shape(&counts)) {
+        let counts: Vec<usize> = topic.partitions.iter().map(|p| p.replicas.len()).collect();
+        match (&topic.error, topic_shape(&counts)) {
             (None, Some(shape)) => {
                 map.insert(name.to_string(), shape);
             }

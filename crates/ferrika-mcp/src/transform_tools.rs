@@ -15,10 +15,10 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use rdkafka::Offset;
 use serde_json::{json, Value};
 
 use ferrika_core::error::{KafkaError, KafkaResult};
+use ferrika_core::kafka::consumer::StartOffset;
 use ferrika_core::kafka::consumer::{ConsumedMessage, KafkaConsumerClient};
 use ferrika_core::kafka::context::ResolvedContext;
 use ferrika_core::kafka::producer::OwnedProducerRecord;
@@ -361,7 +361,7 @@ pub(super) async fn preview(
             ferrika_core::kafka::consumer::timestamp_start_offsets(topic, &partitions, &lookup)
                 .into_iter()
                 .map(|(p, offset)| match offset {
-                    Offset::Offset(o) => (p, Some(o)),
+                    StartOffset::At(o) => (p, Some(o)),
                     // Nothing at or after the timestamp: start at the end.
                     _ => (p, Some(i64::MAX)),
                 })
@@ -375,7 +375,7 @@ pub(super) async fn preview(
         let (low, high) = consumer.fetch_watermarks(topic, p, timeout())?;
         let first = from.unwrap_or(low).clamp(low, high);
         if first < high {
-            assign.push((topic, p, Offset::Offset(first)));
+            assign.push((topic, p, StartOffset::At(first)));
             ends.insert(p, high);
         }
     }

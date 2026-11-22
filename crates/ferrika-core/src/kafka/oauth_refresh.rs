@@ -111,7 +111,7 @@ fn set_token(rk: *mut rdsys::rd_kafka_t, token: &OAuthToken) -> KafkaResult<()> 
 
 /// The first token of a client, fetched before the client is created so a
 /// bad token endpoint or missing AWS credentials fail up front.
-pub struct OAuthSetup {
+pub(crate) struct OAuthSetup {
     source: Arc<dyn TokenSource>,
     token: OAuthToken,
     timeout: Duration,
@@ -119,7 +119,7 @@ pub struct OAuthSetup {
 
 /// The token setup for `config`, or `None` when it does not use OAUTHBEARER.
 /// The first token request is bounded by the request timeout.
-pub fn prepare(config: &KafkaClientConfig) -> KafkaResult<Option<OAuthSetup>> {
+pub(crate) fn prepare(config: &KafkaClientConfig) -> KafkaResult<Option<OAuthSetup>> {
     if !config.uses_oauth() {
         return Ok(None);
     }
@@ -135,7 +135,10 @@ pub fn prepare(config: &KafkaClientConfig) -> KafkaResult<Option<OAuthSetup>> {
 impl OAuthSetup {
     /// Sets the first token on `client` and starts its refresher. The
     /// caller keeps the refresher next to the client, declared before it.
-    pub fn attach<C: ClientContext>(self, client: &Client<C>) -> KafkaResult<OAuthRefresher> {
+    pub(crate) fn attach<C: ClientContext>(
+        self,
+        client: &Client<C>,
+    ) -> KafkaResult<OAuthRefresher> {
         let sink = ClientSink(client.native_ptr());
         sink.set(&self.token)?;
         Ok(OAuthRefresher::start(
@@ -149,7 +152,7 @@ impl OAuthSetup {
 
 /// Prepares the token, then attaches it to the client `create` builds:
 /// `with_oauth(config, || rd_config.create(), |c| c.client())`.
-pub fn with_oauth<T, C: ClientContext>(
+pub(crate) fn with_oauth<T, C: ClientContext>(
     config: &KafkaClientConfig,
     create: impl FnOnce() -> KafkaResult<T>,
     client_of: impl FnOnce(&T) -> &Client<C>,

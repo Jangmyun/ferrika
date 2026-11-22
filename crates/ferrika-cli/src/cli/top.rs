@@ -279,8 +279,8 @@ async fn fetch_cluster_snapshot(
 ) -> KafkaResult<TopClusterSnapshot> {
     let config = global.to_kafka_config();
     let admin = KafkaAdminClient::new(&config)?;
-    let meta = admin.fetch_raw_metadata(None, Some(SNAPSHOT_TIMEOUT))?;
-    let brokers_online = meta.brokers().len();
+    let meta = admin.fetch_metadata(None, Some(SNAPSHOT_TIMEOUT))?;
+    let brokers_online = meta.brokers.len();
 
     // Used only to read watermarks: it never subscribes or commits, so no group is created.
     let probe = KafkaConsumerClient::lookup(&config)?;
@@ -288,34 +288,34 @@ async fn fetch_cluster_snapshot(
     let mut topics = Vec::new();
     let mut total_partitions = 0;
     let keys: Vec<(&str, i32)> = meta
-        .topics()
+        .topics
         .iter()
-        .filter(|t| !is_internal_topic(t.name()))
-        .flat_map(|t| t.partitions().iter().map(move |p| (t.name(), p.id())))
+        .filter(|t| !is_internal_topic(&t.name))
+        .flat_map(|t| t.partitions.iter().map(move |p| (t.name.as_str(), p.id)))
         .collect();
     let watermarks = probe
         .fetch_watermarks_batch(&keys, Some(SNAPSHOT_TIMEOUT))
         .unwrap_or_default();
 
-    for t in meta.topics() {
-        let p_count = t.partitions().len();
+    for t in &meta.topics {
+        let p_count = t.partitions.len();
         total_partitions += p_count;
-        if is_internal_topic(t.name()) {
+        if is_internal_topic(&t.name) {
             continue;
         }
 
         let mut depth: i64 = 0;
         let mut produced: i64 = 0;
-        for p in t.partitions() {
-            if let Some(&(low, high)) = watermarks.get(&(t.name().to_string(), p.id())) {
+        for p in &t.partitions {
+            if let Some(&(low, high)) = watermarks.get(&(t.name.clone(), p.id)) {
                 depth += crate::kafka::metrics::partition_depth(low, high);
                 produced += high;
             }
         }
-        let rate = rate_tracker.track(t.name(), produced);
+        let rate = rate_tracker.track(&t.name, produced);
 
         topics.push(TopTopicItem {
-            name: t.name().to_string(),
+            name: t.name.clone(),
             partitions: p_count,
             total_messages: depth,
             msg_rate_per_sec: rate,

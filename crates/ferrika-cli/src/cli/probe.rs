@@ -2,11 +2,11 @@ use std::time::Duration;
 
 use clap::Args;
 use comfy_table::{Cell, CellAlignment, Color};
-use rdkafka::Offset;
 
 use crate::cli::{output, GlobalOpts};
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::consumer::KafkaConsumerClient;
+use crate::kafka::consumer::StartOffset;
 use crate::kafka::producer::{KafkaProducerClient, OwnedProducerRecord};
 use crate::ops::probe::{ProbePayload, ProbeSample, ProbeStats};
 
@@ -231,12 +231,12 @@ async fn execute_probes(
         .map(|&p| (args.topic.as_str(), p))
         .collect();
     let ends = consumer.fetch_watermarks_batch(&keys, None)?;
-    let assignments: Vec<(&str, i32, Offset)> = partitions
+    let assignments: Vec<(&str, i32, StartOffset)> = partitions
         .iter()
         .map(|&p| {
             let start = ends
                 .get(&(args.topic.clone(), p))
-                .map_or(Offset::End, |&(_, high)| Offset::Offset(high));
+                .map_or(StartOffset::End, |&(_, high)| StartOffset::At(high));
             (args.topic.as_str(), p, start)
         })
         .collect();

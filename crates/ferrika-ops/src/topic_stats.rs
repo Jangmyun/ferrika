@@ -4,11 +4,11 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
-use rdkafka::Offset;
 use serde::Serialize;
 
 use ferrika_core::error::KafkaResult;
 use ferrika_core::kafka::config::KafkaClientConfig;
+use ferrika_core::kafka::consumer::StartOffset;
 use ferrika_core::kafka::consumer::{ConsumedMessage, KafkaConsumerClient};
 
 /// Distinct keys are counted exactly up to this many, then reported as "at least".
@@ -131,9 +131,9 @@ pub async fn analyze_topic(
             (high > low).then_some((p, high))
         })
         .collect();
-    let assignments: Vec<(&str, i32, Offset)> = ends
+    let assignments: Vec<(&str, i32, StartOffset)> = ends
         .keys()
-        .map(|&p| (topic, p, Offset::Beginning))
+        .map(|&p| (topic, p, StartOffset::Beginning))
         .collect();
     let mut analysis = TopicAnalysis::default();
     if !assignments.is_empty() {

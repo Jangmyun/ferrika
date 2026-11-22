@@ -219,12 +219,10 @@ impl<T: Send + 'static> TaggedDeliveryPipeline<T> {
         tag: T,
     ) -> KafkaResult<()> {
         let enqueued_at = Instant::now();
-        let future = producer.enqueue(record).await?;
-        let topic = record.topic.clone();
-        let partition = record.partition;
+        let delivery = producer.enqueue(record).await?;
         let payload_bytes = record.payload.as_ref().map_or(0, Vec::len);
         self.in_flight.spawn(async move {
-            let result = map_delivery(future.await, topic, partition);
+            let result = delivery.await;
             let outcome = DeliveryOutcome {
                 result,
                 latency: enqueued_at.elapsed(),
@@ -272,6 +270,29 @@ fn map_delivery(
             partition,
             reason: "delivery report was dropped before completion".to_string(),
         }),
+    }
+}
+
+/// A record handed to the producer with [`KafkaProducerClient::enqueue`].
+/// Awaiting it gives the broker's acknowledgement (or the delivery error).
+#[must_use = "a pending delivery does nothing unless awaited"]
+pub struct PendingDelivery {
+    future: DeliveryFuture,
+    topic: String,
+    partition: Option<i32>,
+}
+
+impl std::future::Future for PendingDelivery {
+    type Output = KafkaResult<DeliveryReceipt>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.future)
+            .poll(cx)
+            .map(|delivery| map_delivery(delivery, std::mem::take(&mut this.topic), this.partition))
     }
 }
 
@@ -365,13 +386,20 @@ impl KafkaProducerClient {
         Ok(receipts)
     }
 
-    /// Hands a record to librdkafka without waiting for the broker acknowledgement.
-    /// Retries while the local queue is full, up to the configured message timeout.
-    pub async fn enqueue(&self, record: &OwnedProducerRecord) -> KafkaResult<DeliveryFuture> {
+    /// Hands a record to librdkafka without waiting for the broker acknowledgement;
+    /// await the returned [`PendingDelivery`] for it. Retries while the local
+    /// queue is full, up to the configured message timeout.
+    pub async fn enqueue(&self, record: &OwnedProducerRecord) -> KafkaResult<PendingDelivery> {
         let deadline = Instant::now() + self.config.message_timeout;
         loop {
             match self.producer.send_result(build_future_record(record)) {
-                Ok(future) => return Ok(future),
+                Ok(future) => {
+                    return Ok(PendingDelivery {
+                        future,
+                        topic: record.topic.clone(),
+                        partition: record.partition,
+                    })
+                }
                 Err((RdKafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), _))
                     if Instant::now() < deadline =>
                 {

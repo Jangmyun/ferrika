@@ -139,10 +139,10 @@ pub async fn ping_cluster(profile: &ClusterProfile, timeout: Duration) -> Cluste
     let config = profile.to_kafka_config();
 
     match KafkaAdminClient::new(&config) {
-        Ok(client) => match client.fetch_raw_metadata(None, Some(timeout)) {
+        Ok(client) => match client.fetch_metadata(None, Some(timeout)) {
             Ok(metadata) => {
                 let rtt_ms = start.elapsed().as_secs_f64() * 1000.0;
-                let broker_count = metadata.brokers().len();
+                let broker_count = metadata.brokers.len();
                 let controller_id = client.active_controller_id().unwrap_or(-1);
 
                 let status = classify_health(broker_count, controller_id);
