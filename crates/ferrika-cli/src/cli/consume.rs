@@ -368,6 +368,9 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                 std::fs::create_dir_all(parent)?;
             }
         }
+        if let Some(notice) = append_notice(path) {
+            eprintln!("{} {notice}", "ℹ".cyan());
+        }
         // Record data: owner-only (0600) on unix, not the umask default.
         let file = crate::files::open_private_file(path, true)?;
         Some(BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, file))
@@ -665,6 +668,19 @@ fn decoded_view(
         view.key = Some(crate::codec::schema::key_text(&key.text).into_bytes());
     }
     view
+}
+
+/// `--save` adds records to a file that already has some: said, or running
+/// the command twice reads like one run's output. `None` for a new or empty
+/// file.
+fn append_notice(path: &Path) -> Option<String> {
+    let len = std::fs::metadata(path).ok()?.len();
+    (len > 0).then(|| {
+        format!(
+            "Appending to '{}', which already holds {len} byte(s).",
+            path.display()
+        )
+    })
 }
 
 /// Adds `-D`'s decoded value and key to a JSON line (`decoded`,
@@ -1090,6 +1106,19 @@ mod tests {
         assert!(grep.matches(&decoded_view(&msg, Some(&decoded), None)));
         // Undecoded parts stay as they were.
         assert_eq!(decoded_view(&msg, Some(&decoded), None).key, msg.key);
+    }
+
+    #[test]
+    fn saving_into_a_non_empty_file_is_announced() {
+        let dir = std::env::temp_dir().join(format!("ferrika-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("out.jsonl");
+        assert_eq!(append_notice(&path), None);
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(append_notice(&path), None);
+        std::fs::write(&path, "{}\n").unwrap();
+        assert!(append_notice(&path).is_some_and(|n| n.contains("3 byte(s)")));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
