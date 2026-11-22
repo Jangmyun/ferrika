@@ -790,10 +790,17 @@ fn broker_rules(f: &mut Findings, input: &LintInput, opts: &LintOptions, online:
         }
     }
     // One cluster-wide fix only when every flagged broker has the same
-    // values; otherwise the brokers disagree (see the drift findings).
+    // values and the new value suits every broker (it sets the default on
+    // all of them); otherwise the brokers disagree (see the drift findings).
+    let below_every_rf = |value: i64| {
+        brokers
+            .values()
+            .filter_map(|c| c.i64("default.replication.factor"))
+            .all(|rf| value < rf)
+    };
     let one_fix = min_isr_too_high.len() == 1;
     for ((rf, min_isr), ids) in &min_isr_too_high {
-        let fix = if one_fix {
+        let fix = if one_fix && below_every_rf(rf - 1) {
             Fix::BrokerConfig {
                 broker: None,
                 changes: vec![set(MIN_ISR, rf - 1)],
@@ -889,7 +896,6 @@ fn shown(value: &str) -> &str {
     }
 }
 
-/// B006 for one key: brokers whose value differs from the majority.
 /// ` on brokers 1, 3` when only some of the `total` brokers have a setting;
 /// nothing when all do.
 fn on_brokers(ids: &[i32], total: usize) -> String {
@@ -901,6 +907,7 @@ fn on_brokers(ids: &[i32], total: usize) -> String {
     format!(" on {noun} {}", list.join(", "))
 }
 
+/// B006 for one key: brokers whose value differs from the majority.
 fn drift(f: &mut Findings, brokers: &BTreeMap<i32, Configs>, key: &str) {
     let values: Vec<(i32, &str, Option<ConfigOrigin>)> = brokers
         .iter()
@@ -1668,6 +1675,17 @@ mod tests {
         let b004: Vec<_> = findings.iter().filter(|f| f.rule == "B004").collect();
         assert_eq!(b004.len(), 2, "{b004:?}");
         assert!(b004.iter().all(|f| f.fix_class == Manual));
+
+        // Brokers 1 and 2 are flagged, but min ISR 2 everywhere would give
+        // broker 3 (RF 2) the same problem: no cluster-wide fix.
+        for id in 1..=2 {
+            i.broker_configs.get_mut(&id).unwrap()[1] = entry(MIN_ISR, "3", Dflt);
+        }
+        i.broker_configs.get_mut(&3).unwrap()[1] = entry(MIN_ISR, "1", Dflt);
+        let findings = lint(&i, &opts(Env::Prod));
+        let b004 = only(&findings, "B004");
+        assert!(b004.message.contains("on brokers 1, 2"), "{}", b004.message);
+        assert_eq!(b004.fix_class, Manual);
     }
 
     #[test]
