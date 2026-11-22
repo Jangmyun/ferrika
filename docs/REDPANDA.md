@@ -34,7 +34,7 @@ PLAIN, and its own wire client (users, ACLs) with SCRAM.
 | Health: uneven leadership | Differs | `health` may suggest rebalancing leaders; Redpanda does that itself (`rpk cluster partitions balance`) |
 | Preferred leader election (`topics elect-leaders`, desktop "Rebalance leaders") | Not supported by Redpanda | Redpanda has no ElectLeaders API and balances leadership itself (`rpk cluster partitions balance`); Ferrika says so |
 | Reassignment: plan, execute, verify, status, undo | Works | Checked moving partitions between three nodes |
-| Replication factor changes (`topics set-replication`, lint fix, undo) | Works | Redpanda refuses replica-count changes through reassignment; Ferrika then sets the topic's `replication.factor` and Redpanda places the replicas. Undo of a change made by `lint --fix` may report a drift (the record holds the planned replicas): use `undo --force` |
+| Replication factor changes (`topics set-replication`, lint fix, undo) | Works | Redpanda refuses replica-count changes through reassignment; Ferrika then sets the topic's `replication.factor` and Redpanda places the replicas. Redpanda only accepts an odd replication factor. Undo of a change made by `lint --fix` or the desktop may report a drift (the record holds the planned replicas): use `undo --force` |
 | Offline broker | Works | `health` reports it, `monitor brokers` shows it offline, `reassign plan` refuses it as a target |
 | Schema Registry: list, get, register, check, compatibility, delete | Works | |
 | ACLs: create, list, delete | Works | Enforced with SASL: reads allowed by an ACL work, writes without one get TopicAuthorizationFailed |
