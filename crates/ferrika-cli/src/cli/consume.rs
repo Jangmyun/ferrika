@@ -258,14 +258,46 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                 .iter()
                 .map(|&p| (args.topic.as_str(), p))
                 .collect();
+            // A group starting at its committed offsets: where those are.
+            let committed = match (
+                &kafka_config.group_id,
+                starts.iter().any(|(_, s)| *s == Offset::Stored),
+            ) {
+                (Some(group), true) => crate::kafka::wire::fetch_group_offsets(
+                    &kafka_config,
+                    std::slice::from_ref(group),
+                )
+                .ok()
+                .and_then(|mut all| all.remove(group))
+                .unwrap_or_default(),
+                _ => Default::default(),
+            };
             for ((_, p), (low, high)) in consumer.fetch_watermarks_batch(&keys, None)? {
-                if starts
-                    .iter()
-                    .any(|&(sp, start)| sp == p && starts_at_end(start, low, high))
-                {
+                let at_end = starts.iter().any(|&(sp, start)| {
+                    sp == p
+                        && match start {
+                            Offset::Stored => committed
+                                .get(&(args.topic.clone(), p))
+                                .is_some_and(|&c| c >= high),
+                            start => starts_at_end(start, low, high),
+                        }
+                });
+                if at_end {
                     time_stop.finish(p);
                 }
                 ends.insert(p, high);
+            }
+            let unbounded: Vec<String> = partitions
+                .iter()
+                .filter(|p| !ends.contains_key(p))
+                .map(i32::to_string)
+                .collect();
+            if !unbounded.is_empty() {
+                eprintln!(
+                    "{} Could not read the end of partition(s) {}; they finish only at a record past --to-timestamp.",
+                    "!".yellow(),
+                    unbounded.join(", ")
+                );
             }
         }
         let assignments: Vec<(&str, i32, Offset)> = starts
