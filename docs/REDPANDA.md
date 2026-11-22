@@ -34,7 +34,7 @@ PLAIN, and its own wire client (users, ACLs) with SCRAM.
 | Health: uneven leadership | Differs | `health` may suggest rebalancing leaders; Redpanda does that itself (`rpk cluster partitions balance`) |
 | Preferred leader election (`topics elect-leaders`, desktop "Rebalance leaders") | Not supported by Redpanda | Redpanda has no ElectLeaders API and balances leadership itself (`rpk cluster partitions balance`); Ferrika says so |
 | Reassignment: plan, execute, verify, status, undo | Works | Checked moving partitions between three nodes |
-| Replication factor changes (`topics set-replication`, lint fix, undo) | Works | Redpanda refuses replica-count changes through reassignment; Ferrika then sets the topic's `replication.factor` and Redpanda places the replicas |
+| Replication factor changes (`topics set-replication`, lint fix, undo) | Works | Redpanda refuses replica-count changes through reassignment; Ferrika then sets the topic's `replication.factor` and Redpanda places the replicas. Undo of a change made by `lint --fix` may report a drift (the record holds the planned replicas): use `undo --force` |
 | Offline broker | Works | `health` reports it, `monitor brokers` shows it offline, `reassign plan` refuses it as a target |
 | Schema Registry: list, get, register, check, compatibility, delete | Works | |
 | ACLs: create, list, delete | Works | Enforced with SASL: reads allowed by an ACL work, writes without one get TopicAuthorizationFailed |
@@ -44,6 +44,20 @@ PLAIN, and its own wire client (users, ACLs) with SCRAM.
 | Operation history and undo (topic configs, ACLs, quotas, offsets) | Works | |
 | MCP server (read tools) | Works | |
 | Desktop: Overview, Brokers, Topics, Message Studio, Schemas | Works | |
+
+## Trying SASL on the test cluster
+
+Start [`docs/e2e/redpanda-compose.yml`](e2e/redpanda-compose.yml), then
+create a superuser and turn SASL on (test values only):
+
+```bash
+docker exec ferrika-redpanda-redpanda-0-1 rpk security user create admin -p admin-secret --mechanism SCRAM-SHA-256
+docker exec ferrika-redpanda-redpanda-0-1 rpk cluster config set superusers '["admin"]'
+docker exec ferrika-redpanda-redpanda-0-1 rpk cluster config set enable_sasl true
+# PLAIN as well, for the default build of ferrika (SCRAM needs --features ssl):
+docker exec ferrika-redpanda-redpanda-0-1 rpk cluster config set sasl_mechanisms '["SCRAM","PLAIN"]'   -X user=admin -X pass=admin-secret -X sasl.mechanism=SCRAM-SHA-256
+ferrika profile add rp-admin -b localhost:39092 --security-protocol sasl_plaintext   --sasl-mechanism PLAIN --sasl-username admin --sasl-password-stdin
+```
 
 ## Kafka APIs
 
