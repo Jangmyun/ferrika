@@ -409,7 +409,14 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
     let idle_timeout = args.timeout.map(Duration::from_millis);
     // Buffer terminal output: println! issues one write per message, which dominates
     // the cost of consuming large topics. Buffers are flushed whenever the stream pauses.
-    let mut out = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, std::io::stdout());
+    let mut out =
+        BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, DeliveredBytes::new(std::io::stdout()));
+    // Which records have fully reached stdout: with `--group` only their
+    // offsets are stored, so a reader that closes the pipe early (`| head`)
+    // gets the rest again on the next run.
+    let mut ledger = OutputLedger::default();
+    // The error of a write to a stdout whose reader went away.
+    let mut closed: Option<std::io::Error> = None;
     // `--format json` prints one JSON object per record (JSON Lines, the same
     // shape as --save); status lines go to stderr in every mode.
     let json_lines = global.format == OutputFormat::Json;
@@ -419,6 +426,11 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
     let mut idle_deadline = idle_timeout.map(|d| tokio::time::Instant::now() + d);
 
     loop {
+        // Records whose output has reached stdout by now are done with.
+        let done = ledger.settle(out.get_ref().delivered);
+        if use_group {
+            store_failures += store_done(&consumer, &args.topic, &done);
+        }
         if let Some(max) = args.max_messages {
             if stats.matched >= max as u64 {
                 break;
@@ -431,8 +443,10 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
         tokio::select! {
             biased;
             _ = &mut ctrl_c => {
-                out.flush()?;
-                eprintln!("\n{}", "Consumer interrupted by user (Ctrl+C).".yellow());
+                keep_open_output(out.flush(), &mut closed)?;
+                if closed.is_none() {
+                    eprintln!("\n{}", "Consumer interrupted by user (Ctrl+C).".yellow());
+                }
                 break;
             }
             event = next_event(&consumer, reader.as_mut(), !ends.is_empty()) => {
@@ -455,18 +469,14 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                         if ends.get(&msg.partition).is_some_and(|&end| msg.offset + 1 >= end) {
                             time_stop.finish(msg.partition);
                         }
-                        if use_group {
-                            if let Err(e) = consumer.store_processed(&msg) {
-                                eprintln!("{} Could not store offset: {e}", "✖".red());
-                                store_failures += 1;
-                            }
-                        }
                         let masked = mask.then(|| msg.masked());
                         let filtered = match &masked {
                             Some(m) if mask_filters => m,
                             _ => &msg,
                         };
                         if !filter.matches(filtered) {
+                            // Done with: stored once what came before reached stdout.
+                            ledger.add(msg.partition, msg.offset, 0);
                             stats.record_skip();
                             continue;
                         }
@@ -505,12 +515,14 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                         };
                         if let Some(tf) = &text_filter {
                             if !tf.matches(&decoded_view(filtered, decoded.as_ref(), decoded_key.as_ref())) {
+                                ledger.add(msg.partition, msg.offset, 0);
                                 stats.record_skip();
                                 continue;
                             }
                         }
                         if let Some(expr) = &where_expr {
                             if !crate::kafka::filter::expression_matches(expr, filtered, decoded.as_ref(), decoded_key.as_ref()) {
+                                ledger.add(msg.partition, msg.offset, 0);
                                 stats.record_skip();
                                 continue;
                             }
@@ -528,10 +540,10 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                             writeln!(writer, "{}", jsonl_record(&msg))?;
                         }
 
-                        if json_lines {
+                        let line = if json_lines {
                             let mut record = jsonl_record(&msg);
                             add_decoded(&mut record, decoded.as_ref(), decoded_key.as_ref());
-                            writeln!(out, "{record}")?;
+                            record.to_string()
                         } else {
                             let shown;
                             let msg_ref = match decoded_key {
@@ -546,15 +558,20 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                                 }
                                 None => &msg,
                             };
-                            let formatted = format_message(
+                            format_message(
                                 msg_ref,
                                 args.pretty_json,
                                 args.show_headers,
                                 args.decode_wire_format,
                                 args.hex,
                                 decoded.as_ref(),
-                            );
-                            writeln!(out, "{formatted}")?;
+                            )
+                        };
+                        // The line and its newline.
+                        ledger.add(msg.partition, msg.offset, line.len() as u64 + 1);
+                        keep_open_output(writeln!(out, "{line}"), &mut closed)?;
+                        if closed.is_some() {
+                            break;
                         }
                         unflushed = true;
                     }
@@ -571,14 +588,20 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                 }
             }
             _ = tokio::time::sleep(OUTPUT_FLUSH_INTERVAL), if unflushed => {
-                out.flush()?;
+                keep_open_output(out.flush(), &mut closed)?;
+                if closed.is_some() {
+                    break;
+                }
                 if let Some(ref mut writer) = file_writer {
                     writer.flush()?;
                 }
                 unflushed = false;
             }
             _ = sleep_until_or_forever(idle_deadline) => {
-                out.flush()?;
+                keep_open_output(out.flush(), &mut closed)?;
+                if closed.is_some() {
+                    break;
+                }
                 eprintln!(
                     "{}",
                     format!("Idle timeout of {} ms reached with no incoming messages.", args.timeout.unwrap_or(0))
@@ -589,9 +612,24 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
         }
     }
 
-    out.flush()?;
+    if closed.is_none() {
+        keep_open_output(out.flush(), &mut closed)?;
+    }
     if let Some(ref mut writer) = file_writer {
         writer.flush()?;
+    }
+    // Records whose output reached stdout (all of them unless the pipe
+    // closed) are done with; with a group their offsets are stored.
+    let done = ledger.settle(out.get_ref().delivered);
+    if use_group {
+        store_failures += store_done(&consumer, &args.topic, &done);
+    }
+    if let Some(error) = closed {
+        // The reader went away (`| head`): what it was given counts as read.
+        // Bytes still buffered would never arrive; drop them unwritten.
+        let (_, _unwritten) = out.into_parts();
+        let written = ledger.written;
+        return finish_closed_output(&consumer, use_group, written, store_failures, error);
     }
     // Every matched record went to the file or the (redirected) stdout.
     crate::cli::export_finished(stats.matched);
@@ -627,6 +665,159 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
     // so a script does not take the run as done and skip the re-read.
     group_outcome(commit.is_ok(), store_failures)?;
     read_outcome(read_errors, stats.total_received)
+}
+
+/// Stores, for each partition, the offset after the last record done with
+/// (`done`: partition to that record's offset). Returns how many failed.
+fn store_done(
+    consumer: &KafkaConsumerClient,
+    topic: &str,
+    done: &std::collections::BTreeMap<i32, i64>,
+) -> usize {
+    let mut failures = 0;
+    for (&partition, &offset) in done {
+        // librdkafka stores `offset + 1`, the next record to read.
+        if let Err(e) = consumer.store_processed_offset(topic, partition, offset) {
+            eprintln!("{} Could not store offset: {e}", "✖".red());
+            failures += 1;
+        }
+    }
+    failures
+}
+
+/// The end of a run whose stdout reader went away (`consume ... | head`):
+/// commits the group's offsets of the records that reached stdout (stored
+/// already), audits the outcome and returns the pipe error, which ends the
+/// command with exit status 0 (see `cli::exit_with_error`).
+fn finish_closed_output(
+    consumer: &KafkaConsumerClient,
+    use_group: bool,
+    written: u64,
+    store_failures: usize,
+    error: std::io::Error,
+) -> anyhow::Result<()> {
+    crate::cli::export_finished(written);
+    let outcome = if !use_group {
+        format!("{written} record(s) written")
+    } else {
+        match consumer.commit_stored(CommitMode::Sync) {
+            Ok(()) if store_failures == 0 => {
+                format!("committed the offsets of {written} written record(s)")
+            }
+            Ok(()) => format!(
+                "committed the offsets of {written} written record(s); {store_failures} offset(s) could not be stored"
+            ),
+            Err(e) => {
+                // stderr may be gone too: never panic on it.
+                let _ = writeln!(std::io::stderr(), "Final offset commit failed: {e}");
+                format!("the offsets of {written} written record(s) were not committed")
+            }
+        }
+    };
+    let _ = writeln!(
+        std::io::stderr(),
+        "Output closed after {written} record(s); {outcome}."
+    );
+    crate::cli::record_audit_result(
+        true,
+        &format!("ended with a pipe error (output closed?); {outcome}"),
+    );
+    Err(error.into())
+}
+
+/// Whether a write failed because the reader of the output went away:
+/// EPIPE (os error 32), on Windows ERROR_BROKEN_PIPE (109) or
+/// ERROR_NO_DATA (232).
+fn is_closed_output(error: &std::io::Error) -> bool {
+    let closed_codes: &[i32] = if cfg!(windows) { &[109, 232] } else { &[32] };
+    error.kind() == std::io::ErrorKind::BrokenPipe
+        || error
+            .raw_os_error()
+            .is_some_and(|code| closed_codes.contains(&code))
+}
+
+/// A write to stdout: a closed pipe is kept in `closed` (the run then ends
+/// and commits what was written) instead of being returned.
+fn keep_open_output(
+    result: std::io::Result<()>,
+    closed: &mut Option<std::io::Error>,
+) -> std::io::Result<()> {
+    match result {
+        Err(e) if is_closed_output(&e) => {
+            *closed = Some(e);
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+/// A writer that counts the bytes its inner writer accepted: under a
+/// `BufWriter`, the bytes that actually reached stdout.
+struct DeliveredBytes<W> {
+    inner: W,
+    delivered: u64,
+}
+
+impl<W> DeliveredBytes<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            delivered: 0,
+        }
+    }
+}
+
+impl<W: Write> Write for DeliveredBytes<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.delivered += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Records handed to the output, in order, and how far into the output each
+/// one ends, so that the records fully written can be told from the ones
+/// still buffered when the reader goes away.
+#[derive(Debug, Default)]
+struct OutputLedger {
+    /// Output bytes handed to the writer so far.
+    queued: u64,
+    /// (partition, offset, output end, printed) of records not settled yet.
+    pending: std::collections::VecDeque<(i32, i64, u64, bool)>,
+    /// Printed records whose output was fully delivered.
+    written: u64,
+}
+
+impl OutputLedger {
+    /// A record whose output (`bytes` long, 0 for a record filtered out) was
+    /// handed to the writer after everything added before.
+    fn add(&mut self, partition: i32, offset: i64, bytes: u64) {
+        self.queued += bytes;
+        self.pending
+            .push_back((partition, offset, self.queued, bytes > 0));
+    }
+
+    /// Settles the records whose output lies within the first `delivered`
+    /// bytes. Returns the offset of the last settled record per partition;
+    /// records after the first unsettled one are never included.
+    fn settle(&mut self, delivered: u64) -> std::collections::BTreeMap<i32, i64> {
+        let mut done = std::collections::BTreeMap::new();
+        while let Some(&(partition, offset, end, printed)) = self.pending.front() {
+            if end > delivered {
+                break;
+            }
+            self.pending.pop_front();
+            done.insert(partition, offset);
+            if printed {
+                self.written += 1;
+            }
+        }
+        done
+    }
 }
 
 /// `Err` when the consumer reported errors and nothing was read (no read
@@ -1023,6 +1214,92 @@ fn format_message_display(msg: &ConsumedMessage, pretty_json: bool, show_headers
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_records_that_fully_reached_stdout_are_settled() {
+        let mut ledger = OutputLedger::default();
+        ledger.add(0, 10, 5); // bytes 0..5
+        ledger.add(1, 7, 4); // 5..9
+        ledger.add(0, 11, 0); // filtered out
+        ledger.add(0, 12, 6); // 9..15
+        ledger.add(1, 8, 3); // 15..18
+                             // Nothing reached stdout yet.
+        assert!(ledger.settle(0).is_empty());
+        // 10 bytes: the first two records and the filtered one after them;
+        // the record at 0/12 was cut short.
+        let done = ledger.settle(10);
+        assert_eq!(done, [(0, 11), (1, 7)].into_iter().collect());
+        assert_eq!(ledger.written, 2);
+        // Settled records are not reported twice.
+        assert!(ledger.settle(10).is_empty());
+        let done = ledger.settle(18);
+        assert_eq!(done, [(0, 12), (1, 8)].into_iter().collect());
+        assert_eq!(ledger.written, 4);
+    }
+
+    #[test]
+    fn a_filtered_record_after_an_unwritten_one_is_not_settled() {
+        let mut ledger = OutputLedger::default();
+        ledger.add(0, 1, 4);
+        ledger.add(0, 2, 4);
+        ledger.add(0, 3, 0);
+        // The record at offset 2 is still buffered: offset 3 must wait too.
+        assert_eq!(ledger.settle(6), [(0, 1)].into_iter().collect());
+        assert_eq!(ledger.written, 1);
+        // Filtered records with nothing printed before them settle at once.
+        let mut ledger = OutputLedger::default();
+        ledger.add(2, 40, 0);
+        assert_eq!(ledger.settle(0), [(2, 40)].into_iter().collect());
+        assert_eq!(ledger.written, 0);
+    }
+
+    #[test]
+    fn delivered_bytes_count_what_reached_the_inner_writer() {
+        // A writer that takes at most 3 bytes and then fails like a closed pipe.
+        struct Pipe(usize);
+        impl Write for Pipe {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                if self.0 == 0 {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                let n = buf.len().min(self.0);
+                self.0 -= n;
+                Ok(n)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut out = BufWriter::with_capacity(16, DeliveredBytes::new(Pipe(3)));
+        let mut ledger = OutputLedger::default();
+        let mut closed = None;
+        for (offset, line) in [(0, "a"), (1, "b"), (2, "cc")] {
+            ledger.add(0, offset, line.len() as u64 + 1);
+            keep_open_output(writeln!(out, "{line}"), &mut closed).unwrap();
+        }
+        keep_open_output(out.flush(), &mut closed).unwrap();
+        assert!(closed.is_some());
+        // "a\n" and the first byte of "b\n" got through: only offset 0 counts.
+        assert_eq!(out.get_ref().delivered, 3);
+        assert_eq!(
+            ledger.settle(out.get_ref().delivered),
+            [(0, 0)].into_iter().collect()
+        );
+        assert_eq!(ledger.written, 1);
+    }
+
+    #[test]
+    fn a_closed_pipe_is_kept_and_other_errors_returned() {
+        let mut closed = None;
+        assert!(keep_open_output(Ok(()), &mut closed).is_ok());
+        assert!(closed.is_none());
+        let other = std::io::Error::other("disk full");
+        assert!(keep_open_output(Err(other), &mut closed).is_err());
+        assert!(closed.is_none());
+        let pipe = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert!(keep_open_output(Err(pipe), &mut closed).is_ok());
+        assert!(closed.is_some());
+    }
 
     #[test]
     fn partitions_with_nothing_to_read_are_recognised() {

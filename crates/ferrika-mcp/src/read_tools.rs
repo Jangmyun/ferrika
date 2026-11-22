@@ -1055,6 +1055,29 @@ mod tests {
         assert!(err.to_string().contains("200"), "{err}");
     }
 
+    #[tokio::test]
+    async fn schema_fields_is_metadata_and_stays_outside_the_export_gate() {
+        use ferrika_governance::test_policy::{self, MemoryLog};
+        let g = context();
+        // No record data: offered and not recorded as an export, also under
+        // `export: forbidden`.
+        let forbidden = test_policy::export_forbidden();
+        let listed = tool_definitions(peek_listed(&forbidden, &g));
+        assert!(listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "schema_fields"));
+        let log = MemoryLog::default();
+        let call = json!({ "name": "schema_fields", "arguments": { "topic": "orders" } });
+        let reply = call_tool(&call, &g, &forbidden, &log, Some("mcp:t/1#00")).await;
+        // The test profile has no registry: the tool says so, nothing is audited.
+        assert_eq!(reply["isError"], true);
+        let text = reply["content"][0]["text"].as_str().unwrap_or("");
+        assert!(text.contains("Schema Registry URL"), "{text}");
+        assert!(log.entries.take().is_empty());
+    }
+
     #[test]
     fn schema_fields_reads_the_topic_value_or_key_subject() {
         assert_eq!(
