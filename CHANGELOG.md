@@ -20,6 +20,9 @@ and 0.2.0 makes it crate-internal.
 - `trace inject --sampled` and `compact analyze --from-beginning` could not
   be turned off (`--sampled false`, `--from-beginning=false`).
 - `consume --save` says when it appends to a file that already has records.
+- `compact` read keys as lossy text, so binary keys (Avro, varints) that
+  differed only in invalid UTF-8 bytes counted as one; such keys are now
+  compared and shown as `0x` and hex.
 - `reassign verify` called a partition that no move was running for "in
   progress" forever; it now reports it as not moving.
 - Preferred leader elections and reassignments asked the broker to wait as
