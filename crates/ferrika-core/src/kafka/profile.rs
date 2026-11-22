@@ -515,6 +515,11 @@ impl ProfileStore {
     ) -> BTreeSet<String> {
         let mut kept = BTreeSet::new();
         for name in previous {
+            // Its secrets could not be read at load: the empty fields say
+            // nothing about what the user wants, so nothing is removed.
+            if self.unreadable.contains(name) {
+                continue;
+            }
             let Some(profile) = self.profiles.get_mut(name) else {
                 continue;
             };
@@ -938,6 +943,24 @@ impl ClusterProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_mode_never_removes_secrets_it_could_not_read() {
+        let mut store = ProfileStore::default();
+        // The read at load failed, so the field is empty in memory.
+        store
+            .profiles
+            .insert("prod".into(), ClusterProfile::new("prod", "b:9092"));
+        store.unreadable.insert("prod".into());
+        let previous: BTreeSet<String> = ["prod".to_string()].into();
+        let mut forgotten = Vec::new();
+        store.keep_os_secrets_out(
+            &previous,
+            |_, _| Some("still-in-the-keyring".into()),
+            |name, field| forgotten.push(format!("{name}/{field}")),
+        );
+        assert!(forgotten.is_empty(), "{forgotten:?}");
+    }
 
     #[test]
     fn file_mode_does_not_copy_os_stored_secrets_into_the_file() {

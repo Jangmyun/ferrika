@@ -181,13 +181,24 @@ pub fn main_cli() {
         .map_err(|e| e.format(&mut command))
         .unwrap_or_else(|e| e.exit());
     if brokers_from_env {
-        // The profile the command uses: the chosen one, else the active one.
-        let profile = cli
-            .global_opts
-            .profile
-            .clone()
-            .filter(|p| !p.trim().is_empty())
-            .or_else(|| crate::kafka::profile::ProfileStore::load_or_default().active_profile);
+        // The profile the command uses (the chosen one, else the active
+        // one), when the profiles file has it. Read without the OS
+        // credential store: only the name is needed. Without a profiles file
+        // the variable simply names the brokers.
+        let path = crate::kafka::profile::ProfileStore::default_path();
+        let store = path
+            .exists()
+            .then(|| crate::kafka::profile::ProfileStore::load_from_path(&path).ok())
+            .flatten();
+        let profile = store.and_then(|store| {
+            let name = cli
+                .global_opts
+                .profile
+                .clone()
+                .filter(|p| !p.trim().is_empty())
+                .or(store.active_profile)?;
+            store.profiles.contains_key(&name).then_some(name)
+        });
         if let Some(warning) = env_brokers_warning(
             profile.as_deref(),
             cli.global_opts.bootstrap_servers.as_deref(),
