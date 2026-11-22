@@ -82,13 +82,21 @@ impl FailOn {
         };
         severities.filter(|s| *s <= threshold).count()
     }
+
+    /// Whether a check that could not read `warnings` part(s) of the cluster
+    /// ends with [`crate::cli::INCOMPLETE_EXIT_CODE`] (when no finding fails
+    /// first). Only `never` lets it pass.
+    pub(crate) fn fails_incomplete(self, warnings: usize) -> bool {
+        warnings > 0 && self != FailOn::Never
+    }
 }
 
 pub async fn run(args: HealthArgs, global: &GlobalOpts) -> KafkaResult<()> {
     if let Some(seconds) = args.watch {
         return watch(&args, global, Duration::from_secs(seconds)).await;
     }
-    let issues = collect(global).await?;
+    let data = snapshot(global).await?;
+    let issues = health_checks(&data);
     if global.format == OutputFormat::Json {
         output::print_json(&issues)?;
     } else if issues.is_empty() {
@@ -121,6 +129,15 @@ pub async fn run(args: HealthArgs, global: &GlobalOpts) -> KafkaResult<()> {
         return Err(KafkaError::Check(format!(
             "{failing} finding(s) at or above the --fail-on level"
         )));
+    }
+    if args.fail_on.fails_incomplete(data.warnings.len()) {
+        eprintln!(
+            "{} {} part(s) of the cluster could not be checked (exit status {}).",
+            "Incomplete:".yellow().bold(),
+            data.warnings.len(),
+            crate::cli::INCOMPLETE_EXIT_CODE
+        );
+        crate::cli::report_incomplete();
     }
     Ok(())
 }
@@ -365,11 +382,6 @@ async fn post_webhook(
     Ok(())
 }
 
-/// Runs the health checks against the cluster.
-pub(crate) async fn collect(global: &GlobalOpts) -> KafkaResult<Vec<HealthIssue>> {
-    Ok(health_checks(&snapshot(global).await?))
-}
-
 /// Reads what the health checks need from the cluster; see
 /// [`crate::ops::health::snapshot`].
 pub(crate) async fn snapshot(global: &GlobalOpts) -> KafkaResult<ClusterSnapshot> {
@@ -431,6 +443,14 @@ mod tests {
         let mut moving = at(900);
         tracker.apply(&mut moving, 120_000);
         assert!(!stalled(&moving));
+    }
+
+    #[test]
+    fn an_incomplete_check_fails_unless_fail_on_never() {
+        assert!(!FailOn::Critical.fails_incomplete(0));
+        assert!(FailOn::Critical.fails_incomplete(1));
+        assert!(FailOn::Info.fails_incomplete(2));
+        assert!(!FailOn::Never.fails_incomplete(1));
     }
 
     #[test]
