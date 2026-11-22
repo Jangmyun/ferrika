@@ -215,7 +215,7 @@ pub fn verify_with(
         return Err(PolicyError::Rules(
             "format 2 fields (expires_at, on_expiry, audit_forward, audit_anchor, \
              anchor_required, read_only_brokers, export, export_clusters, watermark, \
-             watermark_text, screen_capture, mcp_write, environments, default_environment,
+             watermark_text, screen_capture, mcp_write, environments, default_environment, \
              copy_down) need format 2"
                 .to_string(),
         ));
