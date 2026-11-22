@@ -16,6 +16,11 @@ use crate::ops::report::{
     ReportContext, TrendSource, AUDIT_SCAN,
 };
 
+/// The product named in the report (the library version is shown apart).
+const PRODUCT: &str = "Ferrika CLI";
+/// This CLI's version, not the ferrika-ops one.
+const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Args, Debug, Clone)]
 pub struct ReportArgs {
     /// Time window ending now, e.g. 30m, 2h, 1d. Limits the audit timeline;
@@ -122,6 +127,8 @@ async fn collect(args: &ReportArgs, global: &GlobalOpts) -> Report {
     data.cluster_name = profile.clone();
 
     let ctx = ReportContext {
+        product: PRODUCT.to_string(),
+        product_version: PRODUCT_VERSION.to_string(),
         policy: PolicySummary::of(policy, &profile, &config.bootstrap_servers),
         profile,
         bootstrap: config.bootstrap_servers.clone(),
@@ -143,6 +150,12 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         args: ReportArgs,
+    }
+
+    #[test]
+    fn the_report_names_the_cli_and_its_version() {
+        assert_eq!(PRODUCT, "Ferrika CLI");
+        assert_eq!(PRODUCT_VERSION, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

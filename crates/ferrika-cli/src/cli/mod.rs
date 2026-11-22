@@ -613,6 +613,17 @@ pub fn report_differences(exit_code: bool, differences: bool) {
     }
 }
 
+/// The exit status of `health` when no finding failed but part of the
+/// cluster (the consumer group list, committed offsets, end offsets) could
+/// not be read, so the check is incomplete.
+pub const INCOMPLETE_EXIT_CODE: i32 = 3;
+
+/// Ends a command that returns without an error with
+/// [`INCOMPLETE_EXIT_CODE`] (see [`finish_exit_code`]).
+pub fn report_incomplete() {
+    FINISH_EXIT_CODE.store(INCOMPLETE_EXIT_CODE, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The exit status of a command that returned without an error.
 pub fn finish_exit_code() -> i32 {
     FINISH_EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed)

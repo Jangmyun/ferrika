@@ -241,9 +241,23 @@ pub fn health_checks(data: &ClusterSnapshot) -> Vec<HealthIssue> {
         );
     }
 
+    // What could not be read: an empty group list may hide idle or lagging
+    // groups, so say so instead of reporting a clean bill of health.
+    for warning in &data.warnings {
+        push(
+            Severity::Warning,
+            format!("{INCOMPLETE_PREFIX}{warning}"),
+            None,
+        );
+    }
+
     issues.sort_by_key(|i| i.severity);
     issues
 }
+
+/// Starts the message of a finding made from a [`ClusterSnapshot::warnings`]
+/// entry: part of the cluster could not be checked.
+pub const INCOMPLETE_PREFIX: &str = "Incomplete check: ";
 
 /// Reads what the health checks need from the cluster: brokers, topics, the
 /// metadata quorum and each group's lag. Groups carry their summed committed
@@ -263,10 +277,18 @@ pub async fn snapshot(
     data.topics = admin.list_topic_summaries(timeout)?;
     data.quorum = ferrika_core::kafka::wire::describe_quorum(config).unwrap_or_default();
     // Only offsets are used here: skip the record reads for time lag.
-    let (lags, _) = crate::exporter::scrape(admin, config, false).await;
-    data.consumers = admin
-        .list_consumer_group_listings(timeout)
-        .unwrap_or_default()
+    let (lags, failed) = crate::exporter::scrape(admin, config, false).await;
+    let listings = match admin.list_consumer_group_listings(timeout) {
+        Ok(listings) => listings,
+        Err(e) => {
+            data.warnings
+                .push(format!("Consumer groups could not be listed: {e}"));
+            Vec::new()
+        }
+    };
+    let listed = data.warnings.is_empty();
+    data.warnings.extend(lag_warnings(&failed, listed));
+    data.consumers = listings
         .into_iter()
         .map(|g| {
             let mine: Vec<_> = lags
@@ -293,6 +315,34 @@ pub async fn snapshot(
         })
         .collect();
     Ok(data)
+}
+
+/// What the lag lookup (`failed`, the steps of
+/// [`crate::exporter::scrape_cluster_metrics_checked`] that failed) leaves
+/// unknown. `listed` is whether the snapshot's own group listing worked; if
+/// not, that warning already covers a failed group list here.
+pub fn lag_warnings(failed: &[&str], listed: bool) -> Vec<String> {
+    failed
+        .iter()
+        .filter_map(|step| match *step {
+            "groups" if listed => {
+                Some("Consumer group lag is unknown: the groups could not be listed".to_string())
+            }
+            "topics" => {
+                Some("Consumer group lag is incomplete: the topics could not be listed".to_string())
+            }
+            "watermarks" => Some(
+                "Consumer group lag is incomplete: partition end offsets could not be read"
+                    .to_string(),
+            ),
+            "offsets" => Some(
+                "Consumer group lag is incomplete: the committed offsets of some groups could not be read"
+                    .to_string(),
+            ),
+            // Brokers are read (and fail the snapshot) on their own.
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -405,5 +455,36 @@ mod tests {
     fn empty_cluster_has_no_findings() {
         let data = ClusterSnapshot::empty("c", "h:9092");
         assert!(health_checks(&data).is_empty());
+    }
+
+    #[test]
+    fn snapshot_warnings_become_incomplete_check_findings() {
+        let mut data = ClusterSnapshot::empty("c", "h:9092");
+        data.warnings
+            .push("Consumer groups could not be listed: timed out".into());
+        let issues = health_checks(&data);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, Severity::Warning);
+        assert_eq!(
+            issues[0].message,
+            "Incomplete check: Consumer groups could not be listed: timed out"
+        );
+        assert_eq!(issues[0].target, None);
+    }
+
+    #[test]
+    fn failed_lag_steps_become_warnings() {
+        assert!(lag_warnings(&[], true).is_empty());
+        // Brokers fail the snapshot itself; nothing to add.
+        assert!(lag_warnings(&["brokers"], true).is_empty());
+        let w = lag_warnings(&["groups", "watermarks", "offsets"], true);
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(w[0].contains("groups could not be listed"), "{w:?}");
+        assert!(w[1].contains("end offsets"), "{w:?}");
+        assert!(w[2].contains("committed offsets"), "{w:?}");
+        // The snapshot's own failed listing already says the groups are unknown.
+        let w = lag_warnings(&["groups", "topics"], false);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("topics could not be listed"), "{w:?}");
     }
 }

@@ -111,6 +111,14 @@ Mattermost incoming webhooks) plus the findings as `new` and `cleared`.
 in a finding (lag, records behind) do not count as a new finding, and an
 unreachable cluster is reported as a critical finding.
 
+When part of the cluster cannot be read (the consumer group list, committed
+offsets or partition end offsets), the check is incomplete: each such part
+is a warning finding starting with `Incomplete check:` (in `--json` too), so
+"no groups" is never reported for a group list that failed. Exit status:
+1 when a finding is at or above `--fail-on` (or on an error), 3 when none
+is but the check was incomplete, 0 otherwise. `--fail-on never` exits 0 in
+both cases.
+
 ### Config check (`ferrika lint`)
 
 Where `health` looks at the cluster's state, `lint` looks at its settings:
@@ -473,6 +481,11 @@ ferrika topics describe orders-v1
 
 # Create a new topic
 ferrika topics create user-events --partitions 6 --replication 1 -c retention.ms=604800000
+
+# Without -p/-r the broker's num.partitions and default.replication.factor
+# apply (as with kafka-topics.sh; Kafka 2.4+, older brokers get 1); the
+# resulting counts are printed
+ferrika topics create user-events
 
 # Show a topic's config overrides, then change only the listed keys
 # (other overrides are kept; uses IncrementalAlterConfigs, PLAINTEXT/SASL_PLAIN)

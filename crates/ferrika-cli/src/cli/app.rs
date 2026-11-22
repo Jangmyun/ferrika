@@ -214,7 +214,8 @@ pub fn main_cli() {
         }
     }
     run(cli);
-    // `diff ... --exit-code` that found differences ends with status 1.
+    // `diff ... --exit-code` that found differences ends with status 1, an
+    // incomplete `health` check with 3.
     let code = cli::finish_exit_code();
     if code != 0 {
         std::process::exit(code);

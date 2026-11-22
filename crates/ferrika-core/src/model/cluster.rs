@@ -227,6 +227,11 @@ pub struct ClusterSnapshot {
     pub quorum: Option<QuorumInfo>,
     /// Partition moves in progress.
     pub reassignments: Vec<OngoingReassignment>,
+    /// Parts of the cluster that could not be read (such as the consumer
+    /// group list or committed offsets), so the snapshot is incomplete: an
+    /// empty group list then means "unknown", not "no groups". Empty when
+    /// everything was read.
+    pub warnings: Vec<String>,
 }
 
 impl ClusterSnapshot {
@@ -575,6 +580,7 @@ impl ClusterSnapshot {
                 observers: Vec::new(),
             }),
             reassignments: Vec::new(),
+            warnings: Vec::new(),
         };
         data.fill_mock_group_partitions();
         // Keep the summary numbers consistent with the demo topics shown in tables.
@@ -607,6 +613,7 @@ impl ClusterSnapshot {
             sample_messages: Vec::new(),
             quorum: None,
             reassignments: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 

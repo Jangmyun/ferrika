@@ -13,6 +13,36 @@ use crate::kafka::config::KafkaClientConfig;
 use crate::kafka::detached::DetachedDrop;
 use crate::model::cluster::{BrokerInfo, PartitionDetail, TopicSummary};
 
+/// The partition count or replication factor that asks the broker for its
+/// default (`num.partitions`, `default.replication.factor`; KIP-464).
+pub const BROKER_DEFAULT: i32 = -1;
+
+/// What [`KafkaAdminClient::create_topic_with_broker_defaults`] asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TopicCreation {
+    /// The partition count sent; [`BROKER_DEFAULT`] when the broker chose.
+    pub partitions: i32,
+    /// The replication factor sent; [`BROKER_DEFAULT`] when the broker chose.
+    pub replication_factor: i32,
+    /// The broker could not apply its defaults (older than Kafka 2.4), so 1
+    /// was sent for what was omitted.
+    pub fell_back: bool,
+}
+
+/// Whether a partition count / replication factor pair leaves either to the broker.
+fn uses_broker_default((partitions, replication): (i32, i32)) -> bool {
+    partitions == BROKER_DEFAULT || replication == BROKER_DEFAULT
+}
+
+/// Whether `err` is librdkafka refusing broker defaults for a new topic
+/// because the broker does not offer CreateTopics v4 (KIP-464).
+fn broker_defaults_unsupported(err: &KafkaError) -> bool {
+    let text = err.to_string();
+    text.contains("KIP-464")
+        || text.contains("UnsupportedFeature")
+        || text.contains("UnsupportedVersion")
+}
+
 /// A consumer group as the broker's group listing reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupListing {
@@ -663,6 +693,47 @@ impl KafkaAdminClient {
         Ok(())
     }
 
+    /// Creates `name`, leaving an omitted partition count or replication
+    /// factor to the broker (`num.partitions`, `default.replication.factor`,
+    /// KIP-464: sent as -1, which needs CreateTopics v4, Kafka 2.4+), like
+    /// `kafka-topics.sh`. A broker too old for that gets 1 for what was
+    /// omitted instead, and [`TopicCreation::fell_back`] says so. Explicit
+    /// values are sent as given.
+    pub async fn create_topic_with_broker_defaults(
+        &self,
+        name: &str,
+        partitions: Option<i32>,
+        replication_factor: Option<i32>,
+        configs: Option<&HashMap<String, String>>,
+        timeout: Option<Duration>,
+    ) -> KafkaResult<TopicCreation> {
+        let requested = (
+            partitions.unwrap_or(BROKER_DEFAULT),
+            replication_factor.unwrap_or(BROKER_DEFAULT),
+        );
+        match self
+            .create_topic(name, requested.0, requested.1, configs, timeout)
+            .await
+        {
+            Ok(()) => Ok(TopicCreation {
+                partitions: requested.0,
+                replication_factor: requested.1,
+                fell_back: false,
+            }),
+            Err(e) if uses_broker_default(requested) && broker_defaults_unsupported(&e) => {
+                let (p, r) = (partitions.unwrap_or(1), replication_factor.unwrap_or(1));
+                tracing::debug!(%e, "Broker defaults for new topics unsupported; using 1");
+                self.create_topic(name, p, r, configs, timeout).await?;
+                Ok(TopicCreation {
+                    partitions: p,
+                    replication_factor: r,
+                    fell_back: true,
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Creates `target` with the partition count, replication factor and
     /// config overrides of `source` (each overridable). Records are not copied.
     /// Returns the partition count, replication factor and number of overrides used.
@@ -931,6 +1002,24 @@ mod tests {
         let admin = super::KafkaAdminClient::new(&config).unwrap();
         let timeout = std::time::Duration::from_millis(300);
         assert_eq!(admin.cluster_id(Some(timeout)), None);
+    }
+
+    #[test]
+    fn broker_defaults_fall_back_only_for_an_old_broker() {
+        use super::{broker_defaults_unsupported, uses_broker_default, BROKER_DEFAULT};
+        use crate::error::KafkaError;
+        assert!(uses_broker_default((BROKER_DEFAULT, 3)));
+        assert!(uses_broker_default((6, BROKER_DEFAULT)));
+        assert!(!uses_broker_default((6, 3)));
+        let old = KafkaError::Admin(
+            "create_topics request failed: Admin operation error: UnsupportedFeature \
+             (Local: Required feature not supported by broker)"
+                .into(),
+        );
+        assert!(broker_defaults_unsupported(&old));
+        let exists =
+            KafkaError::Admin("Failed to create topic 't': Broker: Topic already exists".into());
+        assert!(!broker_defaults_unsupported(&exists));
     }
 
     #[test]
