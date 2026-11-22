@@ -382,7 +382,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
         .italic()
     );
 
-    if filter.is_active() {
+    if filter.is_active() || text_filter.is_some() {
         eprintln!(
             "{}",
             "Active filter applied. Only matching messages will be shown."
@@ -602,7 +602,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
         args.topic.yellow().bold()
     );
 
-    if filter.is_active() {
+    if filter.is_active() || text_filter.is_some() {
         eprintln!("{}", stats.summary_string().bright_black().italic());
     }
 
