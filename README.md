@@ -4,9 +4,10 @@
 
 Ferrika (Ferris + Kafka) is a native CLI for working with Apache Kafka
 clusters: topics, producing and consuming, consumer group lag, ACLs,
-Schema Registry, Kafka Connect, health and config checks, backup and restore.
-It starts in milliseconds, links `librdkafka` statically and needs no Java
-runtime.
+Schema Registry, Kafka Connect, health and config checks, backup and restore,
+copying records with filters and PII masking (`transform`), and a terminal
+dashboard (`top`). It starts in milliseconds, links `librdkafka` statically
+and needs no Java runtime.
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
@@ -37,7 +38,7 @@ irm https://github.com/Jangmyun/ferrika/releases/latest/download/install.ps1 | i
 ```
 
 The scripts check the archive's sha256 before installing. Set
-`FERRIKA_VERSION` (for example `v0.1.1`, the first release with binaries) to
+`FERRIKA_VERSION` (for example `v0.2.0`; binaries exist from `v0.1.1` on) to
 pin a release,
 `FERRIKA_INSTALL_DIR` to install elsewhere, and on Windows
 `FERRIKA_NO_MODIFY_PATH=1` to leave `PATH` alone.
@@ -110,6 +111,7 @@ still starting can answer.
 | Schemas and integrations | `schema`, `connect`, `acl`, `quota`, `user` |
 | Change safety | `audit`, `history`, `undo`, `policy` |
 | AI assistants | `mcp` |
+| RabbitMQ (preview) | `rabbit` (queues, exchanges, bindings, peek, publish, DLQ inspect and redrive; separate RabbitMQ profiles) |
 
 Examples for each are in the [command reference](docs/CLI.md).
 
@@ -142,6 +144,7 @@ Without a terminal, or with `--plain`, `-n <count>` or `--json`, `top` prints
 a refreshing text view or one JSON snapshot instead. The dashboard is the
 default-on `tui` cargo feature of `ferrika-cli` (ratatui and crossterm);
 build with `--no-default-features` to leave it out.
+
 ## Stream transform
 
 `ferrika transform` copies records to another topic or cluster through a
@@ -172,7 +175,11 @@ processor: no joins, windows or exactly-once delivery. See
   (Ed25519) with `ferrika policy keygen | sign | verify | show`. Installed
   machine-wide, it makes read-only targets, forbidden actions, PII masking
   and record-export limits mandatory, and can forward audit entries to a
-  SIEM or anchor them in the OS log. Read the
+  SIEM or anchor them in the OS log. Environments (dev, staging, prod
+  tiers matched by broker or profile name) can add their own read-only and
+  forbid rules and refuse or require masking for copies from a higher tier
+  to a lower one (`copy_down`); `mcp_write` limits what AI assistants may
+  change. Read the
   [threat model in docs/POLICY.md](docs/POLICY.md#threat-model-and-what-open-source-changes)
   first: because the source is open, enforcement relies on allowing only
   signed official binaries.
@@ -184,8 +191,8 @@ processor: no joins, windows or exactly-once delivery. See
   queue, exchange and binding listings. `--allow-write` adds a small set of
   write tools (produce, create topic, change config, reset offsets, run a
   transform within the cluster) that are planned, confirmed and audited, and
-  still pass the same policy and read-only checks. Their changes land in the operation history, so
-  `ferrika undo` reverts what an assistant changed.
+  still pass the same policy and read-only checks. Their changes land in the
+  operation history, so `ferrika undo` reverts what an assistant changed.
 
 ```bash
 claude mcp add ferrika-prod -- ferrika -p prod mcp

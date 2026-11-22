@@ -1,10 +1,10 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.5",
-  "serialNumber": "urn:uuid:42112259-11b5-4d8e-9464-911cc3729b61",
+  "serialNumber": "urn:uuid:afe8e805-b343-4e00-bd31-6fde126999bd",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-11-22T15:42:57Z",
+    "timestamp": "2026-11-22T16:03:37Z",
     "tools": [
       {
         "name": "tools/sbom.py (cargo metadata)"
@@ -12,10 +12,10 @@
     ],
     "component": {
       "type": "application",
-      "bom-ref": "pkg:cargo/ferrika-cli@0.1.1",
+      "bom-ref": "pkg:cargo/ferrika-cli@0.2.0",
       "name": "ferrika-cli",
-      "version": "0.1.1",
-      "purl": "pkg:cargo/ferrika-cli@0.1.1",
+      "version": "0.2.0",
+      "purl": "pkg:cargo/ferrika-cli@0.2.0",
       "licenses": [
         {
           "expression": "Apache-2.0"

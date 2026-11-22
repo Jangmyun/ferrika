@@ -20,7 +20,7 @@ body:
     attributes:
       label: Ferrika version
       description: Output of `ferrika --version`, or the crate version
-      placeholder: ferrika 0.1.1
+      placeholder: ferrika 0.2.0
     validations:
       required: true
   - type: dropdown

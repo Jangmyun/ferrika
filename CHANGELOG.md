@@ -4,68 +4,95 @@ All notable changes to the Ferrika crates and the `ferrika` CLI. The crates
 share one version. Before 1.0, a minor version (0.x) may break the library
 API; a patch version (0.x.y) does not. Exception: `ferrika-cli`'s Rust `cli`
 module is the command line's own code (argument structs, the command enum),
-not a library API; options added to commands change it in patch versions,
-and 0.2.0 makes it crate-internal.
+not a library API; options added to commands changed it in 0.1 patch
+versions, and 0.2.0 made it crate-internal.
 
-## Unreleased
+## 0.2.0
 
-The RabbitMQ entries below are planned for 0.2.0.
+New: connection presets for Kafka-compatible services, `ferrika transform`,
+an interactive `ferrika top` dashboard, RabbitMQ support (preview), policy
+environments and the `screen_capture` and `mcp_write` rules, and MCP
+transform and RabbitMQ tools. This release breaks a few CLI defaults, the
+library API and older builds' reading of new policies; read "Upgrading from
+0.1" first.
+
+### Upgrading from 0.1
+
+Toolchain:
+
+- Building from source needs Rust 1.89 or newer (`lapin` and its AMQP
+  crates); the crates declare `rust-version = "1.89"`. Prebuilt binaries are
+  not affected.
+
+Command line (scripts may need a change):
+
+- `acl delete` without a filter (every binding) needs `--all`; `-f` alone is
+  refused.
+- `quota set/remove --user default` and `--client-id default` now name an
+  entity called `default`. For the default quota use `--user-default`,
+  `--client-id-default` or `--ip-default`.
+- `ferrika top` at a terminal opens the interactive dashboard. Scripts that
+  read its output should pass `--plain` (or `-n`/`--json`; a stdout that is
+  not a terminal still gets the printed view). `--interval-secs` is now
+  `--interval` (the old name still works) and defaults to 5 s instead of 2.
+- A profile's `request_timeout_ms` now applies unless `--timeout` is given;
+  before, the 30 s default of `--timeout` always replaced it. Pass
+  `--timeout 30` to keep the old value for such a profile.
+- `--header-filter KEY=VALUE` matches the exact value (`KEY:VALUE` still
+  means "contains"), and repeated filters must all match.
+- `monitor lag GROUP --topic NAME` fails when the topic does not exist
+  instead of reporting 0 lag.
+- `dlq export` records carry the whole value (`payload` or
+  `payload_base64`) besides `payload_preview`.
+
+Library API (Rust users of the crates):
+
+- New public paths for logic that was private to the CLI (presets,
+  transform options, the copy policy check, RabbitMQ connection and view):
+  see "Library API for front ends" under Added (#96).
+- `ferrika-cli` (#23): the command modules, their argument structs (with
+  `ProfileAddArgs::security_protocol`, which became `Option<String>` for
+  `--preset`), `Commands` and the fields of `Cli` are crate-internal. Run
+  the command line in-process with `cli::app::{Cli, run}` (`Cli::parse_from`)
+  or use the library crates; `rabbit` and `transform` keep the few items GUI
+  front ends need.
+- `ferrika-core` (#25): the SASL OAUTHBEARER and AWS MSK IAM internals
+  (SigV4 presigning, credential-file and `credential_process` parsing,
+  region guessing, JWT and form encoding, `OidcSource`, `MskIamSource`),
+  `parse_properties` and the expression-completion helpers are
+  crate-internal. Set `sasl_mechanism` (`OAUTHBEARER`, `AWS_MSK_IAM`) on a
+  `ClusterProfile` and let the clients build the token source; read a
+  `.properties` file with `ClusterProfile::from_properties`.
+- `ferrika-governance` and `ferrika-ops` (#24): about 50 items only their
+  own crate used are crate-internal, among them the policy directory
+  override helpers (use `policy::policy_dir`, `load_from`),
+  `resolve_brokers` and `broker_glob_match` (use `glob_match`,
+  `normalize_broker`, `brokers_for_with`), syslog framing, the topology and
+  time-histogram building blocks (use `topology::from_rdkafka_metadata`,
+  `time_histogram::run`/`compute`), lint fix undo files, history constants,
+  `dlq::build_redrive_plan` (use `build_redrive_plan_from`),
+  `mirror::Verbatim`, `transform::MAX_STEPS` and `Pipeline::uses_fields`.
+- `PolicyAction` has new variants `MessagesPeek` and `MessagesMove`; a
+  `match` on it needs arms for them.
+- `PolicyRules` has new fields (`screen_capture`, `mcp_write`,
+  `environments`, `default_environment`, `copy_down`); struct literals need
+  them or `..Default::default()`.
+- `MessageFilter::header_filters` is a `Vec<HeaderFilter>` instead of a
+  map, and `with_header` adds a filter instead of replacing one for the
+  same key.
+
+Company policy:
+
+- The new rules `screen_capture`, `mcp_write`, `environments`,
+  `default_environment` and `copy_down` make a policy format 2, and the
+  categories `messages.peek` and `messages.move` are new. Builds before
+  0.2.0 treat a policy that uses any of them as invalid (unknown rule or
+  category) and fall back to the strictest mode. Update every client (CLI,
+  MCP servers and other front ends) to 0.2.0 first, then roll out such a
+  policy. Policies without them keep working on both versions.
 
 ### Added
 
-- MCP: `transform_preview` (read tool) runs `ferrika transform` steps
-  (`[{"filter": ...}, {"drop": ...}, {"mask": "partial"}, ...]`) on a topic
-  from the beginning or `from_timestamp` up to its current end and returns
-  up to 50 transformed records with counts (read, kept, filtered, sampled
-  out, not JSON); it writes nothing and joins no consumer group. It passes
-  the export gate like `peek_messages` (hidden and refused under `export:
-  forbidden`, recorded under `audited`), masks returned text unless
-  `mask_pii` is false, returns header names but not header values, and under
-  enforced masking puts a mask step first so filters see only masked data.
-- MCP: `transform_execute` (write tool, `--allow-write`) copies the
-  transformed records into another existing topic on the same cluster,
-  through the plan/confirm/execute flow of the other write tools. It needs
-  `max_records` (at most 10,000; counted against `--max-produce-records`,
-  the unwritten part given back), absolute start times only, a destination
-  inside `--topics`, and passes the write gate as `produce` plus
-  `ferrika_ops::mirror::authorize_copy` (enforced masking refuses it unless
-  the first step is `mask`). Arguments naming another cluster are refused
-  (`cross_cluster_unsupported`); use the CLI for that. The audit result
-  records the counts and the steps' SHA-256, never the steps or record data.
-- MCP (preview): `rabbit_queues`, `rabbit_exchanges` and `rabbit_bindings`
-  list a virtual host of a RabbitMQ profile (`profile` argument, else the
-  active RabbitMQ profile; `vhost`, `filter`; at most 500 entries). They
-  read no message bodies and take no URL, so a stored password only goes
-  to its profile's broker. `ferrika-mcp` now depends on `ferrika-rabbitmq`
-  without its default `amqp` feature (the workspace dependency turns default
-  features off; `ferrika-cli` enables `amqp`). RabbitMQ peek and DLQ
-  inspect/redrive are not offered over MCP yet (a peek requeues messages).
-- Library API for front ends (GUI front ends and other library users), so
-  they reuse the CLI's own checks instead of copies that could drift. The
-  CLI now calls these itself; its behaviour is unchanged.
-  - `ferrika_core::kafka::preset`: the connection presets with
-    `display_name`, `credential_fields` (what the service calls each
-    credential), `credentials_hint` and `notes` that name no CLI flags,
-    `resolve` and a structured `missing_settings`.
-  - `ferrika_core::kafka::profile::{url_credentials, split_url_credentials,
-    url_has_credentials, percent_decode}`: the inverse of
-    `url_with_basic_auth`.
-  - `ferrika_core::model::policy::PolicyAction::also_requires` and
-    `ferrika_governance::policy::extra_category_refusal`: a RabbitMQ redrive
-    needs `produce` allowed as well as `messages.move`, in every front end.
-  - `ferrika_ops::transform::{check_options, RunOptions, DecodingTransform,
-    TransformSummary}`: option checks on plain data, the per-record
-    decode-then-steps hook and the serializable run summary with its audit
-    detail.
-  - `ferrika_ops::mirror::authorize_copy` (`CopyCheck`, `CopyCluster`,
-    `CopyAuthorized`): the policy checks for copying records between
-    clusters (enforced masking unless the copy masks first, the export gate
-    for another cluster, the destination's write gate and read-only
-    profile) on plain inputs.
-  - `ferrika_rabbitmq::connection` (`ResolvedRabbit::resolve`,
-    `credentials`, `client`, `amqp_target`) and `ferrika_rabbitmq::view`
-    (`ShownMessage` with PII masking, `mask_properties`, `Inspection`,
-    `RedrivePreview`, `redrive_outcome`, `parse_headers`).
 - `ferrika profile add --preset NAME` fills in the security protocol and
   SASL mechanism for Kafka-compatible services: `confluent-cloud`
   (SASL_SSL + PLAIN), `msk-iam` (SASL_SSL + AWS-MSK-IAM), `msk-scram`
@@ -106,12 +133,10 @@ The RabbitMQ entries below are planned for 0.2.0.
   policy checks as `mirror`; under enforced PII masking a run is allowed when
   `--mask` is its first step. The audit result entry records the counts and
   a SHA-256 of the steps, never the steps or record data.
-- `ferrika-ops`: `transform` (the step pipeline), and
-  `mirror::run_copy_pipeline` with a `RecordTransform` hook, a preview
-  destination and `MirrorConfig::from_timestamp` / `until_end`.
-- `ferrika-core`: `Expr::matches_parsed` (evaluate an expression on an
-  already parsed JSON value) and `DriverError::partition_eof`.
-
+- `ferrika mirror --mask[=redact]`: masks PII in keys, values and header
+  values (the transform mask step) before writing, so a mirror passes
+  enforced masking and `copy_down: masked`. It cannot be combined with
+  `--grep`, `-k` or `--header-filter`, which read raw values.
 - Preview: RabbitMQ support in the new crate `ferrika-rabbitmq` and the
   command `ferrika rabbit`, through the management HTTP API: `queues`,
   `exchanges` and `bindings` of a vhost, `peek <queue> -n N` (reads and
@@ -136,16 +161,15 @@ The RabbitMQ entries below are planned for 0.2.0.
   republished copy, stopping at the first failure. Redriven messages keep
   their headers (`x-death` included). Credentials in `--rabbit-url` are
   used for AMQP too, with a warning that they can end up in shell
-  history. New dependency `lapin`
-  (MIT) in `ferrika-rabbitmq`, behind its default feature `amqp`.
+  history. New dependency `lapin` (MIT) in `ferrika-rabbitmq`, behind its
+  default feature `amqp`.
 - Policy categories `messages.peek` (`rabbit peek`, `rabbit dlq inspect`,
   the `rabbit dlq redrive` preview) and `messages.move` (`rabbit dlq redrive
   --execute`). `rabbit publish` is `produce`, so `forbid: ["produce"]`
   covers both brokers, and a RabbitMQ redrive needs `produce` allowed as
   well as `messages.move`. For `rabbit` commands the policy's
   broker-address rules match both the management and the AMQP
-  `host:port`. `PolicyAction` gains `MessagesPeek` and `MessagesMove` (a
-  breaking change for code that matches on it).
+  `host:port`. `PolicyAction` gains `MessagesPeek` and `MessagesMove`.
 - Policy environments (format 2): `rules.environments` names environment
   tiers (`"prod": {"tier": 3, "brokers": ["*.prod.corp"], "profiles":
   ["prod-*"]}`), each matched by broker-address and/or profile-name globs,
@@ -156,31 +180,93 @@ The RabbitMQ entries below are planned for 0.2.0.
   cluster in no environment): `masked` needs `transform --mask` as the
   first step or `mirror --mask`, `forbid` refuses them. Checked in the
   shared `authorize_copy` and `EffectivePolicy::check`, so `mirror`,
-  `transform --execute`, MCP write tools and the desktop app apply the same
-  rules. `policy show` lists the environments, `profile list` gains an
+  `transform --execute`, MCP write tools and other front ends apply the
+  same rules. `policy show` lists the environments, `profile list` gains an
   `ENV` column (and an `environment` JSON field), and an allowed change's
   audit request entry reads `requested (environment prod)`. See
   docs/POLICY.md "Environments".
-- `ferrika mirror --mask[=redact]`: masks PII in keys, values and header
-  values (the transform mask step) before writing, so a mirror passes
-  enforced masking and `copy_down: masked`. It cannot be combined with
-  `--grep`, `-k` or `--header-filter`, which read raw values.
+- Policy rule `screen_capture: allowed | blocked` (format 2, opt-in, default
+  `allowed`): `blocked` asks a desktop front end to keep its window out of
+  screenshots, screen recordings and screen shares. No effect in the CLI;
+  `policy show` lists it. Library: `ScreenCaptureRule` and
+  `EffectivePolicy::screen_capture_blocked_at`.
+- Policy rule `mcp_write: allowed | confirm_human | forbidden` (format 2,
+  default `allowed`) for AI assistants using `ferrika mcp --allow-write`:
+  `forbidden` leaves the write tools out of `tools/list` and refuses and
+  audits a call; `confirm_human` has the server confirm every write through
+  MCP elicitation whatever `--confirm` says (a client without elicitation
+  gets no write tools). The CLI is unaffected; `policy show` lists it.
+  Library: `McpWriteRule` and `EffectivePolicy::mcp_write_at`.
+- MCP: `transform_preview` (read tool) runs `ferrika transform` steps
+  (`[{"filter": ...}, {"drop": ...}, {"mask": "partial"}, ...]`) on a topic
+  from the beginning or `from_timestamp` up to its current end and returns
+  up to 50 transformed records with counts (read, kept, filtered, sampled
+  out, not JSON); it writes nothing and joins no consumer group. It passes
+  the export gate like `peek_messages` (hidden and refused under `export:
+  forbidden`, recorded under `audited`), masks returned text unless
+  `mask_pii` is false, returns header names but not header values, and under
+  enforced masking puts a mask step first so filters see only masked data.
+- MCP: `transform_execute` (write tool, `--allow-write`) copies the
+  transformed records into another existing topic on the same cluster,
+  through the plan/confirm/execute flow of the other write tools. It needs
+  `max_records` (at most 10,000; counted against `--max-produce-records`,
+  the unwritten part given back), absolute start times only, a destination
+  inside `--topics`, and passes the write gate as `produce` plus
+  `ferrika_ops::mirror::authorize_copy` (enforced masking refuses it unless
+  the first step is `mask`). Arguments naming another cluster are refused
+  (`cross_cluster_unsupported`); use the CLI for that. The audit result
+  records the counts and the steps' SHA-256, never the steps or record data.
+- MCP (preview): `rabbit_queues`, `rabbit_exchanges` and `rabbit_bindings`
+  list a virtual host of a RabbitMQ profile (`profile` argument, else the
+  active RabbitMQ profile; `vhost`, `filter`; at most 500 entries). They
+  read no message bodies and take no URL, so a stored password only goes
+  to its profile's broker. `ferrika-mcp` now depends on `ferrika-rabbitmq`
+  without its default `amqp` feature (the workspace dependency turns default
+  features off; `ferrika-cli` enables `amqp`). RabbitMQ peek and DLQ
+  inspect/redrive are not offered over MCP yet (a peek requeues messages).
+- Library API for front ends (GUI front ends and other library users), so
+  they reuse the CLI's own checks instead of copies that could drift. The
+  CLI now calls these itself; its behaviour is unchanged (#96).
+  - `ferrika_core::kafka::preset`: the connection presets with
+    `display_name`, `credential_fields` (what the service calls each
+    credential), `credentials_hint` and `notes` that name no CLI flags,
+    `resolve` and a structured `missing_settings`.
+  - `ferrika_core::kafka::profile::{url_credentials, split_url_credentials,
+    url_has_credentials, percent_decode}`: the inverse of
+    `url_with_basic_auth`.
+  - `ferrika_core::model::policy::PolicyAction::also_requires` and
+    `ferrika_governance::policy::extra_category_refusal`: a RabbitMQ redrive
+    needs `produce` allowed as well as `messages.move`, in every front end.
+  - `ferrika_ops::transform::{check_options, RunOptions, OptionsProblem,
+    DecodingTransform, TransformSummary}`: option checks on plain data, the
+    per-record decode-then-steps hook and the serializable run summary with
+    its audit detail.
+  - `ferrika_ops::mirror::authorize_copy` (`CopyCheck`, `CopyCluster`,
+    `CopyAuthorized`): the policy checks for copying records between
+    clusters (enforced masking unless the copy masks first, the export gate
+    for another cluster, the destination's write gate and read-only
+    profile) on plain inputs.
+  - `ferrika_rabbitmq::connection` (`ResolvedRabbit::resolve`,
+    `credentials`, `client`, `amqp_target`) and `ferrika_rabbitmq::view`
+    (`ShownMessage` with PII masking, `mask_properties`, `Inspection`,
+    `RedrivePreview`, `redrive_outcome`, `parse_headers`).
 - Library: `ferrika_core::model::policy::{Environment, CopyDownRule}` and
   the `PolicyRules` fields `environments`, `default_environment` and
   `copy_down`; `ferrika_governance::policy::{EnvironmentMatch, CopyDown}`
   with `EffectivePolicy::{environment, copy_down,
-  copy_down_needs_broker_metadata}`. Code that builds `PolicyRules`
-  without `..Default::default()` must add the new fields.
+  copy_down_needs_broker_metadata}`.
+- `ferrika-ops`: `transform` (the step pipeline), and
+  `mirror::run_copy_pipeline` with a `RecordTransform` hook, a preview
+  destination and `MirrorConfig::from_timestamp` / `until_end`.
+- `ferrika-core`: `Expr::matches_parsed` (evaluate an expression on an
+  already parsed JSON value) and `DriverError::partition_eof`.
 
 ### Changed
 
+- Building needs Rust 1.89 or newer (`lapin` and its AMQP crates); the
+  crates declare `rust-version = "1.89"` and CI checks it.
 - `ferrika top`: the refresh interval option is now `--interval` (the old
   `--interval-secs` still works) and defaults to 5 seconds instead of 2.
-- `rabbit peek` is a write: it changes the messages it reads (redelivered
-  flag, quorum-queue delivery count), so read-only rules and profiles refuse
-  it and it is audited like other writes, besides being a record export.
-- Building now needs Rust 1.89 or newer (`lapin` and its AMQP crates);
-  the crates declare `rust-version = "1.89"` and CI checks it.
 - **Breaking:** `acl delete` without a filter (which removes every binding)
   now needs `--all`; `-f/--force` alone is refused. `--all` cannot be
   combined with a filter, still only previews without `-f`, and its preview
@@ -192,9 +278,6 @@ The RabbitMQ entries below are planned for 0.2.0.
   `--ip default` keeps its meaning). Passing `--user default` or
   `--client-id default` prints a note about the change. Listings show the
   default entity as `<default>`.
-- **Breaking (library):** `ferrika_core::kafka::filter::MessageFilter::header_filters`
-  is a `Vec<HeaderFilter>` instead of a map, and `with_header` adds a filter
-  instead of replacing an earlier one for the same key.
 - `consume`/`mirror --header-filter`: `KEY=VALUE` matches the exact
   (case-sensitive) value besides `KEY:VALUE` (value contains, unchanged).
   Repeated filters must all match; before, a repeated key kept only the
@@ -209,6 +292,22 @@ The RabbitMQ entries below are planned for 0.2.0.
   group continues instead of resending. `--execute` without `-g` prints a
   note that a rerun resends the same records. `ferrika_ops::mirror::CommitTracker`
   is now public for this.
+- `rabbit peek` is a write: it changes the messages it reads (redelivered
+  flag, quorum-queue delivery count), so read-only rules and profiles refuse
+  it and it is audited like other writes, besides being a record export.
+- **Breaking (library):** `ferrika-cli`'s command modules, argument structs,
+  `Commands` and `Cli`'s fields are crate-internal (#23).
+- **Breaking (library):** 21 internals of `ferrika-core`'s AWS MSK IAM,
+  OIDC and profile code (#25) and about 50 items of `ferrika-governance`
+  and `ferrika-ops` that only their own crate used (#24) are crate-internal.
+  See "Upgrading from 0.1" for what to use instead.
+- **Breaking (library):** `ferrika_core::kafka::filter::MessageFilter::header_filters`
+  is a `Vec<HeaderFilter>` instead of a map, and `with_header` adds a filter
+  instead of replacing an earlier one for the same key.
+- **Breaking (library):** `PolicyAction` gains `MessagesPeek` and
+  `MessagesMove`; `PolicyRules` gains `screen_capture`, `mcp_write`,
+  `environments`, `default_environment` and `copy_down`, so code that builds
+  it without `..Default::default()` must add them.
 
 ### Compatibility
 
@@ -216,11 +315,12 @@ The RabbitMQ entries below are planned for 0.2.0.
   is invalid for builds before 0.2.0 (unknown category), so they fall back
   to the strictest mode. Roll such a policy out only once every client runs
   0.2.0 or later.
-- A signed policy that uses `environments`, `default_environment` or
-  `copy_down` is format 2, and builds without environment support refuse
-  it as having unknown rules (they do not ignore the section), so they run
-  in the strictest mode until updated. Update every client first. Policies
-  without these fields are unchanged and still signed as format 1.
+- A signed policy that uses `screen_capture`, `mcp_write`, `environments`,
+  `default_environment` or `copy_down` is format 2, and builds without
+  these rules refuse it as having unknown rules (they do not ignore them),
+  so they run in the strictest mode until updated. Update every client
+  first. Policies without these fields are unchanged and still signed as
+  format 1 (unless they use other format-2 rules such as `export`).
 - Under enforced masking `mirror --mask` is now allowed (plain `mirror`
   is still refused).
 
