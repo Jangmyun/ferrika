@@ -14,6 +14,8 @@ and 0.2.0 makes it crate-internal.
 - A profile's request timeout (`request_timeout_ms`) was always replaced
   by `--timeout`'s default of 30 s; it now applies unless `--timeout` is
   given.
+- `monitor lag GROUP --topic NAME` with a topic that does not exist printed
+  an empty table and a total lag of 0; it is now an error.
 - `consume -D` applied `--grep` and `-k` to the undecoded bytes, so text of an
   Avro or Protobuf record (such as `"age":41`) was never found; they now look
   at the decoded text.

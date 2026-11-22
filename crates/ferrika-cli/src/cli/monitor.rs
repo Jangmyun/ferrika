@@ -181,6 +181,21 @@ fn ensure_group_exists(groups: &[String], group: &str) -> Result<(), KafkaError>
     }
 }
 
+/// Errors unless `topic` is among `topics`: a mistyped --topic printed an
+/// empty table with a total lag of 0.
+fn ensure_topic_exists<'a>(
+    mut topics: impl Iterator<Item = &'a str>,
+    topic: &str,
+) -> Result<(), KafkaError> {
+    if topics.any(|t| t == topic) {
+        Ok(())
+    } else {
+        Err(KafkaError::config(format!(
+            "Topic '{topic}' does not exist"
+        )))
+    }
+}
+
 async fn handle_lag(
     global: &GlobalOpts,
     group_id: Option<&str>,
@@ -214,6 +229,10 @@ async fn handle_lag(
                 return Err(err.into());
             }
         };
+
+        if let Some(filter) = topic_filter {
+            ensure_topic_exists(summaries.iter().map(|t| t.name.as_str()), filter)?;
+        }
 
         let mut consumer_cfg = kafka_config.clone();
         consumer_cfg.group_id = Some(target_group.to_string());
@@ -606,6 +625,14 @@ fn chrono_or_simple_time() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mistyped_topic_is_an_error() {
+        let topics = ["orders", "payments"];
+        assert!(ensure_topic_exists(topics.iter().copied(), "orders").is_ok());
+        let err = ensure_topic_exists(topics.iter().copied(), "order").unwrap_err();
+        assert!(err.to_string().contains("'order' does not exist"), "{err}");
+    }
 
     #[test]
     fn group_overview_shows_members_and_lag() {
