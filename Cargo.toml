@@ -9,7 +9,7 @@ resolver = "2"
 members = ["crates/ferrika-core", "crates/ferrika-governance", "crates/ferrika-ops", "crates/ferrika-mcp", "crates/ferrika-cli", "crates/ferrika-rabbitmq"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 # Minimum Rust version (lapin and its AMQP crates need 1.89); CI checks it.
 rust-version = "1.89"
@@ -57,14 +57,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Workspace crates
-ferrika-core = { path = "crates/ferrika-core", version = "0.1.1" }
-ferrika-governance = { path = "crates/ferrika-governance", version = "0.1.1" }
-ferrika-ops = { path = "crates/ferrika-ops", version = "0.1.1" }
-ferrika-mcp = { path = "crates/ferrika-mcp", version = "0.1.1" }
-ferrika-cli = { path = "crates/ferrika-cli", version = "0.1.1" }
+ferrika-core = { path = "crates/ferrika-core", version = "0.2.0" }
+ferrika-governance = { path = "crates/ferrika-governance", version = "0.2.0" }
+ferrika-ops = { path = "crates/ferrika-ops", version = "0.2.0" }
+ferrika-mcp = { path = "crates/ferrika-mcp", version = "0.2.0" }
+ferrika-cli = { path = "crates/ferrika-cli", version = "0.2.0" }
 # Without default features (no AMQP client): ferrika-mcp only lists queues,
 # exchanges and bindings; ferrika-cli turns `amqp` on for the redrive.
-ferrika-rabbitmq = { path = "crates/ferrika-rabbitmq", version = "0.1.1", default-features = false }
+ferrika-rabbitmq = { path = "crates/ferrika-rabbitmq", version = "0.2.0", default-features = false }
 
 # Debug builds (check, clippy, test) keep line tables for ferrika so panics
 # and backtraces still name files and lines, and no debug info for
