@@ -1,9 +1,10 @@
 //! RabbitMQ read tools (preview): queues, exchanges and bindings of a
 //! virtual host through the management HTTP API (`ferrika_rabbitmq`).
 //!
-//! They read metadata only: no message body is fetched (peeking at a
+//! They read metadata only: no message body is fetched. Peeking at a
 //! RabbitMQ queue takes messages and requeues them, which changes state,
-//! so it is not offered here). The connection is always a RabbitMQ profile
+//! so it is a write tool (`rabbit_writes.rs`, with `--allow-write`). The
+//! connection is always a RabbitMQ profile
 //! (`ferrika rabbit profile add`): the one named by `profile`, else the
 //! active one. A URL cannot be passed, so a profile's stored password only
 //! ever goes to that profile's broker.
@@ -88,12 +89,9 @@ pub(super) fn connection(
     })
 }
 
-/// Runs RabbitMQ read tool `name`.
-pub(super) async fn call(name: &str, args: &Value) -> KafkaResult<Value> {
-    let resolved = connection(args, || {
-        RabbitProfileStore::load().map_err(|e| e.to_string())
-    })?;
-    let credentials = resolved.credentials(None).map_err(|e| {
+/// The login of `resolved`: the profile's user and stored password.
+pub(super) fn credentials(resolved: &ResolvedRabbit) -> KafkaResult<Option<(String, String)>> {
+    resolved.credentials(None).map_err(|e| {
         KafkaError::config(match e {
             CredentialsError::MissingPassword => {
                 "The RabbitMQ profile has a user but no stored password; store one with \
@@ -101,7 +99,15 @@ pub(super) async fn call(name: &str, args: &Value) -> KafkaResult<Value> {
             }
             CredentialsError::PasswordWithoutUser => "The RabbitMQ profile has no user",
         })
+    })
+}
+
+/// Runs RabbitMQ read tool `name`.
+pub(super) async fn call(name: &str, args: &Value) -> KafkaResult<Value> {
+    let resolved = connection(args, || {
+        RabbitProfileStore::load().map_err(|e| e.to_string())
     })?;
+    let credentials = credentials(&resolved)?;
     let client = resolved
         .client(credentials.as_ref(), RABBIT_TIMEOUT)
         .map_err(KafkaError::config)?;

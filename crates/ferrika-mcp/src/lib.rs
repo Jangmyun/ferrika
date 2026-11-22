@@ -10,11 +10,15 @@
 //! [`WriteOptions`] add write tools (`write_tools.rs`). Each write is
 //! planned, then confirmed, then run, and passes the same company policy,
 //! read-only profile and audit gate as the CLI and the GUI (`guard.rs`).
+//! The RabbitMQ write tools (`rabbit_writes.rs`) peek at and inspect
+//! queues (reading requeues, so it is a write), publish, and with the
+//! `amqp` feature move dead-lettered messages back.
 
 mod backend;
 mod guard;
 mod protocol;
 mod rabbit_tools;
+mod rabbit_writes;
 mod read_tools;
 mod transform_tools;
 mod transport;
@@ -37,6 +41,14 @@ pub struct WriteOptions {
     /// Topics the write tools may change (globs); empty means every topic
     /// except internal ones (`__*`).
     pub topics: Vec<String>,
+    /// RabbitMQ queues the `rabbit_*` write tools may read from, move out
+    /// of or publish to through the default exchange (globs); empty means
+    /// every queue.
+    pub queues: Vec<String>,
+    /// RabbitMQ exchanges `rabbit_publish` and `rabbit_dlq_redrive` may
+    /// publish to (globs, `amq.default` for the default exchange); empty
+    /// means every exchange except the broker's own `amq.rabbitmq.*`.
+    pub exchanges: Vec<String>,
     /// How a write is confirmed before it runs.
     pub confirm: ConfirmMode,
     /// Most write executions per minute.

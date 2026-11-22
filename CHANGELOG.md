@@ -38,8 +38,31 @@ The RabbitMQ entries below are planned for 0.2.0.
   read no message bodies and take no URL, so a stored password only goes
   to its profile's broker. `ferrika-mcp` now depends on `ferrika-rabbitmq`
   without its default `amqp` feature (the workspace dependency turns default
-  features off; `ferrika-cli` enables `amqp`). RabbitMQ peek and DLQ
-  inspect/redrive are not offered over MCP yet (a peek requeues messages).
+  features off; `ferrika-cli` enables `amqp`).
+- MCP (preview): RabbitMQ write tools, offered with `--allow-write` and run
+  through the plan/confirm/execute flow of the other write tools:
+  `rabbit_peek` (up to 20 messages) and `rabbit_dlq_inspect` (up to 50,
+  grouped by `x-death` with a sample of 10) are writes because reading
+  requeues the messages (marked redelivered); they are gated as
+  `messages.peek`, pass the export gate, and return bodies and headers
+  PII-masked unless `mask_pii` is false (always masked under enforced
+  masking). `rabbit_publish` (one UTF-8 message to an existing exchange,
+  gated as `produce`, counted against `--max-produce-records`) fails with
+  `unroutable` when no binding takes the message. `rabbit_dlq_redrive` (up
+  to 1,000 messages, optional `to_exchange`/`routing_key`) shows in its plan
+  how many of up to 100 previewed messages go to which destination (the
+  preview's requeue is audited), and moves them over AMQP with publisher
+  confirms, stopping at the first failure; it is gated as `messages.move`
+  plus `produce`. The gates match the RabbitMQ profile and the management
+  and AMQP `host:port` like `ferrika rabbit`; a read-only RabbitMQ profile
+  refuses them (a read-only Kafka profile does not), and `mcp_write`
+  applies. New `ferrika mcp` options `--queues GLOB` and `--exchanges GLOB`
+  (repeatable) limit them; by default every queue and every exchange but
+  `amq.rabbitmq.*` is allowed, and with either set a redrive must name
+  `to_exchange`. Audit entries name queues, exchanges and counts, never
+  bodies. `ferrika-mcp` has a new `amqp` feature (off by default, enabled
+  by `ferrika-cli`) for `rabbit_dlq_redrive`; without it the crate still
+  builds without the AMQP client.
 - Library API for front ends (GUI front ends and other library users), so
   they reuse the CLI's own checks instead of copies that could drift. The
   CLI now calls these itself; its behaviour is unchanged.
