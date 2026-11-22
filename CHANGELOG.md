@@ -34,7 +34,13 @@ and 0.2.0 makes it crate-internal.
   `SchemaRegistryClient::with_timeout`, `ConnectClient::with_timeout`,
   `audit::recent_matching`, `exporter::scrape_cluster_metrics_checked`,
   `model::acl::kafka_principal`, `model::quota::{canonical_quota_entity,
-  same_quota_entity}`, `wire::delete_acl_bindings`.
+  same_quota_entity}`, `wire::delete_acl_bindings`,
+  `reassign::ensure_not_moving`,
+  `SchemaRegistryClient::is_compatible_with_all_versions`,
+  `dlq::names_original_topic`.
+- `dlq` reads the origin and error headers of Spring Kafka
+  (`kafka_dlt-*`) and Kafka Connect (`__connect.errors.*`) dead-letter
+  topics.
 - `consume -D -f json` lines carry the decoded record (`decoded`,
   `decoded_key`, `decoded_with`) next to the raw one.
 - `monitor export` serves `ferrika_scrape_success` (0 when a step of the last
@@ -158,6 +164,16 @@ and 0.2.0 makes it crate-internal.
 - `consume` exited 0 when it read nothing and reported errors (no read
   permission).
 - `reassign plan` accepted offline brokers as targets.
+- `reassign plan` and `topics set-replication` read a partition being moved
+  as having its old and new replicas, planning a higher replication factor
+  or dropping replicas still being copied; they now refuse while a move
+  runs, and the undo record keeps the pre-move replicas.
+- `compact snapshot` wrote 60-character previews instead of the values.
+- `schema check` without `-m` judged locally under BACKWARD and could
+  disagree with the registry; it now asks the registry under the subject's
+  level (`-m` keeps the local what-if).
+- `dlq redrive --execute` sent records without an origin header to a topic
+  guessed from the DLQ's name; that now needs `-t`.
 
 ### Changed
 
