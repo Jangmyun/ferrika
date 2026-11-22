@@ -62,6 +62,15 @@ pub struct PartitionReassignmentResult {
     pub error: Option<String>,
 }
 
+/// How long a request asks the broker to wait for an operation: a little
+/// less than the socket's read timeout (`request_timeout`), so the broker's
+/// answer, even a timed-out one, arrives before the client gives up on a
+/// write that may have been done.
+fn broker_wait_ms(request_timeout: std::time::Duration) -> i32 {
+    let margin = (request_timeout / 2).min(std::time::Duration::from_secs(5));
+    i32::try_from(request_timeout.saturating_sub(margin).as_millis()).unwrap_or(i32::MAX)
+}
+
 /// Submits the given replica assignments to the cluster controller.
 ///
 /// Returns one result per partition. A request-level failure (authorization,
@@ -70,7 +79,7 @@ pub fn alter_partition_reassignments(
     config: &KafkaClientConfig,
     assignments: &[PartitionAssignment],
 ) -> KafkaResult<Vec<PartitionReassignmentResult>> {
-    let timeout_ms = i32::try_from(config.request_timeout.as_millis()).unwrap_or(i32::MAX);
+    let timeout_ms = broker_wait_ms(config.request_timeout);
     let body = encode_alter_partition_reassignments(assignments, timeout_ms);
 
     let mut conn = connect_to_controller(config)?;
@@ -1287,7 +1296,7 @@ pub fn elect_preferred_leaders(
     config: &KafkaClientConfig,
     partitions: Option<&[(String, i32)]>,
 ) -> KafkaResult<ElectionOutcome> {
-    let timeout_ms = i32::try_from(config.request_timeout.as_millis()).unwrap_or(i32::MAX);
+    let timeout_ms = broker_wait_ms(config.request_timeout);
     let body = encode_elect_leaders(partitions, timeout_ms);
     let mut conn = connect_to_controller(config)?;
     // A broker without the API closes the connection on the request, which
@@ -2645,6 +2654,14 @@ mod tests {
         }
         assert_eq!(deleted[0].resource_type, AclResourceType::Group);
         assert_eq!(deleted[0].permission_type, AclPermissionType::Deny);
+    }
+
+    #[test]
+    fn the_broker_answers_before_the_socket_times_out() {
+        use std::time::Duration;
+        assert_eq!(broker_wait_ms(Duration::from_secs(30)), 25_000);
+        assert_eq!(broker_wait_ms(Duration::from_secs(4)), 2_000);
+        assert_eq!(broker_wait_ms(Duration::ZERO), 0);
     }
 
     #[test]

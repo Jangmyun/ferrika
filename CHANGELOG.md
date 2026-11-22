@@ -22,6 +22,9 @@ and 0.2.0 makes it crate-internal.
 - `consume --save` says when it appends to a file that already has records.
 - `reassign verify` called a partition that no move was running for "in
   progress" forever; it now reports it as not moving.
+- Preferred leader elections and reassignments asked the broker to wait as
+  long as the client's read timeout, so a late answer could be lost; the
+  broker now gets a few seconds less.
 
 ## 0.1.1
 
