@@ -276,20 +276,62 @@ ferrika connect delete s3-sink
 
 ### RabbitMQ (`ferrika rabbit`, preview)
 
-Through the RabbitMQ management HTTP API (plugin `rabbitmq_management`).
-`publish` passes the company policy like `produce`; `peek` output counts as
-a record export like `consume` and is masked when the policy enforces it.
+Through the RabbitMQ management HTTP API (plugin `rabbitmq_management`);
+`dlq redrive --execute` moves messages over AMQP 0-9-1.
+
+Connections are RabbitMQ profiles in `rabbit-profiles.json` next to
+`profiles.json` (separate from the Kafka profiles), passwords in the OS
+credential store. A command uses `--rabbit-profile NAME`, else the active
+RabbitMQ profile; `--rabbit-url`, `--vhost`, `--rabbit-user`, the password
+options and `--amqp-url` override the profile's values. `--rabbit-url`
+without `--rabbit-profile` uses no profile (a profile's password is never
+sent to a URL typed by hand).
+
+Under the company policy: `publish` is the category `produce`, like Kafka's
+`produce`. The management API has no browse, so `peek` and `dlq inspect`
+take the messages and requeue them (they are marked redelivered, and on a
+quorum queue this can count towards its delivery limit): they are writes in
+the category `messages.peek` (refused on read-only profiles and brokers,
+audited), and their output is a record export like `consume`, masked when
+the policy enforces masking. The `dlq redrive` preview reads the same way
+(`messages.peek`); `dlq redrive --execute` is `messages.move`.
 
 ```bash
-export FERRIKA_RABBIT_URL=http://rabbit:15672 FERRIKA_RABBIT_USER=ops
-export FERRIKA_RABBIT_PASSWORD=...               # or --rabbit-password-stdin
-ferrika rabbit queues                            # vhost "/" unless --vhost
-ferrika rabbit exchanges --vhost shop
+ferrika rabbit profile add prod --rabbit-url https://rabbit.prod:15671 \
+  --vhost shop --rabbit-user ops --rabbit-password-stdin --use
+ferrika rabbit profile add dev --rabbit-url http://localhost:15672 --read-only
+ferrika rabbit profile list                      # also: use, show, remove
+ferrika rabbit queues                            # the active profile
+ferrika rabbit --rabbit-profile dev exchanges --vhost other
 ferrika -f json rabbit bindings
 ferrika rabbit peek orders.dlq -n 5              # requeues: messages get "redelivered"
 ferrika rabbit publish orders -k order.created -m '{"id":1}' --content-type application/json
 ferrika rabbit publish amq.default -k my-queue -m hello   # the default exchange
+
+# Without a profile:
+export FERRIKA_RABBIT_URL=http://rabbit:15672 FERRIKA_RABBIT_USER=ops
+export FERRIKA_RABBIT_PASSWORD=...               # or --rabbit-password-stdin
+ferrika rabbit queues
 ```
+
+Dead-lettered messages:
+
+```bash
+ferrika rabbit dlq inspect orders.dlq -n 100     # by original queue, reason, exchange, routing key (x-death)
+ferrika rabbit dlq redrive orders.dlq            # preview: where each message would go
+ferrika rabbit dlq redrive orders.dlq -n 500 --execute          # asks first; --yes to skip
+ferrika rabbit dlq redrive orders.dlq --to-exchange retry -k order.retry --execute
+```
+
+`--execute` connects over AMQP (`--amqp-url`, the profile's AMQP URL, or the
+management host on 5672, or `amqps` on 5671 when the management URL is
+https) and moves one message at a time: get without auto-ack, publish to
+the original exchange and routing key of the newest `x-death` entry (or the
+overrides) with `mandatory` and publisher confirms, and ack only after the
+confirm. It stops at the first failure and returns that message to the
+queue. Redriven messages keep their headers and get
+`x-ferrika-redriven-from: <queue>`. The audit log records the counts, the
+source queue and the destinations, never message bodies.
 
 ### Client quotas (`ferrika quota`)
 

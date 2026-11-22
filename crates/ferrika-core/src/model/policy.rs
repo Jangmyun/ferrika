@@ -595,10 +595,17 @@ pub enum PolicyAction {
     QuotaChange,
     SchemaChange,
     ConnectChange,
+    /// Reading messages in a way that changes them on the broker: a
+    /// RabbitMQ peek takes messages and requeues them, which marks them
+    /// redelivered and can count towards a quorum queue's delivery limit.
+    MessagesPeek,
+    /// Moving messages between queues, e.g. redriving dead-lettered
+    /// RabbitMQ messages to their original exchange.
+    MessagesMove,
 }
 
 impl PolicyAction {
-    pub const ALL: [PolicyAction; 14] = [
+    pub const ALL: [PolicyAction; 16] = [
         Self::TopicsCreate,
         Self::TopicsDelete,
         Self::TopicsPurge,
@@ -613,6 +620,8 @@ impl PolicyAction {
         Self::QuotaChange,
         Self::SchemaChange,
         Self::ConnectChange,
+        Self::MessagesPeek,
+        Self::MessagesMove,
     ];
 
     /// The name used in a policy's `forbid` list.
@@ -632,6 +641,8 @@ impl PolicyAction {
             Self::QuotaChange => "quota.change",
             Self::SchemaChange => "schema.change",
             Self::ConnectChange => "connect.change",
+            Self::MessagesPeek => "messages.peek",
+            Self::MessagesMove => "messages.move",
         }
     }
 
@@ -652,6 +663,11 @@ impl PolicyAction {
             // Publishing to a RabbitMQ exchange writes messages like
             // `produce`: one `forbid: ["produce"]` covers both brokers.
             "rabbit publish" => Self::Produce,
+            // The management API has no browse: reading takes messages and
+            // requeues them (marked redelivered). A redrive preview reads
+            // the same way.
+            "rabbit peek" | "rabbit dlq inspect" | "rabbit dlq redrive" => Self::MessagesPeek,
+            "rabbit dlq redrive --execute" => Self::MessagesMove,
             _ => match head {
                 "topics" | "reassign" => Self::TopicsAlter,
                 "produce" | "generate" | "mirror" | "transform" | "restore" | "probe" | "bench"
@@ -680,6 +696,14 @@ mod tests {
             assert_eq!(PolicyAction::from_id(action.id()), Some(action));
         }
         assert_eq!(PolicyAction::from_id("topics.nuke"), None);
+        assert_eq!(
+            PolicyAction::from_id("messages.peek"),
+            Some(PolicyAction::MessagesPeek)
+        );
+        assert_eq!(
+            PolicyAction::from_id("messages.move"),
+            Some(PolicyAction::MessagesMove)
+        );
     }
 
     #[test]
@@ -704,6 +728,18 @@ mod tests {
         assert_eq!(
             PolicyAction::from_cli("transform --execute"),
             PolicyAction::from_cli("rabbit publish"),
+            PolicyAction::Produce
+        );
+        for peek in ["rabbit peek", "rabbit dlq inspect", "rabbit dlq redrive"] {
+            assert_eq!(PolicyAction::from_cli(peek), PolicyAction::MessagesPeek);
+        }
+        assert_eq!(
+            PolicyAction::from_cli("rabbit dlq redrive --execute"),
+            PolicyAction::MessagesMove
+        );
+        // Kafka's redrive stays a produce.
+        assert_eq!(
+            PolicyAction::from_cli("dlq redrive --execute"),
             PolicyAction::Produce
         );
         assert_eq!(

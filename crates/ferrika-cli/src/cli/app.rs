@@ -84,7 +84,7 @@ pub enum Commands {
     Connect(cli::connect::ConnectArgs),
     /// Serve cluster tools to AI assistants over MCP (stdin/stdout); read-only unless --allow-write
     Mcp(cli::mcp::McpArgs),
-    /// RabbitMQ (preview): queues, exchanges, bindings, peek and publish via the management API
+    /// RabbitMQ (preview): queues, exchanges, bindings, peek, publish, DLQ inspect/redrive, profiles
     Rabbit(cli::rabbit::RabbitArgs),
     /// Show the local audit log of cluster changes (GUI, CLI and MCP)
     Audit {
@@ -284,10 +284,11 @@ pub fn run(mut cli: Cli) {
             Err(err) => cli::exit_with_error(&err),
         }
     }
-    // `rabbit` names its broker with its own options; without a usable URL
-    // there is nothing for the gates below to match.
-    if let Some(Commands::Rabbit(args)) = &cli.command {
-        if let Err(err) = args.connection.address() {
+    // `rabbit` names its broker with a RabbitMQ profile and its own
+    // options; resolve them once, before the gates read the profile name
+    // and the address (an unknown profile or no URL stops the command).
+    if let Some(Commands::Rabbit(args)) = &mut cli.command {
+        if let Err(err) = cli::rabbit::resolve(args) {
             cli::exit_with_error(&err);
         }
     }
@@ -393,13 +394,15 @@ pub fn run(mut cli: Cli) {
             &request,
             governance::policy::AuditMode::RecordRequest,
             || {
-                // A read-only Kafka profile says nothing about a RabbitMQ broker.
-                if !targets_kafka(cli.command.as_ref()) {
-                    return Ok(());
+                // A read-only Kafka profile says nothing about a RabbitMQ
+                // broker, which has its own profiles.
+                match cli.command.as_ref() {
+                    Some(Commands::Rabbit(args)) => cli::rabbit::ensure_writable(args, action),
+                    _ => cli
+                        .global_opts
+                        .ensure_writable(action)
+                        .map_err(|e| e.to_string()),
                 }
-                cli.global_opts
-                    .ensure_writable(action)
-                    .map_err(|e| e.to_string())
             },
         ) {
             cli::exit_with_error(&refusal_message(&refusal, cli.command.as_ref()));
@@ -567,21 +570,14 @@ fn needs_profiles(command: Option<&Commands>) -> bool {
     )
 }
 
-/// Whether `command` works on the Kafka cluster of the global options (its
-/// profile and brokers). `rabbit` talks to the RabbitMQ management API its
-/// own options name, so the gates match that address and no Kafka profile.
-fn targets_kafka(command: Option<&Commands>) -> bool {
-    !matches!(command, Some(Commands::Rabbit(_)))
-}
-
 /// The profile name the policy and audit gates use for `command`: the
-/// resolved Kafka profile, or none for a broker named by its own options
-/// (the audit entries then name its address).
+/// resolved Kafka profile, or for `rabbit` the RabbitMQ profile (none when
+/// the broker is named by options only; the audit entries then name its
+/// address).
 fn gate_profile(command: Option<&Commands>, global: &cli::GlobalOpts) -> String {
-    if targets_kafka(command) {
-        global.resolved_profile_name().unwrap_or_default()
-    } else {
-        String::new()
+    match command {
+        Some(Commands::Rabbit(args)) => cli::rabbit::gate_profile(args),
+        _ => global.resolved_profile_name().unwrap_or_default(),
     }
 }
 
@@ -595,7 +591,7 @@ fn gate_brokers(
     needed: bool,
 ) -> Result<String, String> {
     match command {
-        Some(Commands::Rabbit(args)) => args.connection.address(),
+        Some(Commands::Rabbit(args)) => cli::rabbit::gate_address(args),
         _ => crate::governance::policy::brokers_for(&global.to_kafka_config(), needed),
     }
 }
@@ -1556,8 +1552,17 @@ mod tests {
         assert!(!records_history("rabbit publish"));
         assert_eq!(export_gate(&publish), None);
 
+        // A peek takes messages and requeues them (marked redelivered): a
+        // write in its own category, and an export of record data.
         let peek = command(&["rabbit", url, "peek", "orders.dlq", "-n", "5"]);
-        assert_eq!(write_action(&peek), None);
+        assert!(may_write(&peek));
+        assert_eq!(write_action(&peek), Some("rabbit peek"));
+        assert_eq!(
+            model::policy::PolicyAction::from_cli("rabbit peek"),
+            model::policy::PolicyAction::MessagesPeek
+        );
+        assert_eq!(write_target(&peek), "queue orders.dlq on vhost /");
+        assert!(!records_history("rabbit peek"));
         let gate = export_gate(&peek).expect("peek shows record data");
         assert_eq!(
             (gate.channel, gate.label, gate.target.as_str()),
@@ -1565,9 +1570,36 @@ mod tests {
         );
         assert!(reads_records(&peek));
 
+        let inspect = command(&["rabbit", url, "dlq", "inspect", "orders.dlq"]);
+        assert_eq!(write_action(&inspect), Some("rabbit dlq inspect"));
+        let gate = export_gate(&inspect).expect("inspect shows record data");
+        assert_eq!(gate.label, "rabbit dlq inspect");
+
+        let preview = command(&["rabbit", url, "dlq", "redrive", "orders.dlq"]);
+        assert_eq!(write_action(&preview), Some("rabbit dlq redrive"));
+        assert_eq!(export_gate(&preview), None);
+        let execute = command(&[
+            "rabbit",
+            url,
+            "dlq",
+            "redrive",
+            "orders.dlq",
+            "--execute",
+            "--yes",
+        ]);
+        assert_eq!(write_action(&execute), Some("rabbit dlq redrive --execute"));
+        assert_eq!(
+            model::policy::PolicyAction::from_cli("rabbit dlq redrive --execute"),
+            model::policy::PolicyAction::MessagesMove
+        );
+        assert!(!records_history("rabbit dlq redrive --execute"));
+        assert_eq!(export_gate(&execute), None);
+
         for args in [
             &["rabbit", url, "queues"][..],
             &["rabbit", url, "bindings"][..],
+            &["rabbit", "profile", "list"][..],
+            &["rabbit", "profile", "use", "prod"][..],
         ] {
             let cmd = command(args);
             assert_eq!(write_action(&cmd), None, "{args:?}");
@@ -1577,8 +1609,8 @@ mod tests {
 
     #[test]
     fn rabbit_gates_match_the_management_address_not_a_kafka_profile() {
-        use super::{gate_brokers, gate_profile, targets_kafka};
-        let publish = command(&[
+        use super::{gate_brokers, gate_profile};
+        let mut publish = command(&[
             "-p",
             "prod-kafka",
             "rabbit",
@@ -1593,14 +1625,19 @@ mod tests {
             .unwrap()
             .global_opts;
         assert!(!needs_profiles(Some(&publish)));
-        assert!(!targets_kafka(Some(&publish)));
+        // `main` resolves the connection before the gates; a URL without
+        // --rabbit-profile reads no RabbitMQ profile.
+        let Commands::Rabbit(args) = &mut publish else {
+            panic!("a rabbit command")
+        };
+        args.connection.profile = None;
+        cli::rabbit::resolve(args).unwrap();
         assert_eq!(gate_profile(Some(&publish), &global), "");
         assert_eq!(
             gate_brokers(Some(&publish), &global, true).unwrap(),
             "rabbit.prod.corp:443"
         );
         assert!(!super::fails_fast_without_broker(&publish));
-        assert!(targets_kafka(Some(&command(&["topics", "list"]))));
     }
 
     #[test]

@@ -1,7 +1,9 @@
 # Multi-broker support: broker abstraction and RabbitMQ
 
-Status: stage 2 design, with a first preview implementation
-(`ferrika rabbit`, crate `ferrika-rabbitmq`). Kafka behaviour is unchanged.
+Status: stage 2 design with a preview implementation (`ferrika rabbit`,
+crate `ferrika-rabbitmq`), planned for 0.2.0. The product decisions of
+2026-11-22 are in [Decisions](#decisions-2026-11-22) and supersede the
+earlier proposals below where they differ. Kafka behaviour is unchanged.
 
 ## Goal
 
@@ -82,11 +84,16 @@ the profile and broker addresses to match, and (3) the history state model.
 Minimal and additive:
 
 1. `PolicyAction::from_cli("rabbit publish")` returns `Produce`
-   (`ferrika-core`, `model/policy.rs`). No new category, so existing signed
-   policies keep their meaning and older binaries keep accepting policies.
+   (`ferrika-core`, `model/policy.rs`). Two new categories,
+   `messages.peek` and `messages.move` (see [New policy
+   categories](#new-policy-categories)).
 2. `cli/app.rs` asks `gate_profile` and `gate_brokers` for the profile name
    and broker addresses instead of always reading the Kafka options. For
-   every Kafka command they return what was used before.
+   every Kafka command they return what was used before; for `rabbit` they
+   return the RabbitMQ profile and the management `host:port`, resolved
+   once before the gates (`cli::rabbit::resolve`). The read-only check of
+   the write gate uses the RabbitMQ profile's `read_only` flag for `rabbit`
+   commands and the Kafka profile's for the others.
 
 `WriteRequest`, `ExportRequest`, `authorize_write`, `authorize_export`, the
 audit log and the masking helpers are used as they are.
@@ -109,18 +116,31 @@ and a `brokers_for` per kind. This is not needed for the CLI preview.
 A signed policy with an unknown `forbid` entry is refused by
 `parse_payload`, so a binary that does not know a new category falls back
 to the strictest mode. New categories are therefore a policy-format event,
-not a free addition. Proposed when RabbitMQ topology writes arrive (phase 3):
+not a free addition.
+
+Added in 0.2.0, with this branch:
 
 | Category | Covers |
 | --- | --- |
-| `queues.create` | declare a queue or exchange |
-| `queues.delete` | delete a queue or exchange |
-| `queues.purge` | purge a queue |
-| `bindings.change` | add or remove a binding |
-| `messages.move` | move or redrive messages between queues |
+| `messages.peek` | reading messages in a way that changes them: `rabbit peek`, `rabbit dlq inspect`, the `rabbit dlq redrive` preview (management `get` with requeue) |
+| `messages.move` | moving messages between queues: `rabbit dlq redrive --execute` |
 
-Until then, `from_cli` maps unknown `rabbit ...` writes to `config.change`
-(the broadest category), as for any unknown write.
+`rabbit publish` stays `produce`, so one `forbid: ["produce"]` covers both
+brokers. The names follow the existing `resource.verb` pattern
+(`topics.delete`, `offsets.reset`) with `messages` as the resource, so a
+later Kafka command that moves records (for example a redrive that deletes
+what it moved) can use `messages.move` too.
+
+Compatibility: builds before 0.2.0 do not know these two names, so a
+signed policy that forbids them is invalid there and those builds run in
+the strictest mode. The policy format number is not raised for this (a new
+`forbid` value is not a new field); the CHANGELOG and `docs/POLICY.md` say
+to roll such a policy out only once every client runs 0.2.0 or later.
+
+Still proposed, for RabbitMQ topology writes (phase 3): `queues.create`,
+`queues.delete`, `queues.purge`, `bindings.change`. Until then `from_cli`
+maps unknown `rabbit ...` writes to `config.change` (the broadest
+category), as for any unknown write.
 
 ## Crate layout
 
@@ -135,12 +155,18 @@ ferrika-cli ──> ferrika-mcp ──> ferrika-ops ──> ferrika-governance �
   Schema Registry and Connect clients, it is a client.
 - `ferrika-cli`: `ferrika rabbit ...` in `cli/rabbit.rs`, classified in the
   gates in `cli/app.rs`. The CLI re-exports the crate as `rabbitmq`.
+- `ferrika-rabbitmq` also holds the RabbitMQ profiles (`profile`) and the
+  AMQP redrive (`amqp`, behind the default feature `amqp`, with `lapin`).
 - The Kafka path is untouched. `ferrika-ops` and `ferrika-mcp` do not depend
-  on the new crate yet; DLQ reprocessing (phase 2) adds `ferrika-ops →
-  ferrika-rabbitmq`.
+  on the new crate; the DLQ redrive lives in `ferrika-rabbitmq::amqp`,
+  called by the CLI.
 
-No new third-party dependency: `serde`, `serde_json` and `thiserror` are
-already workspace dependencies.
+New third-party dependency: `lapin` 4.13 (MIT) with its AMQP crates
+(`amq-protocol*`, `async-rs`, `tcp-stream`...), only in `ferrika-rabbitmq`
+and only with the `amqp` feature; TLS through rustls with the ring backend
+and the OS trust store (no aws-lc, no OpenSSL). It raises the minimum Rust
+version to 1.89 and adds about 130 crates to `Cargo.lock` (the SBOM in
+`docs/sbom` is regenerated).
 
 ## Access method: the management HTTP API
 
@@ -178,60 +204,102 @@ with `ack_requeue_true` takes messages and requeues them:
 
 The CLI caps a peek at 500 messages, truncates payloads at 50 000 bytes
 (reported as `truncated` with the full `size`), and says on stderr that the
-messages were requeued and marked redelivered. Whether peek should count as
-a write under read-only rules is an open decision (below).
+messages were requeued and marked redelivered. Because of these side
+effects a peek is a write under the policy (decision 1 below).
 
-Why not AMQP for the MVP: the management API covers listing, peeking and
-publishing with one HTTP client we already ship and audit; AMQP 0-9-1 would
-add a dependency and a connection model (channels, confirms) that only pays
-off for high-volume moves (bulk DLQ redrive) and stream reading. Listing is
+Why not AMQP for everything: the management API covers listing, peeking
+and publishing with one HTTP client we already ship and audit; AMQP 0-9-1
+is used only where the management API cannot do the job safely, moving
+messages (`dlq redrive --execute`). Listing is
 also unpaginated for now: a vhost with tens of thousands of queues can hit
 the 64 MiB cap; `?page=&page_size=` support is phase 2.
 
 ## Connection and profile configuration
 
-Now (preview), from options and environment variables only:
+RabbitMQ profiles (decision 3): `rabbit-profiles.json` in the directory of
+`profiles.json` (so `FERRIKA_CONFIG_DIR` and `FERRIKA_CONFIG_PATH` move
+both), managed with `ferrika rabbit profile add|list|use|remove|show`:
+
+```json
+{
+  "active_profile": "prod",
+  "profiles": {
+    "prod": {
+      "management_url": "https://rabbit.prod.corp:15671",
+      "vhost": "shop",
+      "user": "ops",
+      "password_in_store": true,
+      "amqp_url": "amqps://rabbit.prod.corp:5671",
+      "read_only": false
+    }
+  }
+}
+```
+
+- The password goes to the OS credential store through
+  `ferrika_core::kafka::secrets`, account `<profile>/rabbitmq_password`.
+  No Kafka profile field has that name, so a Kafka and a RabbitMQ profile
+  with the same name never share an entry, and removing a Kafka profile
+  never deletes a RabbitMQ password. Without a credential store (or with
+  `FERRIKA_SECRET_STORE=file`) the password stays in the file, as for
+  Kafka profiles.
+- URLs in a profile must not carry credentials (`profile add` refuses
+  them), so the file never holds a password inside a URL.
+- `amqp_url` is optional: by default the management host on 5672, or
+  `amqps` on 5671 when the management URL is https.
+- `read_only` refuses the profile's writes (`publish`, `peek`, `dlq
+  inspect`, `dlq redrive`), like a read-only Kafka profile.
+- `profile add NAME` takes the connection from the same options as every
+  `rabbit` command (`--rabbit-url`, `--vhost`, `--rabbit-user`, the
+  password options, `--amqp-url`) plus `--read-only`, `-d` and `--use`.
+  Replacing a profile keeps its stored password when no new one is given
+  and the user is unchanged.
+
+Resolution (`cli::rabbit::resolve`, once, before the gates): the profile
+named by `--rabbit-profile` / `FERRIKA_RABBIT_PROFILE`, else the active
+RabbitMQ profile; every option below overrides the profile's value.
+`--rabbit-url` without `--rabbit-profile` uses no profile, so a profile's
+stored password is never sent to a URL typed by hand, and a stored
+password is used only for the profile's own user.
+
+Options and environment variables:
 
 | Option | Environment | Default |
 | --- | --- | --- |
-| `--rabbit-url URL` | `FERRIKA_RABBIT_URL` | none (required) |
-| `--vhost VHOST` | `FERRIKA_RABBIT_VHOST` | `/` |
-| `--rabbit-user USER` | `FERRIKA_RABBIT_USER` | user in the URL, if any |
+| `--rabbit-profile NAME` | `FERRIKA_RABBIT_PROFILE` | the active RabbitMQ profile |
+| `--rabbit-url URL` | `FERRIKA_RABBIT_URL` | the profile's |
+| `--vhost VHOST` | `FERRIKA_RABBIT_VHOST` | the profile's, else `/` |
+| `--rabbit-user USER` | `FERRIKA_RABBIT_USER` | the profile's, else the user in the URL |
 | `--rabbit-password` (prefer the variable) | `FERRIKA_RABBIT_PASSWORD` | |
 | `--rabbit-password-stdin` | | |
+| `--amqp-url URL` | `FERRIKA_RABBIT_AMQP_URL` | the profile's, else derived |
 
 Credentials may also be in the URL (`https://user:pass@host`), as for
 Connect. They are never printed: the client's and the options' `Debug`
 output redacts them, and errors name only `host:port`.
 
-Next (phase 2): RabbitMQ fields on a profile, so a profile names one
-system and its credentials live in the OS credential store through the
-existing `kafka::secrets` mechanism:
-
-- `rabbitmq_url` (secret field, like `connect_url`, since it may carry
-  credentials), `rabbitmq_vhost`, `rabbitmq_user`, `rabbitmq_password`
-  (secret);
-- the profile's `read_only` flag then also guards `rabbit` writes, and the
-  profile name is what `read_only` globs match;
-- open question whether a profile may hold only RabbitMQ (no
-  `bootstrap_servers`): `ClusterProfile::bootstrap_servers` is required
-  today. Adding fields to the public `ClusterProfile` struct is a
-  library-API change for 0.2.0.
+The earlier plan to add RabbitMQ fields to the Kafka `ClusterProfile` was
+dropped (decision 3): no public API change there, and a RabbitMQ-only
+connection does not need Kafka's required `bootstrap_servers`.
 
 ## Governance mapping of the commands
 
 | Command | Gate | Policy category | Audit |
 | --- | --- | --- | --- |
 | `rabbit queues / exchanges / bindings` | none (metadata) | | none |
-| `rabbit peek` | export gate, channel `stdout` | | `record.export` when exports are audited and stdout is redirected; `policy.blocked` when forbidden |
+| `rabbit peek` | write gate, and export gate (channel `stdout`) | `messages.peek` | request and result entries (`rabbit peek`, target queue/vhost); `record.export` when exports are audited and stdout is redirected; `policy.blocked` when refused |
 | `rabbit publish` | write gate | `produce` | request entry before the call, result entry after (`rabbit publish`, target exchange/vhost/routing key) |
+| `rabbit dlq inspect` | write gate, and export gate (channel `stdout`) | `messages.peek` | as `peek` |
+| `rabbit dlq redrive` (preview) | write gate | `messages.peek` | request and result entries; shows destinations, no bodies |
+| `rabbit dlq redrive --execute` | write gate, confirmation unless `--yes` | `messages.move` | request entry (source queue, vhost, destination rule); result entry with the moved count per destination and, on failure, a fixed reason; never bodies or broker error text |
+| `rabbit profile ...` | none (local configuration) | | none |
 
 Masking applies to `peek` when the policy enforces it (or with
 `--mask-pii`). A publish that no binding routes (`routed: false`) is an
 error, so scripts notice the dropped message, and its audit result entry
 records the failure.
 
-## DLQ reprocessing (phase 2, design only)
+## DLQ reprocessing
 
 RabbitMQ dead-lettering: a queue with `x-dead-letter-exchange` (argument or
 policy `dead-letter-exchange`) and optionally `x-dead-letter-routing-key`
@@ -242,15 +310,19 @@ adds an `x-death` header: a list of tables, newest first, each with `queue`,
 `exchange`, `routing-keys` and `time`; it also sets
 `x-first-death-queue/-reason/-exchange` (and, since 3.13, `x-last-death-*`).
 
-`ferrika rabbit dlq` would mirror `ferrika dlq`:
+`ferrika rabbit dlq` mirrors `ferrika dlq`:
 
-- `inspect QUEUE`: group the DLQ's messages by original queue and reason
-  from `x-death` (peek, masked under the policy, export-gated).
-- `redrive QUEUE [--to-exchange X] [--routing-key K] [--execute]`: preview
-  by default; with `--execute`, a write `rabbit dlq redrive --execute`,
-  category `produce` (or `messages.move` once that category exists).
-  The original destination is the first `x-death` entry's `exchange` and
-  `routing-keys`, overridable.
+- `inspect QUEUE [-n N]`: the DLQ's messages grouped by original queue,
+  reason, exchange and routing key from the newest `x-death` entry, plus
+  each message (payload masked under the policy). Reads through the
+  management peek, so it is a `messages.peek` write and an export.
+- `redrive QUEUE [--to-exchange X] [-k K] [-n N]`: a preview (management
+  peek, at most 500 messages) of where each message would go, with counts
+  per destination and the messages that have no `x-death`.
+- `redrive ... --execute [--yes]`: moves up to N messages over AMQP
+  (below), category `messages.move`. The destination is the first (newest)
+  `x-death` entry's `exchange` and first `routing-keys` value; each can be
+  overridden. A message without `x-death` needs `--to-exchange`.
 
 The move must not lose or duplicate silently. With the management API
 alone the safest order is per message: `get` with `ack_requeue_false` is
@@ -261,14 +333,30 @@ destructive before the publish succeeds, so the plan is:
    stripped, and a `x-ferrika-redriven` header for traceability);
 3. remove the published ones from the DLQ.
 
-Step 3 has no "delete this message" call in the management API, so a
-correct move needs AMQP (consume with manual ack, publish with publisher
-confirms, then ack). The redrive is therefore the point where an AMQP client
-(`lapin` or a minimal 0-9-1 implementation) is added, behind a feature if
-binary size matters. Shovel (`/api/parameters/shovel`) with
-`src-delete-after: queue-length` is an alternative that moves server-side
-without AMQP in Ferrika, but it moves whole batches without per-message
-filtering.
+Step 3 has no "delete this message" call in the management API, so the
+move uses AMQP 0-9-1 (`ferrika_rabbitmq::amqp::redrive`, lapin on tokio),
+one message at a time on one channel in publisher-confirm mode:
+
+1. `basic.get` without auto-ack (the message is held for this client; one
+   at a time, so no prefetched messages are held);
+2. `basic.publish` to the destination with `mandatory`, the message's
+   properties and headers kept (`x-death` included) plus
+   `x-ferrika-redriven-from: <queue>`, then wait for the confirm;
+3. `basic.ack` only after a positive confirm with no returned message.
+
+The first failure stops the move: an unroutable (returned) or nacked
+publish, a publish error, no confirm within the timeout, or a message
+without a destination is rejected with requeue (`basic.nack`, requeue) and
+goes back to the queue; closing the channel returns it too if the reject
+fails. A failed ack after a confirmed publish leaves the message in both
+queues; the report and the audit outcome say so. A publish that timed out
+waiting for its confirm may still arrive, so that case can duplicate as
+well. The audit result entry records the moved count per destination and a
+fixed reason text, never bodies or broker error text.
+
+Shovel (`/api/parameters/shovel`) with `src-delete-after: queue-length` is
+an alternative that moves server-side without AMQP in Ferrika, but it moves
+whole batches without per-message destinations.
 
 History and undo: a redrive is not undoable (messages are consumed
 downstream), so like `dlq redrive` it is recorded in the audit log only.
@@ -291,39 +379,70 @@ Topology writes are undoable and fit the existing model:
 
 ## Phases
 
-1. **This step (preview):** `ferrika-rabbitmq` with the management client;
-   `ferrika rabbit queues | exchanges | bindings | peek | publish`; publish
-   through the write gate (`produce`), peek through the export gate and
-   masking; table and `--format json` output.
-2. RabbitMQ profile fields and secrets; pagination; `rabbit dlq inspect`;
-   `rabbit dlq redrive` (preview without `--execute`, then with an AMQP
-   client); the neutral `GateTarget` type; e2e checks against a throw-away
-   `rabbitmq:4-management` container in `tools/e2e`.
+1. **Done (preview):** `ferrika-rabbitmq` with the management client;
+   `ferrika rabbit queues | exchanges | bindings | peek | publish`; table
+   and `--format json` output.
+2. **Done (preview, this branch, for 0.2.0):** RabbitMQ profiles and
+   secrets; `messages.peek` / `messages.move`; peek as a write;
+   `rabbit dlq inspect`; `rabbit dlq redrive` with an AMQP client.
+   Still open in this phase: pagination; the neutral `GateTarget` type; e2e
+   checks against a throw-away `rabbitmq:4-management` container in
+   `tools/e2e` (the AMQP move is unit-tested against a fake broker only).
 3. Topology writes (declare/delete/purge queues and exchanges, bindings)
    with new policy categories, history and undo; MCP tools; desktop views.
 4. Stream queues (stream protocol or AMQP consumer with offsets).
 
-## Open decisions
+## Decisions (2026-11-22)
 
-1. **Peek under read-only rules.** Peek changes queue state (redelivered
-   flag, quorum delivery count). Keep it a read gated as an export (current),
-   or classify it as a write so `read_only` refuses it, or refuse it only on
-   quorum queues with a `delivery-limit`?
-2. **Policy categories.** Reuse `produce` for publish (current). Introduce
-   the `queues.*`, `bindings.change` and `messages.move` categories in the
-   next policy-format version, accepting that older binaries go strictest
-   with such a policy?
-3. **Address matching.** The policy matches the management API's
-   `host:port`, not the AMQP listener (5672/5671) or the cluster's node
-   names. Should RabbitMQ also add the cluster's nodes (`GET /api/nodes`)
-   the way Kafka adds metadata brokers, and should policies be able to name
-   AMQP addresses?
-4. **Profiles.** Extend `ClusterProfile` (one profile per system, Kafka or
-   RabbitMQ) or add a separate RabbitMQ profile store? Affects the public
-   library API in 0.2.0.
-5. **AMQP dependency** for DLQ redrive: `lapin` (adds an async AMQP stack)
-   versus a minimal in-house 0-9-1 client versus Shovel only.
-6. **Publishing the crate.** `ferrika-rabbitmq` is a normal workspace crate
-   so `cargo publish --workspace` keeps working (the CLI depends on it).
-   Publish it as a preview 0.x crate, or keep it behind a CLI feature until
-   it stabilises?
+1. **`rabbit peek` is a write**, not only an export: it marks messages
+   redelivered and may count towards a quorum queue's delivery limit. It
+   passes the write gate (read-only policies and profiles refuse it) and is
+   audited, in addition to the export gate and masking. The stderr warning
+   about requeue/redelivered stays. The same holds for `rabbit dlq inspect`
+   and the `rabbit dlq redrive` preview, which read the same way.
+2. **New policy categories land in 0.2.0, with this branch:**
+   `messages.peek` and `messages.move` (see [New policy
+   categories](#new-policy-categories)); `rabbit publish` keeps mapping to
+   `produce`. Older binaries reading a signed policy that names a new
+   category treat it as invalid and run in the strictest mode; documented
+   in `docs/POLICY.md` and the CHANGELOG.
+3. **RabbitMQ connections get a separate store**, `rabbit-profiles.json`
+   next to `profiles.json`, not fields on the Kafka `ClusterProfile` (no
+   public API change there). Passwords in the OS credential store under
+   `<profile>/rabbitmq_password`. CLI: `ferrika rabbit profile
+   add|list|use|remove|show`; commands take `--rabbit-profile` (default:
+   the active RabbitMQ profile) with `--rabbit-url`, `--vhost` and
+   `--rabbit-user` as overrides. The policy gate still matches the
+   management `host:port`.
+4. **DLQ redrive uses AMQP via `lapin`** (MIT, 4.13, tokio, rustls with
+   ring), only in `ferrika-rabbitmq`, behind the default-on feature `amqp`.
+   `rabbit dlq inspect` and `rabbit dlq redrive [--execute]` as described in
+   [DLQ reprocessing](#dlq-reprocessing); `--execute` asks for confirmation
+   unless `--yes`. The AMQP URL comes from the profile (`amqp_url`), else
+   the management host on 5672 (`amqps` on 5671 when the management URL is
+   https).
+5. **`ferrika-rabbitmq` is published to crates.io as a preview** with the
+   other crates (`cargo publish --workspace`): metadata and a README marked
+   preview are in place; it is not published from this branch.
+
+## Open questions
+
+1. **Address matching.** The policy matches the management API's
+   `host:port`, not the AMQP listener (5672/5671) that `dlq redrive
+   --execute` connects to, nor the cluster's node names. Should the gate
+   also match the AMQP address (and `GET /api/nodes`), the way Kafka adds
+   metadata brokers?
+2. **`forbid: ["produce"]` and redrive.** A redrive republishes messages
+   but is gated as `messages.move` only (Kafka's `dlq redrive --execute` is
+   `produce`). Should a RabbitMQ redrive also be refused when `produce` is
+   forbidden?
+3. **`x-death` on redriven messages.** They keep their headers, `x-death`
+   included, so the broker's history of them stays and repeated failures
+   keep counting. Strip it instead (a clean retry), or make it an option?
+4. **Credentials in a management URL** used without a profile are not
+   carried over to AMQP (lapin then logs in as `guest`); pass
+   `--rabbit-user` for a redrive. Parse them out of the URL instead?
+5. **MSRV.** lapin 4.13 needs Rust 1.89 (the README said 1.85). Accept the
+   bump for 0.2.0, or make the CLI's AMQP support a non-default feature?
+6. **Publishing the crate** under the shared workspace version (0.2.0), or
+   a version series of its own while it is a preview?

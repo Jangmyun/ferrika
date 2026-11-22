@@ -1,11 +1,17 @@
 //! RabbitMQ support for Ferrika (preview): a typed client for the RabbitMQ
-//! management HTTP API.
+//! management HTTP API, connection profiles and dead-letter redrive over
+//! AMQP.
 //!
 //! - [`model`]: queues, exchanges, bindings and peeked messages as the API
-//!   returns them, plus the request bodies. No I/O.
+//!   returns them, the request bodies, and the `x-death` history of
+//!   dead-lettered messages. No I/O.
 //! - [`client`]: [`client::ManagementClient`], which lists queues, exchanges
 //!   and bindings of a virtual host, peeks at messages and publishes to an
 //!   exchange over HTTP(S).
+//! - [`profile`]: named connections in `rabbit-profiles.json`, passwords in
+//!   the OS credential store.
+//! - [`amqp`] (feature `amqp`, default): moving dead-lettered messages back
+//!   to their exchange with manual acks and publisher confirms.
 //!
 //! This crate only talks to the broker. The company policy, the audit log
 //! and PII masking are applied by the caller (the `ferrika rabbit` command),
@@ -27,6 +33,9 @@
 //! # }
 //! ```
 
+#[cfg(feature = "amqp")]
+pub mod amqp;
 pub mod client;
 pub mod error;
 pub mod model;
+pub mod profile;

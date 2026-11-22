@@ -2,17 +2,32 @@
 name = "ferrika-rabbitmq"
 version.workspace = true
 edition.workspace = true
-description = "Ferrika RabbitMQ support (preview): a typed client for the RabbitMQ management HTTP API"
+description = "Ferrika RabbitMQ support (preview): management HTTP API client, connection profiles and AMQP dead-letter redrive"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords = ["rabbitmq", "amqp", "management-api", "cli", "devops"]
+readme = "README.md"
+keywords = ["rabbitmq", "amqp", "management-api", "dead-letter", "devops"]
 categories = ["api-bindings", "network-programming"]
 
-# The HTTP client (`ferrika_core::kafka::http::Endpoint`), Base64 and the
-# error conventions come from ferrika-core; there is no AMQP dependency.
+# The HTTP client (`ferrika_core::kafka::http::Endpoint`), Base64, the OS
+# credential store and the config directory come from ferrika-core.
 [dependencies]
 ferrika-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+# AMQP 0-9-1 (MIT), only for moving messages (`dlq redrive --execute`):
+# manual acks and publisher confirms, which the management API lacks. On
+# tokio; TLS through rustls with the ring backend and the OS trust store,
+# like the HTTP clients.
+lapin = { version = "4.13", default-features = false, features = ["tokio", "rustls--ring", "rustls-native-certs"], optional = true }
+# Time limits on the AMQP calls.
+tokio = { workspace = true, optional = true }
+
+[features]
+default = ["amqp"]
+# The AMQP client (`amqp` module). Without it the crate has the management
+# API client and the profiles only.
+amqp = ["dep:lapin", "dep:tokio"]

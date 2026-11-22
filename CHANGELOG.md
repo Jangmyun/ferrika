@@ -9,6 +9,8 @@ and 0.2.0 makes it crate-internal.
 
 ## Unreleased
 
+The RabbitMQ entries below are planned for 0.2.0.
+
 ### Added
 
 - `ferrika profile add --preset NAME` fills in the security protocol and
@@ -65,15 +67,48 @@ and 0.2.0 makes it crate-internal.
   minimum).
 - Preview: RabbitMQ support through the management HTTP API, in the new
   crate `ferrika-rabbitmq` and the command `ferrika rabbit`: `queues`,
+- Preview: RabbitMQ support in the new crate `ferrika-rabbitmq` and the
+  command `ferrika rabbit`, through the management HTTP API: `queues`,
   `exchanges` and `bindings` of a vhost, `peek <queue> -n N` (reads and
   requeues, so the messages are marked redelivered) and `publish <exchange>
   -k <routing-key> -m <body>`, with table and `--format json` output.
-  Connection with `--rabbit-url`, `--vhost`, `--rabbit-user` and
-  `FERRIKA_RABBIT_PASSWORD` (or `--rabbit-password-stdin`). `publish` passes
-  the same policy gate and audit log as `produce` (policy category
-  `produce`); `peek` is a record export like `consume` and is masked when
-  the policy enforces masking. Commands and output may change; design and
-  next steps in `docs/plans/multi-broker.md`.
+  Commands and output may change; design and decisions in
+  `docs/plans/multi-broker.md`.
+- RabbitMQ profiles: `ferrika rabbit profile add|list|use|remove|show`,
+  stored in `rabbit-profiles.json` next to `profiles.json` (separate from
+  the Kafka profiles; `ClusterProfile` is unchanged), passwords in the OS
+  credential store under `<profile>/rabbitmq_password`. Commands take
+  `--rabbit-profile` (default: the active RabbitMQ profile); `--rabbit-url`,
+  `--vhost`, `--rabbit-user`, `FERRIKA_RABBIT_PASSWORD` /
+  `--rabbit-password-stdin` and `--amqp-url` override it. `--read-only` on
+  a profile refuses its writes.
+- `ferrika rabbit dlq inspect <queue>`: dead-lettered messages grouped by
+  original queue, reason, exchange and routing key from `x-death`, masked
+  under the policy. `ferrika rabbit dlq redrive <queue> [--to-exchange X]
+  [-k K] [-n N]`: a preview of where each message would go; with
+  `--execute` (asks first unless `--yes`) the messages are moved over AMQP
+  0-9-1, one at a time, acknowledged only after the broker confirmed the
+  republished copy, stopping at the first failure. New dependency `lapin`
+  (MIT) in `ferrika-rabbitmq`, behind its default feature `amqp`.
+- Policy categories `messages.peek` (`rabbit peek`, `rabbit dlq inspect`,
+  the `rabbit dlq redrive` preview) and `messages.move` (`rabbit dlq redrive
+  --execute`). `rabbit publish` is `produce`, so `forbid: ["produce"]`
+  covers both brokers. `PolicyAction` gains `MessagesPeek` and
+  `MessagesMove` (a breaking change for code that matches on it).
+
+### Changed
+
+- `rabbit peek` is a write: it changes the messages it reads (redelivered
+  flag, quorum-queue delivery count), so read-only rules and profiles refuse
+  it and it is audited like other writes, besides being a record export.
+- Building now needs Rust 1.89 or newer (`lapin` and its AMQP crates).
+
+### Compatibility
+
+- A signed policy whose `forbid` names `messages.peek` or `messages.move`
+  is invalid for builds before 0.2.0 (unknown category), so they fall back
+  to the strictest mode. Roll such a policy out only once every client runs
+  0.2.0 or later.
 
 ### Fixed
 

@@ -27,6 +27,7 @@ pub mod produce;
 pub mod profile;
 pub mod quota;
 pub mod rabbit;
+pub mod rabbit_profile;
 pub mod reassign;
 pub mod record;
 pub mod report;

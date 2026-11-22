@@ -5,6 +5,10 @@
   "version": 1,
   "metadata": {
     "timestamp": "2026-11-22T09:34:16Z",
+  "serialNumber": "urn:uuid:a8cf0433-c414-44fc-99d7-133108370d3e",
+  "version": 1,
+  "metadata": {
+    "timestamp": "2026-11-22T12:06:31Z",
     "tools": [
       {
         "name": "tools/sbom.py (cargo metadata)"
@@ -87,18 +91,99 @@
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
+      "bom-ref": "pkg:cargo/amq-protocol@10.7.0",
+      "name": "amq-protocol",
+      "version": "10.7.0",
+      "purl": "pkg:cargo/amq-protocol@10.7.0",
+      "licenses": [
+        {
+          "expression": "BSD-2-Clause"
         }
       ],
       "hashes": [
         {
           "alg": "SHA-256",
           "content": "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
+          "content": "ba56915f72aa721b4bca471fa71ff8ec10aecc0d5e2d99497edb44358ccedd7b"
         }
       ],
       "externalReferences": [
         {
           "type": "vcs",
           "url": "https://github.com/zakarumych/allocator-api2"
+          "url": "https://github.com/amqp-rs/amq-protocol"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/amq-protocol-tcp@10.7.0",
+      "name": "amq-protocol-tcp",
+      "version": "10.7.0",
+      "purl": "pkg:cargo/amq-protocol-tcp@10.7.0",
+      "licenses": [
+        {
+          "expression": "BSD-2-Clause"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "84153f37233d155953ccbacb21257b4cb82edb68e57066495ff86495d8783a32"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/amqp-rs/amq-protocol"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/amq-protocol-types@10.7.0",
+      "name": "amq-protocol-types",
+      "version": "10.7.0",
+      "purl": "pkg:cargo/amq-protocol-types@10.7.0",
+      "licenses": [
+        {
+          "expression": "BSD-2-Clause"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "1aca84dae6981386bc016fc44434ff9cb6b1f99c25fd0e890ddb048c91261db1"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/amqp-rs/amq-protocol"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/amq-protocol-uri@10.7.0",
+      "name": "amq-protocol-uri",
+      "version": "10.7.0",
+      "purl": "pkg:cargo/amq-protocol-uri@10.7.0",
+      "licenses": [
+        {
+          "expression": "BSD-2-Clause"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "9b58add0b63b221e87956f3ec47d6b8f1a0a6f69cc970b668590000c3aa701af"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/amqp-rs/amq-protocol"
         }
       ]
     },
@@ -255,18 +340,75 @@
       "licenses": [
         {
           "expression": "Apache-2.0"
+      "bom-ref": "pkg:cargo/asn1-rs@0.7.2",
+      "name": "asn1-rs",
+      "version": "0.7.2",
+      "purl": "pkg:cargo/asn1-rs@0.7.2",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "hashes": [
         {
           "alg": "SHA-256",
           "content": "cab112f0a86d568ea0e627cc1d6be74a1e9cd55214684db5561995f6dad897c6"
+          "content": "b7f43a50ac4fdca5df8e885c21b835997f0a1cdee65494a6847694a98652d9d8"
         }
       ],
       "externalReferences": [
         {
           "type": "vcs",
           "url": "https://github.com/brendanzab/approx"
+          "url": "https://github.com/rusticata/asn1-rs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/asn1-rs-derive@0.6.0",
+      "name": "asn1-rs-derive",
+      "version": "0.6.0",
+      "purl": "pkg:cargo/asn1-rs-derive@0.6.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "3109e49b1e4909e9db6515a30c633684d68cdeaa252f215214cb4fa1a5bfee2c"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusticata/asn1-rs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/asn1-rs-impl@0.2.0",
+      "name": "asn1-rs-impl",
+      "version": "0.2.0",
+      "purl": "pkg:cargo/asn1-rs-impl@0.2.0",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "7b18050c2cd6fe86c3a76584ef5e0baf286d038cda203eb6223df2cc413565f7"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusticata/asn1-rs.git"
         }
       ]
     },
@@ -315,6 +457,78 @@
         {
           "type": "vcs",
           "url": "https://github.com/smol-rs/async-channel"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/async-compat@0.2.7",
+      "name": "async-compat",
+      "version": "0.2.7",
+      "purl": "pkg:cargo/async-compat@0.2.7",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "3293517e7da05b02ea72ba703bf2acc2906a53b2addf2c08fb65de7a90530891"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/smol-rs/async-compat"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/async-executor@1.14.1",
+      "name": "async-executor",
+      "version": "1.14.1",
+      "purl": "pkg:cargo/async-executor@1.14.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f426a31126c735126297bc5ea7a521263c9faff4f63ca415267ee625651c4f37"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/smol-rs/async-executor"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/async-global-executor@3.1.0",
+      "name": "async-global-executor",
+      "version": "3.1.0",
+      "purl": "pkg:cargo/async-global-executor@3.1.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "13f937e26114b93193065fd44f507aa2e9169ad0cdabbb996920b1fe1ddea7ba"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Keruspe/async-global-executor"
         }
       ]
     },
@@ -411,6 +625,30 @@
         {
           "type": "vcs",
           "url": "https://github.com/dcchut/async-recursion"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/async-rs@0.8.13",
+      "name": "async-rs",
+      "version": "0.8.13",
+      "purl": "pkg:cargo/async-rs@0.8.13",
+      "licenses": [
+        {
+          "expression": "BSD-2-Clause"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "407bdac3815af195d2d63fa50595610ea8ba4d47b7fc5a37895b05d3b571c241"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/amqp-rs/async-rs"
         }
       ]
     },
@@ -536,6 +774,78 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/backon@1.6.0",
+      "name": "backon",
+      "version": "1.6.0",
+      "purl": "pkg:cargo/backon@1.6.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "cffb0e931875b666fc4fcb20fee52e9bbd1ef836fd9e9e04ec21555f9f85f7ef"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Xuanwo/backon"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/base64@0.22.1",
+      "name": "base64",
+      "version": "0.22.1",
+      "purl": "pkg:cargo/base64@0.22.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/marshallpierce/rust-base64"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/base64ct@1.8.3",
+      "name": "base64ct",
+      "version": "1.8.3",
+      "purl": "pkg:cargo/base64ct@1.8.3",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/bitflags@2.13.2",
       "name": "bitflags",
       "version": "2.13.2",
@@ -636,6 +946,10 @@
       "name": "by_address",
       "version": "1.2.1",
       "purl": "pkg:cargo/by_address@1.2.1",
+      "bom-ref": "pkg:cargo/bumpalo@3.20.4",
+      "name": "bumpalo",
+      "version": "3.20.4",
+      "purl": "pkg:cargo/bumpalo@3.20.4",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
@@ -645,12 +959,14 @@
         {
           "alg": "SHA-256",
           "content": "64fa3c856b712db6612c019f14756e64e4bcea13337a6b33b696333a9eaa2d06"
+          "content": "87a0cf66fd1eb2fb7b822cb78370d82303750809bc6ba855f3f58e517d3238db"
         }
       ],
       "externalReferences": [
         {
           "type": "vcs",
           "url": "https://github.com/mbrubeck/by_address"
+          "url": "https://github.com/fitzgen/bumpalo"
         }
       ]
     },
@@ -824,6 +1140,30 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/chacha20@0.10.2",
+      "name": "chacha20",
+      "version": "0.10.2",
+      "purl": "pkg:cargo/chacha20@0.10.2",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/stream-ciphers"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/cipher@0.4.4",
       "name": "cipher",
       "version": "0.4.4",
@@ -992,6 +1332,30 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/cms@0.2.3",
+      "name": "cms",
+      "version": "0.2.3",
+      "purl": "pkg:cargo/cms@0.2.3",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "7b77c319abfd5219629c45c34c89ba945ed3c5e49fcde9d16b6c3885f118a730"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats/tree/master/cms"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/colorchoice@1.0.5",
       "name": "colorchoice",
       "version": "1.0.5",
@@ -1035,6 +1399,30 @@
         {
           "type": "vcs",
           "url": "https://github.com/mackwic/colored"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/combine@4.6.9",
+      "name": "combine",
+      "version": "4.6.9",
+      "purl": "pkg:cargo/combine@4.6.9",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "4356eba6976435498d05a311ee9fc486da3bc81c200d3f0d7dd9703b41913f92"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Marwes/combine"
         }
       ]
     },
@@ -1116,6 +1504,34 @@
       "name": "convert_case",
       "version": "0.10.0",
       "purl": "pkg:cargo/convert_case@0.10.0",
+      "bom-ref": "pkg:cargo/const-oid@0.9.6",
+      "name": "const-oid",
+      "version": "0.9.6",
+      "purl": "pkg:cargo/const-oid@0.9.6",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats/tree/master/const-oid"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/cookie-factory@0.3.3",
+      "name": "cookie-factory",
+      "version": "0.3.3",
+      "purl": "pkg:cargo/cookie-factory@0.3.3",
       "licenses": [
         {
           "expression": "MIT"
@@ -1125,12 +1541,14 @@
         {
           "alg": "SHA-256",
           "content": "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
+          "content": "9885fa71e26b8ab7855e2ec7cae6e9b380edff76cd052e07c683a0319d51b3a2"
         }
       ],
       "externalReferences": [
         {
           "type": "vcs",
           "url": "https://github.com/rutrum/convert-case"
+          "url": "https://github.com/rust-bakery/cookie-factory"
         }
       ]
     },
@@ -1227,6 +1645,102 @@
         {
           "type": "vcs",
           "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/cpufeatures@0.3.1",
+      "name": "cpufeatures",
+      "version": "0.3.1",
+      "purl": "pkg:cargo/cpufeatures@0.3.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/critical-section@1.2.0",
+      "name": "critical-section",
+      "version": "1.2.0",
+      "purl": "pkg:cargo/critical-section@1.2.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-embedded/critical-section"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/crossbeam-channel@0.5.17",
+      "name": "crossbeam-channel",
+      "version": "0.5.17",
+      "purl": "pkg:cargo/crossbeam-channel@0.5.17",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/crossbeam-rs/crossbeam"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/crossbeam-epoch@0.9.21",
+      "name": "crossbeam-epoch",
+      "version": "0.9.21",
+      "purl": "pkg:cargo/crossbeam-epoch@0.9.21",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/crossbeam-rs/crossbeam"
         }
       ]
     },
@@ -1332,6 +1846,10 @@
       "name": "darling",
       "version": "0.24.1",
       "purl": "pkg:cargo/darling@0.24.1",
+      "bom-ref": "pkg:cargo/data-encoding@2.11.1",
+      "name": "data-encoding",
+      "version": "2.11.1",
+      "purl": "pkg:cargo/data-encoding@2.11.1",
       "licenses": [
         {
           "expression": "MIT"
@@ -1341,6 +1859,7 @@
         {
           "alg": "SHA-256",
           "content": "ed17f5901b6630b993ca003def43f2f8ef4014fc13b047b57aad617ff32bc2ec"
+          "content": "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
         }
       ],
       "externalReferences": [
@@ -1395,6 +1914,7 @@
         {
           "type": "vcs",
           "url": "https://github.com/TedDriggs/darling"
+          "url": "https://github.com/ia0/data-encoding"
         }
       ]
     },
@@ -1448,6 +1968,78 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/der@0.7.10",
+      "name": "der",
+      "version": "0.7.10",
+      "purl": "pkg:cargo/der@0.7.10",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats/tree/master/der"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/der-parser@10.0.0",
+      "name": "der-parser",
+      "version": "10.0.0",
+      "purl": "pkg:cargo/der-parser@10.0.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "07da5016415d5a3c4dd39b11ed26f915f52fc4e0dc197d87908bc916e51bc1a6"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusticata/der-parser.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/der_derive@0.7.3",
+      "name": "der_derive",
+      "version": "0.7.3",
+      "purl": "pkg:cargo/der_derive@0.7.3",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "8034092389675178f570469e6c3b0465d3d30b4505c294a6550db47f3c17ad18"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats/tree/master/der/derive"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/deranged@0.5.9",
       "name": "deranged",
       "version": "0.5.9",
@@ -1479,12 +2071,20 @@
       "licenses": [
         {
           "expression": "MIT"
+      "bom-ref": "pkg:cargo/des@0.8.1",
+      "name": "des",
+      "version": "0.8.1",
+      "purl": "pkg:cargo/des@0.8.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "hashes": [
         {
           "alg": "SHA-256",
           "content": "d751e9e49156b02b44f9c1815bcb94b984cdcc4396ecc32521c739452808b134"
+          "content": "ffdd80ce8ce993de27e9f063a444a4d53ce8e8db4c1f00cc03af5ad5a9867a1e"
         }
       ],
       "externalReferences": [
@@ -1515,6 +2115,7 @@
         {
           "type": "vcs",
           "url": "https://github.com/JelteF/derive_more"
+          "url": "https://github.com/RustCrypto/block-ciphers"
         }
       ]
     },
@@ -1587,6 +2188,30 @@
         {
           "type": "vcs",
           "url": "https://github.com/dirs-dev/dirs-sys-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/displaydoc@0.2.7",
+      "name": "displaydoc",
+      "version": "0.2.7",
+      "purl": "pkg:cargo/displaydoc@0.2.7",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c6232dd377dcc64799954cbd3a9bb882e9cdc1308ccd87b1c098f1fb2eaf82a8"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/yaahc/displaydoc"
         }
       ]
     },
@@ -1863,18 +2488,51 @@
       "licenses": [
         {
           "expression": "Zlib"
+      "bom-ref": "pkg:cargo/flagset@0.4.7",
+      "name": "flagset",
+      "version": "0.4.7",
+      "purl": "pkg:cargo/flagset@0.4.7",
+      "licenses": [
+        {
+          "expression": "Apache-2.0"
         }
       ],
       "hashes": [
         {
           "alg": "SHA-256",
           "content": "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+          "content": "b7ac824320a75a52197e8f2d787f6a38b6718bb6897a35142d749af3c0e8f4fe"
         }
       ],
       "externalReferences": [
         {
           "type": "vcs",
           "url": "https://github.com/orlp/foldhash"
+          "url": "https://github.com/enarx/flagset"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/flume@0.12.0",
+      "name": "flume",
+      "version": "0.12.0",
+      "purl": "pkg:cargo/flume@0.12.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0/MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/zesterer/flume"
         }
       ]
     },
@@ -1923,6 +2581,30 @@
         {
           "type": "vcs",
           "url": "https://github.com/sfackler/foreign-types"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/form_urlencoded@1.2.3",
+      "name": "form_urlencoded",
+      "version": "1.2.3",
+      "purl": "pkg:cargo/form_urlencoded@1.2.3",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/servo/rust-url"
         }
       ]
     },
@@ -2043,6 +2725,30 @@
         {
           "type": "vcs",
           "url": "https://github.com/rust-lang/futures-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/futures-rustls@0.26.0",
+      "name": "futures-rustls",
+      "version": "0.26.0",
+      "purl": "pkg:cargo/futures-rustls@0.26.0",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "a8f2f12607f92c69b12ed746fabf9ca4f5c482cba46679c1a75b874ed7c26adb"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/quininer/futures-rustls"
         }
       ]
     },
@@ -2288,6 +2994,78 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/hickory-net@0.26.3",
+      "name": "hickory-net",
+      "version": "0.26.3",
+      "purl": "pkg:cargo/hickory-net@0.26.3",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c480823ed7c2c5d0f09c41020cb6b7c28029ce60ec42dc942158dcf22f8e0a4d"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hickory-dns/hickory-dns"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/hickory-proto@0.26.3",
+      "name": "hickory-proto",
+      "version": "0.26.3",
+      "purl": "pkg:cargo/hickory-proto@0.26.3",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "12b92608f679a6fa515dd1d15c1ff89443026e391200a2c840c7afcba482893d"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hickory-dns/hickory-dns"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/hickory-resolver@0.26.3",
+      "name": "hickory-resolver",
+      "version": "0.26.3",
+      "purl": "pkg:cargo/hickory-resolver@0.26.3",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "3f3da5255c95d5a716857d54b5b8f4e8d67c3484d3beaaaae2ce25063b3ba981"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hickory-dns/hickory-dns"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/hkdf@0.12.4",
       "name": "hkdf",
       "version": "0.12.4",
@@ -2343,18 +3121,219 @@
       "licenses": [
         {
           "expression": "MIT/Apache-2.0"
+      "bom-ref": "pkg:cargo/icu_collections@2.4.0",
+      "name": "icu_collections",
+      "version": "2.4.0",
+      "purl": "pkg:cargo/icu_collections@2.4.0",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
         }
       ],
       "hashes": [
         {
           "alg": "SHA-256",
           "content": "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
+          "content": "fe090a42a0d3140fed8c63263ed1fecc02422cb2f4bfe55cd8de2de1b8e105dd"
         }
       ],
       "externalReferences": [
         {
           "type": "vcs",
           "url": "https://github.com/TedDriggs/ident_case"
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/icu_locale_core@2.4.0",
+      "name": "icu_locale_core",
+      "version": "2.4.0",
+      "purl": "pkg:cargo/icu_locale_core@2.4.0",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "25d29b57c17c6528d0dc4c2141cfa2d08200465acb537a3909c8b9b8a4a984c0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/icu_normalizer@2.4.0",
+      "name": "icu_normalizer",
+      "version": "2.4.0",
+      "purl": "pkg:cargo/icu_normalizer@2.4.0",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "404a3b8c486f205c87fe7f23ab6894d84a4ad76d6e4671ae1981ba7def87c599"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/icu_normalizer_data@2.4.0",
+      "name": "icu_normalizer_data",
+      "version": "2.4.0",
+      "purl": "pkg:cargo/icu_normalizer_data@2.4.0",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "20f0088bfb7441f7a37fa0c9e20cb1e9cba1cac6b9ce8cd2a6dc44294f8e8cbc"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/icu_properties@2.4.0",
+      "name": "icu_properties",
+      "version": "2.4.0",
+      "purl": "pkg:cargo/icu_properties@2.4.0",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "2ea83d991c56158f7cf898bf86436c1dfe7c07ee82fe88951f2695c9f37a379f"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/icu_properties_data@2.4.0",
+      "name": "icu_properties_data",
+      "version": "2.4.0",
+      "purl": "pkg:cargo/icu_properties_data@2.4.0",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "b98f29af82d02b163fe50161388350e743bb3107cc8e8c2f7314cb505faddfcf"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/icu_provider@2.4.0",
+      "name": "icu_provider",
+      "version": "2.4.0",
+      "purl": "pkg:cargo/icu_provider@2.4.0",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "413099315636c588ee8f011190b329b971a09a8fae9d157e01dcae8379468514"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/idna@1.1.0",
+      "name": "idna",
+      "version": "1.1.0",
+      "purl": "pkg:cargo/idna@1.1.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "3b0875f23caa03898994f6ddc501886a45c7d3d62d04d2d90788d47be1b1e4de"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/servo/rust-url/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/idna_adapter@1.2.2",
+      "name": "idna_adapter",
+      "version": "1.2.2",
+      "purl": "pkg:cargo/idna_adapter@1.2.2",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hsivonen/idna_adapter"
         }
       ]
     },
@@ -2439,18 +3418,51 @@
       "licenses": [
         {
           "expression": "MIT"
+      "bom-ref": "pkg:cargo/ipconfig@0.3.4",
+      "name": "ipconfig",
+      "version": "0.3.4",
+      "purl": "pkg:cargo/ipconfig@0.3.4",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
         }
       ],
       "hashes": [
         {
           "alg": "SHA-256",
           "content": "4c3b5acc1e2fd9375041a388da33d1eb8aed5f7a8c0dd3543e3ea2805adfbe20"
+          "content": "4d40460c0ce33d6ce4b0630ad68ff63d6661961c48b6dba35e5a4d81cfb48222"
         }
       ],
       "externalReferences": [
         {
           "type": "vcs",
           "url": "https://github.com/ratatui/instability"
+          "url": "https://github.com/liranringel/ipconfig"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/ipnet@2.12.2",
+      "name": "ipnet",
+      "version": "2.12.2",
+      "purl": "pkg:cargo/ipnet@2.12.2",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "791930b43c0d5973160d90a8f3894509f2b273430f5c5c73b668636d0287c5c0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/krisprice/ipnet"
         }
       ]
     },
@@ -2648,6 +3660,102 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/jni@0.22.4",
+      "name": "jni",
+      "version": "0.22.4",
+      "purl": "pkg:cargo/jni@0.22.4",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "5efd9a482cf3a427f00d6b35f14332adc7902ce91efb778580e180ff90fa3498"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/jni-rs/jni-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/jni-macros@0.22.4",
+      "name": "jni-macros",
+      "version": "0.22.4",
+      "purl": "pkg:cargo/jni-macros@0.22.4",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "a00109accc170f0bdb141fed3e393c565b6f5e072365c3bd58f5b062591560a3"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/jni-rs/jni-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/jni-sys@0.4.1",
+      "name": "jni-sys",
+      "version": "0.4.1",
+      "purl": "pkg:cargo/jni-sys@0.4.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c6377a88cb3910bee9b0fa88d4f42e1d2da8e79915598f65fb0c7ee14c878af2"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/jni-rs/jni-sys"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/jni-sys-macros@0.4.1",
+      "name": "jni-sys-macros",
+      "version": "0.4.1",
+      "purl": "pkg:cargo/jni-sys-macros@0.4.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "38c0b942f458fe50cdac086d2f946512305e5631e720728f2a61aabcd47a6264"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/jni-rs/jni-sys"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/jobserver@0.1.35",
       "name": "jobserver",
       "version": "0.1.35",
@@ -2676,6 +3784,10 @@
       "name": "kasuari",
       "version": "0.4.13",
       "purl": "pkg:cargo/kasuari@0.4.13",
+      "bom-ref": "pkg:cargo/js-sys@0.3.107",
+      "name": "js-sys",
+      "version": "0.3.107",
+      "purl": "pkg:cargo/js-sys@0.3.107",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
@@ -2685,12 +3797,14 @@
         {
           "alg": "SHA-256",
           "content": "72f14c90e40a6133f4805b83542a7ed7364f56070b447f56e7f4e90297122209"
+          "content": "8dc09d2154098bbf4ef54eab6b117a3c24cbbffe94046b16ee6d6d4510584d3a"
         }
       ],
       "externalReferences": [
         {
           "type": "vcs",
           "url": "https://github.com/ratatui/kasuari"
+          "url": "https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys"
         }
       ]
     },
@@ -2715,6 +3829,30 @@
         {
           "type": "vcs",
           "url": "https://github.com/hwchen/keyring-rs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/lapin@4.13.0",
+      "name": "lapin",
+      "version": "4.13.0",
+      "purl": "pkg:cargo/lapin@4.13.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "38a4ecf9a9aef55bd865c3947d738270967d4da16fa0d5fc6d3e7f2b9b28a419"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/amqp-rs/lapin"
         }
       ]
     },
@@ -2912,6 +4050,30 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/litemap@0.8.3",
+      "name": "litemap",
+      "version": "0.8.3",
+      "purl": "pkg:cargo/litemap@0.8.3",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/litrs@1.0.0",
       "name": "litrs",
       "version": "1.0.0",
@@ -3080,6 +4242,30 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/minimal-lexical@0.2.1",
+      "name": "minimal-lexical",
+      "version": "0.2.1",
+      "purl": "pkg:cargo/minimal-lexical@0.2.1",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Alexhuszagh/minimal-lexical"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/mio@1.2.3",
       "name": "mio",
       "version": "1.2.3",
@@ -3104,6 +4290,54 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/moka@0.12.16",
+      "name": "moka",
+      "version": "0.12.16",
+      "purl": "pkg:cargo/moka@0.12.16",
+      "licenses": [
+        {
+          "expression": "(MIT OR Apache-2.0) AND Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "4293f18e7567a1caf3c584855554377025c65e0aa445344d04171f5ad63d19b9"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/moka-rs/moka"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/ndk-context@0.1.1",
+      "name": "ndk-context",
+      "version": "0.1.1",
+      "purl": "pkg:cargo/ndk-context@0.1.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-windowing/android-ndk-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/nix@0.29.0",
       "name": "nix",
       "version": "0.29.0",
@@ -3123,6 +4357,54 @@
         {
           "type": "vcs",
           "url": "https://github.com/nix-rust/nix"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/nom@7.1.3",
+      "name": "nom",
+      "version": "7.1.3",
+      "purl": "pkg:cargo/nom@7.1.3",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Geal/nom"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/nom@8.0.0",
+      "name": "nom",
+      "version": "8.0.0",
+      "purl": "pkg:cargo/nom@8.0.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-bakery/nom"
         }
       ]
     },
@@ -3396,6 +4678,10 @@
       "name": "num_threads",
       "version": "0.1.8",
       "purl": "pkg:cargo/num_threads@0.1.8",
+      "bom-ref": "pkg:cargo/oid-registry@0.8.1",
+      "name": "oid-registry",
+      "version": "0.8.1",
+      "purl": "pkg:cargo/oid-registry@0.8.1",
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
@@ -3405,12 +4691,14 @@
         {
           "alg": "SHA-256",
           "content": "cabcc654086861f9e1bc5115258de62ef92c79b20f4615a1b0cc57c4e82027d4"
+          "content": "12f40cff3dde1b6087cc5d5f5d4d65712f34016a03ed60e9c08dcc392736b5b7"
         }
       ],
       "externalReferences": [
         {
           "type": "vcs",
           "url": "https://github.com/jhpratt/num_threads"
+          "url": "https://github.com/rusticata/oid-registry.git"
         }
       ]
     },
@@ -3633,12 +4921,20 @@
       "licenses": [
         {
           "expression": "MIT OR Apache-2.0"
+      "bom-ref": "pkg:cargo/p12-keystore@0.2.1",
+      "name": "p12-keystore",
+      "version": "0.2.1",
+      "purl": "pkg:cargo/p12-keystore@0.2.1",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
         }
       ],
       "hashes": [
         {
           "alg": "SHA-256",
           "content": "ddeed8580d347d2abf3dcf06a5f0b3dc020258338526b277847cd4248a70fc64"
+          "content": "ffb9bf5222606eb712d3bb30e01bc9420545b00859970897e70c682353a034f2"
         }
       ],
       "externalReferences": [
@@ -3693,6 +4989,7 @@
         {
           "type": "vcs",
           "url": "https://github.com/Ogeon/palette"
+          "url": "https://github.com/ancwrd1/p12-keystore"
         }
       ]
     },
@@ -3770,6 +5067,78 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/pbkdf2@0.12.2",
+      "name": "pbkdf2",
+      "version": "0.12.2",
+      "purl": "pkg:cargo/pbkdf2@0.12.2",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/password-hashes/tree/master/pbkdf2"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/pem-rfc7468@0.7.0",
+      "name": "pem-rfc7468",
+      "version": "0.7.0",
+      "purl": "pkg:cargo/pem-rfc7468@0.7.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats/tree/master/pem-rfc7468"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/percent-encoding@2.3.2",
+      "name": "percent-encoding",
+      "version": "2.3.2",
+      "purl": "pkg:cargo/percent-encoding@2.3.2",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/servo/rust-url/"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/pin-project-lite@0.2.17",
       "name": "pin-project-lite",
       "version": "0.2.17",
@@ -3813,6 +5182,54 @@
         {
           "type": "vcs",
           "url": "https://github.com/smol-rs/piper"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/pkcs12@0.1.0",
+      "name": "pkcs12",
+      "version": "0.1.0",
+      "purl": "pkg:cargo/pkcs12@0.1.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "695b3df3d3cc1015f12d70235e35b6b79befc5fa7a9b95b951eab1dd07c9efc2"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats/tree/master/pkcs12"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/pkcs5@0.7.1",
+      "name": "pkcs5",
+      "version": "0.7.1",
+      "purl": "pkg:cargo/pkcs5@0.7.1",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "e847e2c91a18bfa887dd028ec33f2fe6f25db77db3619024764914affe8b69a6"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats/tree/master/pkcs5"
         }
       ]
     },
@@ -3914,6 +5331,30 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/potential_utf@0.1.6",
+      "name": "potential_utf",
+      "version": "0.1.6",
+      "purl": "pkg:cargo/potential_utf@0.1.6",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "d83eb9bc6d8e5cf568e7a1101d60ee05e81ed50ea106026f3d18deeb046d7661"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/powerfmt@0.2.1",
       "name": "powerfmt",
       "version": "0.2.1",
@@ -3957,6 +5398,30 @@
         {
           "type": "vcs",
           "url": "https://github.com/cryptocorrosion/cryptocorrosion"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/prefix-trie@0.8.4",
+      "name": "prefix-trie",
+      "version": "0.8.4",
+      "purl": "pkg:cargo/prefix-trie@0.8.4",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "4cf6e3177f0684016a5c209b00882e15f8bdd3f3bb48f0491df10cd102d0c6e7"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tiborschneider/prefix-trie"
         }
       ]
     },
@@ -4058,6 +5523,30 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/rand@0.10.4",
+      "name": "rand",
+      "version": "0.10.4",
+      "purl": "pkg:cargo/rand@0.10.4",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "8f6fa277c67e6ea590466f04c3fe82cb509f0864fe470643e5570de9514a9b11"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-random/rand"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/rand@0.8.8",
       "name": "rand",
       "version": "0.8.8",
@@ -4106,6 +5595,30 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/rand_core@0.10.1",
+      "name": "rand_core",
+      "version": "0.10.1",
+      "purl": "pkg:cargo/rand_core@0.10.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rust-random/rand_core"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/rand_core@0.6.4",
       "name": "rand_core",
       "version": "0.6.4",
@@ -4137,12 +5650,20 @@
       "licenses": [
         {
           "expression": "MIT"
+      "bom-ref": "pkg:cargo/rc2@0.8.1",
+      "name": "rc2",
+      "version": "0.8.1",
+      "purl": "pkg:cargo/rc2@0.8.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "hashes": [
         {
           "alg": "SHA-256",
           "content": "3274ba0a2c5e1bcad2a2005d20f4dc59dad26b2eb0940fb094500dba4099d57d"
+          "content": "62c64daa8e9438b84aaae55010a93f396f8e60e3911590fcba770d04643fc1dd"
         }
       ],
       "externalReferences": [
@@ -4221,6 +5742,7 @@
         {
           "type": "vcs",
           "url": "https://github.com/ratatui/ratatui"
+          "url": "https://github.com/RustCrypto/block-ciphers"
         }
       ]
     },
@@ -4394,6 +5916,30 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/resolv-conf@0.7.6",
+      "name": "resolv-conf",
+      "version": "0.7.6",
+      "purl": "pkg:cargo/resolv-conf@0.7.6",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "1e061d1b48cb8d38042de4ae0a7a6401009d6143dc80d2e2d6f31f0bdd6470c7"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hickory-dns/resolv-conf"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/ring@0.17.14",
       "name": "ring",
       "version": "0.17.14",
@@ -4442,6 +5988,30 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/rusticata-macros@4.1.0",
+      "name": "rusticata-macros",
+      "version": "4.1.0",
+      "purl": "pkg:cargo/rusticata-macros@4.1.0",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "faf0c4a6ece9950b9abdb62b1cfcf2a68b3b67a10ba445b3bb85be2a293d0632"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusticata/rusticata-macros.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/rustix@1.1.5",
       "name": "rustix",
       "version": "1.1.5",
@@ -4485,6 +6055,30 @@
         {
           "type": "vcs",
           "url": "https://github.com/rustls/rustls"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/rustls-connector@0.23.11",
+      "name": "rustls-connector",
+      "version": "0.23.11",
+      "purl": "pkg:cargo/rustls-connector@0.23.11",
+      "licenses": [
+        {
+          "expression": "BSD-2-Clause"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "dff68aa89e3d524b33c149f73733b503d00357fdb454eb82e3f3f79b11356d3f"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/amqp-rs/rustls-connector"
         }
       ]
     },
@@ -4593,18 +6187,51 @@
       "licenses": [
         {
           "expression": "Apache-2.0 OR BSL-1.0"
+      "bom-ref": "pkg:cargo/salsa20@0.10.2",
+      "name": "salsa20",
+      "version": "0.10.2",
+      "purl": "pkg:cargo/salsa20@0.10.2",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
         }
       ],
       "hashes": [
         {
           "alg": "SHA-256",
           "content": "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+          "content": "97a22f5af31f73a954c10289c93e8a50cc23d971e80ee446f1f6f7137a088213"
         }
       ],
       "externalReferences": [
         {
           "type": "vcs",
           "url": "https://github.com/dtolnay/ryu"
+          "url": "https://github.com/RustCrypto/stream-ciphers"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/same-file@1.0.6",
+      "name": "same-file",
+      "version": "1.0.6",
+      "purl": "pkg:cargo/same-file@1.0.6",
+      "licenses": [
+        {
+          "expression": "Unlicense/MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/same-file"
         }
       ]
     },
@@ -4653,6 +6280,30 @@
         {
           "type": "vcs",
           "url": "https://github.com/bluss/scopeguard"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/scrypt@0.11.0",
+      "name": "scrypt",
+      "version": "0.11.0",
+      "purl": "pkg:cargo/scrypt@0.11.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "0516a385866c09368f0b5bcd1caff3366aace790fcd46e2bb032697bb172fd1f"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/password-hashes/tree/master/scrypt"
         }
       ]
     },
@@ -5090,6 +6741,54 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/simd_cesu8@1.2.0",
+      "name": "simd_cesu8",
+      "version": "1.2.0",
+      "purl": "pkg:cargo/simd_cesu8@1.2.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "11031e251abf8611c80f460e19dbdeb54a66db918e49c65a7065b46ac7aec520"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/seancroach/simd_cesu8"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/simdutf8@0.1.5",
+      "name": "simdutf8",
+      "version": "0.1.5",
+      "purl": "pkg:cargo/simdutf8@0.1.5",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusticstuff/simdutf8"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/slab@0.4.12",
       "name": "slab",
       "version": "0.4.12",
@@ -5157,6 +6856,78 @@
         {
           "type": "vcs",
           "url": "https://github.com/rust-lang/socket2"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/spin@0.9.9",
+      "name": "spin",
+      "version": "0.9.9",
+      "purl": "pkg:cargo/spin@0.9.9",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mvdnes/spin-rs.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/spki@0.7.3",
+      "name": "spki",
+      "version": "0.7.3",
+      "purl": "pkg:cargo/spki@0.7.3",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats/tree/master/spki"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/stable_deref_trait@1.2.1",
+      "name": "stable_deref_trait",
+      "version": "1.2.1",
+      "purl": "pkg:cargo/stable_deref_trait@1.2.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/storyyeller/stable_deref_trait"
         }
       ]
     },
@@ -5325,6 +7096,150 @@
         {
           "type": "vcs",
           "url": "https://github.com/dtolnay/syn"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/synstructure@0.13.2",
+      "name": "synstructure",
+      "version": "0.13.2",
+      "purl": "pkg:cargo/synstructure@0.13.2",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "728a70f3dbaf5bab7f0c4b1ac8d7ae5ea60a4b5549c8a5914361c99147a709d2"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mystor/synstructure"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/synstructure@0.14.0",
+      "name": "synstructure",
+      "version": "0.14.0",
+      "purl": "pkg:cargo/synstructure@0.14.0",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "901704edd0dfe137f1987838ee4f259e4e063c31371bdb423f7ae38ec6f77f02"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mystor/synstructure"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/system-configuration@0.7.0",
+      "name": "system-configuration",
+      "version": "0.7.0",
+      "purl": "pkg:cargo/system-configuration@0.7.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "a13f3d0daba03132c0aa9767f98351b3488edc2c100cda2d2ec2b04f3d8d3c8b"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mullvad/system-configuration-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/system-configuration-sys@0.6.0",
+      "name": "system-configuration-sys",
+      "version": "0.6.0",
+      "purl": "pkg:cargo/system-configuration-sys@0.6.0",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/mullvad/system-configuration-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/tagptr@0.2.0",
+      "name": "tagptr",
+      "version": "0.2.0",
+      "purl": "pkg:cargo/tagptr@0.2.0",
+      "licenses": [
+        {
+          "expression": "MIT/Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/oliver-giersch/tagptr.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/tcp-stream@0.34.17",
+      "name": "tcp-stream",
+      "version": "0.34.17",
+      "purl": "pkg:cargo/tcp-stream@0.34.17",
+      "licenses": [
+        {
+          "expression": "BSD-2-Clause"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "2afa87967dbc0fa02957531aab16e5d5fe8a8aa71d8efd9d4173c1f14c59e381"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/amqp-rs/tcp-stream"
         }
       ]
     },
@@ -5522,6 +7437,78 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/time-macros@0.2.32",
+      "name": "time-macros",
+      "version": "0.2.32",
+      "purl": "pkg:cargo/time-macros@0.2.32",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "7e689342a48d2ea927c87ea50cabf8594854bf940e9310208848d680d668ed85"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/time-rs/time"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/tinystr@0.8.5",
+      "name": "tinystr",
+      "version": "0.8.5",
+      "purl": "pkg:cargo/tinystr@0.8.5",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "abc840c238154d58f9e86b2792261edfde565a17696e1cda1a449de27979801a"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/tinyvec@1.13.3",
+      "name": "tinyvec",
+      "version": "1.13.3",
+      "purl": "pkg:cargo/tinyvec@1.13.3",
+      "licenses": [
+        {
+          "expression": "Zlib OR Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/Lokathor/tinyvec"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/tokio@1.54.1",
       "name": "tokio",
       "version": "1.54.1",
@@ -5589,6 +7576,30 @@
         {
           "type": "vcs",
           "url": "https://github.com/rustls/tokio-rustls"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/tokio-stream@0.1.19",
+      "name": "tokio-stream",
+      "version": "0.1.19",
+      "purl": "pkg:cargo/tokio-stream@0.1.19",
+      "licenses": [
+        {
+          "expression": "MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/tokio-rs/tokio"
         }
       ]
     },
@@ -6002,6 +8013,54 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/url@2.5.9",
+      "name": "url",
+      "version": "2.5.9",
+      "purl": "pkg:cargo/url@2.5.9",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/servo/rust-url"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/utf8_iter@1.1.0",
+      "name": "utf8_iter",
+      "version": "1.1.0",
+      "purl": "pkg:cargo/utf8_iter@1.1.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "af3bd9d3e571c26fcce9d033b87ea5ab061b8d2ffe9b7a5675d810d68f03edf0"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hsivonen/utf8_iter"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/utf8parse@0.2.2",
       "name": "utf8parse",
       "version": "0.2.2",
@@ -6021,6 +8080,54 @@
         {
           "type": "vcs",
           "url": "https://github.com/alacritty/vte"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/utf_types@1.0.0",
+      "name": "utf_types",
+      "version": "1.0.0",
+      "purl": "pkg:cargo/utf_types@1.0.0",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "3a3b425286980a367278453f3b6d28cdcb134b574e5a35824a6ff5eebad50bb6"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/hsivonen/utf_types"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/uuid@1.29.3",
+      "name": "uuid",
+      "version": "1.29.3",
+      "purl": "pkg:cargo/uuid@1.29.3",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "3c14b15dffa2f4bd712103e857140aa04a4f2ff6e955c77d7eb8e53ee02a3b64"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/uuid-rs/uuid"
         }
       ]
     },
@@ -6098,6 +8205,30 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/walkdir@2.5.1",
+      "name": "walkdir",
+      "version": "2.5.1",
+      "purl": "pkg:cargo/walkdir@2.5.1",
+      "licenses": [
+        {
+          "expression": "Unlicense/MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "b42e295b7452c4604982280d8586001fcad9b8b201cac67bca9771e7a7475403"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/walkdir"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/wasi@0.11.1+wasi-snapshot-preview1",
       "name": "wasi",
       "version": "0.11.1+wasi-snapshot-preview1",
@@ -6117,6 +8248,126 @@
         {
           "type": "vcs",
           "url": "https://github.com/bytecodealliance/wasi"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/wasm-bindgen@0.2.130",
+      "name": "wasm-bindgen",
+      "version": "0.2.130",
+      "purl": "pkg:cargo/wasm-bindgen@0.2.130",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "a0181c14ddd6c7b8b0b0132a5f1ea2f32be0d893cd3ea97b6e3b28886b8a3d1c"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/wasm-bindgen/wasm-bindgen"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/wasm-bindgen-macro@0.2.130",
+      "name": "wasm-bindgen-macro",
+      "version": "0.2.130",
+      "purl": "pkg:cargo/wasm-bindgen-macro@0.2.130",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "6e931a02a39abdbf66966fc35902b5ed58344750a70885bed4ebb3d8eaf28ed9"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/wasm-bindgen-macro-support@0.2.130",
+      "name": "wasm-bindgen-macro-support",
+      "version": "0.2.130",
+      "purl": "pkg:cargo/wasm-bindgen-macro-support@0.2.130",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "2ca4b54280e455bd831e33a6b8e734baf432fe63fbc35c42ac14ce67a043a53a"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/wasm-bindgen/wasm-bindgen/tree/main/crates/macro-support"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/wasm-bindgen-shared@0.2.130",
+      "name": "wasm-bindgen-shared",
+      "version": "0.2.130",
+      "purl": "pkg:cargo/wasm-bindgen-shared@0.2.130",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "3b1f9c3798725016c6ee5f2f57869ec0831e8bbc0ab0310a86e787e97f41389e"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/widestring@1.2.1",
+      "name": "widestring",
+      "version": "1.2.1",
+      "purl": "pkg:cargo/widestring@1.2.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/VoidStarKat/widestring-rs"
         }
       ]
     },
@@ -6170,6 +8421,30 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/winapi-util@0.1.11",
+      "name": "winapi-util",
+      "version": "0.1.11",
+      "purl": "pkg:cargo/winapi-util@0.1.11",
+      "licenses": [
+        {
+          "expression": "Unlicense OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/BurntSushi/winapi-util"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/winapi-x86_64-pc-windows-gnu@0.4.0",
       "name": "winapi-x86_64-pc-windows-gnu",
       "version": "0.4.0",
@@ -6207,6 +8482,78 @@
         {
           "alg": "SHA-256",
           "content": "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/windows-registry@0.6.1",
+      "name": "windows-registry",
+      "version": "0.6.1",
+      "purl": "pkg:cargo/windows-registry@0.6.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "02752bf7fbdcce7f2a27a742f798510f3e5ad88dbe84871e5168e2120c3d5720"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/windows-result@0.4.1",
+      "name": "windows-result",
+      "version": "0.4.1",
+      "purl": "pkg:cargo/windows-result@0.4.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/microsoft/windows-rs"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/windows-strings@0.5.1",
+      "name": "windows-strings",
+      "version": "0.5.1",
+      "purl": "pkg:cargo/windows-strings@0.5.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "7837d08f69c77cf6b07689544538e017c1bfcf57e34b4c0ff58e6c2cd3b37091"
         }
       ],
       "externalReferences": [
@@ -7010,6 +9357,78 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/writeable@0.6.4",
+      "name": "writeable",
+      "version": "0.6.4",
+      "purl": "pkg:cargo/writeable@0.6.4",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/x509-cert@0.2.5",
+      "name": "x509-cert",
+      "version": "0.2.5",
+      "purl": "pkg:cargo/x509-cert@0.2.5",
+      "licenses": [
+        {
+          "expression": "Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "1301e935010a701ae5f8655edc0ad17c44bad3ac5ce8c39185f75453b720ae94"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/RustCrypto/formats/tree/master/x509-cert"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/x509-parser@0.18.1",
+      "name": "x509-parser",
+      "version": "0.18.1",
+      "purl": "pkg:cargo/x509-parser@0.18.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/rusticata/x509-parser.git"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/xdg-home@1.3.0",
       "name": "xdg-home",
       "version": "1.3.0",
@@ -7029,6 +9448,54 @@
         {
           "type": "vcs",
           "url": "https://github.com/zeenix/xdg-home"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/yoke@0.8.4",
+      "name": "yoke",
+      "version": "0.8.4",
+      "purl": "pkg:cargo/yoke@0.8.4",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "417ef3fcf6c300b7dbd25c85531a746931c02ad536f3cf4786ed1e88223340b3"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/yoke-derive@0.8.4",
+      "name": "yoke-derive",
+      "version": "0.8.4",
+      "purl": "pkg:cargo/yoke-derive@0.8.4",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "ec8ebde2db3681e8c9980cc27822030e68752690ddfa9473e739aeb4dbde6d71"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
         }
       ]
     },
@@ -7154,6 +9621,54 @@
     },
     {
       "type": "library",
+      "bom-ref": "pkg:cargo/zerofrom@0.1.8",
+      "name": "zerofrom",
+      "version": "0.1.8",
+      "purl": "pkg:cargo/zerofrom@0.1.8",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "0ec05a11813ea801ff6d75110ad09cd0824ddba17dfe17128ea0d5f68e6c5272"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/zerofrom-derive@0.1.8",
+      "name": "zerofrom-derive",
+      "version": "0.1.8",
+      "purl": "pkg:cargo/zerofrom-derive@0.1.8",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f75b4683f6c7f45248d4d64056a24298c6281e0993356d7d1b4a1a962ef10d4a"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
       "bom-ref": "pkg:cargo/zeroize@1.9.0",
       "name": "zeroize",
       "version": "1.9.0",
@@ -7197,6 +9712,78 @@
         {
           "type": "vcs",
           "url": "https://github.com/RustCrypto/utils"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/zerotrie@0.2.5",
+      "name": "zerotrie",
+      "version": "0.2.5",
+      "purl": "pkg:cargo/zerotrie@0.2.5",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "4ea269c3bd32f0a32c321907a2ae912ba6f4649bb0fc764a15627e99a7095a3f"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/zerovec@0.11.9",
+      "name": "zerovec",
+      "version": "0.11.9",
+      "purl": "pkg:cargo/zerovec@0.11.9",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "f58a2799cfe9a1670c7ea8edbd52ef8edb93cb37a7f83bf31ba9e35d9dae6a40"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:cargo/zerovec-derive@0.11.7",
+      "name": "zerovec-derive",
+      "version": "0.11.7",
+      "purl": "pkg:cargo/zerovec-derive@0.11.7",
+      "licenses": [
+        {
+          "expression": "Unicode-3.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "c3743ddbf47738d929cd1ae2e199d40d0162979dfe31aef8ae646d2bf00bf97a"
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/unicode-org/icu4x"
         }
       ]
     },
