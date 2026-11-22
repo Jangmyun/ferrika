@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use clap::Args;
+use colored::Colorize;
 use comfy_table::{Cell, CellAlignment, Color};
 
 use crate::cli::{output, GlobalOpts};
@@ -8,7 +9,7 @@ use crate::error::KafkaResult;
 use crate::kafka::admin::KafkaAdminClient;
 use crate::kafka::consumer::KafkaConsumerClient;
 use crate::kafka::internal_topic::is_internal_topic;
-use crate::ops::exporter::scrape_cluster_metrics;
+use crate::ops::exporter::scrape_cluster_metrics_checked;
 use crate::ops::top::{
     RateTracker, TopClusterSnapshot, TopConsumerItem, TopSortOrder, TopTopicItem,
 };
@@ -185,6 +186,12 @@ fn render_top_dashboard(
     ]);
 
     println!("{status_table}\n");
+    for warning in &snapshot.warnings {
+        println!("{} {warning}", "⚠ Incomplete:".yellow().bold());
+    }
+    if !snapshot.warnings.is_empty() {
+        println!();
+    }
 
     // 2. Active Consumer Groups (Sorted by Lag)
     println!("👥 Consumer Groups (Sorted by Lag):");
@@ -315,10 +322,17 @@ async fn fetch_cluster_snapshot(
         });
     }
 
-    let lag_metrics = scrape_cluster_metrics(&admin, &config).await;
-    let group_states = admin
-        .list_consumer_group_states(Some(SNAPSHOT_TIMEOUT))
-        .unwrap_or_default();
+    let (lag_metrics, failed) = scrape_cluster_metrics_checked(&admin, &config).await;
+    let mut warnings = Vec::new();
+    let group_states = match admin.list_consumer_group_states(Some(SNAPSHOT_TIMEOUT)) {
+        Ok(states) => states,
+        Err(e) => {
+            warnings.push(format!("Consumer groups could not be listed: {e}"));
+            Vec::new()
+        }
+    };
+    let listed = warnings.is_empty();
+    warnings.extend(crate::ops::health::lag_warnings(&failed, listed));
     let mut consumers = Vec::new();
     for (group_id, state, members) in group_states {
         let mut total_lag = 0;
@@ -358,6 +372,7 @@ async fn fetch_cluster_snapshot(
         total_lag,
         topics,
         consumers,
+        warnings,
     })
 }
 
