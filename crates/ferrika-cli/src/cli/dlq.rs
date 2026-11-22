@@ -341,9 +341,15 @@ async fn run_redrive(args: RedriveDlqArgs, global: &GlobalOpts) -> KafkaResult<(
     let is_simulation = !args.execute;
     // Without -t, a record with no origin header goes to a topic guessed
     // from the DLQ's name (`dlq-s3-sink` -> `s3-sink`): only on request.
+    // (Records skipped as already redriven, or with no guess at all, are not
+    // sent anyway.)
     let guessed = messages
         .iter()
-        .filter(|m| !crate::ops::dlq::names_original_topic(&m.raw_headers))
+        .filter(|m| {
+            !crate::ops::dlq::names_original_topic(&m.raw_headers)
+                && m.original_topic.is_some()
+                && (args.include_redriven || !m.already_redriven())
+        })
         .count();
     if !is_simulation && args.target_topic.is_none() && guessed > 0 {
         let target = crate::ops::dlq::infer_original_topic_from_dlq_name(&args.topic);

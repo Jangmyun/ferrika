@@ -116,11 +116,10 @@ impl DlqMessage {
         let original_topic = find_header_value(&headers_map, ORIGINAL_TOPIC_HEADERS)
             .or_else(|| infer_original_topic_from_dlq_name(dlq_topic));
 
-        let original_partition = find_header_value(&headers_map, ORIGINAL_PARTITION_HEADERS)
-            .and_then(|v| v.parse::<i32>().ok());
+        let original_partition = header_number(&msg.headers, ORIGINAL_PARTITION_HEADERS)
+            .and_then(|n| i32::try_from(n).ok());
 
-        let original_offset = find_header_value(&headers_map, ORIGINAL_OFFSET_HEADERS)
-            .and_then(|v| v.parse::<i64>().ok());
+        let original_offset = header_number(&msg.headers, ORIGINAL_OFFSET_HEADERS);
 
         let exception_message = find_header_value(&headers_map, EXCEPTION_MESSAGE_HEADERS);
         let exception_stacktrace = find_header_value(&headers_map, EXCEPTION_STACK_HEADERS);
@@ -205,6 +204,30 @@ impl DlqMessage {
             ..self.clone()
         }
     }
+}
+
+/// The first of `candidates` present in `headers` as a number: decimal text,
+/// or a 4- or 8-byte big-endian integer as Spring Kafka writes its
+/// `kafka_dlt-original-partition` and `-offset` headers.
+fn header_number(headers: &[(String, Vec<u8>)], candidates: &[&str]) -> Option<i64> {
+    candidates.iter().find_map(|candidate| {
+        let (_, value) = headers
+            .iter()
+            .find(|(k, v)| k.eq_ignore_ascii_case(candidate) && !v.is_empty())?;
+        if let Some(n) = std::str::from_utf8(value)
+            .ok()
+            .and_then(|text| text.trim().parse::<i64>().ok())
+        {
+            return Some(n);
+        }
+        match value.len() {
+            4 => Some(i64::from(i32::from_be_bytes(
+                value.as_slice().try_into().ok()?,
+            ))),
+            8 => Some(i64::from_be_bytes(value.as_slice().try_into().ok()?)),
+            _ => None,
+        }
+    })
 }
 
 /// Whether a record's `headers` name the topic it came from. Without one,
@@ -674,6 +697,20 @@ mod tests {
         assert_eq!(parsed.original_topic.as_deref(), Some("orders-v2"));
         assert_eq!(parsed.exception_message.as_deref(), Some("boom"));
         assert!(names_original_topic(&spring.headers));
+
+        // Spring writes the partition and offset as big-endian integers.
+        let mut binary = msg(&[("kafka_dlt-original-topic", "orders-v2")]);
+        binary.headers.push((
+            "kafka_dlt-original-partition".into(),
+            3i32.to_be_bytes().to_vec(),
+        ));
+        binary.headers.push((
+            "kafka_dlt-original-offset".into(),
+            4711i64.to_be_bytes().to_vec(),
+        ));
+        let parsed = DlqMessage::from_consumed_message(&binary, "orders-dlq");
+        assert_eq!(parsed.original_partition, Some(3));
+        assert_eq!(parsed.original_offset, Some(4711));
 
         let connect = msg(&[("__connect.errors.topic", "payments")]);
         let parsed = DlqMessage::from_consumed_message(&connect, "dlq-s3-sink");
