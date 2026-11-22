@@ -42,8 +42,8 @@ pub enum UserSubcommands {
         /// SCRAM-SHA-256 or SCRAM-SHA-512
         #[arg(long, default_value = "SCRAM-SHA-256")]
         mechanism: String,
-        /// PBKDF2 iterations (at least 4096)
-        #[arg(long, default_value_t = 8192)]
+        /// PBKDF2 iterations (Kafka accepts 4096 to 16384)
+        #[arg(long, default_value_t = 8192, value_parser = clap::value_parser!(u32).range(4096..=16384))]
         iterations: u32,
     },
     /// Delete one SCRAM credential of a user
