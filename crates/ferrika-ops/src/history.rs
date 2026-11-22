@@ -3,6 +3,14 @@
 //! file like the audit log, and trimmed to the last [`KEEP_OPERATIONS`]
 //! operations and [`KEEP_DAYS`] days.
 //!
+//! Size: an append only writes its line. Once the file passes
+//! [`TRIM_ABOVE_BYTES`] it is trimmed (one full read); when that leaves it
+//! above half the limit (the operations are all recent), it is rotated
+//! instead: renamed to `history.jsonl.1`, replacing the previous one, whose
+//! operations are dropped. [`Journal::load`] reads both files, so the
+//! journal holds at most about twice the limit and a full read on append
+//! happens at most once per half a limit of new lines.
+//!
 //! The journal holds before-states (config values, ACL lists, connector
 //! configs), so it is not part of the audit log, which is forwarded to a
 //! SIEM and never records values. The two are tied together by the audit
@@ -30,8 +38,9 @@ pub const KEEP_OPERATIONS: usize = 1000;
 /// Days of operations kept when the journal is trimmed.
 pub const KEEP_DAYS: i64 = 90;
 
-/// The journal is trimmed when an append finds it larger than this.
-const TRIM_ABOVE_BYTES: u64 = 1024 * 1024;
+/// The journal is trimmed (or rotated) when an append finds it larger than
+/// this.
+pub const TRIM_ABOVE_BYTES: u64 = 1024 * 1024;
 
 /// Where connector secrets of an operation are kept in the OS credential
 /// store (`ferrika-history/<op id>`, one entry per config key).
@@ -65,9 +74,16 @@ impl Journal {
         &self.path
     }
 
+    /// The previous, rotated journal (`history.jsonl.1`).
+    pub fn rotated_path(&self) -> PathBuf {
+        let mut name = self.path.as_os_str().to_owned();
+        name.push(".1");
+        PathBuf::from(name)
+    }
+
     /// Appends one event. Holds `history.jsonl.lock` while writing so two
-    /// processes never interleave lines, and trims the journal when it has
-    /// grown past 1 MiB.
+    /// processes never interleave lines, and trims or rotates the journal
+    /// when it has grown past [`TRIM_ABOVE_BYTES`] (see the module docs).
     pub fn append(&self, event: &HistoryEvent) -> std::io::Result<()> {
         let line = serde_json::to_string(event).map_err(std::io::Error::other)?;
         if let Some(dir) = self.path.parent() {
@@ -92,61 +108,80 @@ impl Journal {
         file.flush()?;
         drop(file);
         if len + out.len() as u64 > TRIM_ABOVE_BYTES {
-            if let Err(e) = self.trim_locked(ferrika_core::kafka::clock::now_ms()) {
+            if let Err(e) = self.shrink_locked(ferrika_core::kafka::clock::now_ms()) {
                 tracing::warn!(%e, "Could not trim the operation history");
             }
         }
         Ok(())
     }
 
-    /// Every operation in the journal, oldest first. Lines that are not
-    /// events (cut short, edited) are skipped.
-    pub fn load(&self) -> Vec<Operation> {
-        fold(self.events())
+    /// Trims the journal, then rotates it when it is still above half of
+    /// [`TRIM_ABOVE_BYTES`], so the next full read is at least that many
+    /// bytes of appends away. The caller holds the lock.
+    fn shrink_locked(&self, now_ms: i64) -> std::io::Result<()> {
+        self.trim_locked(now_ms)?;
+        if std::fs::metadata(&self.path)?.len() > TRIM_ABOVE_BYTES / 2 {
+            self.rotate_locked()?;
+        }
+        Ok(())
     }
 
+    /// Renames the journal to `history.jsonl.1`, replacing the previous
+    /// one. Connector secrets of the operations that leave with it go too,
+    /// unless the current file still names the operation. The caller holds
+    /// the lock.
+    fn rotate_locked(&self) -> std::io::Result<()> {
+        let rotated = self.rotated_path();
+        let current = read_events(&self.path);
+        let leaving = fold(read_events(&rotated));
+        std::fs::rename(&self.path, &rotated)?;
+        let kept: std::collections::HashSet<&str> =
+            current.iter().map(|event| event.id.as_str()).collect();
+        for op in leaving.iter().filter(|op| !kept.contains(op.id.as_str())) {
+            forget_secrets(op);
+        }
+        Ok(())
+    }
+
+    /// Every operation in the journal (the rotated file, then the current
+    /// one), oldest first. Lines that are not events (cut short, edited)
+    /// are skipped.
+    pub fn load(&self) -> Vec<Operation> {
+        let mut events = read_events(&self.rotated_path());
+        events.extend(self.events());
+        fold(events)
+    }
+
+    /// The events of the current file only.
     fn events(&self) -> Vec<HistoryEvent> {
-        let Ok(file) = std::fs::File::open(&self.path) else {
-            return Vec::new();
-        };
-        // Split on bytes: a line a crash cut inside a multi-byte character
-        // is not UTF-8, and `lines()` would stop there, losing every later
-        // operation (and the trim would then rewrite the file without them).
-        std::io::BufReader::new(file)
-            .split(b'\n')
-            .map_while(Result::ok)
-            .filter_map(|bytes| {
-                let line = String::from_utf8(bytes).ok()?;
-                serde_json::from_str(line.trim_start_matches('\u{feff}').trim_end_matches('\r'))
-                    .ok()
-            })
-            .collect()
+        read_events(&self.path)
     }
 
     /// Keeps the last [`KEEP_OPERATIONS`] operations of the last
     /// [`KEEP_DAYS`] days (an operation's lines stay together), rewriting
     /// the file through a temporary file. The caller holds the lock.
     /// Connector secrets of dropped operations leave the credential store.
+    /// Only the current file is trimmed; lines of operations that began in
+    /// the rotated file are kept.
     fn trim_locked(&self, now_ms: i64) -> std::io::Result<()> {
-        let ops = self.load();
+        let events = self.events();
+        let ops = fold(events.clone());
         let cutoff = now_ms - KEEP_DAYS * 24 * 60 * 60 * 1000;
         let keep_from = ops.len().saturating_sub(KEEP_OPERATIONS);
         let mut dropped = Vec::new();
-        let mut kept_ids = std::collections::HashSet::new();
+        let mut dropped_ids = std::collections::HashSet::new();
         for (ix, op) in ops.iter().enumerate() {
             if ix < keep_from || op.time_ms < cutoff {
                 dropped.push(op);
-            } else {
-                kept_ids.insert(op.id.as_str());
+                dropped_ids.insert(op.id.as_str());
             }
         }
         if dropped.is_empty() {
             return Ok(());
         }
-        let lines: Vec<String> = self
-            .events()
+        let lines: Vec<String> = events
             .into_iter()
-            .filter(|event| kept_ids.contains(event.id.as_str()))
+            .filter(|event| !dropped_ids.contains(event.id.as_str()))
             .filter_map(|event| serde_json::to_string(&event).ok())
             .collect();
         let tmp = self.path.with_extension("jsonl.tmp");
@@ -164,6 +199,24 @@ impl Journal {
         }
         Ok(())
     }
+}
+
+/// The events of one journal file; nothing when it cannot be opened.
+fn read_events(path: &Path) -> Vec<HistoryEvent> {
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    // Split on bytes: a line a crash cut inside a multi-byte character
+    // is not UTF-8, and `lines()` would stop there, losing every later
+    // operation (and the trim would then rewrite the file without them).
+    std::io::BufReader::new(file)
+        .split(b'\n')
+        .map_while(Result::ok)
+        .filter_map(|bytes| {
+            let line = String::from_utf8(bytes).ok()?;
+            serde_json::from_str(line.trim_start_matches('\u{feff}').trim_end_matches('\r')).ok()
+        })
+        .collect()
 }
 
 /// Removes the connector secrets an operation kept in the credential store.
@@ -329,10 +382,9 @@ impl Change {
 pub struct Recorder {
     journal: Journal,
     id: String,
-    before: Vec<State>,
-    after: Vec<State>,
+    /// The `begin` line as written (secrets blanked), for the digest.
+    begin: Begin,
     started: bool,
-    reversibility: Reversibility,
 }
 
 impl Recorder {
@@ -367,13 +419,11 @@ impl Recorder {
         for state in &mut begin.after {
             blank_secrets(state);
         }
-        let (before, after) = (begin.before.clone(), begin.after.clone());
-        let reversibility = begin.reversibility;
         let event = HistoryEvent {
             v: FORMAT_VERSION,
             id: id.clone(),
             time_ms,
-            body: EventBody::Begin(Box::new(begin)),
+            body: EventBody::Begin(Box::new(begin.clone())),
         };
         let started = match journal.append(&event) {
             Ok(()) => true,
@@ -385,16 +435,14 @@ impl Recorder {
         Self {
             journal,
             id,
-            before,
-            after,
+            begin,
             started,
-            reversibility,
         }
     }
 
     /// How far undo can reverse the operation.
     pub fn reversibility(&self) -> Reversibility {
-        self.reversibility
+        self.begin.reversibility
     }
 
     /// The operation id.
@@ -409,8 +457,9 @@ impl Recorder {
 
     /// Writes the `end` line; `after` replaces the recorded after-state
     /// when it was only known once the change ran. Returns the digest the
-    /// audit entry records as `op_digest`, or `None` when the operation is
-    /// not in the journal.
+    /// audit entry records as `op_digest` (version 2, see
+    /// [`ferrika_core::model::history::operation_digest`]), or `None` when
+    /// the operation is not in the journal.
     pub fn finish(&self, ok: bool, outcome: &str, after: Option<Vec<State>>) -> Option<String> {
         if !self.started {
             return None;
@@ -419,9 +468,11 @@ impl Recorder {
             states.iter_mut().for_each(blank_secrets);
             states
         });
-        let digest = ferrika_core::model::history::state_digest(
-            &self.before,
-            after.as_deref().unwrap_or(&self.after),
+        let digest = ferrika_core::model::history::operation_digest(
+            &self.id,
+            &self.begin,
+            after.as_deref().unwrap_or(&self.begin.after),
+            Some(ok),
         );
         let event = HistoryEvent {
             v: FORMAT_VERSION,
@@ -685,6 +736,82 @@ mod tests {
                 .and_then(|op| op.ok()),
             Some(true)
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_large_journal_of_recent_operations_is_rotated_not_reread_on_every_append() {
+        let (dir, journal) = temp_journal("rotate");
+        let now = ferrika_core::kafka::clock::now_ms();
+        // Large entries (many config keys): fewer than KEEP_OPERATIONS of
+        // them pass the limit, so trimming drops nothing.
+        let big = |id: &str| {
+            let mut event = begin_event(id, now);
+            if let EventBody::Begin(begin) = &mut event.body {
+                begin.target = "x".repeat(2000);
+            }
+            event
+        };
+        let line_len = serde_json::to_string(&big("R00000")).unwrap().len() as u64 + 1;
+        let count = (TRIM_ABOVE_BYTES / line_len + 2) as usize;
+        assert!(count < KEEP_OPERATIONS);
+        for i in 0..count {
+            journal.append(&big(&format!("R{i:05}"))).unwrap();
+        }
+        let rotated = journal.rotated_path();
+        assert!(rotated.exists(), "rotated at the limit");
+        let current = std::fs::metadata(journal.path()).unwrap().len();
+        assert!(current < TRIM_ABOVE_BYTES / 2, "{current}");
+        // History still sees every operation, across both files.
+        let ops = journal.load();
+        assert_eq!(ops.len(), count);
+        assert_eq!(ops[0].id, "R00000");
+        assert_eq!(ops.last().unwrap().id, format!("R{:05}", count - 1));
+        // An operation that began before the rotation still gets its end.
+        journal.append(&end_event("R00000")).unwrap();
+        let ops = journal.load();
+        assert_eq!(
+            ops.iter()
+                .find(|op| op.id == "R00000")
+                .and_then(Operation::ok),
+            Some(true)
+        );
+        // A second rotation drops the first file's operations: bounded.
+        for i in 0..count {
+            journal.append(&big(&format!("S{i:05}"))).unwrap();
+        }
+        let ops = journal.load();
+        // The first file's operations are gone (lines appended after the
+        // first rotation moved on with the second).
+        assert!(ops.iter().all(|op| op.id != "R00000"), "dropped");
+        assert!(ops.len() < 2 * count, "{}", ops.len());
+        let total = std::fs::metadata(journal.path()).unwrap().len()
+            + std::fs::metadata(&rotated).unwrap().len();
+        assert!(total <= 2 * TRIM_ABOVE_BYTES + line_len, "{total}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trimming_keeps_the_end_of_an_operation_that_began_in_the_rotated_file() {
+        let (dir, journal) = temp_journal("trim-orphan");
+        let day = 24 * 60 * 60 * 1000;
+        let now = 200 * day;
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            journal.rotated_path(),
+            format!(
+                "{}\n",
+                serde_json::to_string(&begin_event("EARLY", now - day)).unwrap()
+            ),
+        )
+        .unwrap();
+        journal.append(&end_event("EARLY")).unwrap();
+        journal.append(&begin_event("OLD", now - 91 * day)).unwrap();
+        journal.trim_locked(now).unwrap();
+        let ops = journal.load();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].id, "EARLY");
+        assert_eq!(ops[0].ok(), Some(true));
         let _ = std::fs::remove_dir_all(dir);
     }
 
