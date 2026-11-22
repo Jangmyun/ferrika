@@ -422,6 +422,10 @@ fn run_verify(args: ReassignVerifyArgs, global: &GlobalOpts) -> KafkaResult<()> 
 
     let mut statuses = Vec::new();
     let admin = KafkaAdminClient::new(&kafka_config)?;
+    // The moves the cluster is running: a partition that is neither at its
+    // target nor being moved will not get there by waiting.
+    let moving = crate::kafka::wire::list_partition_reassignments(&kafka_config).ok();
+    let mut not_moving = 0usize;
 
     for p in &plan.partitions {
         let detail = admin.describe_topic(&p.topic, Some(Duration::from_secs(5)))?;
@@ -432,6 +436,20 @@ fn run_verify(args: ReassignVerifyArgs, global: &GlobalOpts) -> KafkaResult<()> 
             .map_or(ReassignmentStatus::Failed, |part| {
                 evaluate_partition_status(&part.replicas, &part.isr, &p.replicas)
             });
+        let is_moving = moving.as_ref().map(|moves| {
+            moves
+                .iter()
+                .any(|m| m.topic == p.topic && m.partition == p.partition)
+        });
+        let stalled = stalled(status, is_moving);
+        if stalled {
+            not_moving += 1;
+        }
+        let status = if stalled {
+            ReassignmentStatus::Failed
+        } else {
+            status
+        };
 
         statuses.push(status);
 
@@ -441,6 +459,9 @@ fn run_verify(args: ReassignVerifyArgs, global: &GlobalOpts) -> KafkaResult<()> 
                 .set_alignment(CellAlignment::Center),
             ReassignmentStatus::InProgress => Cell::new("IN_PROGRESS")
                 .fg(Color::Yellow)
+                .set_alignment(CellAlignment::Center),
+            ReassignmentStatus::Failed if stalled => Cell::new("NOT MOVING")
+                .fg(Color::Red)
                 .set_alignment(CellAlignment::Center),
             ReassignmentStatus::Failed => Cell::new("FAILED")
                 .fg(Color::Red)
@@ -456,6 +477,14 @@ fn run_verify(args: ReassignVerifyArgs, global: &GlobalOpts) -> KafkaResult<()> 
     }
 
     println!("{table}");
+    if not_moving > 0 {
+        println!(
+            "\n{} {not_moving} partition(s) are not at their target and not being moved \
+             (the plan was not executed, was cancelled or was replaced): waiting will not \
+             finish them. Run `ferrika reassign execute` with the plan again.",
+            "✖".red()
+        );
+    }
 
     match verify_outcome(&statuses) {
         Ok(()) => println!(
@@ -472,6 +501,13 @@ fn run_verify(args: ReassignVerifyArgs, global: &GlobalOpts) -> KafkaResult<()> 
     }
 
     Ok(())
+}
+
+/// A partition looks part-way (`InProgress`) but the cluster is not moving
+/// it (`is_moving == Some(false)`): the move never started or was
+/// cancelled. Unknown when the moves could not be listed.
+fn stalled(status: ReassignmentStatus, is_moving: Option<bool>) -> bool {
+    status == ReassignmentStatus::InProgress && is_moving == Some(false)
 }
 
 /// Ok only when every partition is `Completed`; otherwise a check failure
@@ -607,6 +643,16 @@ fn check_target_brokers(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_partition_nobody_moves_is_not_in_progress() {
+        use super::{stalled, ReassignmentStatus::*};
+        assert!(stalled(InProgress, Some(false)));
+        assert!(!stalled(InProgress, Some(true)));
+        // Moves could not be listed: keep the broker's word for it.
+        assert!(!stalled(InProgress, None));
+        assert!(!stalled(Completed, Some(false)));
+    }
+
     #[test]
     fn plans_refuse_unknown_and_offline_target_brokers() {
         use super::check_target_brokers;
