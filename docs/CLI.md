@@ -238,10 +238,14 @@ profile (`profile`, `vhost` arguments as for the listings):
 
 Bodies and header values are PII-masked unless `mask_pii` is false (always
 under enforced masking); the plans show sizes, a short hash and header
-names, never a body. The `rabbit_dlq_redrive` plan reads up to 100 messages
-(requeued, and audited as `mcp rabbit_dlq_redrive plan`) to show how many go
-to which destination; that preview is not bound by the confirmation token,
-the rest of the plan is. Each redriven message counts against
+names, never a body. No plan reads a message (a read requeues, which waits
+for the confirmation like any change): the `rabbit_dlq_redrive` plan shows
+the queue's message counts and dead-letter arguments, and says that each
+message's destination comes from its `x-death` (or `to_exchange`) as it
+moves; call `rabbit_dlq_inspect` first to see the origins. The execute
+result counts the moved messages per destination. Message counts are not
+bound by the confirmation token; the rest of the plan is. Each redriven
+message counts against
 `--max-produce-records` (charged at execute, the unmoved part given back),
 as does each publish. The gates match the RabbitMQ profile name and the
 management and AMQP `host:port`, like `ferrika rabbit`; a read-only

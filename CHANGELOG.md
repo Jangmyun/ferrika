@@ -49,11 +49,13 @@ The RabbitMQ entries below are planned for 0.2.0.
   masking). `rabbit_publish` (one UTF-8 message to an existing exchange,
   gated as `produce`, counted against `--max-produce-records`) fails with
   `unroutable` when no binding takes the message. `rabbit_dlq_redrive` (up
-  to 1,000 messages, optional `to_exchange`/`routing_key`) shows in its plan
-  how many of up to 100 previewed messages go to which destination (the
-  preview's requeue is audited), and moves them over AMQP with publisher
-  confirms, stopping at the first failure; it is gated as `messages.move`
-  plus `produce`. The gates match the RabbitMQ profile and the management
+  to 1,000 messages, optional `to_exchange`/`routing_key`) plans from the
+  queue's statistics and arguments only, reading no message (so nothing is
+  requeued before the move is confirmed; destinations come from each
+  message's `x-death`, or `to_exchange`, as it moves, and
+  `rabbit_dlq_inspect` shows them first), then moves the messages over AMQP
+  with publisher confirms, stopping at the first failure, and reports the
+  count per destination; it is gated as `messages.move` plus `produce`. The gates match the RabbitMQ profile and the management
   and AMQP `host:port` like `ferrika rabbit`; a read-only RabbitMQ profile
   refuses them (a read-only Kafka profile does not), and `mcp_write`
   applies. New `ferrika mcp` options `--queues GLOB` and `--exchanges GLOB`

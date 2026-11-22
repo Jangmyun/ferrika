@@ -475,25 +475,8 @@ impl WriteTools {
             )
         };
         authorize(&self.guard)?;
-        let planned = rabbit_writes::plan(
-            &self.guard,
-            self.rabbit.as_ref(),
-            &conn,
-            tool,
-            &request,
-            !execute,
-        )
-        .await?;
-        if let Some(effect) = &planned.plan_side_effect {
-            let _ = self.guard.record_at(
-                conn.audit_profile(),
-                format!("mcp {tool} plan"),
-                &target,
-                effect,
-                true,
-                None,
-            );
-        }
+        let planned =
+            rabbit_writes::plan(&self.guard, self.rabbit.as_ref(), &conn, tool, &request).await?;
         let planned = Planned {
             plan: planned.plan,
             summary: planned.summary,
@@ -1971,8 +1954,8 @@ fn changes_text_with(
 }
 
 /// The digest that binds a plan's confirmation token: the plan without its
-/// `observed` part (counts a busy broker changes between plan and execute,
-/// a redrive's preview).
+/// `observed` part (counts a busy broker changes between plan and
+/// execute).
 fn plan_digest(plan: &Value) -> String {
     let mut stable = plan.clone();
     if let Some(map) = stable.as_object_mut() {
