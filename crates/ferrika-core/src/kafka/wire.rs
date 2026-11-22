@@ -916,11 +916,7 @@ fn acl_permission_from(code: i8) -> Option<AclPermissionType> {
 
 /// Principal as Kafka stores it: `User:alice` for a bare `alice`.
 fn acl_principal(p: &str) -> String {
-    if p.contains(':') {
-        p.to_string()
-    } else {
-        format!("User:{p}")
-    }
+    crate::model::acl::kafka_principal(p)
 }
 
 /// Writes an ACL binding filter. `default_pattern` applies when the filter
