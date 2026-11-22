@@ -170,11 +170,7 @@ pub fn compare(path: &Path, latest: Option<(u64, String)>) -> io::Result<AnchorC
     let Some((anchor_seq, anchor_hash)) = latest else {
         return Ok(AnchorCheck::Unavailable);
     };
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(e) => return Err(e),
-    };
+    let text = crate::audit::read_lossy(path)?;
     let mut log_seq = 0u64;
     let mut at_anchor: Option<String> = None;
     for line in text.lines() {
@@ -477,6 +473,20 @@ mod tests {
         let hash = sha256_hex(&serde_json::Value::Object(map.clone()).to_string());
         map.insert("hash".into(), hash.clone().into());
         (serde_json::Value::Object(map).to_string(), hash)
+    }
+
+    #[test]
+    fn invalid_utf8_in_the_log_still_compares() {
+        let (dir, path) = temp_log("anchor-utf8");
+        let (first, hash) = pre_seq_line(1, &"0".repeat(64));
+        let mut bytes = format!("{first}\n").into_bytes();
+        bytes.extend_from_slice(&[0xED, b'\n']);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            compare(&path, Some((1, hash))).unwrap(),
+            AnchorCheck::Match { seq: 1, log_seq: 1 }
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn lines(path: &Path) -> Vec<String> {

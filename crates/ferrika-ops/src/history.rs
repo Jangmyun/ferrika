@@ -109,10 +109,17 @@ impl Journal {
         let Ok(file) = std::fs::File::open(&self.path) else {
             return Vec::new();
         };
+        // Split on bytes: a line a crash cut inside a multi-byte character
+        // is not UTF-8, and `lines()` would stop there, losing every later
+        // operation (and the trim would then rewrite the file without them).
         std::io::BufReader::new(file)
-            .lines()
+            .split(b'\n')
             .map_while(Result::ok)
-            .filter_map(|line| serde_json::from_str(line.trim_start_matches('\u{feff}')).ok())
+            .filter_map(|bytes| {
+                let line = String::from_utf8(bytes).ok()?;
+                serde_json::from_str(line.trim_start_matches('\u{feff}').trim_end_matches('\r'))
+                    .ok()
+            })
             .collect()
     }
 
@@ -612,6 +619,23 @@ mod tests {
         assert_eq!(ops[1].ok(), None);
         let text = std::fs::read_to_string(journal.path()).unwrap();
         assert_eq!(text.lines().count(), 4, "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_line_torn_inside_a_character_does_not_hide_later_operations() {
+        let (dir, journal) = temp_journal("torn-utf8");
+        journal.append(&begin_event("A", 1)).unwrap();
+        let mut bytes = std::fs::read(journal.path()).unwrap();
+        bytes.extend_from_slice(br#"{"v":1,"id":"A","ev":"end","outcome":""#);
+        bytes.push(0xED);
+        std::fs::write(journal.path(), bytes).unwrap();
+        journal.append(&end_event("A")).unwrap();
+        journal.append(&begin_event("B", 2)).unwrap();
+        let ops = journal.load();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].ok(), Some(true));
+        assert_eq!(ops[1].id, "B");
         let _ = std::fs::remove_dir_all(dir);
     }
 
