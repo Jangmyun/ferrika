@@ -380,6 +380,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
     let mut stats = FilterStats::default();
     // Offsets of processed records that could not be stored (`--group`).
     let mut store_failures = 0usize;
+    let mut read_errors = 0usize;
     let idle_timeout = args.timeout.map(Duration::from_millis);
     // Buffer terminal output: println! issues one write per message, which dominates
     // the cost of consuming large topics. Buffers are flushed whenever the stream pauses.
@@ -524,6 +525,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                     }
                     ReadEvent::Error(err) => {
                         eprintln!("{} Consumer error: {err}", "✖".red());
+                        read_errors += 1;
                     }
                 }
             }
@@ -582,7 +584,18 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
 
     // The group's position did not (fully) move: say so in the exit code,
     // so a script does not take the run as done and skip the re-read.
-    group_outcome(commit.is_ok(), store_failures)
+    group_outcome(commit.is_ok(), store_failures)?;
+    read_outcome(read_errors, stats.total_received)
+}
+
+/// `Err` when the consumer reported errors and nothing was read (no read
+/// permission on the topic, brokers gone): "Consumed 0" alone would look
+/// like an empty topic to a script.
+fn read_outcome(errors: usize, received: u64) -> anyhow::Result<()> {
+    if errors > 0 && received == 0 {
+        anyhow::bail!("nothing was read and the consumer reported {errors} error(s) (see above)");
+    }
+    Ok(())
 }
 
 /// `Err` when `consume --group` could not commit where it got to: the next
@@ -934,6 +947,15 @@ mod tests {
             failed.contains("partition 2") && failed.contains("NotLeaderForPartition"),
             "{failed}"
         );
+    }
+
+    #[test]
+    fn errors_with_nothing_read_fail_the_run() {
+        assert!(read_outcome(3, 0).is_err());
+        // Transient errors during a run that read records are only shown.
+        assert!(read_outcome(3, 10).is_ok());
+        // An empty topic read without errors is fine.
+        assert!(read_outcome(0, 0).is_ok());
     }
 
     #[test]
