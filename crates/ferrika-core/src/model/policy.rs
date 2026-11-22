@@ -649,6 +649,9 @@ impl PolicyAction {
             "topics config" => Self::ConfigChange,
             "offset delete-group" => Self::GroupsDelete,
             "consume --group" => Self::OffsetsCommit,
+            // Publishing to a RabbitMQ exchange writes messages like
+            // `produce`: one `forbid: ["produce"]` covers both brokers.
+            "rabbit publish" => Self::Produce,
             _ => match head {
                 "topics" | "reassign" => Self::TopicsAlter,
                 "produce" | "generate" | "mirror" | "transform" | "restore" | "probe" | "bench"
@@ -700,6 +703,7 @@ mod tests {
         assert_eq!(PolicyAction::from_cli("produce"), PolicyAction::Produce);
         assert_eq!(
             PolicyAction::from_cli("transform --execute"),
+            PolicyAction::from_cli("rabbit publish"),
             PolicyAction::Produce
         );
         assert_eq!(

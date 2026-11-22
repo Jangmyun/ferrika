@@ -63,6 +63,17 @@ and 0.2.0 makes it crate-internal.
   `--interval-secs` still works) and defaults to 5 seconds instead of 2.
 - Building `ferrika-cli` with default features needs Rust 1.88 (ratatui's
   minimum).
+- Preview: RabbitMQ support through the management HTTP API, in the new
+  crate `ferrika-rabbitmq` and the command `ferrika rabbit`: `queues`,
+  `exchanges` and `bindings` of a vhost, `peek <queue> -n N` (reads and
+  requeues, so the messages are marked redelivered) and `publish <exchange>
+  -k <routing-key> -m <body>`, with table and `--format json` output.
+  Connection with `--rabbit-url`, `--vhost`, `--rabbit-user` and
+  `FERRIKA_RABBIT_PASSWORD` (or `--rabbit-password-stdin`). `publish` passes
+  the same policy gate and audit log as `produce` (policy category
+  `produce`); `peek` is a record export like `consume` and is masked when
+  the policy enforces masking. Commands and output may change; design and
+  next steps in `docs/plans/multi-broker.md`.
 
 ### Fixed
 

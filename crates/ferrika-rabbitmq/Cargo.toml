@@ -1,0 +1,18 @@
+[package]
+name = "ferrika-rabbitmq"
+version.workspace = true
+edition.workspace = true
+description = "Ferrika RabbitMQ support (preview): a typed client for the RabbitMQ management HTTP API"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["rabbitmq", "amqp", "management-api", "cli", "devops"]
+categories = ["api-bindings", "network-programming"]
+
+# The HTTP client (`ferrika_core::kafka::http::Endpoint`), Base64 and the
+# error conventions come from ferrika-core; there is no AMQP dependency.
+[dependencies]
+ferrika-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

@@ -201,6 +201,7 @@ the crate with `-p`:
 | `crates/ferrika-ops` | Backup, mirror, DLQ, diff, lint, health, reports and change history with undo. |
 | `crates/ferrika-mcp` | The MCP server behind `ferrika mcp`. |
 | `crates/ferrika-cli` | The `ferrika` command line. |
+| `crates/ferrika-rabbitmq` | Preview: RabbitMQ management API client behind `ferrika rabbit`. |
 
 The crates are published on [crates.io](https://crates.io/crates/ferrika-core); until 1.0 their API can change.
 

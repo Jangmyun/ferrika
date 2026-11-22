@@ -274,6 +274,23 @@ ferrika connect apply -f s3-sink.json            # create, or replace a connecto
 ferrika connect delete s3-sink
 ```
 
+### RabbitMQ (`ferrika rabbit`, preview)
+
+Through the RabbitMQ management HTTP API (plugin `rabbitmq_management`).
+`publish` passes the company policy like `produce`; `peek` output counts as
+a record export like `consume` and is masked when the policy enforces it.
+
+```bash
+export FERRIKA_RABBIT_URL=http://rabbit:15672 FERRIKA_RABBIT_USER=ops
+export FERRIKA_RABBIT_PASSWORD=...               # or --rabbit-password-stdin
+ferrika rabbit queues                            # vhost "/" unless --vhost
+ferrika rabbit exchanges --vhost shop
+ferrika -f json rabbit bindings
+ferrika rabbit peek orders.dlq -n 5              # requeues: messages get "redelivered"
+ferrika rabbit publish orders -k order.created -m '{"id":1}' --content-type application/json
+ferrika rabbit publish amq.default -k my-queue -m hello   # the default exchange
+```
+
 ### Client quotas (`ferrika quota`)
 
 ```bash
