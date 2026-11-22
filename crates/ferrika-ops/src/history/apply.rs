@@ -174,8 +174,8 @@ pub async fn run(step: &Step, target: &Target<'_>) -> KafkaResult<()> {
                 .map(|p| PartitionAssignment::new(&p.topic, p.partition, p.replicas.clone()))
                 .collect();
             let cfg = config.clone();
-            let results =
-                blocking(move || wire::alter_partition_reassignments(&cfg, &assignments)).await?;
+            let (results, _) =
+                blocking(move || wire::reassign_or_set_replication(&cfg, &assignments)).await?;
             let failed: Vec<String> = results
                 .into_iter()
                 .filter_map(|r| r.error.map(|e| format!("{}-{}: {e}", r.topic, r.partition)))
