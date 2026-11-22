@@ -227,7 +227,7 @@ What counts as an export:
 | CLI, stdout | `consume` (also `-f json`), `dlq inspect`, `compact tombstones`, `diff`, `trace inspect`, `crypto mask --topic`: only when stdout is redirected or piped. On a terminal the records are only viewed and are allowed. | `crypto mask` reading stdin (the user's own input) |
 | CLI, other cluster | `mirror` and `transform --execute` whose destination brokers are not all brokers of the source (normalized like `read_only_brokers`; the same brokers under another profile name are the same cluster). Under enforced masking `mirror` needs `--mask` anyway. | A copy within one cluster (a `produce`) |
 | Desktop app | Message Studio: Export (JSONL), Save payload, Copy record as JSON, Copy payload, and Resend (its text can be copied from the producer form). Under `forbidden` these buttons are disabled with the tooltip "Disabled by company policy (export: forbidden)", and pressing one anyway is refused. | Topics/Consumers Export CSV, Overview Report (metadata) |
-| MCP | `peek_messages` hands records to an outside AI service: under `forbidden` it is left out of `tools/list` and refused if called; under `audited` each call is recorded. | The other tools (metadata) |
+| MCP | `peek_messages` and `transform_preview` hand records to an outside AI service: under `forbidden` they are left out of `tools/list` and refused if called; under `audited` each call is recorded. | The other tools (metadata, and `transform_execute`, which copies within the cluster) |
 
 - `crypto audit` is a CI gate run in pipelines, so it is not refused: under
   `forbidden` it keeps its counts (and `--fail-on-leak`) but leaves out the
@@ -605,8 +605,9 @@ direction.
 - **MCP**: `mask_pii: false` is ignored under enforced masking. The read
   tools never change the cluster. With `ferrika mcp --allow-write`, every
   write tool call (`produce_messages`, `create_topic`, `alter_topic_config`,
-  `reset_consumer_group_offsets`) is checked like a CLI command
-  (`produce`, `topics.create`, `config.change`, `offsets.reset`): `forbid`,
+  `reset_consumer_group_offsets`, `transform_execute`) is checked like a CLI
+  command (`produce`, `topics.create`, `config.change`, `offsets.reset`,
+  `produce`): `forbid`,
   `read_only`, `read_only_brokers`, strictest mode and a read-only profile
   refuse it, at the plan and again right before it runs, and tools refused
   outright are not offered. Under `audit: required` a write is refused when
@@ -616,8 +617,13 @@ direction.
   stays the identity). There is no policy rule yet that allows CLI and desktop app
   writes but refuses MCP writes; until then use `forbid`/`read_only`, or do
   not start the server with `--allow-write`. Under `export: forbidden`
-  `peek_messages` is hidden and refused. `config_lint` only reads; lint
-  fixes are not offered as a tool.
+  `peek_messages` and `transform_preview` are hidden and refused; under
+  enforced masking `transform_preview` puts a mask step first and
+  `transform_execute` is refused unless its first step masks (as
+  `ferrika transform`). `transform_execute` copies only within the server's
+  cluster, so it never passes the export gate. `config_lint` and the
+  RabbitMQ listings (`rabbit_queues`, `rabbit_exchanges`,
+  `rabbit_bindings`) only read; lint fixes are not offered as a tool.
 
 ## Tamper-evident audit log
 

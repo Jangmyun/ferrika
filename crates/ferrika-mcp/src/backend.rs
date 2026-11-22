@@ -13,6 +13,9 @@ use ferrika_core::kafka::config::KafkaClientConfig;
 use ferrika_core::kafka::offset_reset::{OffsetResetPlan, ResetStrategy};
 use ferrika_core::kafka::producer::{DeliveryReceipt, KafkaProducerClient, OwnedProducerRecord};
 use ferrika_core::kafka::wire::ConfigChange;
+use ferrika_ops::transform::TransformSummary;
+
+use super::transform_tools::{Start, StepSpecs};
 
 pub(super) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = KafkaResult<T>> + 'a>>;
 
@@ -21,6 +24,21 @@ pub(super) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = KafkaResult<T>> +
 pub(super) struct TopicShape {
     pub partitions: i32,
     pub replication_factor: i32,
+}
+
+/// A transform `transform_execute` runs: records of `src_topic` from
+/// `start` up to the end each partition has when it starts, through
+/// `steps`, into `dst_topic` on the same cluster, at most `max_records`.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct TransformRun {
+    pub src_topic: String,
+    pub dst_topic: String,
+    pub steps: StepSpecs,
+    pub start: Start,
+    pub partition: Option<i32>,
+    pub max_records: u64,
+    /// Decode Schema Registry wire-format values to JSON first.
+    pub decode: bool,
 }
 
 /// The cluster operations behind the write tools.
@@ -78,6 +96,9 @@ pub(super) trait WriteBackend {
         &self,
         records: Vec<OwnedProducerRecord>,
     ) -> BoxFuture<'_, Vec<KafkaResult<DeliveryReceipt>>>;
+    /// Runs `run` (the copy pipeline of `ferrika transform --execute`) and
+    /// returns its counts.
+    fn transform_copy<'a>(&'a self, run: &'a TransformRun) -> BoxFuture<'a, TransformSummary>;
 }
 
 fn timeout() -> Option<Duration> {
@@ -224,6 +245,57 @@ impl WriteBackend for KafkaBackend {
             Ok(results)
         })
     }
+
+    fn transform_copy<'a>(&'a self, run: &'a TransformRun) -> BoxFuture<'a, TransformSummary> {
+        Box::pin(async move {
+            use ferrika_ops::mirror::{
+                run_copy_pipeline, CopyDestination, MirrorConfig, MirrorStats,
+            };
+            use ferrika_ops::transform::{DecodingTransform, Pipeline};
+            let pipeline =
+                Pipeline::parse(run.steps.iter().map(|(kind, text)| (*kind, text.as_str())))
+                    .map_err(KafkaError::config)?;
+            let digest = pipeline.digest();
+            let decoder = run.decode.then(|| {
+                ferrika_core::kafka::schema::PayloadDecoder::new(
+                    self.config.schema_registry_url.as_deref(),
+                )
+                .with_timeout(self.config.request_timeout)
+            });
+            let mut transform =
+                DecodingTransform::new(pipeline, run.dst_topic.clone()).with_decoder(decoder);
+            let (from_beginning, from_timestamp) = match run.start {
+                Start::Beginning => (true, None),
+                Start::Timestamp(ms) => (false, Some(ms)),
+            };
+            let config = MirrorConfig::new(&run.src_topic, &run.dst_topic)
+                .with_from_beginning(from_beginning)
+                .with_from_timestamp(from_timestamp)
+                .with_until_end(true)
+                .with_partition(run.partition)
+                .with_max_messages(Some(usize::try_from(run.max_records).unwrap_or(usize::MAX)));
+            // No consumer group: nothing is joined or committed, and the
+            // run reads only the range it was planned for.
+            let mut source = self.config.clone();
+            source.group_id = None;
+            let stats = run_copy_pipeline(
+                &source,
+                CopyDestination::Cluster(&self.config),
+                config,
+                &mut transform,
+                |_: &MirrorStats| {},
+            )
+            .await?;
+            Ok(TransformSummary::new(
+                &run.src_topic,
+                &run.dst_topic,
+                false,
+                &stats,
+                transform.counters(),
+                digest,
+            ))
+        })
+    }
 }
 
 /// A shared backend, so a test can keep looking at the fake it handed over.
@@ -287,6 +359,9 @@ impl<T: WriteBackend + ?Sized> WriteBackend for &T {
     ) -> BoxFuture<'_, Vec<KafkaResult<DeliveryReceipt>>> {
         (**self).produce(records)
     }
+    fn transform_copy<'a>(&'a self, run: &'a TransformRun) -> BoxFuture<'a, TransformSummary> {
+        (**self).transform_copy(run)
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +401,9 @@ pub(super) mod fake {
         pub known: Option<Result<Vec<String>, String>>,
         /// How many times the lookup ran.
         pub known_calls: std::cell::Cell<u32>,
+        /// How many records a transform finds to copy (it writes at most
+        /// its `max_records` of them).
+        pub transform_records: u64,
     }
 
     impl FakeCluster {
@@ -552,6 +630,35 @@ pub(super) mod fake {
                 self.change(format!("produce {}/{partition}", record.topic));
             }
             ready(Ok(results))
+        }
+
+        fn transform_copy<'a>(&'a self, run: &'a TransformRun) -> BoxFuture<'a, TransformSummary> {
+            use ferrika_ops::mirror::MirrorStats;
+            use ferrika_ops::transform::{Pipeline, TransformCounters};
+            let digest = match Pipeline::parse(
+                run.steps.iter().map(|(kind, text)| (*kind, text.as_str())),
+            ) {
+                Ok(pipeline) => pipeline.digest(),
+                Err(e) => return ready(Err(KafkaError::config(e))),
+            };
+            let written = self.transform_records.min(run.max_records);
+            let mut stats = MirrorStats::new();
+            for _ in 0..written {
+                stats.record_read();
+                stats.record_mirrored(10);
+            }
+            self.change(format!(
+                "transform {} -> {} ({written} records)",
+                run.src_topic, run.dst_topic
+            ));
+            ready(Ok(TransformSummary::new(
+                &run.src_topic,
+                &run.dst_topic,
+                false,
+                &stats,
+                &TransformCounters::default(),
+                digest,
+            )))
         }
     }
 }

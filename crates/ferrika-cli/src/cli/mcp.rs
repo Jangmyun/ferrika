@@ -10,8 +10,8 @@ use crate::error::KafkaResult;
 #[derive(Args, Debug, Clone, Default)]
 pub struct McpArgs {
     /// Offer the write tools: produce_messages, create_topic, alter_topic_config,
-    /// reset_consumer_group_offsets. Each write is planned, confirmed and audited;
-    /// company policy and a read-only profile still apply
+    /// reset_consumer_group_offsets, transform_execute. Each write is planned,
+    /// confirmed and audited; company policy and a read-only profile still apply
     #[arg(long)]
     pub allow_write: bool,
 
@@ -45,7 +45,8 @@ pub struct McpArgs {
     )]
     pub max_writes_per_minute: u32,
 
-    /// Most records produce_messages may send in this session
+    /// Most records produce_messages and transform_execute may write in this
+    /// session
     #[arg(long, default_value_t = 1000, requires = "allow_write")]
     pub max_produce_records: u64,
 

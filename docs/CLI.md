@@ -179,11 +179,36 @@ findings, with the command for each fix), `list_brokers`, `list_topics`,
 `describe_topic`, `list_consumer_groups`, `consumer_group_lag`,
 `message_histogram` (records per time bucket from offsets), `schema_fields`
 (the field paths of a topic's Schema Registry schema, ready for a `where`
-filter; needs the profile's registry URL) and
-`peek_messages`. None of them changes the cluster, and `peek_messages` reads
-without a consumer group and masks emails, card numbers and tokens unless
-`mask_pii` is false. A broken `profiles.json` or an unknown `-p` profile
-stops the server at start instead of falling back to another cluster.
+filter; needs the profile's registry URL),
+`peek_messages` and `transform_preview`. None of them changes the cluster.
+`peek_messages` reads without a consumer group and masks emails, card
+numbers and tokens unless `mask_pii` is false. A broken `profiles.json` or
+an unknown `-p` profile stops the server at start instead of falling back to
+another cluster.
+
+`transform_preview` shows what `ferrika transform` (see
+[Stream transform](#stream-transform-ferrika-transform)) would write:
+`topic`, `steps` as one-key objects in the order they apply
+(`[{"filter": "$.amount > 100"}, {"drop": "user.email"}, {"rename":
+"old=new"}, {"set": "env=\"staging\""}, {"rekey": "user.id"}, {"mask":
+"partial"}, {"sample": 10}]`), a start (`from_beginning`, the default, or
+`from_timestamp`: ISO 8601, epoch ms or a time ago such as `2h`), and
+`max_records` (10, at most 50), `scan_limit` (5,000, at most 100,000),
+`partition` and `decode_wire_format`. It reads up to the end each partition
+has when it starts, without a consumer group, and returns the transformed
+records (key and value text masked unless `mask_pii` is false, header names
+only) with the counts read, kept, filtered, sampled out and not JSON. When
+the policy enforces masking a mask step is put first, so the other steps
+see only masked data. Like `peek_messages` it passes the export gate.
+
+RabbitMQ (preview): `rabbit_queues`, `rabbit_exchanges` and
+`rabbit_bindings` list a virtual host through the management API, for the
+RabbitMQ profile named by `profile` (default: the active one, see
+[RabbitMQ](#rabbitmq-ferrika-rabbit-preview)), with optional `vhost` and
+`filter` (at most 500 entries). They read no message bodies and take no
+URL, so a profile's stored password only goes to that profile's broker.
+Peeking at a queue and DLQ inspect/redrive are not offered over MCP yet: a
+RabbitMQ peek takes messages and requeues them.
 
 ```bash
 # Claude Code
@@ -197,10 +222,24 @@ claude mcp add ferrika-prod -- ferrika -p prod mcp
 
 #### Write tools (`--allow-write`)
 
-`--allow-write` adds four write tools: `produce_messages` (up to 100 UTF-8
+`--allow-write` adds five write tools: `produce_messages` (up to 100 UTF-8
 records to an existing topic, values and keys optionally encoded with Schema Registry
 subjects: `value_subject`, `key_subject`), `create_topic`, `alter_topic_config` (set or reset keys; others
-stay) and `reset_consumer_group_offsets` (the group must be Empty).
+stay), `reset_consumer_group_offsets` (the group must be Empty) and
+`transform_execute`.
+
+`transform_execute` takes the arguments of `transform_preview` (absolute
+`from_timestamp` only) plus `to`, an existing topic on the same cluster
+inside `--topics`, and a required `max_records` (at most 10,000). It copies
+the range through the steps with the copy pipeline of `ferrika transform
+--execute`, without a consumer group, and writes at most `max_records`
+records; they count against `--max-produce-records` (charged at execute,
+the unwritten part given back). It is checked as a `produce` on the
+destination and, like the CLI, refused under enforced PII masking unless the
+first step is `mask`. Copying to another cluster is not offered over MCP
+(`cross_cluster_unsupported`): use `ferrika transform --dst-profile` from
+the command line, where the export policy applies. The plan shows the steps
+and the range; the audit result records the counts and the steps' SHA-256.
 
 ```bash
 claude mcp add ferrika-dev -- ferrika -p dev mcp --allow-write --topics "test-*"
@@ -237,7 +276,8 @@ start). The policy rule `mcp_write` applies to assistants only:
 for a person's confirmation in the client whatever `--confirm` says (see
 docs/POLICY.md). Internal topics (names starting with `_`) are never written; `--topics <glob>`
 (repeatable) narrows the writable topics further. Limits per session:
-`--max-writes-per-minute` (10), `--max-produce-records` (1,000), plans at 60
+`--max-writes-per-minute` (10), `--max-produce-records` (1,000, for
+`produce_messages` and `transform_execute` together), plans at 60
 per minute, and the same refusal 5 times in a row pauses writes for 30 s.
 `--allow-tools create_topic,produce_messages` offers only some tools.
 

@@ -2,8 +2,10 @@
 //! assistants (Claude Code, Claude Desktop, IDE agents) can inspect a cluster.
 //!
 //! By default every tool is read-only: nothing creates, changes or deletes
-//! cluster state, and peeked records never join or commit to a consumer
-//! group. Record text is PII-masked unless the caller turns masking off.
+//! cluster state, and peeked or previewed records never join or commit to a
+//! consumer group. Record text is PII-masked unless the caller turns masking
+//! off. RabbitMQ tools (preview) list queues, exchanges and bindings of a
+//! RabbitMQ profile without reading message bodies.
 //!
 //! [`WriteOptions`] add write tools (`write_tools.rs`). Each write is
 //! planned, then confirmed, then run, and passes the same company policy,
@@ -12,7 +14,9 @@
 mod backend;
 mod guard;
 mod protocol;
+mod rabbit_tools;
 mod read_tools;
+mod transform_tools;
 mod transport;
 mod write_tools;
 
@@ -37,7 +41,8 @@ pub struct WriteOptions {
     pub confirm: ConfirmMode,
     /// Most write executions per minute.
     pub max_writes_per_minute: u32,
-    /// Most records produce_messages may send in this session.
+    /// Most records produce_messages and transform_execute may write in
+    /// this session.
     pub max_produce_records: u64,
     /// Most records one offset reset may skip or re-read without a person
     /// confirming it.

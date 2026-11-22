@@ -171,7 +171,10 @@ impl<'a> Session<'a> {
             "Access to one Kafka cluster (the profile Ferrika was started with). \
             Start with cluster_health or list_topics; message_histogram shows when a topic's \
             records arrived (bursts, gaps). peek_messages masks emails, card numbers \
-            and tokens unless mask_pii is false."
+            and tokens unless mask_pii is false. transform_preview shows what a transform's \
+            steps (filter, drop, rename, set, rekey, mask, sample) would write, without \
+            writing. rabbit_queues, rabbit_exchanges and rabbit_bindings list a RabbitMQ \
+            profile's virtual host (preview)."
                 .to_string();
         match &self.writes {
             Some(writes) => instructions.push_str(&writes.instructions(self.client.elicitation)),
