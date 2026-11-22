@@ -11,6 +11,44 @@ and 0.2.0 makes it crate-internal.
 
 The RabbitMQ entries below are planned for 0.2.0.
 
+### Security
+
+- Audit forwarding spool: new spool files are named
+  `ferrika-audit-<host>-<user>.<16 random hex>.jsonl` and created with
+  create-new semantics (`0600` on Unix). An existing file is appended to
+  only when it is not a link, junction or other non-regular file (opened
+  without following links) and is owned by the current account (on Unix
+  also: not group/world-writable, one hard link); a file that fails is left
+  alone, reported (`audit forwarding: skipping spool file …`) and a new file
+  is used. A missing spool folder is created `0700` on Unix; an existing one
+  that group or others may write (without the sticky bit), or that another
+  non-root account owns, is refused. Before, a fixed, predictable file name
+  was appended to, so another account with write access to a shared spool
+  folder could pre-create it or swap in a symlink to tamper with or redirect
+  forwarded entries. The old fixed-name file is no longer written; point
+  collectors at `ferrika-audit-*.jsonl`.
+- `ferrika_governance::audit_forward::spool_file` now returns
+  `Option<PathBuf>`: the file this account would append to, `None` before
+  the first entry.
+- Policy directory: `packaging/windows/Install-FerrikaPolicy.ps1` verifies
+  after locking that only Administrators, SYSTEM and TrustedInstaller own
+  the folder and policy files or hold write/create/delete/permission rights
+  on them, and fails otherwise (a folder that still let users create files
+  would let anyone drop a broken `policy.keys` and force strictest mode);
+  `packaging/linux/install-ferrika-policy.sh` verifies root ownership and no
+  group/world write. `ferrika policy show` warns when the policy directory
+  or a policy file may be written by non-administrators (`-f json`:
+  `dir_warnings`; Unix: owner and mode bits, Windows: owner and DACL).
+- Broker lists in policy checks are split on commas **and whitespace**, so a
+  second broker after a space (`prod1:9092 mine:9092`) is no longer read as
+  part of the first. `destination_within_source` (the export gate for
+  `mirror` and `transform --execute`), `shares_broker`, `read_only_brokers`,
+  `export_clusters` and environment broker globs compare normalized
+  `host:port` sets (lowercase host, no trailing dot, default port 9092,
+  bracketed IPv6, duplicates ignored), and `read_only` globs also see each
+  broker in its normalized form (`KAFKA1.prod.corp.` is caught by
+  `kafka1.prod.corp:*`).
+
 ### Added
 
 - MCP: `transform_preview` (read tool) runs `ferrika transform` steps
