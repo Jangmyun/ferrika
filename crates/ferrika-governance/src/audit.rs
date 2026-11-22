@@ -418,7 +418,7 @@ fn chain_hash_of(line: &str) -> String {
         .unwrap_or_else(|| sha256_hex(line))
 }
 
-/// The end of the log, as far as [`append`] needs it.
+/// The end of the log, as far as `append` needs it.
 #[derive(Debug, PartialEq, Eq)]
 struct Tail {
     /// The last non-blank line (without its line break).

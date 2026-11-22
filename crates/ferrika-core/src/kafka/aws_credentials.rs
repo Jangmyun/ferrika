@@ -283,8 +283,8 @@ pub fn resolve_region(
         })
 }
 
-/// A resolver for [`crate::kafka::oauth::MskIamSource`] over the process
-/// environment.
+/// A credential resolver for the MSK IAM token source (`MskIamSource` in
+/// [`crate::kafka::oauth`]) over the process environment.
 pub fn resolver(profile: Option<String>) -> CredentialResolver {
     Arc::new(move || resolve_credentials(&default_lookup(), profile.as_deref()))
 }
