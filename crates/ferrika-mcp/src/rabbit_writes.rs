@@ -18,6 +18,8 @@ use serde_json::{json, Value};
 
 use ferrika_core::codec::pii::ellipsize;
 use ferrika_core::error::{KafkaError, KafkaResult};
+#[cfg(feature = "amqp")]
+use ferrika_rabbitmq::amqp::{RedriveError, RedriveReport, RedriveRequest};
 use ferrika_rabbitmq::connection::ResolvedRabbit;
 use ferrika_rabbitmq::model::{
     exchange_name, Binding, Exchange, OutgoingMessage, PeekedMessage, PublishOutcome, Queue,
@@ -25,11 +27,6 @@ use ferrika_rabbitmq::model::{
 };
 use ferrika_rabbitmq::profile::RabbitProfileStore;
 use ferrika_rabbitmq::view::{Inspection, ShownMessage};
-#[cfg(feature = "amqp")]
-use ferrika_rabbitmq::{
-    amqp::{RedriveError, RedriveReport, RedriveRequest},
-    view::RedrivePreview,
-};
 
 use super::backend::BoxFuture;
 use super::guard::{ToolError, WriteGuard};
@@ -41,9 +38,6 @@ pub(super) const PEEK_MAX: u32 = 20;
 pub(super) const INSPECT_MAX: u32 = 50;
 /// Most messages one `rabbit_dlq_redrive` moves.
 pub(super) const REDRIVE_MAX: u64 = 1000;
-/// Most messages a redrive plan reads for its preview.
-#[cfg(feature = "amqp")]
-const REDRIVE_PREVIEW_MAX: u32 = 100;
 /// Inspected messages returned in full (the groups count them all).
 const INSPECT_SAMPLE: usize = 10;
 /// Longest payload text returned per message.
@@ -478,14 +472,11 @@ fn destination_text(to_exchange: Option<&str>, routing_key: Option<&str>) -> Str
 
 /// A planned RabbitMQ write.
 pub(super) struct RabbitPlanned {
-    /// The plan as the agent sees it. Its `observed` part (message counts,
-    /// the redrive preview) changes on a busy broker and is left out of
-    /// the digest that binds the confirmation token.
+    /// The plan as the agent sees it. Its `observed` part (message counts)
+    /// changes on a busy broker and is left out of the digest that binds
+    /// the confirmation token.
     pub plan: Value,
     pub summary: String,
-    /// What the plan itself did that changes the broker, for the audit log
-    /// (the messages a redrive preview read and requeued).
-    pub plan_side_effect: Option<String>,
     pub work: RabbitWork,
 }
 
@@ -571,16 +562,14 @@ fn requeue_warnings(queue: &Queue) -> Vec<String> {
     warnings
 }
 
-/// The plan of `request` on `conn`. A redrive plan with `preview` reads up
-/// to [`REDRIVE_PREVIEW_MAX`] messages (and requeues them) to show where
-/// they would go; the execute call plans without the preview.
+/// The plan of `request` on `conn`. No plan reads a message (reading
+/// requeues them, a change that waits for the confirmation).
 pub(super) async fn plan(
     guard: &WriteGuard,
     backend: &dyn RabbitBackend,
     conn: &RabbitConn,
     tool: &'static str,
     request: &RabbitRequest,
-    preview: bool,
 ) -> Result<RabbitPlanned, ToolError> {
     let vhost = conn.vhost();
     let rabbit = rabbit_tool_error;
@@ -626,7 +615,6 @@ pub(super) async fn plan(
                     profile_note(conn),
                     if mask { "PII-masked" } else { "NOT masked" }
                 ),
-                plan_side_effect: None,
                 work: if tool == "rabbit_peek" {
                     RabbitWork::Peek {
                         queue: queue.clone(),
@@ -700,7 +688,6 @@ pub(super) async fn plan(
                     profile_note(conn),
                     message.routing_key
                 ),
-                plan_side_effect: None,
                 work: RabbitWork::Publish {
                     exchange: exchange.clone(),
                     message: message.clone(),
@@ -719,7 +706,6 @@ pub(super) async fn plan(
                 conn,
                 tool,
                 (queue, *max, to_exchange.as_deref(), routing_key.as_deref()),
-                preview,
             )
             .await
         }
@@ -741,7 +727,6 @@ async fn plan_redrive(
     _conn: &RabbitConn,
     tool: &'static str,
     _request: (&str, u64, Option<&str>, Option<&str>),
-    _preview: bool,
 ) -> Result<RabbitPlanned, ToolError> {
     Err(ToolError::new(
         "write_disabled",
@@ -756,8 +741,10 @@ async fn plan_redrive(
     conn: &RabbitConn,
     tool: &'static str,
     (queue, max, to_exchange, routing_key): (&str, u64, Option<&str>, Option<&str>),
-    preview: bool,
 ) -> Result<RabbitPlanned, ToolError> {
+    // The plan reads no message: reading requeues (marks redelivered), which
+    // must not happen before the move is confirmed. It uses the queue's
+    // statistics and arguments from the management API only.
     let vhost = conn.vhost();
     let rabbit = rabbit_tool_error;
     guard.check_produce(max)?;
@@ -782,64 +769,24 @@ async fn plan_redrive(
         }
     }
     let destination = destination_text(to_exchange, routing_key);
-    let mut observed = json!({
-        "messages_ready": found.messages_ready,
+    let ready = found.messages_ready;
+    let observed = json!({
+        "messages_ready": ready,
+        "messages": found.messages,
         "consumers": found.consumers,
+        "would_move_at_most": ready.map(|n| n.min(max)),
+        "queue_dead_letter_exchange": found.dead_letter_exchange(),
+        "queue_dead_letter_routing_key": found.arguments.get("x-dead-letter-routing-key"),
     });
-    let mut plan_side_effect = None;
-    if preview {
-        let target = format!("queue {queue} on vhost {vhost} (redrive preview)");
-        // Reading for the preview requeues: the peek category applies.
-        guard.authorize_rabbit(
-            tool,
-            ferrika_core::model::policy::PolicyAction::MessagesPeek,
-            &target,
-            conn.profile(),
-            &conn.addresses,
-            conn.read_only_refusal(tool),
-        )?;
-        let count = u32::try_from(max)
-            .unwrap_or(REDRIVE_PREVIEW_MAX)
-            .min(REDRIVE_PREVIEW_MAX);
-        let messages = backend.peek(conn, queue, count).await.map_err(rabbit)?;
-        let preview = RedrivePreview::new(queue, vhost, &messages, to_exchange, routing_key)
-            .with_unmovable_problem("no x-death header; give to_exchange");
-        // Destinations seen in the preview must be in scope too.
-        for planned in &preview.messages {
-            if let Some(d) = &planned.destination {
-                guard.check_exchange(&d.exchange, Some(&d.routing_key))?;
-            }
-        }
-        let mut warnings = Vec::new();
-        if preview.unmovable > 0 {
-            warnings.push(format!(
-                "{} message(s) have no x-death header and no to_exchange is given: the move \
-                 stops at the first of them.",
-                preview.unmovable
-            ));
-        }
-        if max > messages.len() as u64 && messages.len() as u64 == u64::from(count) {
-            warnings.push(format!(
-                "The preview read the first {} message(s); the move takes up to {max}, each to \
-                 its own destination.",
-                messages.len()
-            ));
-        }
-        observed["preview"] = json!({
-            "read": messages.len(),
-            "destinations": preview.destinations,
-            "unmovable": preview.unmovable,
-            "warnings": warnings,
-        });
-        plan_side_effect = Some(format!(
-            "read {} message(s) for the redrive preview; requeued (marked redelivered)",
-            messages.len()
-        ));
-    }
     let mut warnings = vec![
+        "The plan reads no message. Where each message goes is decided as it moves: its \
+         newest x-death entry (original exchange and routing key), or to_exchange / \
+         routing_key when given. Call rabbit_dlq_inspect first to see the origins and reasons."
+            .to_string(),
         "Each message is published to its destination, confirmed by the broker, then removed \
-         from the queue; the move stops at the first failure and the message being moved goes \
-         back to the queue."
+         from the queue; the move stops at the first failure (also at a message without \
+         x-death when no to_exchange is given), and the message being moved goes back to the \
+         queue."
             .to_string(),
         "Redriven messages keep their headers (x-death included) and get \
          x-ferrika-redriven-from."
@@ -865,7 +812,6 @@ async fn plan_redrive(
              {destination} over AMQP",
             profile_note(conn)
         ),
-        plan_side_effect,
         work: RabbitWork::Redrive {
             queue: queue.to_string(),
             max,
@@ -1124,7 +1070,7 @@ pub(super) fn definitions() -> Vec<Value> {
     tools.push(json!({
         "name": "rabbit_dlq_redrive",
         "title": "Redrive a RabbitMQ dead-letter queue",
-        "description": "RabbitMQ (preview): moves up to max messages out of a dead-letter queue back to their original exchange and routing key (from x-death), or to to_exchange / routing_key. The plan reads up to 100 messages (requeued) to show how many go where. Execute moves them one by one over AMQP: publish with publisher confirms, then remove from the queue; it stops at the first failure and says how far it got.",
+        "description": "RabbitMQ (preview): moves up to max messages out of a dead-letter queue back to their original exchange and routing key (from x-death), or to to_exchange / routing_key. The plan reads no message (it shows the queue's counts; use rabbit_dlq_inspect to see origins first). Execute moves them one by one over AMQP: publish with publisher confirms, then remove from the queue; it stops at the first failure and says how far it got.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": false,
@@ -1165,6 +1111,8 @@ mod tests {
         bindings: Vec<Binding>,
         messages: Vec<PeekedMessage>,
         unroutable: bool,
+        /// Reading a message fails the test's call (a plan must not read).
+        peek_fails: bool,
         peeks: Cell<usize>,
         published: RefCell<Vec<(String, OutgoingMessage)>>,
         #[cfg(feature = "amqp")]
@@ -1210,6 +1158,11 @@ mod tests {
             count: u32,
         ) -> BoxFuture<'a, Vec<PeekedMessage>> {
             self.peeks.set(self.peeks.get() + 1);
+            if self.peek_fails {
+                return Box::pin(async {
+                    Err(KafkaError::config("this broker refuses reading messages"))
+                });
+            }
             let messages = self.messages.iter().take(count as usize).cloned().collect();
             Box::pin(async move { Ok(messages) })
         }
@@ -1675,39 +1628,45 @@ mod tests {
 
     #[cfg(feature = "amqp")]
     #[tokio::test]
-    async fn redrive_plan_previews_destinations_and_execute_moves() {
-        let (mut tools, rabbit, log) = fresh(broker());
+    async fn redrive_plan_reads_no_message_and_execute_moves() {
+        // Any read (which would requeue) fails here, so a plan that read
+        // would be refused.
+        let (mut tools, rabbit, log) = fresh(FakeRabbit {
+            peek_fails: true,
+            ..broker()
+        });
         let args = json!({ "queue": "orders.dlq", "max": 10 });
         let plan = tools.call_token("rabbit_dlq_redrive", &args).await;
         assert_eq!(plan["isError"], false, "{plan}");
-        let preview = &plan["structuredContent"]["plan"]["observed"]["preview"];
-        assert_eq!(preview["read"], 2, "{plan}");
-        assert_eq!(
-            preview["destinations"]["exchange 'shop', routing key 'order.created'"],
-            2
-        );
-        assert_eq!(rabbit.peeks.get(), 1);
-        // The preview's requeue is audited, without bodies.
-        assert!(log
-            .entries
-            .borrow()
-            .iter()
-            .any(|e| e.action == "mcp rabbit_dlq_redrive plan" && e.outcome.contains("read 2")));
+        assert_eq!(rabbit.peeks.get(), 0);
+        let p = &plan["structuredContent"]["plan"];
+        assert_eq!(p["observed"]["messages_ready"], 3, "{plan}");
+        assert_eq!(p["observed"]["would_move_at_most"], 3);
+        assert!(p["observed"].get("preview").is_none());
+        assert!(p["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("rabbit_dlq_inspect"));
+        // Plans are not audited.
+        assert!(log.entries.borrow().is_empty());
 
         let done = tools
             .call_token("rabbit_dlq_redrive", &execute(&args, &token(&plan)))
             .await;
-        assert_eq!(done["structuredContent"]["result"]["moved"], 2, "{done}");
-        // The execute does not read a preview again.
-        assert_eq!(rabbit.peeks.get(), 1);
+        let result = &done["structuredContent"]["result"];
+        assert_eq!(result["moved"], 2, "{done}");
+        assert_eq!(
+            result["destinations"]["exchange 'shop', routing key 'order.created'"],
+            2
+        );
+        assert_eq!(rabbit.peeks.get(), 0);
         let requests = rabbit.redrives.borrow();
         assert_eq!(requests[0].queue, "orders.dlq");
         assert_eq!(requests[0].limit, 10);
         let entries = log.entries.borrow();
-        let entry = entries
-            .iter()
-            .find(|e| e.action == "mcp rabbit_dlq_redrive")
-            .unwrap();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        let entry = &entries[0];
+        assert_eq!(entry.action, "mcp rabbit_dlq_redrive");
         assert!(entry.ok);
         assert!(entry
             .outcome
@@ -1784,7 +1743,7 @@ mod tests {
             )
             .await;
         assert_eq!(named["isError"], false, "{named}");
-        assert_eq!(rabbit.peeks.get(), 1);
+        assert_eq!(rabbit.peeks.get(), 0);
         let too_many = tools
             .call_token(
                 "rabbit_dlq_redrive",
