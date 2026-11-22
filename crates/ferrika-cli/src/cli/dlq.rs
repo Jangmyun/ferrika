@@ -384,7 +384,12 @@ async fn run_redrive(args: RedriveDlqArgs, global: &GlobalOpts) -> KafkaResult<(
         is_simulation,
         !args.include_redriven,
     );
-    if let Some(note) = rerun_note(is_simulation, args.group.as_deref()) {
+    if let Some(note) = rerun_note(
+        is_simulation,
+        args.group.as_deref(),
+        !args.from_offset.is_empty(),
+        global.wants_json(args.json),
+    ) {
         // On stderr: JSON on stdout stays parseable.
         eprintln!("{note}");
     }
@@ -556,9 +561,17 @@ impl RedriveOutcome {
 }
 
 /// The note for a live redrive without `-g`: nothing records how far it
-/// got, so running it again sends the same records again.
-fn rerun_note(is_simulation: bool, group: Option<&str>) -> Option<&'static str> {
-    (!is_simulation && group.is_none()).then_some(
+/// got, so running it again sends the same records again. Left out when the
+/// run already continues from `--from-offset` (the caller tracks progress)
+/// and for JSON output, whose `next_from_offset` says where to continue and
+/// which scripts read from stdout and stderr together.
+fn rerun_note(
+    is_simulation: bool,
+    group: Option<&str>,
+    resumes: bool,
+    json: bool,
+) -> Option<&'static str> {
+    (!is_simulation && group.is_none() && !resumes && !json).then_some(
         "Note: without -g/--group no progress is recorded; running this redrive again \
          resends the same records. Pass -g <group> (or the --from-offset value printed \
          at the end) to continue where it stopped.",
@@ -879,9 +892,12 @@ mod tests {
 
     #[test]
     fn a_live_redrive_without_a_group_warns_about_reruns() {
-        assert!(rerun_note(false, None).is_some());
-        assert!(rerun_note(false, Some("redrive")).is_none());
-        assert!(rerun_note(true, None).is_none());
+        assert!(rerun_note(false, None, false, false).is_some());
+        assert!(rerun_note(false, Some("redrive"), false, false).is_none());
+        assert!(rerun_note(true, None, false, false).is_none());
+        // Continuing from --from-offset, or JSON output: no note.
+        assert!(rerun_note(false, None, true, false).is_none());
+        assert!(rerun_note(false, None, false, true).is_none());
     }
 
     #[test]
