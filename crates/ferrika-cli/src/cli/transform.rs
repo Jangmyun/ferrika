@@ -270,23 +270,18 @@ struct CliTransform {
 }
 
 impl RecordTransform for CliTransform {
-    fn apply(
-        &mut self,
-        msg: &ConsumedMessage,
-    ) -> impl std::future::Future<Output = Option<OwnedProducerRecord>> {
-        async move {
-            let decoded = match (&mut self.decoder, msg.payload.as_deref()) {
-                // A value that did not decode (no wire format, unknown
-                // schema) is not JSON text and goes on as it was read.
-                (Some(decoder), Some(payload)) => decoder
-                    .decode(payload)
-                    .await
-                    .and_then(|d| serde_json::from_str::<Value>(&d.text).ok()),
-                _ => None,
-            };
-            self.pipeline
-                .apply(msg, decoded, &self.dst_topic, &mut self.counters)
-        }
+    async fn apply(&mut self, msg: &ConsumedMessage) -> Option<OwnedProducerRecord> {
+        let decoded = match (&mut self.decoder, msg.payload.as_deref()) {
+            // A value that did not decode (no wire format, unknown
+            // schema) is not JSON text and goes on as it was read.
+            (Some(decoder), Some(payload)) => decoder
+                .decode(payload)
+                .await
+                .and_then(|d| serde_json::from_str::<Value>(&d.text).ok()),
+            _ => None,
+        };
+        self.pipeline
+            .apply(msg, decoded, &self.dst_topic, &mut self.counters)
     }
 }
 

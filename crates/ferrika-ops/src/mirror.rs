@@ -333,7 +333,7 @@ pub fn is_self_mirror(
         && ferrika_governance::policy::shares_broker(src_bootstrap, dst_bootstrap)
 }
 
-//// Turns a source record into the record to write, or `None` to skip it.
+/// Turns a source record into the record to write, or `None` to skip it.
 /// The copy pipeline calls it for each record [`MirrorConfig::filter`]
 /// kept, in offset order per partition.
 pub trait RecordTransform {
@@ -369,7 +369,7 @@ pub enum CopyDestination<'a> {
 
 /// The open side of a [`CopyDestination`].
 enum Output<'a> {
-    Producer(KafkaProducerClient),
+    Producer(Box<KafkaProducerClient>),
     Preview(&'a mut dyn FnMut(&OwnedProducerRecord)),
 }
 
@@ -476,7 +476,7 @@ where
     let keys: Vec<(&str, i32)> = partitions.iter().map(|&p| (topic, p)).collect();
     let mut output = match destination {
         CopyDestination::Cluster(dst_config) => {
-            Output::Producer(KafkaProducerClient::new(dst_config)?)
+            Output::Producer(Box::new(KafkaProducerClient::new(dst_config)?))
         }
         CopyDestination::Preview(sink) => Output::Preview(sink),
     };
