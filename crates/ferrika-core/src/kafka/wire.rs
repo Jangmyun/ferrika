@@ -3229,6 +3229,17 @@ mod tests {
             metadata.i32(0);
             write_response(&mut stream, corr, false, &metadata.0);
 
+            // The client first checks that the API is offered.
+            let (api, version, corr) = read_request(&mut stream);
+            assert_eq!((api, version), (API_API_VERSIONS, 0));
+            let mut versions = Writer::default();
+            versions.i16(0);
+            versions.i32(1);
+            versions.i16(API_ALTER_PARTITION_REASSIGNMENTS);
+            versions.i16(0);
+            versions.i16(0);
+            write_response(&mut stream, corr, false, &versions.0);
+
             let (api, version, corr) = read_request(&mut stream);
             assert_eq!((api, version), (API_ALTER_PARTITION_REASSIGNMENTS, 0));
             write_response(&mut stream, corr, true, &alter_response(0, &[(0, 0, None)]));
