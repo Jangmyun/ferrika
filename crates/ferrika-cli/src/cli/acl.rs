@@ -249,7 +249,9 @@ impl AclDeleteArgs {
 fn check_delete_scope(args: &AclDeleteArgs) -> KafkaResult<()> {
     if args.has_no_filter() && !args.all {
         return Err(KafkaError::acl(
-            "'acl delete' without a filter would delete every ACL binding. Give a filter              (--principal, --topic, --group, --cluster, --operation, --permission), or pass              --all to delete them all (it still only previews without --force)."
+            "'acl delete' without a filter would delete every ACL binding. Give a filter \
+             (--principal, --topic, --group, --cluster, --operation, --permission), or pass \
+             --all to delete them all (it still only previews without --force)."
                 .to_string(),
         ));
     }
