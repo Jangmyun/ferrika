@@ -917,47 +917,52 @@ async fn registry_check(
     global: &GlobalOpts,
 ) -> KafkaResult<()> {
     let latest = client.get_latest_subject_schema(subject).await?;
-    // The level is shown and picks the endpoint; not being allowed to read
-    // it does not stop the check.
+    // The level is only shown: not being allowed to read it does not stop
+    // the check.
     let level = client
         .compatibility(subject)
         .await
         .unwrap_or_else(|_| "unknown".to_string());
-    let transitive = level.to_ascii_uppercase().ends_with("_TRANSITIVE");
-    let compatible = if transitive {
-        match client
-            .is_compatible_with_all_versions(subject, candidate, &latest.schema_type)
-            .await
+    // `.../versions` applies the subject's level itself, against every
+    // version when it is transitive. A registry without that endpoint (404,
+    // 405) is asked about the latest version; any other error stops here.
+    let mut latest_only = false;
+    let compatible = match client
+        .is_compatible_with_all_versions(subject, candidate, &latest.schema_type)
+        .await
+    {
+        Ok(compatible) => compatible,
+        Err(e)
+            if ["returned 404", "returned 405"]
+                .iter()
+                .any(|code| e.to_string().contains(code)) =>
         {
-            Ok(compatible) => compatible,
-            // An older registry without the endpoint: the latest version only.
-            Err(_) => {
+            latest_only = true;
+            if global.format != OutputFormat::Json {
                 eprintln!(
-                    "{} The registry could not check every version; checked against the latest only.",
+                    "{} This registry cannot check every version; checked against the latest only.",
                     "!".yellow()
                 );
-                client
-                    .is_compatible(subject, candidate, &latest.schema_type)
-                    .await?
             }
+            client
+                .is_compatible(subject, candidate, &latest.schema_type)
+                .await?
         }
-    } else {
-        client
-            .is_compatible(subject, candidate, &latest.schema_type)
-            .await?
+        Err(e) => return Err(e),
     };
     let mode = parse_compat_mode(&level).map_or(CompatibilityMode::Backward, |(m, _)| m);
-    let mut report = evaluate_compatibility(Some(subject), &latest.schema, candidate, mode)
-        .unwrap_or_else(|_| CompatibilityReport {
-            subject: Some(subject.to_string()),
-            mode,
-            is_compatible: compatible,
-            violations: Vec::new(),
-            added_fields: Vec::new(),
-            deleted_fields: Vec::new(),
-            modified_fields: Vec::new(),
-        });
-    let local = report.is_compatible;
+    let local_report = evaluate_compatibility(Some(subject), &latest.schema, candidate, mode).ok();
+    // `None`: the local comparison could not read the schemas.
+    let local = local_report.as_ref().map(|r| r.is_compatible);
+    let mut report = local_report.unwrap_or_else(|| CompatibilityReport {
+        subject: Some(subject.to_string()),
+        mode,
+        is_compatible: compatible,
+        violations: Vec::new(),
+        added_fields: Vec::new(),
+        deleted_fields: Vec::new(),
+        modified_fields: Vec::new(),
+    });
     report.is_compatible = compatible;
     if global.format != OutputFormat::Json {
         eprintln!(
@@ -965,11 +970,15 @@ async fn registry_check(
             format!("Checked by the Schema Registry under the subject's level {level}.")
                 .bright_black()
         );
-        if local != compatible {
+        if local.is_some_and(|local| local != compatible) {
             eprintln!(
                 "{} The field-level comparison below says {}; the registry's verdict decides.",
                 "!".yellow(),
-                if local { "compatible" } else { "incompatible" }
+                if local == Some(true) {
+                    "compatible"
+                } else {
+                    "incompatible"
+                }
             );
         }
     }
@@ -983,6 +992,10 @@ async fn registry_check(
             obj.insert("checked_by".into(), "registry".into());
             obj.insert("registry_level".into(), level.clone().into());
             obj.insert("local_is_compatible".into(), local.into());
+            obj.insert(
+                "checked_versions".into(),
+                if latest_only { "latest" } else { "all" }.into(),
+            );
         }
         output::print_json(&json)?;
     } else {
@@ -1182,6 +1195,10 @@ mod tests {
                     "/compatibility/subjects/orders-value/versions/latest".to_string(),
                     format!(r#"{{"is_compatible":{compatible}}}"#),
                 ),
+                (
+                    "/compatibility/subjects/orders-value/versions".to_string(),
+                    format!(r#"{{"is_compatible":{compatible}}}"#),
+                ),
             ]
         };
         let global = super::GlobalOpts {
@@ -1206,7 +1223,9 @@ mod tests {
         // A transitive level is checked against every version: compatible
         // with the latest but not with an older one is incompatible.
         let mut transitive = routes(true);
-        transitive.retain(|(path, _)| !path.starts_with("/config"));
+        transitive.retain(|(path, _)| {
+            !path.starts_with("/config") && path != "/compatibility/subjects/orders-value/versions"
+        });
         transitive.push((
             "/config/orders-value".to_string(),
             r#"{"compatibilityLevel":"FULL_TRANSITIVE"}"#.to_string(),
