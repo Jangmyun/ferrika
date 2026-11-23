@@ -1,4 +1,3 @@
-use rdkafka::Offset;
 use std::io::{self, BufRead};
 use std::time::Duration;
 
@@ -12,6 +11,7 @@ use crate::codec::pii::{
 };
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::consumer::KafkaConsumerClient;
+use crate::kafka::consumer::StartOffset;
 
 /// Field-level PII masking and Kafka security compliance auditor.
 #[derive(Debug, Args)]
@@ -93,7 +93,7 @@ pub async fn handle_crypto_command(args: CryptoArgs, global: &GlobalOpts) -> Kaf
 async fn handle_audit(args: CryptoAuditArgs, global: &GlobalOpts) -> KafkaResult<()> {
     let config = global.to_kafka_config();
     let consumer = KafkaConsumerClient::scanner(&config)?;
-    consumer.assign_topic(&args.topic, Offset::Beginning)?;
+    consumer.assign_topic(&args.topic, StartOffset::Beginning)?;
 
     let mut scanned = 0;
     let mut findings = Vec::new();
@@ -262,7 +262,7 @@ async fn handle_mask(args: CryptoMaskArgs, global: &GlobalOpts) -> KafkaResult<(
         // Stream from Kafka topic and mask
         let config = global.to_kafka_config();
         let consumer = KafkaConsumerClient::scanner(&config)?;
-        consumer.assign_topic(&topic, Offset::Beginning)?;
+        consumer.assign_topic(&topic, StartOffset::Beginning)?;
 
         let mut count = 0;
         let timeout = Duration::from_millis(1000);

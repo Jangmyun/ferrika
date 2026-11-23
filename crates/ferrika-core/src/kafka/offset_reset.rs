@@ -1,4 +1,4 @@
-use rdkafka::consumer::CommitMode;
+use crate::kafka::consumer::CommitMode;
 use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
 

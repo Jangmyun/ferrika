@@ -6,13 +6,13 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use rdkafka::Offset;
 use serde_json::{json, Value};
 
 use ferrika_core::codec::pii::{mask_bytes, mask_payload, MaskStrategy};
 use ferrika_core::error::{KafkaError, KafkaResult};
 use ferrika_core::kafka::admin::KafkaAdminClient;
 use ferrika_core::kafka::consumer::KafkaConsumerClient;
+use ferrika_core::kafka::consumer::StartOffset;
 use ferrika_core::kafka::context::ResolvedContext;
 use ferrika_core::model::cluster::TopicSummary;
 use ferrika_governance::policy::{self, AuditSink, EffectivePolicy, ExportChannel, ExportRequest};
@@ -815,7 +815,7 @@ async fn peek_messages(context: &ResolvedContext, args: &Value) -> KafkaResult<V
             }
         };
         if start < high {
-            starts.push((topic, p, Offset::Offset(start)));
+            starts.push((topic, p, StartOffset::At(start)));
             ends.insert(p, high);
         }
     }

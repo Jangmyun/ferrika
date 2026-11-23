@@ -634,7 +634,7 @@ impl GroupCommit {
                 .map_err(|e| KafkaError::Offset(e.to_string()))?;
         }
         self.consumer
-            .commit(&tpl, rdkafka::consumer::CommitMode::Sync)
+            .commit(&tpl, crate::kafka::consumer::CommitMode::Sync)
             .map_err(|e| {
                 KafkaError::Offset(format!(
                     "could not commit the redrive progress to group '{}': {e}; records \

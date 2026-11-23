@@ -1,4 +1,8 @@
 //! Consumer group offsets and lag as the GUI and `monitor lag` show them.
+//!
+//! Semver: [`committed_partition_list`] and [`apply_group_offsets`] use
+//! `rdkafka::TopicPartitionList` (rdkafka 0.39) and change with it; plain
+//! maps are planned for 0.3.
 
 use std::collections::HashMap;
 

@@ -4,8 +4,6 @@ use std::time::Duration;
 
 use clap::Args;
 use colored::Colorize;
-use rdkafka::consumer::CommitMode;
-use rdkafka::Offset;
 
 use crate::cli::{print_connection_hint, GlobalOpts, OutputFormat};
 use crate::codec::pii::{mask_payload, MaskStrategy};
@@ -15,6 +13,7 @@ use crate::kafka::consumer::{
     timestamp_start_offsets, ConsumedMessage, KafkaConsumerClient, ParallelReader, PartitionRead,
     ReadEvent, TimestampStop,
 };
+use crate::kafka::consumer::{CommitMode, StartOffset};
 use crate::kafka::filter::{FilterStats, MessageFilter};
 use crate::ops::backup::jsonl_record;
 
@@ -241,7 +240,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
             None => existing,
         };
         time_stop = TimestampStop::new(args.to_timestamp, &partitions);
-        let starts: Vec<(i32, Offset)> = match (args.offset, args.from_timestamp) {
+        let starts: Vec<(i32, StartOffset)> = match (args.offset, args.from_timestamp) {
             // --from-timestamp seeks to the first record at or after it.
             (None, Some(ts)) => {
                 let keys: Vec<(&str, i32)> = partitions
@@ -256,7 +255,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                     .to_timestamp
                     .is_some_and(|to| to < jiff::Timestamp::now().as_millisecond());
                 for &(p, start) in &starts {
-                    if window_closed && start == Offset::End {
+                    if window_closed && start == StartOffset::End {
                         time_stop.finish(p);
                     }
                 }
@@ -281,7 +280,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
             // A group starting at its committed offsets: where those are.
             let committed = match (
                 &kafka_config.group_id,
-                starts.iter().any(|(_, s)| *s == Offset::Stored),
+                starts.iter().any(|(_, s)| *s == StartOffset::Committed),
             ) {
                 (Some(group), true) => crate::kafka::wire::fetch_group_offsets(
                     &kafka_config,
@@ -296,7 +295,8 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                 let at_end = starts.iter().any(|&(sp, start)| {
                     sp == p
                         && match start {
-                            Offset::Stored => match committed.get(&(args.topic.clone(), p)) {
+                            StartOffset::Committed => match committed.get(&(args.topic.clone(), p))
+                            {
                                 Some(&c) => c >= high,
                                 // No commit: the reset policy picks the start.
                                 None => match kafka_config.auto_offset_reset {
@@ -325,7 +325,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                 );
             }
         }
-        let assignments: Vec<(&str, i32, Offset)> = starts
+        let assignments: Vec<(&str, i32, StartOffset)> = starts
             .iter()
             .map(|&(p, start)| (args.topic.as_str(), p, start))
             .collect();
@@ -953,13 +953,13 @@ async fn next_event(
 /// it at the end would leave its records out without a word.
 fn time_lookup_offsets(
     lookups: std::collections::HashMap<(String, i32), crate::kafka::consumer::Lookup>,
-) -> anyhow::Result<std::collections::HashMap<(String, i32), Offset>> {
+) -> anyhow::Result<std::collections::HashMap<(String, i32), StartOffset>> {
     use crate::kafka::consumer::Lookup;
     lookups
         .into_iter()
         .map(|(key, lookup)| match lookup {
-            Lookup::At(offset) => Ok((key, Offset::Offset(offset))),
-            Lookup::End => Ok((key, Offset::End)),
+            Lookup::At(offset) => Ok((key, StartOffset::At(offset))),
+            Lookup::End => Ok((key, StartOffset::End)),
             Lookup::Failed(failure) => Err(anyhow::anyhow!(
                 "cannot find where partition {} starts at --from-timestamp: {}",
                 key.1,
@@ -971,12 +971,12 @@ fn time_lookup_offsets(
 
 /// Whether reading from `start` finds nothing before `high` (an empty
 /// partition, or a start at its end).
-fn starts_at_end(start: Offset, low: i64, high: i64) -> bool {
+fn starts_at_end(start: StartOffset, low: i64, high: i64) -> bool {
     match start {
-        Offset::Beginning => low >= high,
-        Offset::End => true,
-        Offset::Offset(o) => o >= high,
-        Offset::OffsetTail(n) => n <= 0 || low >= high,
+        StartOffset::Beginning => low >= high,
+        StartOffset::End => true,
+        StartOffset::At(o) => o >= high,
+        StartOffset::Tail(n) => n <= 0 || low >= high,
         _ => false,
     }
 }
@@ -1022,7 +1022,7 @@ fn clamped_starts(
     topic: &str,
     partitions: &[i32],
     requested: i64,
-) -> anyhow::Result<Vec<(i32, Offset)>> {
+) -> anyhow::Result<Vec<(i32, StartOffset)>> {
     let mut starts = Vec::with_capacity(partitions.len());
     for &p in partitions {
         let (low, high) = consumer.fetch_watermarks(topic, p, None)?;
@@ -1041,7 +1041,7 @@ fn clamped_starts(
             }
             None => requested,
         };
-        starts.push((p, Offset::Offset(start)));
+        starts.push((p, StartOffset::At(start)));
     }
     Ok(starts)
 }
@@ -1049,13 +1049,13 @@ fn clamped_starts(
 /// Resolves the starting offset for an explicit partition assignment.
 /// Without a group there are no stored offsets, so it starts at the end (new messages only)
 /// unless --from-beginning is given.
-fn start_offset(offset: Option<i64>, from_beginning: bool, use_group: bool) -> Offset {
+fn start_offset(offset: Option<i64>, from_beginning: bool, use_group: bool) -> StartOffset {
     match offset {
-        Some(off) if off >= 0 => Offset::Offset(off),
-        Some(off) => Offset::OffsetTail(off.unsigned_abs() as i64),
-        None if from_beginning => Offset::Beginning,
-        None if use_group => Offset::Stored,
-        None => Offset::End,
+        Some(off) if off >= 0 => StartOffset::At(off),
+        Some(off) => StartOffset::Tail(off.unsigned_abs() as i64),
+        None if from_beginning => StartOffset::Beginning,
+        None if use_group => StartOffset::Committed,
+        None => StartOffset::End,
     }
 }
 
@@ -1303,15 +1303,15 @@ mod tests {
 
     #[test]
     fn partitions_with_nothing_to_read_are_recognised() {
-        assert!(starts_at_end(Offset::Beginning, 5, 5));
-        assert!(!starts_at_end(Offset::Beginning, 0, 5));
-        assert!(starts_at_end(Offset::End, 0, 5));
-        assert!(starts_at_end(Offset::Offset(5), 0, 5));
-        assert!(!starts_at_end(Offset::Offset(4), 0, 5));
-        assert!(!starts_at_end(Offset::OffsetTail(3), 0, 5));
-        assert!(starts_at_end(Offset::OffsetTail(3), 5, 5));
+        assert!(starts_at_end(StartOffset::Beginning, 5, 5));
+        assert!(!starts_at_end(StartOffset::Beginning, 0, 5));
+        assert!(starts_at_end(StartOffset::End, 0, 5));
+        assert!(starts_at_end(StartOffset::At(5), 0, 5));
+        assert!(!starts_at_end(StartOffset::At(4), 0, 5));
+        assert!(!starts_at_end(StartOffset::Tail(3), 0, 5));
+        assert!(starts_at_end(StartOffset::Tail(3), 5, 5));
         // A group's stored position is not known here.
-        assert!(!starts_at_end(Offset::Stored, 5, 5));
+        assert!(!starts_at_end(StartOffset::Committed, 5, 5));
     }
 
     #[test]
@@ -1325,8 +1325,8 @@ mod tests {
             .into(),
         )
         .unwrap();
-        assert_eq!(ok[&("t".to_string(), 0)], Offset::Offset(7));
-        assert_eq!(ok[&("t".to_string(), 1)], Offset::End);
+        assert_eq!(ok[&("t".to_string(), 0)], StartOffset::At(7));
+        assert_eq!(ok[&("t".to_string(), 1)], StartOffset::End);
         let failed = time_lookup_offsets(
             [(
                 ("t".to_string(), 2),

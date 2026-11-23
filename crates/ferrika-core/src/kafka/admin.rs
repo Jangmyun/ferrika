@@ -196,6 +196,78 @@ pub struct ConfigEntryView {
     pub sensitive: bool,
 }
 
+/// Cluster metadata as one Metadata request reports it: the live brokers and
+/// the topics with their partitions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterMetadata {
+    pub brokers: Vec<BrokerMetadata>,
+    pub topics: Vec<TopicMetadata>,
+}
+
+/// One broker in a [`ClusterMetadata`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrokerMetadata {
+    pub id: i32,
+    pub host: String,
+    pub port: u16,
+}
+
+/// One topic in a [`ClusterMetadata`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopicMetadata {
+    pub name: String,
+    /// The broker's error for this topic (for example not authorized or
+    /// unknown), as text; such a topic usually has no partitions.
+    pub error: Option<String>,
+    pub partitions: Vec<PartitionMetadata>,
+}
+
+/// One partition in a [`TopicMetadata`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartitionMetadata {
+    pub id: i32,
+    /// The leader's broker id, or -1 without a leader.
+    pub leader: i32,
+    pub replicas: Vec<i32>,
+    pub isr: Vec<i32>,
+}
+
+impl ClusterMetadata {
+    fn from_driver(metadata: &Metadata) -> Self {
+        Self {
+            brokers: metadata
+                .brokers()
+                .iter()
+                .map(|b| BrokerMetadata {
+                    id: b.id(),
+                    host: b.host().to_string(),
+                    port: u16::try_from(b.port()).unwrap_or(0),
+                })
+                .collect(),
+            topics: metadata
+                .topics()
+                .iter()
+                .map(|t| TopicMetadata {
+                    name: t.name().to_string(),
+                    error: t
+                        .error()
+                        .map(|e| rdkafka::types::RDKafkaErrorCode::from(e).to_string()),
+                    partitions: t
+                        .partitions()
+                        .iter()
+                        .map(|p| PartitionMetadata {
+                            id: p.id(),
+                            leader: p.leader(),
+                            replicas: p.replicas().to_vec(),
+                            isr: p.isr().to_vec(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Kafka administrative client for cluster metadata and topic management.
 pub struct KafkaAdminClient {
     // Declared before `admin` so it stops before the client is destroyed.
@@ -225,8 +297,18 @@ impl KafkaAdminClient {
         &self.config
     }
 
-    /// Fetches raw metadata for the entire cluster or a specific topic.
-    pub fn fetch_raw_metadata(
+    /// Fetches the metadata of the entire cluster, or of one topic.
+    pub fn fetch_metadata(
+        &self,
+        topic: Option<&str>,
+        timeout: Option<Duration>,
+    ) -> KafkaResult<ClusterMetadata> {
+        let metadata = self.fetch_raw_metadata(topic, timeout)?;
+        Ok(ClusterMetadata::from_driver(&metadata))
+    }
+
+    /// Fetches the driver's metadata for the entire cluster or a specific topic.
+    pub(crate) fn fetch_raw_metadata(
         &self,
         topic: Option<&str>,
         timeout: Option<Duration>,

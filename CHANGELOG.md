@@ -364,6 +364,31 @@ The RabbitMQ entries below are planned for 0.2.0.
   steps of a failed undo as data), `Journal::rotated_path` and
   `audit::op_digests` are new, and `undo::DigestCheck` has a `Legacy`
   variant.
+- **Breaking (library):** `rdkafka` is no longer part of the documented API:
+  - `ferrika_core::rdkafka` (the re-export) is removed.
+  - New `kafka::consumer::StartOffset` (`Beginning`, `End`, `At(i64)`,
+    `Tail(i64)`, `Committed`) replaces `rdkafka::Offset` in
+    `Lookup::as_offset`, `timestamp_start_offsets`, `PartitionRead::start`
+    and `KafkaConsumerClient::{assign_with_offsets, resolve_logical_offsets,
+    assign_topic, seek, offsets_for_timestamp}`.
+  - New `kafka::consumer::CommitMode` (`Sync`, `Async`) replaces rdkafka's in
+    `KafkaConsumerClient::{commit_message, commit_all, commit_stored, commit}`.
+  - `KafkaConsumerClient::inner` is removed; `positions()` returns the read
+    positions as a `(topic, partition) -> offset` map.
+  - `KafkaProducerClient::enqueue` returns a `PendingDelivery` future that
+    resolves to `KafkaResult<DeliveryReceipt>` instead of rdkafka's
+    `DeliveryFuture`.
+  - `KafkaAdminClient::fetch_raw_metadata` is crate-internal; use the new
+    `fetch_metadata`, which returns `ClusterMetadata` (brokers, topics,
+    partitions). `ferrika_ops::topology::from_rdkafka_metadata` is replaced
+    by `from_metadata(&ClusterMetadata, ..)` and `collect(&KafkaAdminClient)`.
+  - `KafkaClientConfig::to_rdkafka_config` and
+    `kafka::oauth_refresh::{prepare, OAuthSetup, with_oauth}` are
+    crate-internal.
+  - Still on rdkafka 0.39 types until 0.3: `KafkaConsumerClient::{fetch_committed_offsets,
+    fetch_committed_offsets_for, commit}` (`TopicPartitionList`) and
+    `ferrika_ops::group_lag::{committed_partition_list, apply_group_offsets}`.
+  - `ferrika-mcp` no longer depends on `rdkafka`.
 
 ### Compatibility
 

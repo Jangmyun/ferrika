@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 
-use rdkafka::metadata::Metadata;
+use ferrika_core::error::KafkaResult;
+use ferrika_core::kafka::admin::{ClusterMetadata, KafkaAdminClient};
 use serde::{Deserialize, Serialize};
 
 /// Detailed topology and workload profile of an individual Kafka broker node.
@@ -176,39 +177,44 @@ pub(crate) fn build_topology_report(
     }
 }
 
-/// Converts rdkafka cluster metadata into `ClusterTopologyReport`, marking
+/// Reads the cluster metadata through `admin` and builds its topology report,
+/// marking the active controller.
+pub fn collect(admin: &KafkaAdminClient) -> KafkaResult<ClusterTopologyReport> {
+    let metadata = admin.fetch_metadata(None, None)?;
+    Ok(from_metadata(&metadata, admin.active_controller_id()))
+}
+
+/// Converts cluster metadata into `ClusterTopologyReport`, marking
 /// `controller_id` (see `KafkaAdminClient::active_controller_id`) as controller.
-pub fn from_rdkafka_metadata(
-    metadata: &Metadata,
+pub fn from_metadata(
+    metadata: &ClusterMetadata,
     controller_id: Option<i32>,
 ) -> ClusterTopologyReport {
     let raw_brokers: Vec<RawBrokerInput> = metadata
-        .brokers()
+        .brokers
         .iter()
         .map(|b| RawBrokerInput {
-            id: b.id(),
-            host: b.host().to_string(),
-            port: b.port() as u16,
-            rack: None, // rdkafka metadata doesn't expose rack directly
-            is_controller: Some(b.id()) == controller_id,
+            id: b.id,
+            host: b.host.clone(),
+            port: b.port,
+            rack: None, // Metadata as librdkafka reports it carries no rack
+            is_controller: Some(b.id) == controller_id,
         })
         .collect();
 
-    let mut raw_partitions = Vec::new();
-    for topic in metadata.topics() {
-        let topic_name = topic.name();
-        for p in topic.partitions() {
-            let replicas: Vec<i32> = p.replicas().to_vec();
-            let isr: Vec<i32> = p.isr().to_vec();
-            raw_partitions.push(RawPartitionInput {
-                topic: topic_name.to_string(),
-                partition_id: p.id(),
-                leader: p.leader(),
-                replicas,
-                isr,
-            });
-        }
-    }
+    let raw_partitions: Vec<RawPartitionInput> = metadata
+        .topics
+        .iter()
+        .flat_map(|t| {
+            t.partitions.iter().map(|p| RawPartitionInput {
+                topic: t.name.clone(),
+                partition_id: p.id,
+                leader: p.leader,
+                replicas: p.replicas.clone(),
+                isr: p.isr.clone(),
+            })
+        })
+        .collect();
 
     build_topology_report(&raw_brokers, &raw_partitions)
 }
@@ -216,6 +222,55 @@ pub fn from_rdkafka_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_converts_into_a_report() {
+        use ferrika_core::kafka::admin::{BrokerMetadata, PartitionMetadata, TopicMetadata};
+        let metadata = ClusterMetadata {
+            brokers: vec![
+                BrokerMetadata {
+                    id: 1,
+                    host: "a".into(),
+                    port: 9092,
+                },
+                BrokerMetadata {
+                    id: 2,
+                    host: "b".into(),
+                    port: 9093,
+                },
+            ],
+            topics: vec![TopicMetadata {
+                name: "orders".into(),
+                error: None,
+                partitions: vec![
+                    PartitionMetadata {
+                        id: 0,
+                        leader: 1,
+                        replicas: vec![1, 2],
+                        isr: vec![1, 2],
+                    },
+                    PartitionMetadata {
+                        id: 1,
+                        leader: 2,
+                        replicas: vec![2, 1],
+                        isr: vec![2],
+                    },
+                ],
+            }],
+        };
+        let report = from_metadata(&metadata, Some(2));
+        assert_eq!(report.brokers_count, 2);
+        assert_eq!(report.topics_count, 1);
+        assert_eq!(report.total_partitions, 2);
+        assert_eq!(report.under_replicated_count, 1);
+        let controller: Vec<i32> = report
+            .brokers
+            .iter()
+            .filter(|b| b.is_controller)
+            .map(|b| b.id)
+            .collect();
+        assert_eq!(controller, [2]);
+    }
 
     #[test]
     fn test_build_topology_report_balanced_and_healthy() {

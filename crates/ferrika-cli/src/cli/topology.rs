@@ -4,7 +4,7 @@ use comfy_table::{Cell, CellAlignment, Color};
 use crate::cli::{output, GlobalOpts};
 use crate::error::KafkaResult;
 use crate::kafka::admin::KafkaAdminClient;
-use crate::ops::topology::{from_rdkafka_metadata, ClusterTopologyReport};
+use crate::ops::topology::ClusterTopologyReport;
 
 /// Command line arguments for Kafka cluster topology and partition placement visualizer.
 #[derive(Debug, Args)]
@@ -34,9 +34,7 @@ pub struct TopologyArgs {
 pub async fn run(args: TopologyArgs, global: &GlobalOpts) -> KafkaResult<()> {
     let config = global.to_kafka_config();
     let admin = KafkaAdminClient::new(&config)?;
-    let metadata = admin.fetch_raw_metadata(None, None)?;
-
-    let mut report = from_rdkafka_metadata(&metadata, admin.active_controller_id());
+    let mut report = crate::ops::topology::collect(&admin)?;
 
     // Apply filtering
     if let Some(ref t_filter) = args.topic {

@@ -1,11 +1,16 @@
+//! Consumers: group consumers, group-less scanners and the parallel reader.
+//!
+//! Semver: `fetch_committed_offsets`, `fetch_committed_offsets_for` and
+//! `commit` of [`KafkaConsumerClient`] take or return
+//! `rdkafka::TopicPartitionList` (rdkafka 0.39) and change with it; plain
+//! maps are planned for 0.3. Everything else here uses Ferrika types.
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use rdkafka::consumer::{
-    BaseConsumer, CommitMode, Consumer, DefaultConsumerContext, StreamConsumer,
-};
+use rdkafka::consumer::{BaseConsumer, Consumer, DefaultConsumerContext, StreamConsumer};
 use rdkafka::message::{Headers, Message};
 use rdkafka::{Offset, TopicPartitionList};
 use serde::de::DeserializeOwned;
@@ -13,6 +18,53 @@ use serde::de::DeserializeOwned;
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::config::KafkaClientConfig;
 use crate::kafka::detached::DetachedDrop;
+
+/// Where a consumer starts reading a partition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StartOffset {
+    /// The oldest retained record (the partition's low watermark).
+    Beginning,
+    /// The end of the partition: only records produced from now on.
+    End,
+    /// An explicit offset.
+    At(i64),
+    /// This many records before the end.
+    Tail(i64),
+    /// The consumer group's committed offset; without one, the client's
+    /// `auto.offset.reset` policy picks the start.
+    Committed,
+}
+
+impl StartOffset {
+    /// The driver's offset for this start.
+    pub(crate) fn to_driver(self) -> Offset {
+        match self {
+            StartOffset::Beginning => Offset::Beginning,
+            StartOffset::End => Offset::End,
+            StartOffset::At(o) => Offset::Offset(o),
+            StartOffset::Tail(n) => Offset::OffsetTail(n),
+            StartOffset::Committed => Offset::Stored,
+        }
+    }
+}
+
+/// Whether a commit waits for the broker's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommitMode {
+    /// Blocks until the broker acknowledges the commit.
+    Sync,
+    /// Sends the commit and returns at once.
+    Async,
+}
+
+impl CommitMode {
+    pub(crate) fn to_driver(self) -> rdkafka::consumer::CommitMode {
+        match self {
+            CommitMode::Sync => rdkafka::consumer::CommitMode::Sync,
+            CommitMode::Async => rdkafka::consumer::CommitMode::Async,
+        }
+    }
+}
 
 /// Deserialized/owned representation of a message consumed from a Kafka topic.
 #[derive(Debug, Clone)]
@@ -41,14 +93,14 @@ pub async fn record_timestamps(
         return Ok(found);
     }
     let consumer = KafkaConsumerClient::scanner(config)?;
-    let assignments: Vec<(&str, i32, rdkafka::Offset)> = positions
+    let assignments: Vec<(&str, i32, StartOffset)> = positions
         .iter()
         .map(|(t, p, o)| {
             // A negative offset means the oldest retained record.
             let offset = if *o < 0 {
-                rdkafka::Offset::Beginning
+                StartOffset::Beginning
             } else {
-                rdkafka::Offset::Offset(*o)
+                StartOffset::At(*o)
             };
             (t.as_str(), *p, offset)
         })
@@ -113,29 +165,29 @@ impl Lookup {
         }
     }
 
-    /// The start position: [`Offset::End`] unless an offset was found.
-    pub fn as_offset(&self) -> Offset {
+    /// The start position: [`StartOffset::End`] unless an offset was found.
+    pub fn as_offset(&self) -> StartOffset {
         match self {
-            Lookup::At(o) => Offset::Offset(*o),
-            Lookup::End | Lookup::Failed(_) => Offset::End,
+            Lookup::At(o) => StartOffset::At(*o),
+            Lookup::End | Lookup::Failed(_) => StartOffset::End,
         }
     }
 }
 
 /// Start offsets per partition from an [`KafkaConsumerClient::offsets_for_timestamp`]
-/// lookup: the first offset at or after the timestamp, [`Offset::End`] when
-/// the partition has no such record (or no lookup result).
+/// lookup: the first offset at or after the timestamp, [`StartOffset::End`]
+/// when the partition has no such record (or no lookup result).
 pub fn timestamp_start_offsets(
     topic: &str,
     partitions: &[i32],
-    lookup: &HashMap<(String, i32), Offset>,
-) -> Vec<(i32, Offset)> {
+    lookup: &HashMap<(String, i32), StartOffset>,
+) -> Vec<(i32, StartOffset)> {
     partitions
         .iter()
         .map(|&p| {
             let start = match lookup.get(&(topic.to_string(), p)) {
-                Some(Offset::Offset(o)) if *o >= 0 => Offset::Offset(*o),
-                _ => Offset::End,
+                Some(StartOffset::At(o)) if *o >= 0 => StartOffset::At(*o),
+                _ => StartOffset::End,
             };
             (p, start)
         })
@@ -361,17 +413,17 @@ pub fn limit_prefetch(config: &mut KafkaClientConfig) {
 const WATERMARK_RESOLVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Whether `offset` is `Beginning` or `End`, which librdkafka resolves itself.
-fn is_logical(offset: Offset) -> bool {
-    matches!(offset, Offset::Beginning | Offset::End)
+fn is_logical(offset: StartOffset) -> bool {
+    matches!(offset, StartOffset::Beginning | StartOffset::End)
 }
 
 /// `offset` as an explicit offset, given the partition's `(low, high)`
 /// watermarks. Anything but `Beginning` and `End`, or an unknown partition,
 /// is returned unchanged.
-fn resolve_offset(offset: Offset, watermarks: Option<(i64, i64)>) -> Offset {
+fn resolve_offset(offset: StartOffset, watermarks: Option<(i64, i64)>) -> StartOffset {
     match (offset, watermarks) {
-        (Offset::Beginning, Some((low, _))) => Offset::Offset(low),
-        (Offset::End, Some((_, high))) => Offset::Offset(high),
+        (StartOffset::Beginning, Some((low, _))) => StartOffset::At(low),
+        (StartOffset::End, Some((_, high))) => StartOffset::At(high),
         _ => offset,
     }
 }
@@ -384,7 +436,7 @@ const SKIP_REPORT_EVERY: u64 = 4096;
 pub struct PartitionRead<'a> {
     pub topic: &'a str,
     pub partition: i32,
-    pub start: Offset,
+    pub start: StartOffset,
     /// The offset to stop before; `None` reads on as records arrive.
     pub end: Option<i64>,
 }
@@ -421,10 +473,10 @@ impl ParallelReader {
         }
         // Explicit starting offsets spare each reader librdkafka's 500 ms
         // retry of a logical one (see `resolve_logical_offsets`).
-        let starts: Vec<Offset> = if partitions.iter().any(|p| is_logical(p.start)) {
+        let starts: Vec<StartOffset> = if partitions.iter().any(|p| is_logical(p.start)) {
             match KafkaConsumerClient::lookup(&cfg) {
                 Ok(lookup) => {
-                    let assignments: Vec<(&str, i32, Offset)> = partitions
+                    let assignments: Vec<(&str, i32, StartOffset)> = partitions
                         .iter()
                         .map(|p| (p.topic, p.partition, p.start))
                         .collect();
@@ -443,7 +495,7 @@ impl ParallelReader {
             let mine: Vec<&PartitionRead> = partitions.iter().skip(i).step_by(readers).collect();
             let mut tpl = TopicPartitionList::new();
             for (n, p) in partitions.iter().enumerate().skip(i).step_by(readers) {
-                tpl.add_partition_offset(p.topic, p.partition, starts[n])?;
+                tpl.add_partition_offset(p.topic, p.partition, starts[n].to_driver())?;
             }
             let mut rd_config = consumer_config(&cfg)?;
             // Each reader prefetches up to this much. librdkafka's 64 MiB
@@ -653,11 +705,11 @@ impl KafkaConsumerClient {
     /// Assigns partitions with explicit starting offsets, without joining a consumer group.
     /// Prefer this over `assign_partitions` + `seek`: seeking right after an assign fails
     /// with "Erroneous state" until the partition fetcher has started.
-    pub fn assign_with_offsets(&self, assignments: &[(&str, i32, Offset)]) -> KafkaResult<()> {
+    pub fn assign_with_offsets(&self, assignments: &[(&str, i32, StartOffset)]) -> KafkaResult<()> {
         let offsets = self.resolve_logical_offsets(assignments);
         let mut tpl = TopicPartitionList::new();
         for (&(topic, partition, _), offset) in assignments.iter().zip(offsets) {
-            tpl.add_partition_offset(topic, partition, offset)?;
+            tpl.add_partition_offset(topic, partition, offset.to_driver())?;
         }
         self.consumer.assign(&tpl)?;
         Ok(())
@@ -671,7 +723,10 @@ impl KafkaConsumerClient {
     /// later: `consume -b -n 1` took 614 ms and `consume --offset 0 -n 1`
     /// (an explicit offset) 114 ms. If the watermarks cannot be read, the
     /// logical offsets are kept and librdkafka resolves them as before.
-    pub fn resolve_logical_offsets(&self, assignments: &[(&str, i32, Offset)]) -> Vec<Offset> {
+    pub fn resolve_logical_offsets(
+        &self,
+        assignments: &[(&str, i32, StartOffset)],
+    ) -> Vec<StartOffset> {
         let logical: Vec<(&str, i32)> = assignments
             .iter()
             .filter(|(_, _, offset)| is_logical(*offset))
@@ -717,9 +772,9 @@ impl KafkaConsumerClient {
 
     /// Assigns every partition of `topic`, starting at `start`, and returns
     /// the partition ids.
-    pub fn assign_topic(&self, topic: &str, start: Offset) -> KafkaResult<Vec<i32>> {
+    pub fn assign_topic(&self, topic: &str, start: StartOffset) -> KafkaResult<Vec<i32>> {
         let partitions = self.topic_partitions(topic, None)?;
-        let assignments: Vec<(&str, i32, Offset)> =
+        let assignments: Vec<(&str, i32, StartOffset)> =
             partitions.iter().map(|&p| (topic, p, start)).collect();
         self.assign_with_offsets(&assignments)?;
         Ok(partitions)
@@ -750,10 +805,11 @@ impl KafkaConsumerClient {
         &self,
         topic: &str,
         partition: i32,
-        offset: Offset,
+        offset: StartOffset,
         timeout: Duration,
     ) -> KafkaResult<()> {
-        self.consumer.seek(topic, partition, offset, timeout)?;
+        self.consumer
+            .seek(topic, partition, offset.to_driver(), timeout)?;
         Ok(())
     }
 
@@ -860,13 +916,13 @@ impl KafkaConsumerClient {
 
     /// Resolves, per partition, the first offset whose timestamp is at or after
     /// `timestamp_ms`. Partitions with no such record (or a failed lookup) map
-    /// to [`Offset::End`]; see [`Self::offsets_at_time`] to tell them apart.
+    /// to [`StartOffset::End`]; see [`Self::offsets_at_time`] to tell them apart.
     pub fn offsets_for_timestamp(
         &self,
         partitions: &[(&str, i32)],
         timestamp_ms: i64,
         timeout: Option<Duration>,
-    ) -> KafkaResult<HashMap<(String, i32), Offset>> {
+    ) -> KafkaResult<HashMap<(String, i32), StartOffset>> {
         Ok(self
             .offsets_at_time(partitions, timestamp_ms, timeout)?
             .into_iter()
@@ -941,7 +997,7 @@ impl KafkaConsumerClient {
         .map_err(|e| KafkaError::Offset(e.to_string()))?;
 
         self.pin();
-        self.consumer.commit(&tpl, mode)?;
+        self.consumer.commit(&tpl, mode.to_driver())?;
         Ok(())
     }
 
@@ -952,7 +1008,7 @@ impl KafkaConsumerClient {
             .assignment()
             .map_err(|e| KafkaError::Consumer(e.to_string()))?;
         self.pin();
-        self.consumer.commit(&tpl, mode)?;
+        self.consumer.commit(&tpl, mode.to_driver())?;
         Ok(())
     }
 
@@ -982,7 +1038,7 @@ impl KafkaConsumerClient {
     /// Commits the offsets stored with [`Self::store_processed`].
     pub fn commit_stored(&self, mode: CommitMode) -> KafkaResult<()> {
         self.pin();
-        match self.consumer.commit_consumer_state(mode) {
+        match self.consumer.commit_consumer_state(mode.to_driver()) {
             Ok(()) => Ok(()),
             // Nothing was stored since the last commit.
             Err(e)
@@ -997,14 +1053,28 @@ impl KafkaConsumerClient {
     /// Commits offsets specified in a TopicPartitionList.
     pub fn commit(&self, tpl: &TopicPartitionList, mode: CommitMode) -> KafkaResult<()> {
         self.pin();
-        self.consumer.commit(tpl, mode)?;
+        self.consumer.commit(tpl, mode.to_driver())?;
         Ok(())
     }
 
-    /// Returns a reference to the inner rdkafka StreamConsumer.
-    pub fn inner(&self) -> &StreamConsumer<DefaultConsumerContext> {
-        &self.consumer
+    /// The next offset to read of each assigned partition that has a read
+    /// position, keyed by `(topic, partition)`. Partitions without one
+    /// (nothing fetched yet) are left out.
+    pub fn positions(&self) -> KafkaResult<HashMap<(String, i32), i64>> {
+        let tpl = self.consumer.position()?;
+        Ok(explicit_offsets(&tpl))
     }
+}
+
+/// The entries of `tpl` that hold an explicit offset.
+fn explicit_offsets(tpl: &TopicPartitionList) -> HashMap<(String, i32), i64> {
+    tpl.elements()
+        .iter()
+        .filter_map(|e| match e.offset() {
+            Offset::Offset(o) => Some(((e.topic().to_string(), e.partition()), o)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn uuid_or_timestamp() -> u128 {
@@ -1037,17 +1107,67 @@ mod tests {
     }
 
     #[test]
+    fn start_offsets_map_to_driver_offsets() {
+        assert_eq!(StartOffset::Beginning.to_driver(), Offset::Beginning);
+        assert_eq!(StartOffset::End.to_driver(), Offset::End);
+        assert_eq!(StartOffset::At(42).to_driver(), Offset::Offset(42));
+        assert_eq!(StartOffset::Tail(5).to_driver(), Offset::OffsetTail(5));
+        assert_eq!(StartOffset::Committed.to_driver(), Offset::Stored);
+    }
+
+    #[test]
+    fn commit_modes_map_to_driver_modes() {
+        assert!(matches!(
+            CommitMode::Sync.to_driver(),
+            rdkafka::consumer::CommitMode::Sync
+        ));
+        assert!(matches!(
+            CommitMode::Async.to_driver(),
+            rdkafka::consumer::CommitMode::Async
+        ));
+    }
+
+    #[test]
+    fn positions_keep_only_explicit_offsets() {
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition_offset("t", 0, Offset::Offset(12))
+            .unwrap();
+        tpl.add_partition_offset("t", 1, Offset::Invalid).unwrap();
+        tpl.add_partition_offset("u", 0, Offset::Offset(0)).unwrap();
+        let got = explicit_offsets(&tpl);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[&("t".to_string(), 0)], 12);
+        assert_eq!(got[&("u".to_string(), 0)], 0);
+    }
+
+    #[test]
     fn logical_offsets_become_watermarks() {
         let marks = Some((5, 90));
-        assert_eq!(resolve_offset(Offset::Beginning, marks), Offset::Offset(5));
-        assert_eq!(resolve_offset(Offset::End, marks), Offset::Offset(90));
+        assert_eq!(
+            resolve_offset(StartOffset::Beginning, marks),
+            StartOffset::At(5)
+        );
+        assert_eq!(resolve_offset(StartOffset::End, marks), StartOffset::At(90));
         // Explicit and stored offsets are not touched, nor is an unknown partition.
-        assert_eq!(resolve_offset(Offset::Offset(7), marks), Offset::Offset(7));
-        assert_eq!(resolve_offset(Offset::Stored, marks), Offset::Stored);
-        assert_eq!(resolve_offset(Offset::Beginning, None), Offset::Beginning);
-        assert_eq!(resolve_offset(Offset::End, None), Offset::End);
-        assert!(is_logical(Offset::Beginning) && is_logical(Offset::End));
-        assert!(!is_logical(Offset::Offset(0)) && !is_logical(Offset::Stored));
+        assert_eq!(
+            resolve_offset(StartOffset::At(7), marks),
+            StartOffset::At(7)
+        );
+        assert_eq!(
+            resolve_offset(StartOffset::Committed, marks),
+            StartOffset::Committed
+        );
+        assert_eq!(
+            resolve_offset(StartOffset::Tail(3), marks),
+            StartOffset::Tail(3)
+        );
+        assert_eq!(
+            resolve_offset(StartOffset::Beginning, None),
+            StartOffset::Beginning
+        );
+        assert_eq!(resolve_offset(StartOffset::End, None), StartOffset::End);
+        assert!(is_logical(StartOffset::Beginning) && is_logical(StartOffset::End));
+        assert!(!is_logical(StartOffset::At(0)) && !is_logical(StartOffset::Committed));
     }
 
     #[test]
@@ -1069,12 +1189,16 @@ mod tests {
     #[test]
     fn test_timestamp_start_offsets_missing_or_end_is_end() {
         let mut lookup = HashMap::new();
-        lookup.insert(("t".to_string(), 0), Offset::Offset(17));
-        lookup.insert(("t".to_string(), 1), Offset::End);
+        lookup.insert(("t".to_string(), 0), StartOffset::At(17));
+        lookup.insert(("t".to_string(), 1), StartOffset::End);
         let starts = timestamp_start_offsets("t", &[0, 1, 2], &lookup);
         assert_eq!(
             starts,
-            vec![(0, Offset::Offset(17)), (1, Offset::End), (2, Offset::End)]
+            vec![
+                (0, StartOffset::At(17)),
+                (1, StartOffset::End),
+                (2, StartOffset::End)
+            ]
         );
     }
 
@@ -1083,10 +1207,10 @@ mod tests {
         assert_eq!(Lookup::from_offset(Offset::Offset(7)), Lookup::At(7));
         assert_eq!(Lookup::from_offset(Offset::Offset(-1)), Lookup::End);
         assert_eq!(Lookup::from_offset(Offset::End), Lookup::End);
-        assert_eq!(Lookup::At(7).as_offset(), Offset::Offset(7));
-        assert_eq!(Lookup::End.as_offset(), Offset::End);
+        assert_eq!(Lookup::At(7).as_offset(), StartOffset::At(7));
+        assert_eq!(Lookup::End.as_offset(), StartOffset::End);
         let failed = LookupFailure::new("x", crate::error::ErrorClass::Other);
-        assert_eq!(Lookup::Failed(failed).as_offset(), Offset::End);
+        assert_eq!(Lookup::Failed(failed).as_offset(), StartOffset::End);
     }
 
     #[test]
