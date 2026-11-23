@@ -345,10 +345,11 @@ pub async fn run_undo(args: UndoArgs, global: &GlobalOpts) -> KafkaResult<()> {
     let plan = undo::prepare(op, &ops, &scope, audited.as_deref(), &config, &admin).await?;
     let refusal = plan.refusal(args.force, policy.is_active());
 
-    if global.format == OutputFormat::Json && args.dry_run {
-        let mut value = serde_json::to_value(&plan).unwrap_or_default();
-        value["refused"] = json!(refusal);
-        output::print_json(&value)?;
+    let json_out = global.format == OutputFormat::Json;
+    if json_out && (args.dry_run || refusal.is_some()) {
+        output::print_json(&plan_json(&plan, refusal.as_deref(), None))?;
+    }
+    if json_out && args.dry_run {
         // A refused undo fails a dry run too, with the same exit code.
         return match refusal {
             Some(reason) => Err(KafkaError::config(format!(
@@ -358,7 +359,9 @@ pub async fn run_undo(args: UndoArgs, global: &GlobalOpts) -> KafkaResult<()> {
             None => Ok(()),
         };
     }
-    describe_plan(op, &plan);
+    if !json_out {
+        describe_plan(op, &plan);
+    }
 
     if let Some(reason) = refusal {
         if plan.digest == DigestCheck::Mismatch {
@@ -397,6 +400,9 @@ pub async fn run_undo(args: UndoArgs, global: &GlobalOpts) -> KafkaResult<()> {
         );
     }
     if plan.runnable_steps().is_empty() {
+        if json_out {
+            return output::print_json(&plan_json(&plan, None, Some("nothing to undo")));
+        }
         println!(
             "{} {} is already in its previous state; nothing to undo.",
             "✔".green().bold(),
@@ -493,12 +499,29 @@ pub async fn run_undo(args: UndoArgs, global: &GlobalOpts) -> KafkaResult<()> {
         }
     }
     match result {
+        Ok(text) if json_out => output::print_json(&plan_json(&plan, None, Some(&text))),
         Ok(text) => {
             println!("{} {text}", "✔".green().bold());
             Ok(())
         }
         Err(e) => Err(KafkaError::admin(format!("Undo of {} failed: {e}", op.id))),
     }
+}
+
+/// The undo plan as `-f json` prints it: the plan's fields, `refused` (the
+/// reason, or null) and `result`, the outcome text once the undo ran or
+/// found nothing to do (null for a dry run or a refusal).
+fn plan_json<T: serde::Serialize>(
+    plan: &T,
+    refusal: Option<&str>,
+    result: Option<&str>,
+) -> serde_json::Value {
+    let mut value = serde_json::to_value(plan).unwrap_or_default();
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("refused".into(), json!(refusal));
+        obj.insert("result".into(), json!(result));
+    }
+    value
 }
 
 /// Runs the write gate once for each policy category the undo steps fall
@@ -622,6 +645,18 @@ fn print_drift(rows: &[DriftRow]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn undo_json_adds_refusal_and_result_to_the_plan() {
+        let plan = serde_json::json!({"op": "op-1", "steps": []});
+        let v = super::plan_json(&plan, Some("state drifted"), None);
+        assert_eq!(v["op"], "op-1");
+        assert_eq!(v["refused"], "state drifted");
+        assert!(v["result"].is_null());
+        let v = super::plan_json(&plan, None, Some("Deleted topic t"));
+        assert!(v["refused"].is_null());
+        assert_eq!(v["result"], "Deleted topic t");
+    }
+
     use super::*;
     use crate::model::history::{Begin, End, Reversibility};
 

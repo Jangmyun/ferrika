@@ -186,6 +186,10 @@ pub fn run(
         RabbitProfileSubcommands::Use { name } => {
             store.set_active(name)?;
             store.save()?;
+            if json {
+                output::print_json(&profile_action_json(name, "activated"))?;
+                return Ok(());
+            }
             println!(
                 "{} RabbitMQ commands now use profile '{}'.",
                 "✔".green().bold(),
@@ -195,6 +199,10 @@ pub fn run(
         RabbitProfileSubcommands::Remove { name } => {
             store.remove(name)?;
             store.save()?;
+            if json {
+                output::print_json(&profile_action_json(name, "removed"))?;
+                return Ok(());
+            }
             println!(
                 "{} Removed RabbitMQ profile '{}'.",
                 "✔".green().bold(),
@@ -288,9 +296,24 @@ fn profile_from(
     })
 }
 
+/// `rabbit profile use|remove -f json`: the profile and what was done
+/// (`activated` or `removed`).
+fn profile_action_json(name: &str, action: &str) -> serde_json::Value {
+    serde_json::json!({ "profile": name, "action": action })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_actions_name_the_profile_and_what_happened() {
+        let value = profile_action_json("prod", "removed");
+        assert_eq!(
+            value,
+            serde_json::json!({"profile": "prod", "action": "removed"})
+        );
+    }
 
     fn add(name: &str) -> RabbitProfileAddArgs {
         RabbitProfileAddArgs {

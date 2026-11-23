@@ -201,16 +201,20 @@ pub async fn run(args: ProduceArgs, global: &GlobalOpts) -> anyhow::Result<()> {
             }
         }
     } else {
-        // Streaming stdin pipe mode
-        println!(
-            "{}",
-            format!(
-                "Listening for input from stdin (producing to '{}')... Press Ctrl+C or send EOF to finish.",
-                args.topic
-            )
-            .bright_black()
-            .italic()
-        );
+        // Streaming stdin pipe mode. With `--format json` stdout carries
+        // only the final summary, so the prompt goes to stderr.
+        let json = global.format == OutputFormat::Json;
+        let listening = format!(
+            "Listening for input from stdin (producing to '{}')... Press Ctrl+C or send EOF to finish.",
+            args.topic
+        )
+        .bright_black()
+        .italic();
+        if json {
+            eprintln!("{listening}");
+        } else {
+            println!("{listening}");
+        }
 
         let mut reader = BufReader::new(tokio::io::stdin());
         let mut line_buf: Vec<u8> = Vec::with_capacity(4096);
@@ -379,12 +383,22 @@ pub async fn run(args: ProduceArgs, global: &GlobalOpts) -> anyhow::Result<()> {
             ));
         }
         let _ = producer.flush(Some(Duration::from_secs(5)));
-        println!(
-            "{} Finished. Produced {} message(s) to topic '{}'.",
-            "✔".green().bold(),
-            delivered.to_string().cyan().bold(),
-            args.topic.yellow().bold()
-        );
+        if json {
+            output::print_json(&stdin_summary_json(
+                &args.topic,
+                delivered,
+                failed + local_errors,
+                skipped_blank,
+                interrupted,
+            ))?;
+        } else {
+            println!(
+                "{} Finished. Produced {} message(s) to topic '{}'.",
+                "✔".green().bold(),
+                delivered.to_string().cyan().bold(),
+                args.topic.yellow().bold()
+            );
+        }
         if skipped_blank > 0 {
             eprintln!(
                 "{}",
@@ -398,6 +412,25 @@ pub async fn run(args: ProduceArgs, global: &GlobalOpts) -> anyhow::Result<()> {
         }
         Ok(())
     }
+}
+
+/// The summary `produce` prints for a stdin run under `--format json`
+/// (counts only, never record data).
+fn stdin_summary_json(
+    topic: &str,
+    produced: usize,
+    failed: usize,
+    skipped_blank: usize,
+    interrupted: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "status": if failed == 0 { "success" } else { "failed" },
+        "topic": topic,
+        "produced": produced,
+        "failed": failed,
+        "skipped_blank": skipped_blank,
+        "interrupted": interrupted,
+    })
 }
 
 /// `work`'s output, or `None` when `stop` (Ctrl+C) completes first.
@@ -469,6 +502,22 @@ fn strip_bom(line: &[u8]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stdin_summary_counts_only() {
+        let value = super::stdin_summary_json("orders", 3, 1, 2, false);
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "status": "failed", "topic": "orders", "produced": 3, "failed": 1,
+                "skipped_blank": 2, "interrupted": false,
+            })
+        );
+        assert_eq!(
+            super::stdin_summary_json("t", 1, 0, 0, true)["status"],
+            "success"
+        );
+    }
+
     use super::*;
 
     #[tokio::test]

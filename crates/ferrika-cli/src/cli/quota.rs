@@ -143,6 +143,16 @@ fn parse_quota_value(raw: &str) -> Result<f64, String> {
     }
 }
 
+/// The JSON `quota set` / `quota remove` print: the entity, the key and
+/// the new value (`null` once removed), shaped like a `quota list` item.
+fn quota_change_json(entity: &QuotaEntity, key: &str, value: Option<f64>) -> serde_json::Value {
+    serde_json::json!({
+        "entity": quota_entity_label(entity),
+        "key": key,
+        "value": value,
+    })
+}
+
 pub fn run(args: QuotaArgs, global: &GlobalOpts) -> KafkaResult<()> {
     let config = global.to_kafka_config();
     match args.command {
@@ -188,6 +198,9 @@ pub fn run(args: QuotaArgs, global: &GlobalOpts) -> KafkaResult<()> {
             let result = wire::alter_client_quota(&config, &entity, &key, Some(value));
             record::finish(pending, &result, &format!("Set {key} = {value}"));
             result?;
+            if global.format == OutputFormat::Json {
+                return output::print_json(&quota_change_json(&entity, &key, Some(value)));
+            }
             println!(
                 "{} Set {key} = {value} for {}",
                 "✔".green().bold(),
@@ -206,6 +219,9 @@ pub fn run(args: QuotaArgs, global: &GlobalOpts) -> KafkaResult<()> {
             let result = wire::alter_client_quota(&config, &entity, &key, None);
             record::finish(pending, &result, &format!("Removed {key}"));
             result?;
+            if global.format == OutputFormat::Json {
+                return output::print_json(&quota_change_json(&entity, &key, None));
+            }
             println!(
                 "{} Removed {key} for {}",
                 "✔".green().bold(),
@@ -244,6 +260,16 @@ fn quota_change(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_changes_print_like_list_items() {
+        let entity = vec![("user".to_string(), Some("alice".to_string()))];
+        let set = quota_change_json(&entity, "producer_byte_rate", Some(1024.0));
+        assert_eq!(set["key"], "producer_byte_rate");
+        assert_eq!(set["value"], 1024.0);
+        assert_eq!(set["entity"], quota_entity_label(&entity));
+        assert!(quota_change_json(&entity, "producer_byte_rate", None)["value"].is_null());
+    }
 
     #[test]
     fn quota_value_must_be_finite_and_not_negative() {

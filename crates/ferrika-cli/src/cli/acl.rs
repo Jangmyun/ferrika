@@ -5,7 +5,7 @@ use colored::Colorize;
 use comfy_table::{Cell, CellAlignment, Color};
 
 use crate::cli::record::{self, Change};
-use crate::cli::{output, GlobalOpts};
+use crate::cli::{output, GlobalOpts, OutputFormat};
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::acl::{audit_security_rules, AclRiskLevel, AclStore};
 use crate::kafka::config::KafkaClientConfig;
@@ -488,6 +488,9 @@ fn run_create(
         },
     );
     let added = added?;
+    if global.format == OutputFormat::Json {
+        return output::print_json(&create_json(&binding, backend.where_label(), added));
+    }
     if added {
         println!(
             "{} Created ACL binding in the {}: {} {} on {} '{}' for {}",
@@ -509,6 +512,31 @@ fn run_create(
     Ok(())
 }
 
+/// `acl create` under `-f json`: the binding, where it went, and whether
+/// it was new.
+fn create_json<T: serde::Serialize>(binding: &T, place: &str, created: bool) -> serde_json::Value {
+    serde_json::json!({
+        "binding": binding,
+        "where": place,
+        "created": created,
+    })
+}
+
+/// `acl delete` under `-f json`: the matching bindings and, once run with
+/// `--force`, how many were deleted (`None`: a preview, nothing deleted).
+fn delete_json<T: serde::Serialize>(
+    matching: &[T],
+    place: &str,
+    deleted: Option<usize>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "where": place,
+        "matching": matching,
+        "executed": deleted.is_some(),
+        "deleted": deleted.unwrap_or(0),
+    })
+}
+
 /// Handles `ferrika acl delete`
 fn run_delete(
     args: AclDeleteArgs,
@@ -528,6 +556,11 @@ fn run_delete(
     )?;
 
     let matching = backend.list(&filter, true)?;
+    let json = global.format == OutputFormat::Json;
+    if json && (matching.is_empty() || !args.force) {
+        // Nothing to delete, or a preview without --force.
+        return output::print_json(&delete_json(&matching, backend.where_label(), None));
+    }
     if matching.is_empty() {
         println!(
             "{}",
@@ -579,6 +612,13 @@ fn run_delete(
         },
     );
     let deleted_count = deleted?;
+    if json {
+        return output::print_json(&delete_json(
+            &matching,
+            backend.where_label(),
+            Some(deleted_count),
+        ));
+    }
 
     println!(
         "\n{} Successfully deleted {} ACL binding(s).",
@@ -702,6 +742,22 @@ fn run_audit(args: AclAuditArgs, backend: &AclBackend, global: &GlobalOpts) -> K
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn create_and_delete_json_shapes() {
+        let created = super::create_json(&"b", "cluster", true);
+        assert_eq!(created["created"], true);
+        assert_eq!(created["where"], "cluster");
+        let preview = super::delete_json(&["a", "b"], "cluster", None);
+        assert_eq!(preview["executed"], false);
+        assert_eq!(preview["deleted"], 0);
+        assert_eq!(preview["matching"].as_array().map(Vec::len), Some(2));
+        let done = super::delete_json(&["a"], "local policy file", Some(1));
+        assert_eq!(
+            (done["executed"].clone(), done["deleted"].clone()),
+            (true.into(), 1.into())
+        );
+    }
+
     use super::*;
 
     #[test]

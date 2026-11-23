@@ -88,11 +88,16 @@ pub async fn run(args: LintArgs, global: &GlobalOpts) -> KafkaResult<()> {
         .collect();
 
     if args.fix {
-        println!(
-            "{}",
-            format!("env: {} ({why})", env_name(env)).bright_black()
-        );
-        print_skipped(&input.skipped, false);
+        if global.format == OutputFormat::Json {
+            eprintln!("env: {} ({why})", env_name(env));
+            print_skipped(&input.skipped, true);
+        } else {
+            println!(
+                "{}",
+                format!("env: {} ({why})", env_name(env)).bright_black()
+            );
+            print_skipped(&input.skipped, false);
+        }
         return run_fixes(&args, global, &admin, &config, &mut input, &opts, findings).await;
     }
 
@@ -205,36 +210,32 @@ async fn run_fixes(
         .filter(|f| f.fix_class == FixClass::Guided && f.applicable() && !selected(f, &args.rules))
         .count();
 
+    // `--format json`: one document at the end, nothing else on stdout.
+    let json = global.format == OutputFormat::Json;
+    let mode_name = if args.dry_run { "validate" } else { "apply" };
+    let excluded_json: Vec<serde_json::Value> = excluded
+        .iter()
+        .map(|(f, reason)| serde_json::json!({ "finding": f, "reason": reason }))
+        .collect();
     if plan.is_empty() && excluded.is_empty() {
+        if json {
+            return output::print_json(&serde_json::json!({
+                "mode": mode_name,
+                "plan": plan,
+                "excluded": excluded_json,
+                "guided_skipped": guided_skipped,
+                "results": [],
+                "summary": fix_summary_json(0, 0, 0, 0),
+            }));
+        }
         println!("{} Nothing to fix.", "✔".green().bold());
         if guided_skipped > 0 {
             println!("{guided_skipped} guided fix(es) run only when their rule is named, e.g. --rule T001.");
         }
         return Ok(());
     }
-    println!("{}", "Plan:".bold());
-    for f in &plan {
-        println!(
-            "  {} {} {}: {} {}",
-            f.rule.bold(),
-            target_label(&f.target).cyan(),
-            f.fix_class.label().bright_black(),
-            f.change_summary(),
-            "allowed".green()
-        );
-    }
-    for (f, reason) in &excluded {
-        println!(
-            "  {} {} {}: {} {}",
-            f.rule.bold(),
-            target_label(&f.target).cyan(),
-            f.fix_class.label().bright_black(),
-            f.change_summary(),
-            format!("excluded ({reason})").red()
-        );
-    }
-    if guided_skipped > 0 {
-        println!("{guided_skipped} guided fix(es) left out; name their rule with --rule to include them.");
+    if !json {
+        print_plan(&plan, &excluded, guided_skipped);
     }
 
     if let Some(path) = &args.save_plan {
@@ -244,10 +245,19 @@ async fn run_fixes(
             bootstrap: &bootstrap,
             fixes: &plan,
         };
-        let json = serde_json::to_string_pretty(&saved)
+        let text = serde_json::to_string_pretty(&saved)
             .map_err(|e| KafkaError::Serialization(e.to_string()))?;
-        std::fs::write(path, json)
+        std::fs::write(path, text)
             .map_err(|e| KafkaError::io(format!("Cannot write {}: {e}", path.display())))?;
+        if json {
+            return output::print_json(&serde_json::json!({
+                "mode": "save_plan",
+                "plan": plan,
+                "excluded": excluded_json,
+                "guided_skipped": guided_skipped,
+                "plan_file": path.display().to_string(),
+            }));
+        }
         println!("Plan written to {}; nothing was changed.", path.display());
         return Ok(());
     }
@@ -316,6 +326,9 @@ async fn run_fixes(
         }
     };
     let show = |r: &lint::apply::FixResult| {
+        if json {
+            return;
+        }
         let head = format!("{} {}", r.finding.rule, target_label(&r.finding.target));
         match &r.outcome {
             Outcome::Applied(m) => println!("{} {head}: {m}", "✔".green().bold()),
@@ -348,20 +361,109 @@ async fn run_fixes(
     } else {
         "applied"
     };
-    println!("{applied} {verb}, {failed} failed, {skipped} skipped, {refused} refused by policy or profile.");
+    if !json {
+        println!("{applied} {verb}, {failed} failed, {skipped} skipped, {refused} refused by policy or profile.");
+    }
+    let mut undo_file = None;
     if !undo.is_empty() {
         match save_undo(&profile, undo) {
-            Ok(path) => println!("Previous values saved to {}.", path.display()),
+            Ok(path) => {
+                if !json {
+                    println!("Previous values saved to {}.", path.display());
+                }
+                undo_file = Some(path.display().to_string());
+            }
             Err(e) => eprintln!(
                 "{} could not save the previous values: {e}",
                 "Warning:".yellow()
             ),
         }
     }
+    if json {
+        let results: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "rule": r.finding.rule,
+                    "target": target_label(&r.finding.target),
+                    "outcome": outcome_json(&r.outcome),
+                })
+            })
+            .collect();
+        output::print_json(&serde_json::json!({
+            "mode": mode_name,
+            "plan": plan,
+            "excluded": excluded_json,
+            "guided_skipped": guided_skipped,
+            "results": results,
+            "summary": fix_summary_json(applied, failed, skipped, refused),
+            "undo_file": undo_file,
+        }))?;
+    }
     if failed > 0 {
         return Err(KafkaError::Check(format!("{failed} fix(es) failed")));
     }
     Ok(())
+}
+
+/// Prints the fix plan: the allowed fixes and the excluded ones.
+fn print_plan(plan: &[LintFinding], excluded: &[(LintFinding, String)], guided_skipped: usize) {
+    println!("{}", "Plan:".bold());
+    for f in plan {
+        println!(
+            "  {} {} {}: {} {}",
+            f.rule.bold(),
+            target_label(&f.target).cyan(),
+            f.fix_class.label().bright_black(),
+            f.change_summary(),
+            "allowed".green()
+        );
+    }
+    for (f, reason) in excluded {
+        println!(
+            "  {} {} {}: {} {}",
+            f.rule.bold(),
+            target_label(&f.target).cyan(),
+            f.fix_class.label().bright_black(),
+            f.change_summary(),
+            format!("excluded ({reason})").red()
+        );
+    }
+    if guided_skipped > 0 {
+        println!("{guided_skipped} guided fix(es) left out; name their rule with --rule to include them.");
+    }
+}
+
+/// The `summary` object of `lint --fix --format json`.
+fn fix_summary_json(
+    applied: usize,
+    failed: usize,
+    skipped: usize,
+    refused: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "applied": applied,
+        "failed": failed,
+        "skipped": skipped,
+        "refused": refused,
+    })
+}
+
+/// A fix outcome as `lint --fix --format json` writes it: a status word
+/// and the message, if any.
+fn outcome_json(outcome: &crate::ops::lint::apply::Outcome) -> serde_json::Value {
+    use crate::ops::lint::apply::Outcome;
+    let (status, message) = match outcome {
+        Outcome::Applied(m) => ("applied", Some(m)),
+        Outcome::Validated(m) => ("validated", Some(m)),
+        Outcome::Failed(m) => ("failed", Some(m)),
+        Outcome::NotAllowed(m) => ("not_allowed", Some(m)),
+        Outcome::Changed => ("changed", None),
+        Outcome::Refused(m) => ("refused", Some(m)),
+        Outcome::Declined => ("declined", None),
+        Outcome::Stopped => ("stopped", None),
+    };
+    serde_json::json!({ "status": status, "message": message })
 }
 
 /// Asks for a group's name before deleting it.
@@ -480,6 +582,23 @@ fn print_rules(global: &GlobalOpts) -> KafkaResult<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fix_outcomes_have_stable_json() {
+        use crate::ops::lint::apply::Outcome;
+        assert_eq!(
+            super::outcome_json(&Outcome::Applied("set".into())),
+            serde_json::json!({"status": "applied", "message": "set"})
+        );
+        assert_eq!(
+            super::outcome_json(&Outcome::Declined),
+            serde_json::json!({"status": "declined", "message": null})
+        );
+        assert_eq!(
+            super::fix_summary_json(1, 2, 3, 4),
+            serde_json::json!({"applied": 1, "failed": 2, "skipped": 3, "refused": 4})
+        );
+    }
+
     use super::*;
     use clap::Parser;
 

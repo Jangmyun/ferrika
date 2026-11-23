@@ -62,6 +62,19 @@ pub enum MonitorSubcommands {
     },
 }
 
+/// `--watch` redraws a terminal view; JSON is one snapshot per run.
+const WATCH_JSON_ERROR: &str = "--watch redraws a terminal view and has no JSON output; run \
+    without --watch for one JSON snapshot (repeat it from a script to poll)";
+
+/// What `monitor export` prints once before serving, under `-f json`.
+fn exporter_json(host: &str, port: u16, scrape_interval_secs: u64) -> serde_json::Value {
+    serde_json::json!({
+        "metrics_url": format!("http://{host}:{port}/metrics"),
+        "healthz_url": format!("http://{host}:{port}/healthz"),
+        "scrape_interval_secs": scrape_interval_secs,
+    })
+}
+
 /// Executes the monitor CLI command.
 pub async fn run(args: MonitorArgs, global: &GlobalOpts) -> anyhow::Result<()> {
     // If running exporter server, bypass terminal watch loop
@@ -81,6 +94,9 @@ pub async fn run(args: MonitorArgs, global: &GlobalOpts) -> anyhow::Result<()> {
         MonitorSubcommands::Export { .. } => unreachable!(),
     };
     let interval = Duration::from_secs(interval_secs.max(1));
+    if args.watch && global.format == OutputFormat::Json {
+        return Err(KafkaError::config(WATCH_JSON_ERROR).into());
+    }
 
     let mut refreshed = false;
     loop {
@@ -125,7 +141,7 @@ pub async fn run(args: MonitorArgs, global: &GlobalOpts) -> anyhow::Result<()> {
         tokio::select! {
             _ = tokio::time::sleep(interval) => {},
             _ = tokio::signal::ctrl_c() => {
-                println!("\n{}", "Live monitor stopped by user.".yellow());
+                eprintln!("\n{}", "Live monitor stopped by user.".yellow());
                 break;
             }
         }
@@ -434,6 +450,13 @@ async fn handle_export(
 
     let interval = Duration::from_secs(scrape_interval_secs.max(1));
 
+    if global.format == OutputFormat::Json {
+        output::print_json(&exporter_json(host, port, scrape_interval_secs))?;
+        crate::ops::exporter::start_exporter_server(admin, kafka_config, host, port, interval)
+            .await?;
+        return Ok(());
+    }
+
     println!(
         "{}",
         "── Ferrika Prometheus Metrics Exporter ──".cyan().bold()
@@ -641,6 +664,15 @@ fn chrono_or_simple_time() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exporter_json_names_the_urls() {
+        let v = exporter_json("0.0.0.0", 9308, 15);
+        assert_eq!(v["metrics_url"], "http://0.0.0.0:9308/metrics");
+        assert_eq!(v["healthz_url"], "http://0.0.0.0:9308/healthz");
+        assert_eq!(v["scrape_interval_secs"], 15);
+        assert!(WATCH_JSON_ERROR.starts_with("--watch"));
+    }
 
     #[test]
     fn a_mistyped_topic_is_an_error() {

@@ -119,6 +119,10 @@ async fn handle_ping(args: ClusterPingArgs, global: &GlobalOpts) -> KafkaResult<
     };
 
     if profiles_to_ping.is_empty() {
+        if global.wants_json(args.json) {
+            // No clusters, no results: an empty list.
+            return output::print_json(&Vec::<ClusterPingResult>::new());
+        }
         println!("No cluster profiles found. Configure clusters using 'ferrika profile add'.");
         return Ok(());
     }

@@ -74,8 +74,10 @@ const EXAMPLE: &str = r#"{
 
 pub fn run(args: PolicyArgs, global: &GlobalOpts) -> anyhow::Result<()> {
     match args.command {
-        PolicyCommand::Keygen { out, force } => keygen(&out, force),
-        PolicyCommand::Sign { key, input, out } => sign(&key, &input, &out),
+        PolicyCommand::Keygen { out, force } => keygen(&out, force, global.wants_json(false)),
+        PolicyCommand::Sign { key, input, out } => {
+            sign(&key, &input, &out, global.wants_json(false))
+        }
         PolicyCommand::Verify { file, public_key } => verify(file, public_key, global),
         PolicyCommand::Show => {
             show(policy::current(), global);
@@ -88,13 +90,28 @@ pub fn run(args: PolicyArgs, global: &GlobalOpts) -> anyhow::Result<()> {
         // A file, because Windows PowerShell 5 re-encodes piped output.
         PolicyCommand::Example { out: Some(path) } => {
             std::fs::write(&path, EXAMPLE)?;
-            println!("{} {}", "✔ Wrote".green().bold(), path.display());
+            if global.wants_json(false) {
+                output::print_json(&serde_json::json!({ "written": path }))?;
+            } else {
+                println!("{} {}", "✔ Wrote".green().bold(), path.display());
+            }
             Ok(())
         }
     }
 }
 
-fn keygen(out: &Path, force: bool) -> anyhow::Result<()> {
+/// What `policy keygen --format json` prints: the key id and the two
+/// file paths, never the private key itself.
+fn keygen_json(key_id: &str, private_path: &Path, public_path: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "key_id": key_id,
+        "private_key_file": private_path,
+        "public_key_file": public_path,
+        "policy_dir": policy_dir(),
+    })
+}
+
+fn keygen(out: &Path, force: bool, json: bool) -> anyhow::Result<()> {
     let private_path = out.join(PRIVATE_KEY_FILE);
     let public_path = out.join(PUBLIC_KEY_FILE);
     // `symlink_metadata`: a dangling symlink is something there too.
@@ -115,6 +132,14 @@ fn keygen(out: &Path, force: bool) -> anyhow::Result<()> {
         false,
         force,
     )?;
+    if json {
+        output::print_json(&keygen_json(
+            &policy::key_id(&public),
+            &private_path,
+            &public_path,
+        ))?;
+        return Ok(());
+    }
     println!(
         "{} key {}",
         "✔ Created signing".green().bold(),
@@ -206,7 +231,7 @@ fn open_new(path: &Path, _private: bool) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-fn sign(key: &Path, input: &Path, out: &Path) -> anyhow::Result<()> {
+fn sign(key: &Path, input: &Path, out: &Path, json: bool) -> anyhow::Result<()> {
     let pkcs8 =
         std::fs::read(key).map_err(|e| anyhow::anyhow!("could not read {}: {e}", key.display()))?;
     let payload = std::fs::read_to_string(input)
@@ -215,6 +240,16 @@ fn sign(key: &Path, input: &Path, out: &Path) -> anyhow::Result<()> {
     let signed = policy::sign(&pkcs8, payload)?;
     let parsed = policy::parse_payload(payload)?;
     std::fs::write(out, serde_json::to_string_pretty(&signed)? + "\n")?;
+    if json {
+        output::print_json(&serde_json::json!({
+            "written": out,
+            "issuer": parsed.issuer,
+            "key_id": signed.key_id,
+            "format": signed.format,
+            "expires_at": parsed.expires_at,
+        }))?;
+        return Ok(());
+    }
     println!(
         "{} {} (issuer {}, key {}, format {})",
         "✔ Signed".green().bold(),
@@ -635,6 +670,18 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("warning: the policy directory"));
         assert_eq!(lines[1], "  /etc/ferrika: owned by uid 1000, not root");
+    }
+
+    #[test]
+    fn keygen_json_names_files_not_keys() {
+        let value = super::keygen_json(
+            "abcd",
+            std::path::Path::new("k/policy-signing.key"),
+            std::path::Path::new("k/policy-signing.pub"),
+        );
+        assert_eq!(value["key_id"], "abcd");
+        assert_eq!(value["private_key_file"], "k/policy-signing.key");
+        assert_eq!(value["public_key_file"], "k/policy-signing.pub");
     }
 
     #[cfg(unix)]

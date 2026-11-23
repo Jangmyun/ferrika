@@ -5,7 +5,7 @@ use clap::{Args, Subcommand};
 use colored::Colorize;
 use comfy_table::{Cell, CellAlignment, Color};
 
-use crate::cli::{output, GlobalOpts};
+use crate::cli::{output, GlobalOpts, OutputFormat};
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::admin::KafkaAdminClient;
 use crate::kafka::reassign::{
@@ -268,13 +268,16 @@ fn run_plan(mut args: ReassignPlanArgs, global: &GlobalOpts) -> KafkaResult<()> 
 fn run_execute(args: ReassignExecuteArgs, global: &GlobalOpts) -> KafkaResult<()> {
     let plan = ReassignmentPlan::load_from_file(&args.plan)?;
     plan.validate()?;
+    let json = global.format == OutputFormat::Json;
 
-    println!(
-        "\n{} Loaded plan with {} partition assignments from {}",
-        "📋".cyan(),
-        plan.partitions.len().to_string().yellow().bold(),
-        args.plan.display().to_string().bold()
-    );
+    if !json {
+        println!(
+            "\n{} Loaded plan with {} partition assignments from {}",
+            "📋".cyan(),
+            plan.partitions.len().to_string().yellow().bold(),
+            args.plan.display().to_string().bold()
+        );
+    }
 
     if args.throttle_bytes.is_some() {
         return Err(KafkaError::config(
@@ -283,13 +286,21 @@ fn run_execute(args: ReassignExecuteArgs, global: &GlobalOpts) -> KafkaResult<()
     }
 
     if plan.partitions.iter().any(|p| p.log_dirs.is_some()) {
-        println!(
+        let note = format!(
             "{} Plan 'log_dirs' entries are ignored; replicas use the brokers' default log directories.",
             "⚠".yellow().bold()
         );
+        if json {
+            eprintln!("{note}");
+        } else {
+            println!("{note}");
+        }
     }
 
     if !args.execute {
+        if json {
+            return output::print_json(&execute_json(&args.plan, plan.partitions.len(), None));
+        }
         println!(
             "\n{} {}",
             "💡 [SIMULATION MODE - DRY-RUN]".yellow().bold(),
@@ -332,6 +343,23 @@ fn run_execute(args: ReassignExecuteArgs, global: &GlobalOpts) -> KafkaResult<()
     }
 
     let accepted = results.len() - failures.len();
+    if json {
+        let rejected: Vec<(String, i32, String)> = failures
+            .iter()
+            .map(|f| {
+                (
+                    f.topic.clone(),
+                    f.partition,
+                    f.error.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        output::print_json(&execute_json(
+            &args.plan,
+            plan.partitions.len(),
+            Some((accepted, &rejected)),
+        ))?;
+    }
     if accepted == 0 {
         return Err(KafkaError::admin(format!(
             "The controller rejected all {} partition reassignment(s)",
@@ -339,17 +367,22 @@ fn run_execute(args: ReassignExecuteArgs, global: &GlobalOpts) -> KafkaResult<()
         )));
     }
 
-    println!(
-        "\n{} Controller accepted partition reassignment for {} of {} partitions",
-        "✓".green().bold(),
-        accepted.to_string().cyan().bold(),
-        results.len()
-    );
+    if !json {
+        println!(
+            "\n{} Controller accepted partition reassignment for {} of {} partitions",
+            "✓".green().bold(),
+            accepted.to_string().cyan().bold(),
+            results.len()
+        );
+    }
     if !failures.is_empty() {
         return Err(KafkaError::admin(format!(
             "{} partition reassignment(s) were rejected",
             failures.len()
         )));
+    }
+    if json {
+        return Ok(());
     }
     println!(
         "{} Track progress by running: ferrika reassign verify -i {}",
@@ -358,6 +391,35 @@ fn run_execute(args: ReassignExecuteArgs, global: &GlobalOpts) -> KafkaResult<()
     );
 
     Ok(())
+}
+
+/// A partition the controller rejected: topic, partition and error.
+type Rejected = (String, i32, String);
+
+/// `reassign execute -f json`: the plan, and with `submitted` (accepted
+/// count; rejected topic, partition and error) what the controller said.
+/// Without `submitted` it was a dry run.
+fn execute_json(
+    plan: &std::path::Path,
+    partitions: usize,
+    submitted: Option<(usize, &[Rejected])>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "plan": plan.display().to_string(),
+        "partitions": partitions,
+        "executed": submitted.is_some(),
+    });
+    if let Some((accepted, rejected)) = submitted {
+        value["accepted"] = accepted.into();
+        value["rejected"] = rejected
+            .iter()
+            .map(|(topic, partition, error)| {
+                serde_json::json!({ "topic": topic, "partition": partition, "error": error })
+            })
+            .collect::<Vec<_>>()
+            .into();
+    }
+    value
 }
 
 /// Starts the history record of a reassignment: the partitions' replicas
@@ -400,12 +462,15 @@ fn run_verify(args: ReassignVerifyArgs, global: &GlobalOpts) -> KafkaResult<()> 
     let plan = ReassignmentPlan::load_from_file(&args.plan)?;
     plan.validate()?;
     let kafka_config = global.to_kafka_config();
+    let json = global.format == OutputFormat::Json;
 
-    println!(
-        "\n{} Verifying reassignment progress for {} partition(s)...",
-        "🔍".cyan(),
-        plan.partitions.len().to_string().bold()
-    );
+    if !json {
+        println!(
+            "\n{} Verifying reassignment progress for {} partition(s)...",
+            "🔍".cyan(),
+            plan.partitions.len().to_string().bold()
+        );
+    }
 
     let mut table = output::table(vec![
         Cell::new("Topic").fg(Color::Cyan),
@@ -421,6 +486,7 @@ fn run_verify(args: ReassignVerifyArgs, global: &GlobalOpts) -> KafkaResult<()> 
     ]);
 
     let mut statuses = Vec::new();
+    let mut rows = Vec::new();
     let admin = KafkaAdminClient::new(&kafka_config)?;
     // The moves the cluster is running: a partition that is neither at its
     // target nor being moved will not get there by waiting.
@@ -452,6 +518,12 @@ fn run_verify(args: ReassignVerifyArgs, global: &GlobalOpts) -> KafkaResult<()> 
         };
 
         statuses.push(status);
+        rows.push(serde_json::json!({
+            "topic": p.topic,
+            "partition": p.partition,
+            "target_replicas": p.replicas,
+            "status": verify_status_label(status, stalled),
+        }));
 
         let status_cell = match status {
             ReassignmentStatus::Completed => Cell::new("COMPLETED")
@@ -474,6 +546,17 @@ fn run_verify(args: ReassignVerifyArgs, global: &GlobalOpts) -> KafkaResult<()> 
             Cell::new(format!("{:?}", p.replicas)).set_alignment(CellAlignment::Center),
             status_cell,
         ]);
+    }
+
+    if json {
+        let outcome = verify_outcome(&statuses);
+        output::print_json(&serde_json::json!({
+            "plan": args.plan.display().to_string(),
+            "complete": outcome.is_ok(),
+            "not_moving": not_moving,
+            "partitions": rows,
+        }))?;
+        return outcome;
     }
 
     println!("{table}");
@@ -501,6 +584,16 @@ fn run_verify(args: ReassignVerifyArgs, global: &GlobalOpts) -> KafkaResult<()> 
     }
 
     Ok(())
+}
+
+/// The status `reassign verify` shows: `NOT_MOVING` for a stalled
+/// partition, else the status itself.
+fn verify_status_label(status: ReassignmentStatus, stalled: bool) -> String {
+    if stalled {
+        "NOT_MOVING".to_string()
+    } else {
+        status.to_string()
+    }
 }
 
 /// A partition looks part-way (`InProgress`) but the cluster is not moving
@@ -556,6 +649,13 @@ fn run_rollback(args: ReassignRollbackArgs, global: &GlobalOpts) -> KafkaResult<
 
     let rollback_plan = generate_rollback_plan(&current_assignments);
     rollback_plan.save_to_file(&args.output)?;
+
+    if global.format == OutputFormat::Json {
+        return output::print_json(&serde_json::json!({
+            "output": args.output.display().to_string(),
+            "partitions": rollback_plan.partitions.len(),
+        }));
+    }
 
     println!(
         "\n{} Rollback plan capturing {} live partition placements saved to: {}",
@@ -643,6 +743,29 @@ fn check_target_brokers(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn execute_json_says_whether_it_ran_and_what_was_rejected() {
+        let path = std::path::Path::new("plan.json");
+        let dry = super::execute_json(path, 3, None);
+        assert_eq!(dry["executed"], false);
+        assert_eq!(dry["partitions"], 3);
+        assert!(dry.get("accepted").is_none());
+        let rejected = vec![("orders".to_string(), 1, "NOT_CONTROLLER".to_string())];
+        let ran = super::execute_json(path, 3, Some((2, &rejected)));
+        assert_eq!(ran["executed"], true);
+        assert_eq!(ran["accepted"], 2);
+        assert_eq!(ran["rejected"][0]["partition"], 1);
+        assert_eq!(ran["rejected"][0]["error"], "NOT_CONTROLLER");
+    }
+
+    #[test]
+    fn verify_labels_stalled_partitions() {
+        use super::{verify_status_label, ReassignmentStatus::*};
+        assert_eq!(verify_status_label(InProgress, true), "NOT_MOVING");
+        assert_eq!(verify_status_label(InProgress, false), "IN_PROGRESS");
+        assert_eq!(verify_status_label(Completed, false), "COMPLETED");
+    }
+
     #[test]
     fn a_partition_nobody_moves_is_not_in_progress() {
         use super::{stalled, ReassignmentStatus::*};

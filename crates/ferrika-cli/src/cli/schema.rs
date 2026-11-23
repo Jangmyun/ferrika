@@ -14,6 +14,7 @@ use crate::codec::schema_compat::{evaluate_compatibility, CompatibilityMode, Com
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::schema::SchemaRegistryClient;
 use crate::model::history::{Reversibility, State};
+use crate::model::schema::SchemaReference;
 use crate::ops::history::capture;
 
 /// Command line arguments for Schema Registry operations and wire format decoding.
@@ -96,6 +97,12 @@ pub enum SchemaSubcommands {
         /// Fail with non-zero exit code if candidate schema is incompatible
         #[arg(long)]
         fail_on_incompatible: bool,
+        /// A schema this one references, as NAME=SUBJECT:VERSION (VERSION a
+        /// number or `latest`, resolved to a number before sending): NAME is
+        /// the Avro named type, the Protobuf import path or the JSON Schema
+        /// `$ref` it stands for. Repeat for several
+        #[arg(long = "reference", value_name = "NAME=SUBJECT:VERSION", value_parser = parse_reference)]
+        references: Vec<SchemaReference>,
     },
     /// Register a schema file as the next version of a subject (checked for
     /// compatibility by the registry)
@@ -108,6 +115,12 @@ pub enum SchemaSubcommands {
         /// Schema type: AVRO, JSON or PROTOBUF
         #[arg(short = 't', long, default_value = "AVRO")]
         schema_type: String,
+        /// A schema this one references, as NAME=SUBJECT:VERSION (VERSION a
+        /// number or `latest`, resolved to a number before sending): NAME is
+        /// the Avro named type, the Protobuf import path or the JSON Schema
+        /// `$ref` it stands for. Repeat for several
+        #[arg(long = "reference", value_name = "NAME=SUBJECT:VERSION", value_parser = parse_reference)]
+        references: Vec<SchemaReference>,
         /// Schema Registry URL (defaults to the profile's, else http://localhost:8081)
         #[arg(short = 'S', long)]
         registry_url: Option<String>,
@@ -156,22 +169,40 @@ pub enum SchemaSubcommands {
     },
 }
 
+/// Reads `--reference NAME=SUBJECT:VERSION`.
+fn parse_reference(spec: &str) -> Result<SchemaReference, String> {
+    SchemaReference::parse_spec(spec)
+}
+
 /// The registry URL to use: the flag, else the profile's, else localhost.
 fn registry(flag: Option<String>, global: &GlobalOpts) -> String {
     flag.or_else(|| global.to_kafka_config().schema_registry_url)
         .unwrap_or_else(|| "http://localhost:8081".to_string())
 }
 
+struct RegisterRequest<'a> {
+    subject: &'a str,
+    schema_file: &'a str,
+    schema_type: &'a str,
+    references: Vec<SchemaReference>,
+}
+
 async fn handle_register(
-    subject: &str,
-    schema_file: &str,
-    schema_type: &str,
+    request: RegisterRequest<'_>,
     registry_url: &str,
     global: &GlobalOpts,
 ) -> KafkaResult<()> {
+    let RegisterRequest {
+        subject,
+        schema_file,
+        schema_type,
+        mut references,
+    } = request;
     let schema = std::fs::read_to_string(schema_file)
         .map_err(|e| KafkaError::File(format!("Cannot read '{schema_file}': {e}")))?;
     let client = SchemaRegistryClient::new(registry_url).with_timeout(global.http_timeout());
+    // `latest` names a fixed version before anything is sent or recorded.
+    client.resolve_reference_versions(&mut references).await?;
     let captured = capture::subject_versions(&client, subject, false)
         .await
         .map(|before| (vec![before], Vec::new()));
@@ -181,7 +212,9 @@ async fn handle_register(
         record::change_from_capture(Reversibility::Partial, captured)
             .limit("undo soft-deletes the new version; the schema id stays known to the registry"),
     );
-    let id = client.register(subject, &schema, schema_type).await;
+    let id = client
+        .register_with_references(subject, &schema, schema_type, &references)
+        .await;
     if let Some(pending) = pending {
         // The new version number is only known now.
         let after = capture::subject_versions(&client, subject, false)
@@ -194,12 +227,23 @@ async fn handle_register(
         }
     }
     let id = id?;
+    if global.format == OutputFormat::Json {
+        return output::print_json(&json!({
+            "subject": subject,
+            "id": id,
+            "schema_type": schema_type.to_uppercase(),
+            "references": references,
+        }));
+    }
     println!(
         "{} Registered under '{}' with schema id {}.",
         "✔".green().bold(),
         subject.cyan(),
         id
     );
+    for reference in &references {
+        println!("  references {}", reference_label(reference));
+    }
     Ok(())
 }
 
@@ -227,6 +271,9 @@ async fn handle_compat(
         let result = client.set_compatibility(subject, &level).await;
         record::finish(pending, &result, &format!("{subject} now uses {level}"));
         result?;
+        if global.format == OutputFormat::Json {
+            return output::print_json(&json!({ "subject": subject, "compatibility": level }));
+        }
         println!(
             "{} '{}' now uses {}.",
             "✔".green().bold(),
@@ -234,7 +281,11 @@ async fn handle_compat(
             level
         );
     } else {
-        println!("{}", client.compatibility(subject).await?);
+        let level = client.compatibility(subject).await?;
+        if global.format == OutputFormat::Json {
+            return output::print_json(&json!({ "subject": subject, "compatibility": level }));
+        }
+        println!("{level}");
     }
     Ok(())
 }
@@ -273,6 +324,9 @@ async fn handle_delete_subject(
     let versions = client.delete_subject(subject).await;
     record::finish(pending, &versions, &format!("Deleted subject {subject}"));
     let versions = versions?;
+    if global.format == OutputFormat::Json {
+        return output::print_json(&json!({ "subject": subject, "deleted_versions": versions }));
+    }
     println!(
         "{} Deleted '{}' (versions {:?}).",
         "✔".green().bold(),
@@ -294,16 +348,16 @@ pub async fn handle_schema_command(args: SchemaArgs, global: &GlobalOpts) -> Kaf
             subject,
             schema_file,
             schema_type,
+            references,
             registry_url,
         } => {
-            handle_register(
-                &subject,
-                &schema_file,
-                &schema_type,
-                &registry(registry_url, global),
-                global,
-            )
-            .await
+            let request = RegisterRequest {
+                subject: &subject,
+                schema_file: &schema_file,
+                schema_type: &schema_type,
+                references,
+            };
+            handle_register(request, &registry(registry_url, global), global).await
         }
         SchemaSubcommands::Compat {
             subject,
@@ -350,16 +404,16 @@ pub async fn handle_schema_command(args: SchemaArgs, global: &GlobalOpts) -> Kaf
             registry_url,
             mode,
             fail_on_incompatible,
+            references,
         } => {
-            handle_check_schema(
-                &subject,
-                &schema_file,
-                &registry(registry_url, global),
-                mode.as_deref(),
+            let request = CheckRequest {
+                subject: &subject,
+                schema_file: &schema_file,
+                mode: mode.as_deref(),
                 fail_on_incompatible,
-                global,
-            )
-            .await
+                references,
+            };
+            handle_check_schema(request, &registry(registry_url, global), global).await
         }
         SchemaSubcommands::DiffSchema {
             old_file,
@@ -686,6 +740,14 @@ fn render_schema_definition(def: &SchemaDefinition, global: &GlobalOpts) {
                 ]);
             }
 
+            if !def.references.is_empty() {
+                let lines: Vec<String> = def.references.iter().map(reference_label).collect();
+                table.add_row(vec![
+                    Cell::new("References").fg(Color::DarkGrey),
+                    Cell::new(lines.join("\n")),
+                ]);
+            }
+
             println!("{}", table);
 
             // Pretty print schema content
@@ -701,6 +763,19 @@ fn render_schema_definition(def: &SchemaDefinition, global: &GlobalOpts) {
             }
         }
     }
+}
+
+/// `NAME → SUBJECT version N` (or `latest`), as tables show a reference.
+fn reference_label(reference: &SchemaReference) -> String {
+    let version = if reference.is_latest() {
+        "latest".to_string()
+    } else {
+        reference.version.to_string()
+    };
+    format!(
+        "{} → {} version {version}",
+        reference.name, reference.subject
+    )
 }
 
 fn handle_decode_hex(hex_data: &str, global: &GlobalOpts) -> KafkaResult<()> {
@@ -852,14 +927,27 @@ fn merge_compat_reports(
     merged
 }
 
-async fn handle_check_schema(
-    subject: &str,
-    schema_file: &str,
-    registry_url: &str,
-    mode_str: Option<&str>,
+struct CheckRequest<'a> {
+    subject: &'a str,
+    schema_file: &'a str,
+    mode: Option<&'a str>,
     fail_on_incompatible: bool,
+    references: Vec<SchemaReference>,
+}
+
+async fn handle_check_schema(
+    request: CheckRequest<'_>,
+    registry_url: &str,
     global: &GlobalOpts,
 ) -> KafkaResult<()> {
+    let CheckRequest {
+        subject,
+        schema_file,
+        mode: mode_str,
+        fail_on_incompatible,
+        mut references,
+    } = request;
+    reject_local_mode_with_references(mode_str, &references)?;
     let candidate_schema = fs::read_to_string(schema_file).map_err(|e| {
         KafkaError::io(format!(
             "Failed to read candidate schema file '{schema_file}': {e}"
@@ -868,14 +956,12 @@ async fn handle_check_schema(
 
     let client = SchemaRegistryClient::new(registry_url).with_timeout(global.http_timeout());
     let Some(mode_str) = mode_str else {
-        return registry_check(
-            subject,
-            &candidate_schema,
-            &client,
-            fail_on_incompatible,
-            global,
-        )
-        .await;
+        client.resolve_reference_versions(&mut references).await?;
+        let candidate = Candidate {
+            schema: &candidate_schema,
+            references: &references,
+        };
+        return registry_check(subject, candidate, &client, fail_on_incompatible, global).await;
     };
     let (mode, transitive) = parse_compat_mode(mode_str)?;
     // Transitive: the number of registered versions checked.
@@ -923,13 +1009,42 @@ async fn handle_check_schema(
 /// level, as `register` applies it (any schema type). The local field-level
 /// comparison against the latest version adds detail when it can read the
 /// schemas; where it disagrees, the registry decides.
+/// `-m` compares two schema texts locally and cannot follow references.
+fn reject_local_mode_with_references(
+    mode: Option<&str>,
+    references: &[SchemaReference],
+) -> KafkaResult<()> {
+    if mode.is_some() && !references.is_empty() {
+        return Err(KafkaError::config(
+            "-m compares the schemas locally, which cannot resolve --reference; run without \
+             -m to let the Schema Registry check the schema with its references",
+        ));
+    }
+    Ok(())
+}
+
+/// The schema `schema check` sends: its text and its references.
+#[derive(Clone, Copy)]
+struct Candidate<'a> {
+    schema: &'a str,
+    references: &'a [SchemaReference],
+}
+
+/// When the candidate or the latest version has references, the local
+/// field-level comparison is skipped: it reads one schema text on its own
+/// and cannot follow imports, named types from other subjects or `$ref`s,
+/// so only the registry's verdict is given.
 async fn registry_check(
     subject: &str,
-    candidate: &str,
+    candidate: Candidate<'_>,
     client: &SchemaRegistryClient,
     fail_on_incompatible: bool,
     global: &GlobalOpts,
 ) -> KafkaResult<()> {
+    let Candidate {
+        schema: candidate,
+        references,
+    } = candidate;
     let latest = client.get_latest_subject_schema(subject).await?;
     // The level is only shown: not being allowed to read it does not stop
     // the check.
@@ -942,7 +1057,7 @@ async fn registry_check(
     // 405) is asked about the latest version; any other error stops here.
     let mut latest_only = false;
     let compatible = match client
-        .is_compatible_with_all_versions(subject, candidate, &latest.schema_type)
+        .check_compatibility(subject, candidate, &latest.schema_type, references, true)
         .await
     {
         Ok(compatible) => compatible,
@@ -959,13 +1074,18 @@ async fn registry_check(
                 );
             }
             client
-                .is_compatible(subject, candidate, &latest.schema_type)
+                .check_compatibility(subject, candidate, &latest.schema_type, references, false)
                 .await?
         }
         Err(e) => return Err(e),
     };
     let mode = parse_compat_mode(&level).map_or(CompatibilityMode::Backward, |(m, _)| m);
-    let local_report = evaluate_compatibility(Some(subject), &latest.schema, candidate, mode).ok();
+    let local_skipped = !references.is_empty() || !latest.references.is_empty();
+    let local_report = if local_skipped {
+        None
+    } else {
+        evaluate_compatibility(Some(subject), &latest.schema, candidate, mode).ok()
+    };
     // `None`: the local comparison could not read the schemas.
     let local = local_report.as_ref().map(|r| r.is_compatible);
     let mut report = local_report.unwrap_or_else(|| CompatibilityReport {
@@ -984,6 +1104,14 @@ async fn registry_check(
             format!("Checked by the Schema Registry under the subject's level {level}.")
                 .bright_black()
         );
+        if local_skipped {
+            eprintln!(
+                "{}",
+                "The schemas have references: no local field-level comparison, only the \
+                 registry's verdict."
+                    .bright_black()
+            );
+        }
         if local.is_some_and(|local| local != compatible) {
             eprintln!(
                 "{} The field-level comparison below says {}; the registry's verdict decides.",
@@ -1006,6 +1134,8 @@ async fn registry_check(
             obj.insert("checked_by".into(), "registry".into());
             obj.insert("registry_level".into(), level.clone().into());
             obj.insert("local_is_compatible".into(), local.into());
+            obj.insert("local_skipped".into(), local_skipped.into());
+            obj.insert("references".into(), json!(references));
             obj.insert(
                 "checked_versions".into(),
                 if latest_only { "latest" } else { "all" }.into(),
@@ -1226,6 +1356,10 @@ mod tests {
                 ),
             ]
         };
+        let cand = super::Candidate {
+            schema: candidate,
+            references: &[],
+        };
         let global = super::GlobalOpts {
             profile: None,
             bootstrap_servers: None,
@@ -1240,7 +1374,7 @@ mod tests {
         let url = mock_registry(no_config).await;
         let client = super::SchemaRegistryClient::new(&url);
         assert!(
-            super::registry_check("orders-value", candidate, &client, true, &global)
+            super::registry_check("orders-value", cand, &client, true, &global)
                 .await
                 .is_ok()
         );
@@ -1262,7 +1396,7 @@ mod tests {
         let url = mock_registry(transitive).await;
         let client = super::SchemaRegistryClient::new(&url);
         assert!(
-            super::registry_check("orders-value", candidate, &client, true, &global)
+            super::registry_check("orders-value", cand, &client, true, &global)
                 .await
                 .is_err()
         );
@@ -1270,14 +1404,119 @@ mod tests {
         for (compatible, expect_ok) in [(true, true), (false, false)] {
             let url = mock_registry(routes(compatible)).await;
             let client = super::SchemaRegistryClient::new(&url);
-            let result =
-                super::registry_check("orders-value", candidate, &client, true, &global).await;
+            let result = super::registry_check("orders-value", cand, &client, true, &global).await;
             assert_eq!(
                 result.is_ok(),
                 expect_ok,
                 "registry says {compatible}: {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn register_and_check_take_repeated_references() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            command: SchemaSubcommands,
+        }
+
+        let cli = TestCli::try_parse_from([
+            "schema",
+            "register",
+            "orders-value",
+            "-f",
+            "o.avsc",
+            "--reference",
+            "com.acme.Money=money-value:latest",
+            "--reference",
+            "com.acme.Address=address-value:2",
+        ])
+        .unwrap();
+        let SchemaSubcommands::Register { references, .. } = cli.command else {
+            panic!("expected register");
+        };
+        assert_eq!(references.len(), 2);
+        assert!(references[0].is_latest());
+        assert_eq!(
+            (references[1].subject.as_str(), references[1].version),
+            ("address-value", 2)
+        );
+        let cli = TestCli::try_parse_from([
+            "schema",
+            "check",
+            "orders-value",
+            "-f",
+            "o.avsc",
+            "--reference",
+            "money.json=money:1",
+        ])
+        .unwrap();
+        let SchemaSubcommands::Check { references, .. } = cli.command else {
+            panic!("expected check");
+        };
+        assert_eq!(references[0].name, "money.json");
+        assert!(TestCli::try_parse_from([
+            "schema",
+            "register",
+            "s",
+            "-f",
+            "x",
+            "--reference",
+            "no-version"
+        ])
+        .is_err());
+        // A local -m comparison cannot follow references.
+        assert!(super::reject_local_mode_with_references(Some("backward"), &references).is_err());
+        assert!(super::reject_local_mode_with_references(None, &references).is_ok());
+        assert!(super::reject_local_mode_with_references(Some("backward"), &[]).is_ok());
+        assert_eq!(
+            super::reference_label(&references[0]),
+            "money.json → money version 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn references_skip_the_local_comparison_and_reach_the_registry() {
+        let latest = serde_json::json!({
+            "subject": "orders-value", "version": 1, "id": 1,
+            "schema": r#"{"type":"record","name":"O","fields":[{"name":"m","type":"com.acme.Money"}]}"#,
+            "references": [{"name": "com.acme.Money", "subject": "money", "version": 1}],
+        })
+        .to_string();
+        let url = mock_registry(vec![
+            ("/subjects/orders-value/versions/latest".to_string(), latest),
+            (
+                "/config/orders-value".to_string(),
+                r#"{"compatibilityLevel":"BACKWARD"}"#.to_string(),
+            ),
+            (
+                "/compatibility/subjects/orders-value/versions".to_string(),
+                r#"{"is_compatible":true}"#.to_string(),
+            ),
+        ])
+        .await;
+        let client = super::SchemaRegistryClient::new(&url);
+        let references = vec![SchemaReference::parse_spec("com.acme.Money=money:1").unwrap()];
+        let candidate = super::Candidate {
+            schema: r#"{"type":"record","name":"O","fields":[{"name":"m","type":"com.acme.Money"}]}"#,
+            references: &references,
+        };
+        let global = super::GlobalOpts {
+            profile: None,
+            bootstrap_servers: None,
+            format: super::OutputFormat::Json,
+            timeout: Some(5),
+            resolved: None,
+            write: None,
+        };
+        assert!(
+            super::registry_check("orders-value", candidate, &client, true, &global)
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
