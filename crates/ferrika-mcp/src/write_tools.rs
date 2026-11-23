@@ -13,7 +13,11 @@ use serde_json::{json, Map, Value};
 use std::time::Duration;
 
 use super::backend::{KafkaBackend, TransformRun, WriteBackend};
-use super::guard::{args_digest, digest, GuardConfig, Limits, ToolError, WriteGuard, WRITE_TOOLS};
+use super::guard::{
+    args_digest, digest, is_rabbit_tool, policy_action, GuardConfig, Limits, ToolError, WriteGuard,
+    WRITE_TOOLS,
+};
+use super::rabbit_writes::{self, LiveRabbit, RabbitBackend, RabbitWork};
 use super::transform_tools::{self, EXECUTE_MAX};
 use super::transport::{Peer, PeerError};
 use super::{ConfirmMode, WriteOptions};
@@ -39,6 +43,8 @@ const ELICIT_TIMEOUT: Duration = Duration::from_secs(120);
 pub(super) struct WriteTools {
     pub guard: WriteGuard,
     backend: Box<dyn WriteBackend>,
+    /// The RabbitMQ brokers the `rabbit_*` tools reach.
+    pub(super) rabbit: Box<dyn RabbitBackend>,
     confirm: ConfirmMode,
     elicit_timeout: Duration,
     /// Where executed changes are recorded for `ferrika history` / `undo`;
@@ -93,6 +99,8 @@ enum Work {
         records: Vec<OwnedProducerRecord>,
     },
     Transform(TransformRun),
+    /// A RabbitMQ write (`rabbit_writes.rs`), run by `run_rabbit`.
+    Rabbit(RabbitWork),
 }
 
 /// What a write did.
@@ -117,6 +125,8 @@ impl WriteTools {
                 .filter(|t| args.allow_tools.is_empty() || args.allow_tools.iter().any(|a| a == t))
                 .collect(),
             topics: args.topics.clone(),
+            queues: args.queues.clone(),
+            exchanges: args.exchanges.clone(),
             limits: Limits {
                 writes_per_minute: args.max_writes_per_minute,
                 produce_records: args.max_produce_records,
@@ -148,6 +158,7 @@ impl WriteTools {
         Self {
             guard,
             backend,
+            rabbit: Box::new(LiveRabbit),
             confirm: ConfirmMode::Auto,
             elicit_timeout: ELICIT_TIMEOUT,
             history: None,
@@ -204,7 +215,7 @@ impl WriteTools {
             }
             Work::ResetOffsets { group, plans, .. } => Change::offset_reset(group, plans),
             // Copies, like produce, cannot be taken back.
-            Work::Produce { .. } | Work::Transform(_) => return (None, None),
+            Work::Produce { .. } | Work::Transform(_) | Work::Rabbit(_) => return (None, None),
         };
         let (profile, bootstrap) = self.guard.profile_and_bootstrap();
         let scope = Scope {
@@ -350,6 +361,9 @@ impl WriteTools {
                 format!("{why}, and this client does not support MCP elicitation."),
             ));
         }
+        if is_rabbit_tool(tool) {
+            return self.run_rabbit(tool, args, ctx).await;
+        }
         self.guard.check_cooldown()?;
         let execute = execute_mode(args)?;
         let request = parse(tool, args)?;
@@ -365,7 +379,7 @@ impl WriteTools {
         }
         self.authorize(tool, &request.target()).await?;
         let planned = self.plan(&request).await?;
-        let plan_digest = digest(&planned.plan);
+        let plan_digest = plan_digest(&planned.plan);
         if !execute {
             let (token, expires) = self.guard.issue_token(tool, args_digest(args), plan_digest);
             let person = self.asks_person(ctx.elicitation);
@@ -381,7 +395,10 @@ impl WriteTools {
             Work::Produce { records, .. } => self.guard.charge_produce(records.len() as u64)?,
             // Charged in full now, the part not written given back after.
             Work::Transform(run) => self.guard.charge_produce(run.max_records)?,
-            Work::CreateTopic { .. } | Work::AlterConfig { .. } | Work::ResetOffsets { .. } => {}
+            Work::CreateTopic { .. }
+            | Work::AlterConfig { .. }
+            | Work::ResetOffsets { .. }
+            | Work::Rabbit(_) => {}
         }
         let target = planned.target.clone();
         // Refused here as it was inside the run: audited, not recorded.
@@ -418,6 +435,112 @@ impl WriteTools {
                     .guard
                     .record_result(tool, &target, &error.message, false, op);
                 Err(error)
+            }
+        }
+    }
+
+    /// [`Self::run`] for a RabbitMQ tool: the same plan -> confirm ->
+    /// execute flow, on the RabbitMQ profile the arguments name, gated on
+    /// that profile and the broker's addresses (`authorize_rabbit`). The
+    /// connection is resolved again for the execute from the same
+    /// arguments, which the token binds.
+    async fn run_rabbit(
+        &mut self,
+        tool: &'static str,
+        args: &Value,
+        ctx: &CallContext<'_>,
+    ) -> Result<(Value, bool), ToolError> {
+        self.guard.check_cooldown()?;
+        let execute = execute_mode(args)?;
+        let request = rabbit_writes::parse(tool, args)?;
+        request.check_scope(&self.guard)?;
+        if execute {
+            self.guard.check_rate(true)?;
+        } else {
+            self.guard.admit(false)?;
+        }
+        let conn = self
+            .rabbit
+            .connect(args)
+            .map_err(|e| ToolError::new("invalid_argument", e.to_string()))?;
+        let target = request.target(conn.vhost());
+        let authorize = |guard: &WriteGuard| {
+            guard.authorize_rabbit(
+                tool,
+                policy_action(tool),
+                &target,
+                conn.profile(),
+                &conn.addresses,
+                conn.read_only_refusal(tool),
+            )
+        };
+        authorize(&self.guard)?;
+        let planned =
+            rabbit_writes::plan(&self.guard, self.rabbit.as_ref(), &conn, tool, &request).await?;
+        let planned = Planned {
+            plan: planned.plan,
+            summary: planned.summary,
+            target: target.clone(),
+            destructive: false,
+            person_only: None,
+            work: Work::Rabbit(planned.work),
+        };
+        let digest = plan_digest(&planned.plan);
+        if !execute {
+            let (token, expires) = self.guard.issue_token(tool, args_digest(args), digest);
+            let person = self.asks_person(ctx.elicitation);
+            return Ok((plan_result(tool, &planned, &token, expires, person), false));
+        }
+
+        self.confirm(tool, args, &planned, &digest, ctx).await?;
+        self.guard.admit(true)?;
+        // The confirmation may have taken a while: ask the gate again.
+        authorize(&self.guard)?;
+        let records = request.produce_records();
+        self.guard.charge_produce(records)?;
+        let Work::Rabbit(work) = planned.work else {
+            return Err(ToolError::new("write_disabled", "not a RabbitMQ write"));
+        };
+        let done = rabbit_writes::execute(
+            &self.guard,
+            self.rabbit.as_ref(),
+            &conn,
+            tool,
+            &target,
+            work,
+            records,
+        )
+        .await;
+        match done {
+            Ok(done) => {
+                self.guard.refund_produce(done.unused_budget);
+                let warning = self.guard.record_at(
+                    conn.audit_profile(),
+                    format!("mcp {tool}"),
+                    &target,
+                    &done.outcome,
+                    true,
+                    None,
+                );
+                let executed = Executed {
+                    result: done.result,
+                    outcome: done.outcome,
+                    ok: true,
+                    unused_budget: done.unused_budget,
+                };
+                Ok((execute_result(&executed, warning), true))
+            }
+            Err(failed) => {
+                self.guard.refund_produce(failed.unused_budget);
+                let _ = self.guard.record_at(
+                    conn.audit_profile(),
+                    format!("mcp {tool}"),
+                    &target,
+                    &failed.outcome,
+                    false,
+                    None,
+                );
+                Err(failed.error)
             }
         }
     }
@@ -499,7 +622,12 @@ impl WriteTools {
         planned: &Planned,
         ctx: &CallContext<'_>,
     ) -> Result<(), ToolError> {
-        let profile = &self.guard.config().profile;
+        // A RabbitMQ summary names its own RabbitMQ profile.
+        let profile = if is_rabbit_tool(tool) {
+            ""
+        } else {
+            self.guard.config().profile.as_str()
+        };
         let mut message = format!(
             "Ferrika{}: {}.",
             if profile.is_empty() {
@@ -753,6 +881,10 @@ impl WriteTools {
                     unused_budget: 0,
                 })
             }
+            Work::Rabbit(_) => Err(ToolError::new(
+                "write_disabled",
+                "RabbitMQ writes run through run_rabbit",
+            )),
             Work::Transform(run) => {
                 let summary = self
                     .backend
@@ -1604,7 +1736,7 @@ fn record_arg(i: usize, item: &Value) -> Result<RecordArg, ToolError> {
 
 /// The first 12 hex digits of SHA-256: enough to tell values apart without
 /// returning them.
-fn short_sha256(bytes: &[u8]) -> String {
+pub(super) fn short_sha256(bytes: &[u8]) -> String {
     let d = ring::digest::digest(&ring::digest::SHA256, bytes);
     ferrika_governance::policy::to_hex(&d.as_ref()[..6])
 }
@@ -1655,16 +1787,16 @@ fn execute_mode(args: &Value) -> Result<bool, ToolError> {
 }
 
 /// Typed access to a tool's arguments object.
-struct Fields<'a>(&'a Map<String, Value>);
+pub(super) struct Fields<'a>(pub(super) &'a Map<String, Value>);
 
 impl<'a> Fields<'a> {
-    fn new(args: &'a Value) -> Result<Self, ToolError> {
+    pub(super) fn new(args: &'a Value) -> Result<Self, ToolError> {
         args.as_object()
             .map(Fields)
             .ok_or_else(|| ToolError::invalid("arguments must be an object"))
     }
 
-    fn only(&self, known: &[&str]) -> Result<(), ToolError> {
+    pub(super) fn only(&self, known: &[&str]) -> Result<(), ToolError> {
         match self.0.keys().find(|k| !known.contains(&k.as_str())) {
             Some(k) => Err(ToolError::invalid(format!(
                 "Unknown argument '{k}' (expected: {})",
@@ -1674,7 +1806,7 @@ impl<'a> Fields<'a> {
         }
     }
 
-    fn string(&self, name: &str) -> Result<String, ToolError> {
+    pub(super) fn string(&self, name: &str) -> Result<String, ToolError> {
         match self.0.get(name) {
             Some(Value::String(s)) if !s.is_empty() => Ok(s.clone()),
             Some(Value::String(_)) | None | Some(Value::Null) => {
@@ -1684,7 +1816,7 @@ impl<'a> Fields<'a> {
         }
     }
 
-    fn int(&self, name: &str, min: i64, max: i64) -> Result<Option<i64>, ToolError> {
+    pub(super) fn int(&self, name: &str, min: i64, max: i64) -> Result<Option<i64>, ToolError> {
         match self.0.get(name) {
             None | Some(Value::Null) => Ok(None),
             Some(v) => match v.as_i64() {
@@ -1696,7 +1828,7 @@ impl<'a> Fields<'a> {
         }
     }
 
-    fn string_map(&self, name: &str) -> Result<BTreeMap<String, String>, ToolError> {
+    pub(super) fn string_map(&self, name: &str) -> Result<BTreeMap<String, String>, ToolError> {
         match self.0.get(name) {
             None | Some(Value::Null) => Ok(BTreeMap::new()),
             Some(Value::Object(map)) => map
@@ -1821,6 +1953,17 @@ fn changes_text_with(
         .join(", ")
 }
 
+/// The digest that binds a plan's confirmation token: the plan without its
+/// `observed` part (counts a busy broker changes between plan and
+/// execute).
+fn plan_digest(plan: &Value) -> String {
+    let mut stable = plan.clone();
+    if let Some(map) = stable.as_object_mut() {
+        map.remove("observed");
+    }
+    digest(&stable)
+}
+
 fn state_changed() -> ToolError {
     ToolError::new(
         "state_changed",
@@ -1890,7 +2033,7 @@ fn execute_result(done: &Executed, audit_warning: Option<String>) -> Value {
 }
 
 /// Tool annotations: hints for the client's approval UI, not a guarantee.
-fn annotations(title: &str, destructive: bool, idempotent: bool) -> Value {
+pub(super) fn annotations(title: &str, destructive: bool, idempotent: bool) -> Value {
     json!({
         "title": title,
         "readOnlyHint": false,
@@ -1901,7 +2044,7 @@ fn annotations(title: &str, destructive: bool, idempotent: bool) -> Value {
 }
 
 /// `mode` and `confirmation`, shared by every write tool's schema.
-fn with_mode(mut properties: Value) -> Value {
+pub(super) fn with_mode(mut properties: Value) -> Value {
     properties["mode"] = json!({
         "enum": ["plan", "execute"],
         "default": "plan",
@@ -1914,8 +2057,15 @@ fn with_mode(mut properties: Value) -> Value {
     properties
 }
 
-/// Every write tool's definition.
+/// Every write tool's definition: the Kafka ones, then the RabbitMQ ones.
 fn definitions() -> Vec<Value> {
+    let mut tools = kafka_definitions();
+    tools.extend(rabbit_writes::definitions());
+    tools
+}
+
+/// The Kafka write tools' definitions.
+fn kafka_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "produce_messages",
@@ -2503,7 +2653,11 @@ pub(super) mod tests {
             ..config()
         };
         let (mut tools, cluster, _, _) = tools_with(cluster(), read_only);
-        assert!(tools.definitions(false).is_empty());
+        // The Kafka tools are hidden; the RabbitMQ ones use their own profile.
+        assert!(tools
+            .definitions(false)
+            .iter()
+            .all(|d| is_rabbit_tool(d["name"].as_str().unwrap_or_default())));
         assert!(tools.startup_warnings()[0].contains("read-only"));
         let result = tools
             .call_token("create_topic", &json!({ "topic": "t" }))
