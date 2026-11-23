@@ -1,9 +1,5 @@
 //! Consumers: group consumers, group-less scanners and the parallel reader.
-//!
-//! Semver: `fetch_committed_offsets`, `fetch_committed_offsets_for` and
-//! `commit` of [`KafkaConsumerClient`] take or return
-//! `rdkafka::TopicPartitionList` (rdkafka 0.39) and change with it; plain
-//! maps are planned for 0.3. Everything else here uses Ferrika types.
+//! The public API uses Ferrika types only (offsets as plain maps).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
