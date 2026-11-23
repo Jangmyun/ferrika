@@ -3,8 +3,10 @@
 //! `amqp` feature, `rabbit_dlq_redrive`.
 //!
 //! Reading messages through the management API takes them and requeues
-//! them, which marks them redelivered (and on a quorum queue counts towards
-//! its delivery limit), so even a peek is a write here: like every write
+//! them, which marks them redelivered (and, on a quorum queue with a delivery
+//! limit on RabbitMQ before 4.0, counts towards that limit: such reads are
+//! refused here, see `ferrika_rabbitmq::delivery_limit`), so even a peek is
+//! a write here: like every write
 //! tool it is planned, confirmed and run through `write_tools.rs`, and
 //! gated as `ferrika rabbit` is (`messages.peek`, `produce`,
 //! `messages.move` + `produce`) on the RabbitMQ profile and the broker's
@@ -21,6 +23,7 @@ use ferrika_core::error::{KafkaError, KafkaResult};
 #[cfg(feature = "amqp")]
 use ferrika_rabbitmq::amqp::{RedriveError, RedriveReport, RedriveRequest};
 use ferrika_rabbitmq::connection::ResolvedRabbit;
+use ferrika_rabbitmq::delivery_limit::PeekRisk;
 use ferrika_rabbitmq::model::{
     exchange_name, Binding, Exchange, OutgoingMessage, PeekedMessage, PublishOutcome, Queue,
     DEFAULT_EXCHANGE,
@@ -109,6 +112,9 @@ pub(super) trait RabbitBackend {
     fn queues<'a>(&'a self, conn: &'a RabbitConn) -> BoxFuture<'a, Vec<Queue>>;
     fn exchanges<'a>(&'a self, conn: &'a RabbitConn) -> BoxFuture<'a, Vec<Exchange>>;
     fn bindings<'a>(&'a self, conn: &'a RabbitConn) -> BoxFuture<'a, Vec<Binding>>;
+    /// Whether a peek of `queue` counts towards its delivery limit
+    /// (`ManagementClient::peek_risk`).
+    fn peek_risk<'a>(&'a self, conn: &'a RabbitConn, queue: &'a Queue) -> BoxFuture<'a, PeekRisk>;
     /// Takes up to `count` messages from the head of `queue` and requeues
     /// them.
     fn peek<'a>(
@@ -182,6 +188,15 @@ impl RabbitBackend for LiveRabbit {
         Box::pin(async move {
             self.client(conn)?
                 .bindings(conn.vhost())
+                .await
+                .map_err(rabbit_error)
+        })
+    }
+
+    fn peek_risk<'a>(&'a self, conn: &'a RabbitConn, queue: &'a Queue) -> BoxFuture<'a, PeekRisk> {
+        Box::pin(async move {
+            self.client(conn)?
+                .peek_risk(conn.vhost(), &queue.name)
                 .await
                 .map_err(rabbit_error)
         })
@@ -539,18 +554,20 @@ fn find_queue<'q>(queues: &'q [Queue], name: &str, vhost: &str) -> Result<&'q Qu
     })
 }
 
-/// The warnings about reading `queue`: it is requeued, and a quorum queue
-/// counts the delivery.
-fn requeue_warnings(queue: &Queue) -> Vec<String> {
+/// The warnings about reading `queue`: it is requeued, and whether a
+/// quorum queue counts the read towards its delivery limit (`risk`).
+fn requeue_warnings(queue: &Queue, risk: &PeekRisk) -> Vec<String> {
     let mut warnings = vec![
         "Reading takes the messages and requeues them: the broker marks them redelivered, and \
          messages published meanwhile can change places with them."
             .to_string(),
     ];
-    if queue.kind == "quorum" {
+    if let Some(warning) = risk.warning() {
+        warnings.push(warning);
+    } else if queue.kind == "quorum" {
         warnings.push(
-            "This is a quorum queue: each read counts towards its delivery-limit, and a message \
-             past the limit is dead-lettered or dropped."
+            "This is a quorum queue, but a read does not count towards a delivery limit here \
+             (the queue has none, or the broker is RabbitMQ 4.0 or later)."
                 .to_string(),
         );
     }
@@ -588,6 +605,14 @@ pub(super) async fn plan(
             }
             let queues = backend.queues(conn).await.map_err(rabbit)?;
             let found = find_queue(&queues, queue, vhost)?;
+            // Reads that can dead-letter or drop messages are left to the
+            // CLI, where a person opts in.
+            let risk = backend.peek_risk(conn, found).await.map_err(rabbit)?;
+            if let Some(refusal) =
+                risk.refusal("`ferrika rabbit peek --allow-delivery-count` (not over MCP)")
+            {
+                return Err(ToolError::new("delivery_limit", refusal));
+            }
             let mask = *mask || guard.masking_enforced();
             let what = if tool == "rabbit_peek" {
                 "read"
@@ -603,7 +628,7 @@ pub(super) async fn plan(
                     "queue_type": found.kind,
                     "count": count,
                     "mask_pii": mask,
-                    "warnings": requeue_warnings(found),
+                    "warnings": requeue_warnings(found, &risk),
                     "observed": {
                         "messages_ready": found.messages_ready,
                         "consumers": found.consumers,
@@ -1017,7 +1042,7 @@ pub(super) fn definitions() -> Vec<Value> {
         json!({
             "name": "rabbit_peek",
             "title": "Peek at RabbitMQ messages",
-            "description": "RabbitMQ (preview): reads up to 20 messages at the head of a queue and returns them PII-masked. The management API has no browse: the messages are taken and requeued, so the broker marks them redelivered (on a quorum queue this counts towards its delivery-limit). It is therefore a write: plan first, then execute with the plan's confirmation token.",
+            "description": "RabbitMQ (preview): reads up to 20 messages at the head of a queue and returns them PII-masked. The management API has no browse: the messages are taken and requeued, so the broker marks them redelivered (a quorum queue with a delivery limit on RabbitMQ before 4.0 would count each read towards it, so such queues are refused). It is therefore a write: plan first, then execute with the plan's confirmation token.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -1114,6 +1139,8 @@ mod tests {
         /// Reading a message fails the test's call (a plan must not read).
         peek_fails: bool,
         peeks: Cell<usize>,
+        /// `rabbitmq_version` (unknown when unset).
+        broker_version: Option<&'static str>,
         published: RefCell<Vec<(String, OutgoingMessage)>>,
         #[cfg(feature = "amqp")]
         redrives: RefCell<Vec<RedriveRequest>>,
@@ -1149,6 +1176,14 @@ mod tests {
 
         fn bindings<'a>(&'a self, _: &'a RabbitConn) -> BoxFuture<'a, Vec<Binding>> {
             Box::pin(async move { Ok(self.bindings.clone()) })
+        }
+
+        fn peek_risk<'a>(&'a self, _: &'a RabbitConn, queue: &'a Queue) -> BoxFuture<'a, PeekRisk> {
+            let version = self.broker_version.map(str::to_string);
+            Box::pin(async move {
+                PeekRisk::from_queue(&serde_json::to_value(queue).unwrap(), version)
+                    .map_err(|e| KafkaError::config(e.to_string()))
+            })
         }
 
         fn peek<'a>(
@@ -1291,6 +1326,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peeks_that_can_dead_letter_are_refused() {
+        let limited: Queue = serde_json::from_value(json!({
+            "name": "orders.dlq", "vhost": "/", "type": "quorum",
+            "arguments": { "x-delivery-limit": 3 }
+        }))
+        .unwrap();
+        let old = FakeRabbit {
+            broker_version: Some("3.13.7"),
+            ..broker()
+        };
+        old.queues.borrow_mut()[1] = limited.clone();
+        let (mut tools, rabbit, log) = fresh(old);
+        for tool in ["rabbit_peek", "rabbit_dlq_inspect"] {
+            let refused = tools
+                .call_token(tool, &json!({ "queue": "orders.dlq" }))
+                .await;
+            assert_eq!(refused["isError"], true, "{refused}");
+            let text = refused.to_string();
+            assert!(text.contains("delivery limit of 3"), "{text}");
+            assert!(text.contains("--allow-delivery-count"), "{text}");
+        }
+        assert_eq!(rabbit.peeks.get(), 0);
+        assert!(log.entries.borrow().is_empty());
+
+        // RabbitMQ 4 does not count a peek: planned, with no such warning.
+        let new = FakeRabbit {
+            broker_version: Some("4.4.1"),
+            ..broker()
+        };
+        new.queues.borrow_mut()[1] = limited;
+        let (mut tools, _, _) = fresh(new);
+        let plan = tools
+            .call_token("rabbit_peek", &json!({ "queue": "orders.dlq" }))
+            .await;
+        assert_eq!(plan["isError"], false, "{plan}");
+    }
+
+    #[tokio::test]
     async fn peek_plans_without_reading_then_returns_masked_messages() {
         let (mut tools, rabbit, log) = fresh(broker());
         let args = json!({ "queue": "orders.dlq", "count": 5 });
@@ -1299,7 +1372,7 @@ mod tests {
         let p = &plan["structuredContent"]["plan"];
         assert_eq!(p["queue_type"], "quorum");
         assert_eq!(p["mask_pii"], true);
-        assert!(p["warnings"].to_string().contains("delivery-limit"), "{p}");
+        assert!(p["warnings"].to_string().contains("delivery limit"), "{p}");
         // A plan reads nothing and records nothing.
         assert_eq!(rabbit.peeks.get(), 0);
         assert!(log.entries.borrow().is_empty());

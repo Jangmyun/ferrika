@@ -61,6 +61,17 @@ pub struct RabbitProfile {
     pub read_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// A CA file (PEM) for `https://` and `amqps://` when the broker's
+    /// certificate is signed by a private CA. The management API then
+    /// trusts only this CA; AMQP trusts it besides the OS trust store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<String>,
+    /// A client certificate (PEM) for mutual TLS, with [`Self::client_key`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<String>,
+    /// The client certificate's key (PEM, not encrypted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
 }
 
 fn default_vhost() -> String {
@@ -79,6 +90,9 @@ impl std::fmt::Debug for RabbitProfile {
             .field("amqp_url", &self.amqp_url)
             .field("read_only", &self.read_only)
             .field("description", &self.description)
+            .field("ca_cert", &self.ca_cert)
+            .field("client_cert", &self.client_cert)
+            .field("client_key", &self.client_key)
             .finish()
     }
 }
@@ -95,6 +109,18 @@ impl RabbitProfile {
             amqp_url: None,
             read_only: false,
             description: None,
+            ca_cert: None,
+            client_cert: None,
+            client_key: None,
+        }
+    }
+
+    /// The profile's TLS files (paths).
+    pub fn tls(&self) -> crate::client::TlsFiles {
+        crate::client::TlsFiles {
+            ca_file: self.ca_cert.clone(),
+            client_cert: self.client_cert.clone(),
+            client_key: self.client_key.clone(),
         }
     }
 
@@ -119,6 +145,9 @@ impl RabbitProfile {
         if self.vhost.is_empty() {
             return Err(RabbitError::config("The vhost must not be empty"));
         }
+        self.tls()
+            .client_pair()
+            .map_err(|e| RabbitError::config(e.to_string()))?;
         Ok(())
     }
 
@@ -618,9 +647,39 @@ mod tests {
         assert!(store
             .insert("a", RabbitProfile::new("ftp://rabbit"))
             .is_err());
+        let cert_without_key = RabbitProfile {
+            client_cert: Some("client.pem".to_string()),
+            ..RabbitProfile::new("https://rabbit")
+        };
+        assert!(store.insert("a", cert_without_key).is_err());
         assert!(store.set_active("nope").is_err());
         assert!(store.remove("nope").is_err());
         assert!(store.profiles.is_empty());
+    }
+
+    #[test]
+    fn tls_files_round_trip_and_older_files_still_load() {
+        let profile = RabbitProfile {
+            ca_cert: Some("/etc/ferrika/rabbit-ca.pem".to_string()),
+            client_cert: Some("/etc/ferrika/client.pem".to_string()),
+            client_key: Some("/etc/ferrika/client.key".to_string()),
+            ..RabbitProfile::new("https://rabbit:15671")
+        };
+        profile.validate().unwrap();
+        let json = serde_json::to_value(&profile).unwrap();
+        assert_eq!(json["ca_cert"], "/etc/ferrika/rabbit-ca.pem");
+        let back: RabbitProfile = serde_json::from_value(json).unwrap();
+        assert_eq!(back, profile);
+        assert_eq!(
+            back.tls().ca_file.as_deref(),
+            Some("/etc/ferrika/rabbit-ca.pem")
+        );
+        // A 0.2.0 file has no TLS fields, and an empty profile writes none.
+        let old: RabbitProfile =
+            serde_json::from_str(r#"{"management_url":"https://rabbit"}"#).unwrap();
+        assert!(old.tls().is_empty());
+        let written = serde_json::to_string(&old).unwrap();
+        assert!(!written.contains("ca_cert"), "{written}");
     }
 
     #[test]
