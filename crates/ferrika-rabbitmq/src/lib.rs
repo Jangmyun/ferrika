@@ -10,7 +10,7 @@
 //!   exchange over HTTP(S).
 //! - [`profile`]: named connections in `rabbit-profiles.json`, passwords in
 //!   the OS credential store.
-//! - [`amqp`] (feature `amqp`, default): moving dead-lettered messages back
+//! - `amqp` (feature `amqp`, default): moving dead-lettered messages back
 //!   to their exchange with manual acks and publisher confirms.
 //! - [`connection`]: a profile with the user's overrides applied, and from
 //!   it the login, the management client and the AMQP target.

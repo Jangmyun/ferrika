@@ -1085,7 +1085,7 @@ fn format_message_display_ext(
     )
 }
 
-/// [`format_message_display_ext`] with a payload already decoded through the
+/// `format_message_display_ext` with a payload already decoded through the
 /// Schema Registry, shown in place of the raw wire-format body.
 fn format_message(
     msg: &ConsumedMessage,
@@ -1205,7 +1205,7 @@ fn format_message(
     out
 }
 
-/// [`format_message_display_ext`] without decoding or hex.
+/// `format_message_display_ext` without decoding or hex.
 #[cfg(test)]
 fn format_message_display(msg: &ConsumedMessage, pretty_json: bool, show_headers: bool) -> String {
     format_message_display_ext(msg, pretty_json, show_headers, false, false)

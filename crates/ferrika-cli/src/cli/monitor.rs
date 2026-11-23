@@ -529,7 +529,7 @@ fn render_lag_table(lags: &[PartitionLag]) -> String {
 
 use crate::model::format::format_age;
 
-/// [`render_lag_table`] with a BEHIND column: the age of the first
+/// `render_lag_table` with a BEHIND column: the age of the first
 /// unconsumed record per partition, where known.
 pub fn render_lag_table_with(
     lags: &[PartitionLag],

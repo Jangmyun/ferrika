@@ -528,7 +528,7 @@ impl WriteGuard {
         })
     }
 
-    /// [`Self::authorize`] with the brokers learned from cluster metadata
+    /// `authorize` with the brokers learned from cluster metadata
     /// added to the bootstrap list the policy checks.
     pub(super) fn authorize_with(
         &self,
