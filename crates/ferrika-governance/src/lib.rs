@@ -6,6 +6,7 @@
 pub mod audit;
 pub mod audit_anchor;
 pub mod audit_forward;
+mod file_security;
 pub mod policy;
 mod policy_dir_perm;
 // `test-util` is for tests: test_policy builds policies that claim to be

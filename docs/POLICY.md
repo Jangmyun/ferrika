@@ -469,16 +469,20 @@ does not trust what it finds there:
 - A new spool file gets an unpredictable name (`.<16 random hex digits>.jsonl`)
   and is created with create-new semantics, so an existing file or link is
   never opened by mistake. On Unix it is created `0600`; on Windows it gets
-  the folder's inherited ACL (with the `-SpoolDir` folder of
-  `Install-FerrikaPolicy.ps1`: the creator may modify it, other users only
-  read it; a folder under the user profile is the user's own).
+  the folder's inherited ACL, which the folder check below has vetted (with
+  the `-SpoolDir` folder of `Install-FerrikaPolicy.ps1`: the creator may
+  modify it, other users only read it).
 - Ferrika keeps appending to the newest of its own files
   (`ferrika-audit-<host>-<user>.<random>.jsonl`) only when it passes these
   checks: not a symbolic link, junction or other non-regular file (opened
   without following links), and owned by the current account (Windows: the
   account, or the default owner of its new objects, e.g. Administrators for
   an elevated process). On Unix it must also not be writable by group or
-  others and have a single hard link. A file that fails is left alone (not
+  others and have a single hard link. On Windows its DACL must give no
+  other account than this one, SYSTEM and Administrators a right to write,
+  append, delete or change permissions or owner; deny entries are taken
+  into account in order, and entries inherited from the folder count like
+  explicit ones. A file that fails is left alone (not
   deleted), a warning names it (`audit forwarding: skipping spool file …`),
   and the entry goes to a new file.
 - Ferrika creates a missing spool folder owner-only (`0700`) on Unix. An
@@ -487,6 +491,22 @@ does not trust what it finds there:
   (`1777` / `1733`, like `/tmp`: no one can rename or delete another
   account's files). Otherwise forwarding to it fails with a clear error
   (`spool folder … may be written by group or others`).
+- On Windows, Ferrika creates a missing spool folder with a protected DACL
+  (full access for the current account, SYSTEM and Administrators only,
+  nothing inherited from the parent). An existing folder must be owned by
+  the current account, Administrators, SYSTEM or TrustedInstaller, and its
+  DACL may let other accounts only add files and subfolders (like the
+  sticky bit; the `-SpoolDir` folder of `Install-FerrikaPolicy.ps1` is
+  such a folder): no other account may delete files in it, delete it,
+  change its permissions or owner, or get write access to the files created
+  in it through an inheritable entry. A folder under `C:\ProgramData` that
+  still inherits its parent's ACL, or one granted to `Users` with
+  `icacls <dir> /grant *S-1-5-32-545:(OI)(CI)W`, is refused
+  (`spool folder … may be changed by other accounts (S-1-5-32-545 …)`).
+  Remove the extra entries (`icacls <dir> /remove:g *S-1-5-32-545`) or use
+  a folder only this account can change. Some tools (sandboxes, CI images)
+  grant their own accounts write access to `%TEMP%`; a spool folder there
+  is then refused for the same reason.
 - Files are `0600`, so on Unix the log collector has to run as root or as
   the same account. The files written by Ferrika 0.2.0 and earlier
   (`ferrika-audit-<host>-<user>.jsonl`, no random part) are no longer
