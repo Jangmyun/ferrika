@@ -4,7 +4,7 @@ use clap::{Args, Subcommand};
 use colored::Colorize;
 use comfy_table::{Cell, CellAlignment, Color};
 
-use crate::cli::{output, GlobalOpts};
+use crate::cli::{output, GlobalOpts, OutputFormat};
 use crate::codec::pii::{ellipsize, mask_bytes, MaskStrategy};
 use crate::error::KafkaResult;
 use crate::kafka::bounded_read::{read_topic, BoundedReadOptions};
@@ -332,6 +332,16 @@ async fn run_analyze(args: CompactAnalyzeArgs, global: &GlobalOpts) -> KafkaResu
     Ok(())
 }
 
+/// `compact snapshot` under `-f json`: where the snapshot went and how
+/// many keys it holds.
+fn snapshot_json(topic: &str, path: &std::path::Path, keys: usize) -> serde_json::Value {
+    serde_json::json!({
+        "topic": topic,
+        "output": path.display().to_string(),
+        "keys": keys,
+    })
+}
+
 /// Handles `ferrika compact snapshot`
 async fn run_snapshot(args: CompactSnapshotArgs, global: &GlobalOpts) -> KafkaResult<()> {
     let mut kafka_config = global.to_kafka_config();
@@ -360,6 +370,13 @@ async fn run_snapshot(args: CompactSnapshotArgs, global: &GlobalOpts) -> KafkaRe
         .collect();
     write_snapshot(&args.output, &snapshot, &values, mask)?;
     crate::cli::export_finished(snapshot.entries.len() as u64);
+    if global.format == OutputFormat::Json {
+        return output::print_json(&snapshot_json(
+            &args.topic,
+            &args.output,
+            snapshot.entries.len(),
+        ));
+    }
 
     println!(
         "\n{} Compacted state snapshot with {} deduplicated keys saved to: {}",
@@ -517,6 +534,14 @@ async fn run_tombstones(args: CompactTombstonesArgs, global: &GlobalOpts) -> Kaf
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn snapshot_json_names_the_file_and_key_count() {
+        let v = super::snapshot_json("orders", std::path::Path::new("snap.json"), 3);
+        assert_eq!(v["topic"], "orders");
+        assert_eq!(v["output"], "snap.json");
+        assert_eq!(v["keys"], 3);
+    }
+
     use super::*;
 
     #[test]

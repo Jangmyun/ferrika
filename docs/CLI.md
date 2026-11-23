@@ -7,6 +7,24 @@ global options `-p/--profile`, `-b/--bootstrap-servers`, `-f/--format` and
 their own flags (`consume -b` reads from the beginning, `consume -p` picks a
 partition).
 
+### JSON output
+
+With `-f json` (`--format json`) every command prints one JSON document on
+stdout, also after a change (`topics delete`, `connect pause`, `profile use`,
+`schema register`, ...), and writes notes, progress and errors to stderr.
+A failed command prints its error on stderr and exits non-zero. Exceptions:
+
+| Command | Under `-f json` |
+| --- | --- |
+| `consume` | JSON Lines: one object per record |
+| `transform` | a dry run streams the preview records as JSON Lines (summary on stderr); `--execute` prints one summary |
+| `health --watch` | JSON Lines: one object per finding that appears or clears (`time`, `event`, `severity`, `message`, `target`) |
+| `monitor lag/brokers --watch` | refused: `--watch` redraws a terminal view; run without it for one snapshot |
+| `monitor export` | prints its URLs as one JSON object, then serves Prometheus metrics |
+| `crypto mask` | the masked records themselves, one per line |
+| `mcp` | stdout carries the MCP protocol |
+| `completions` | a shell script |
+
 ## Commands
 
 ### 1. Multi-Cluster Profiles (`ferrika profile`)
@@ -735,6 +753,22 @@ ferrika schema check orders-value -f ./candidate-schema.avsc --fail-on-incompati
 
 # What-if under another mode, evaluated locally field by field (Avro and JSON)
 ferrika schema check orders-value -f ./candidate-schema.avsc -m full_transitive
+
+# Register a schema that uses others: --reference NAME=SUBJECT:VERSION, repeatable.
+# NAME is the Avro named type, the Protobuf import path or the JSON Schema $ref;
+# VERSION is a number or `latest` (resolved to the current number before sending)
+ferrika schema register money-value -f ./money.avsc
+ferrika schema register orders-value -f ./order.avsc \
+  --reference com.acme.Money=money-value:latest
+ferrika schema register orders-proto-value -t PROTOBUF -f ./order.proto \
+  --reference common/money.proto=money-proto-value:1
+
+# Check a candidate with references: the registry resolves them and decides.
+# The local field-level comparison is skipped when the candidate or the latest
+# version has references (it cannot follow them), and -m is refused with --reference
+ferrika schema check orders-value -f ./order-v2.avsc --reference com.acme.Money=money-value:latest
+
+# `schema get` and `schema subject` show a schema's references (table and JSON)
 
 # Offline diff and evolutionary compatibility analysis between two local schema files
 ferrika schema diff-schema ./schemas/order-v1.avsc ./schemas/order-v2.avsc -m full

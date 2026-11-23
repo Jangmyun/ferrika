@@ -243,17 +243,37 @@ impl ProgressTracker {
     }
 }
 
+/// One line of `health --watch` under `-f json`: a finding that appeared
+/// or cleared at `time`.
+fn watch_event(time: &str, event: &str, issue: &HealthIssue) -> serde_json::Value {
+    serde_json::json!({
+        "time": time,
+        "event": event,
+        "severity": issue.severity,
+        "message": issue.message,
+        "target": issue.target,
+    })
+}
+
 async fn watch(args: &HealthArgs, global: &GlobalOpts, every: Duration) -> KafkaResult<()> {
     let cluster = cluster_name(global);
     let mut progress = ProgressTracker::default();
     let mut before: BTreeMap<String, HealthIssue> = BTreeMap::new();
     // The findings as the webhook last reported them.
     let mut notified: BTreeMap<String, HealthIssue> = BTreeMap::new();
-    println!(
+    let json = global.format == OutputFormat::Json;
+    // Under -f json stdout is JSON Lines (one change per line), so the
+    // banner goes to stderr.
+    let banner = format!(
         "Watching {} every {}s (Ctrl+C to stop)…",
         cluster.cyan(),
         every.as_secs()
     );
+    if json {
+        eprintln!("{banner}");
+    } else {
+        println!("{banner}");
+    }
     loop {
         let polled = snapshot(global).await.map(|mut data| {
             progress.apply(&mut data, crate::kafka::clock::now_ms());
@@ -281,10 +301,20 @@ async fn watch(args: &HealthArgs, global: &GlobalOpts, every: Duration) -> Kafka
         };
         let (appeared, cleared) = diff_findings(&before, &now);
         let stamp = jiff::ZonedDateTime::now().strftime("%Y-%m-%d %H:%M:%S");
-        for issue in &appeared {
+        if json {
+            let time = stamp.to_string();
+            for (event, issues) in [("appeared", &appeared), ("cleared", &cleared)] {
+                for issue in issues.iter() {
+                    let line = serde_json::to_string(&watch_event(&time, event, issue))
+                        .map_err(|e| KafkaError::Serialization(e.to_string()))?;
+                    println!("{line}");
+                }
+            }
+        }
+        for issue in appeared.iter().filter(|_| !json) {
             println!("{stamp} {} {}", severity_tag(issue.severity), issue.message);
         }
-        for issue in &cleared {
+        for issue in cleared.iter().filter(|_| !json) {
             println!("{stamp} {} {}", "CLEARED ".green().bold(), issue.message);
         }
         if let Some(url) = &args.webhook {
@@ -398,6 +428,22 @@ pub(crate) async fn snapshot(global: &GlobalOpts) -> KafkaResult<ClusterSnapshot
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watch_events_are_one_json_object_per_change() {
+        let issue = HealthIssue {
+            severity: Severity::Critical,
+            message: "Broker 2 is offline".into(),
+            target: None,
+        };
+        let event = watch_event("2026-11-23 10:00:00", "appeared", &issue);
+        assert_eq!(event["event"], "appeared");
+        assert_eq!(event["severity"], "Critical");
+        assert_eq!(event["message"], "Broker 2 is offline");
+        assert!(event["target"].is_null());
+        // One line: JSON Lines for scripts that follow the watch.
+        assert!(!serde_json::to_string(&event).unwrap().contains('\n'));
+    }
 
     #[test]
     fn watch_judges_progress_over_a_minute_and_keeps_the_verdict_between() {

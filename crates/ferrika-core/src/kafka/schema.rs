@@ -7,7 +7,7 @@ use crate::codec::schema::{
     DecodedPayload, SchemaDefinition,
 };
 use crate::error::{KafkaError, KafkaResult};
-use crate::model::schema::SchemaRef;
+use crate::model::schema::{SchemaRef, SchemaReference};
 
 /// Asynchronous Schema Registry REST API client with thread-safe memory caching.
 #[derive(Clone)]
@@ -198,18 +198,8 @@ impl SchemaRegistryClient {
         schema: &str,
         schema_type: &str,
     ) -> KafkaResult<bool> {
-        let body = schema_body(schema, schema_type);
-        let response = self
-            .http(
-                "POST",
-                &format!("/compatibility/subjects/{}/versions", path_segment(subject)),
-                Some(&body),
-            )
-            .await?;
-        serde_json::from_str::<serde_json::Value>(&response)
-            .ok()
-            .and_then(|v| v.get("is_compatible").and_then(|b| b.as_bool()))
-            .ok_or_else(|| KafkaError::schema("Unexpected compatibility check response"))
+        self.check_compatibility(subject, schema, schema_type, &[], true)
+            .await
     }
 
     /// Whether `schema` could be registered under `subject` (checked against
@@ -220,21 +210,66 @@ impl SchemaRegistryClient {
         schema: &str,
         schema_type: &str,
     ) -> KafkaResult<bool> {
-        let body = schema_body(schema, schema_type);
-        let response = self
-            .http(
-                "POST",
-                &format!(
-                    "/compatibility/subjects/{}/versions/latest",
-                    path_segment(subject)
-                ),
-                Some(&body),
+        self.check_compatibility(subject, schema, schema_type, &[], false)
+            .await
+    }
+
+    /// Asks the registry whether `schema` with its `references` could be
+    /// registered under `subject`: against every version when
+    /// `all_versions` (`POST /compatibility/subjects/{s}/versions`, as
+    /// registering checks a `*_TRANSITIVE` level), else against the latest
+    /// (`.../versions/latest`). References should name numbered versions
+    /// (see [`Self::resolve_reference_versions`]).
+    pub async fn check_compatibility(
+        &self,
+        subject: &str,
+        schema: &str,
+        schema_type: &str,
+        references: &[SchemaReference],
+        all_versions: bool,
+    ) -> KafkaResult<bool> {
+        let body = schema_body(schema, schema_type, references);
+        let path = if all_versions {
+            format!("/compatibility/subjects/{}/versions", path_segment(subject))
+        } else {
+            format!(
+                "/compatibility/subjects/{}/versions/latest",
+                path_segment(subject)
             )
-            .await?;
+        };
+        let response = self.http("POST", &path, Some(&body)).await?;
         serde_json::from_str::<serde_json::Value>(&response)
             .ok()
             .and_then(|v| v.get("is_compatible").and_then(|b| b.as_bool()))
             .ok_or_else(|| KafkaError::schema("Unexpected compatibility check response"))
+    }
+
+    /// Replaces every `latest` version (`-1`) in `references` with the
+    /// referenced subject's current latest version number, so what is sent
+    /// names a fixed version. Fails when a referenced subject is missing.
+    pub async fn resolve_reference_versions(
+        &self,
+        references: &mut [SchemaReference],
+    ) -> KafkaResult<()> {
+        for reference in references.iter_mut().filter(|r| r.is_latest()) {
+            let path = format!(
+                "/subjects/{}/versions/latest",
+                path_segment(&reference.subject)
+            );
+            let body = self.http_get(&path).await.map_err(|e| {
+                KafkaError::schema(format!(
+                    "Reference '{}': cannot read the latest version of '{}': {e}",
+                    reference.name, reference.subject
+                ))
+            })?;
+            reference.version = latest_version_number(&body).ok_or_else(|| {
+                KafkaError::schema(format!(
+                    "Reference '{}': the registry gave no version for '{}'",
+                    reference.name, reference.subject
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     /// Registers `schema` as a new version of `subject`; returns its id.
@@ -244,7 +279,21 @@ impl SchemaRegistryClient {
         schema: &str,
         schema_type: &str,
     ) -> KafkaResult<u32> {
-        let body = schema_body(schema, schema_type);
+        self.register_with_references(subject, schema, schema_type, &[])
+            .await
+    }
+
+    /// Registers `schema` with its `references` (numbered versions; see
+    /// [`Self::resolve_reference_versions`]) as a new version of
+    /// `subject`; returns its id.
+    pub async fn register_with_references(
+        &self,
+        subject: &str,
+        schema: &str,
+        schema_type: &str,
+        references: &[SchemaReference],
+    ) -> KafkaResult<u32> {
+        let body = schema_body(schema, schema_type, references);
         let response = self
             .http(
                 "POST",
@@ -471,22 +520,17 @@ fn registry_error(response: &crate::kafka::http::Response) -> KafkaError {
 /// Request body registering `def` again: its text, its type (AVRO left out,
 /// as in [`schema_body`]) and its references.
 fn definition_body(def: &SchemaDefinition) -> String {
-    let mut body = serde_json::json!({ "schema": def.schema });
-    if !def.schema_type.eq_ignore_ascii_case("AVRO") && !def.schema_type.is_empty() {
-        body["schemaType"] = def.schema_type.to_uppercase().into();
-    }
-    if !def.references.is_empty() {
-        body["references"] = serde_json::json!(def
-            .references
-            .iter()
-            .map(|r| serde_json::json!({
-                "name": r.name,
-                "subject": r.subject,
-                "version": r.version,
-            }))
-            .collect::<Vec<_>>());
-    }
-    body.to_string()
+    schema_body(&def.schema, &def.schema_type, &def.references)
+}
+
+/// The `version` of a `GET /subjects/{s}/versions/latest` response.
+fn latest_version_number(body: &str) -> Option<i32> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("version")?
+        .as_i64()
+        .and_then(|v| i32::try_from(v).ok())
+        .filter(|v| *v > 0)
 }
 
 /// Percent-encodes a subject for use as one URL path segment (subjects
@@ -507,14 +551,24 @@ pub(crate) fn path_segment(text: &str) -> String {
 }
 
 /// Request body for registering or checking a schema. AVRO is the
-/// registry's default type and is left out.
-fn schema_body(schema: &str, schema_type: &str) -> String {
-    if schema_type.eq_ignore_ascii_case("AVRO") || schema_type.is_empty() {
-        serde_json::json!({ "schema": schema }).to_string()
-    } else {
-        serde_json::json!({ "schema": schema, "schemaType": schema_type.to_uppercase() })
-            .to_string()
+/// registry's default type and is left out. `references` are written as the
+/// API defines them (`[{name, subject, version}]`) and left out when empty.
+fn schema_body(schema: &str, schema_type: &str, references: &[SchemaReference]) -> String {
+    let mut body = serde_json::json!({ "schema": schema });
+    if !schema_type.eq_ignore_ascii_case("AVRO") && !schema_type.is_empty() {
+        body["schemaType"] = schema_type.to_uppercase().into();
     }
+    if !references.is_empty() {
+        body["references"] = serde_json::json!(references
+            .iter()
+            .map(|r| serde_json::json!({
+                "name": r.name,
+                "subject": r.subject,
+                "version": r.version,
+            }))
+            .collect::<Vec<_>>());
+    }
+    body.to_string()
 }
 
 impl SchemaRegistryClient {
@@ -711,7 +765,6 @@ impl PayloadDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::schema::SchemaReference;
 
     /// A Schema Registry stand-in answering GETs from `routes` (path, body).
     async fn mock_registry(routes: Vec<(&'static str, String)>) -> String {
@@ -855,6 +908,50 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&definition_body(&avro)).unwrap();
         assert!(body.get("schemaType").is_none());
         assert!(body.get("references").is_none());
+    }
+
+    #[test]
+    fn schema_bodies_carry_references_as_the_api_writes_them() {
+        let refs = vec![SchemaReference {
+            name: "com.acme.Money".into(),
+            subject: "money".into(),
+            version: 4,
+        }];
+        let body: serde_json::Value =
+            serde_json::from_str(&schema_body("{}", "AVRO", &refs)).unwrap();
+        assert!(body.get("schemaType").is_none());
+        assert_eq!(
+            body["references"],
+            serde_json::json!([{"name": "com.acme.Money", "subject": "money", "version": 4}])
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(&schema_body("syntax = \"proto3\";", "protobuf", &[])).unwrap();
+        assert_eq!(body["schemaType"], "PROTOBUF");
+        assert!(body.get("references").is_none());
+    }
+
+    #[tokio::test]
+    async fn latest_references_resolve_to_a_number() {
+        let url = mock_registry(vec![(
+            "/subjects/money/versions/latest",
+            serde_json::json!({"subject": "money", "version": 3, "id": 11, "schema": "{}"})
+                .to_string(),
+        )])
+        .await;
+        let client = SchemaRegistryClient::new(url);
+        let mut refs = vec![
+            SchemaReference::parse_spec("m.json=money:latest").unwrap(),
+            SchemaReference::parse_spec("n.json=money:1").unwrap(),
+        ];
+        client.resolve_reference_versions(&mut refs).await.unwrap();
+        assert_eq!((refs[0].version, refs[1].version), (3, 1));
+        let mut missing = vec![SchemaReference::parse_spec("x=nope:latest").unwrap()];
+        let err = client
+            .resolve_reference_versions(&mut missing)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope"), "{err}");
     }
 
     #[tokio::test]

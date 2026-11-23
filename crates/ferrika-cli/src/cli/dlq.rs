@@ -4,7 +4,7 @@ use std::time::Duration;
 use clap::{Args, Subcommand};
 use comfy_table::{Cell, CellAlignment, Color};
 
-use crate::cli::{output, GlobalOpts};
+use crate::cli::{output, GlobalOpts, OutputFormat};
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::bounded_read::{
     read_ranges, read_topic, topic_watermarks, BoundedReadOptions, PartitionRange, TopicMarks,
@@ -742,6 +742,15 @@ async fn publish_redrive(
     Ok(outcome)
 }
 
+/// `dlq export` under `-f json`: the topic, the file and the record count.
+fn export_json(topic: &str, path: &std::path::Path, records: usize) -> serde_json::Value {
+    serde_json::json!({
+        "topic": topic,
+        "output": path.display().to_string(),
+        "records": records,
+    })
+}
+
 async fn run_export(args: ExportDlqArgs, global: &GlobalOpts) -> KafkaResult<()> {
     let messages = sample_dlq_messages(&args.topic, None, args.limit, global).await?;
     let policy = crate::governance::policy::current();
@@ -769,6 +778,9 @@ async fn run_export(args: ExportDlqArgs, global: &GlobalOpts) -> KafkaResult<()>
         ))
     })?;
     crate::cli::export_finished(messages.len() as u64);
+    if global.format == OutputFormat::Json {
+        return output::print_json(&export_json(&args.topic, &args.output, messages.len()));
+    }
 
     println!(
         "✅ Exported {} DLQ records with failure diagnostics to '{}'\n",
@@ -849,6 +861,14 @@ fn shown(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn export_json_names_the_file_and_count() {
+        let v = super::export_json("orders.dlq", std::path::Path::new("out.json"), 4);
+        assert_eq!(v["topic"], "orders.dlq");
+        assert_eq!(v["output"], "out.json");
+        assert_eq!(v["records"], 4);
+    }
+
     use super::*;
     use clap::Parser;
 

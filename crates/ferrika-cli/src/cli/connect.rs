@@ -119,6 +119,13 @@ pub async fn run(args: ConnectArgs, global: &GlobalOpts) -> KafkaResult<()> {
             let result = client.put_config(&name, &config).await;
             record::finish(pending, &result, &format!("Applied the config of {name}"));
             result?;
+            if global.format == OutputFormat::Json {
+                return output::print_json(&serde_json::json!({
+                    "connector": name,
+                    "action": "apply",
+                    "applied": true,
+                }));
+            }
             println!(
                 "{} Applied the config of '{}'.",
                 "✔".green().bold(),
@@ -150,12 +157,22 @@ pub async fn run(args: ConnectArgs, global: &GlobalOpts) -> KafkaResult<()> {
                 .map_err(|e| KafkaError::File(format!("Cannot read '{file}': {e}")))?;
             let (_, config) = crate::kafka::connect::parse_config_json(&text)?;
             let problems = client.validate(&config).await?;
-            if problems.is_empty() {
+            if global.format == OutputFormat::Json {
+                output::print_json(&serde_json::json!({
+                    "valid": problems.is_empty(),
+                    "problems": problems,
+                }))?;
+                if problems.is_empty() {
+                    return Ok(());
+                }
+            } else if problems.is_empty() {
                 println!("{} The config is valid.", "✔".green().bold());
                 return Ok(());
             }
-            for p in &problems {
-                eprintln!("{} {p}", "✖".red());
+            if global.format != OutputFormat::Json {
+                for p in &problems {
+                    eprintln!("{} {p}", "✖".red());
+                }
             }
             return Err(KafkaError::Check(format!(
                 "{} problem(s) in the connector config",
@@ -188,6 +205,13 @@ pub async fn run(args: ConnectArgs, global: &GlobalOpts) -> KafkaResult<()> {
             let result = client.delete(name).await;
             record::finish(pending, &result, &format!("Deleted connector {name}"));
             result?;
+            if global.format == OutputFormat::Json {
+                return output::print_json(&serde_json::json!({
+                    "connector": name,
+                    "action": "delete",
+                    "deleted": true,
+                }));
+            }
             println!(
                 "{} Deleted connector '{}'.",
                 "✔".green().bold(),
@@ -223,6 +247,9 @@ pub async fn run(args: ConnectArgs, global: &GlobalOpts) -> KafkaResult<()> {
             &format!("{} requested for {name}", action.label()),
         );
         result?;
+        if global.format == OutputFormat::Json {
+            return output::print_json(&action_json(name, action));
+        }
         println!(
             "{} {} requested for '{}'.",
             "✔".green().bold(),
@@ -317,8 +344,43 @@ fn masked(
     connectors
 }
 
+/// A pause, resume or restart under `-f json`: the connector, the action
+/// (`pause`, `resume`, `restart`, `restart-task` with its `task`) and that
+/// it was requested.
+fn action_json(name: &str, action: ConnectorAction) -> serde_json::Value {
+    let (label, task) = match action {
+        ConnectorAction::Pause => ("pause", None),
+        ConnectorAction::Resume => ("resume", None),
+        ConnectorAction::Restart => ("restart", None),
+        ConnectorAction::RestartTask(task) => ("restart-task", Some(task)),
+    };
+    let mut value = serde_json::json!({
+        "connector": name,
+        "action": label,
+        "requested": true,
+    });
+    if let (Some(task), Some(obj)) = (task, value.as_object_mut()) {
+        obj.insert("task".into(), serde_json::json!(task));
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn action_json_names_the_action_and_task() {
+        use crate::kafka::connect::ConnectorAction;
+        let v = super::action_json("sink", ConnectorAction::Pause);
+        assert_eq!(v["action"], "pause");
+        assert!(v.get("task").is_none());
+        let v = super::action_json("sink", ConnectorAction::RestartTask(2));
+        assert_eq!(
+            (v["action"].clone(), v["task"].clone()),
+            ("restart-task".into(), 2.into())
+        );
+        assert_eq!(v["requested"], true);
+    }
+
     use super::*;
 
     #[test]

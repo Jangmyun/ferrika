@@ -68,6 +68,23 @@ The RabbitMQ entries below are planned for 0.2.0.
 
 ### Added
 
+- `schema register` and `schema check` take `--reference NAME=SUBJECT:VERSION`
+  (repeatable) for Avro named types, Protobuf imports and JSON Schema `$ref`s
+  in other subjects, sent as the Schema Registry API's `references`.
+  `VERSION` may be `latest`; it is resolved to the current version number
+  before anything is sent or recorded. `schema check` leaves the local
+  field-level comparison out when the candidate or the latest version has
+  references and gives the registry's verdict (JSON: `local_skipped`,
+  `references`); `-m` (a local comparison) is refused with `--reference`.
+  `schema get` and `schema subject` show references in the table (JSON
+  already had them). Library: `SchemaReference::parse_spec`,
+  `SchemaRegistryClient::register_with_references`, `check_compatibility`
+  and `resolve_reference_versions`.
+- `health --watch` under `-f json` writes JSON Lines, one object per finding
+  that appears or clears; `monitor export` prints its URLs as JSON.
+- A test walks the command tree and fails for a command that is neither
+  known to print JSON under `-f json` nor listed with a reason why not.
+
 - MCP: `transform_preview` (read tool) runs `ferrika transform` steps
   (`[{"filter": ...}, {"drop": ...}, {"mask": "partial"}, ...]`) on a topic
   from the beginning or `from_timestamp` up to its current end and returns
@@ -464,6 +481,17 @@ The RabbitMQ entries below are planned for 0.2.0.
   are now copied byte for byte; only the lines of the operations dropped by
   age or count go (whatever their event kind), and lines that are not JSON
   at all (cut short by a crash). Rotation renames the file as it is.
+- `-f json` is now honoured by every command that printed text or tables
+  regardless: `schema register`, `schema compat`, `schema delete-subject`,
+  `acl create`, `acl delete`, `cluster ping` (without profiles), `compact
+  snapshot`, `connect apply/validate/delete/pause/resume/restart/
+  restart-task`, `dlq export`, `undo`, `lint --fix`, `policy keygen`,
+  `policy sign`, `policy example --out`, `produce` from stdin, `profile
+  add/use/remove/secure/read-only/import`, `quota set/remove`, `reassign
+  execute/verify/rollback`, `topics set-replication`, `user create/delete`
+  and `rabbit profile use/remove`. Each prints one JSON document; notes go
+  to stderr. `monitor --watch` refuses `-f json` instead of mixing a
+  redrawn screen into it. See "JSON output" in docs/CLI.md.
 
 - Watermark lookups (`topics describe` and `list` message counts,
   `consume`, `monitor`, `undo` of a topic creation, and the other users of

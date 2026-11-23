@@ -233,6 +233,8 @@ impl std::fmt::Debug for OAuthArgs {
 /// Executes the profile command with the provided global options.
 pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
     let mut store = ProfileStore::load().map_err(crate::cli::context::with_repair_hint)?;
+    // Changing subcommands print one JSON object instead of their messages.
+    let json = global.format == OutputFormat::Json;
 
     match args.command {
         ProfileSubcommands::List => handle_list(&store, global),
@@ -274,7 +276,9 @@ pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
                 ),
                 None => Vec::new(),
             };
-            handle_add(
+            let name = add_args.name.clone();
+            let set_active = add_args.set_active;
+            let is_new = handle_add(
                 &mut store,
                 add_args.name,
                 add_args.bootstrap_servers,
@@ -292,17 +296,37 @@ pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
                 add_args.connect,
                 add_args.oauth,
             )?;
+            if json {
+                let preset_json = preset.map(|p| {
+                    json!({
+                        "name": p.name(),
+                        "filled": resolved
+                            .filled
+                            .iter()
+                            .map(|(label, value)| json!({ "setting": label, "value": value }))
+                            .collect::<Vec<_>>(),
+                        "notes": preset::cli_notes(p),
+                        "warnings": warnings,
+                    })
+                });
+                let mut value = change_json(&name, if is_new { "created" } else { "updated" });
+                value["active"] = set_active.into();
+                value["preset"] = preset_json.into();
+                output::print_json(&value)?;
+                return Ok(());
+            }
+            print_added(&name, is_new, set_active);
             if let Some(p) = preset {
                 report_preset(p, &resolved.filled, &warnings);
             }
             Ok(())
         }
         ProfileSubcommands::Use { name } => {
-            handle_use(&mut store, &name)?;
+            handle_use(&mut store, &name, json)?;
             Ok(())
         }
         ProfileSubcommands::Remove { name } => {
-            handle_remove(&mut store, &name)?;
+            handle_remove(&mut store, &name, json)?;
             Ok(())
         }
         ProfileSubcommands::Import {
@@ -327,6 +351,14 @@ pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
             );
             store.add(profile, set_active);
             store.save()?;
+            if json {
+                let mut value = change_json(&name, "imported");
+                value["file"] = file.clone().into();
+                value["active"] = set_active.into();
+                value["notes"] = json!(notes);
+                output::print_json(&value)?;
+                return Ok(());
+            }
             println!(
                 "{} Imported profile '{}' from {file}: {summary}",
                 "✔".green().bold(),
@@ -346,6 +378,10 @@ pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
             let path = ProfileStore::default_path();
             let before = ProfileStore::load_from_path(&path)?.plaintext_secret_profiles();
             if before.is_empty() {
+                if json {
+                    output::print_json(&secure_json(&[], &[]))?;
+                    return Ok(());
+                }
                 println!(
                     "{} No passwords are stored in {}.",
                     "✔".green().bold(),
@@ -355,7 +391,15 @@ pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
             }
             store.save()?;
             let left = ProfileStore::load_from_path(&path)?.plaintext_secret_profiles();
-            for name in &before {
+            if json {
+                let moved: Vec<String> = before
+                    .iter()
+                    .filter(|name| !left.contains(*name))
+                    .cloned()
+                    .collect();
+                output::print_json(&secure_json(&moved, &left))?;
+            }
+            for name in before.iter().filter(|_| !json) {
                 if left.contains(name) {
                     println!(
                         "{} {}: could not be stored in the OS credential store (run with FERRIKA_LOG=warn for the reason)",
@@ -382,7 +426,11 @@ pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("Profile '{name}' not found"))?;
             profile.read_only = !off;
             store.save()?;
-            if off {
+            if json {
+                let mut value = change_json(&name, "updated");
+                value["read_only"] = (!off).into();
+                output::print_json(&value)?;
+            } else if off {
                 println!(
                     "{} Profile '{}' allows changes.",
                     "✔".green().bold(),
@@ -843,7 +891,7 @@ fn handle_add(
     schema_registry: Option<String>,
     connect: Option<String>,
     oauth: OAuthArgs,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let protocol = parse_security_protocol(sec_proto)?;
     let (mechanism, oauth_method) = match sasl_mech {
         Some(m) => {
@@ -873,7 +921,11 @@ fn handle_add(
     }
     store.add(profile, set_active);
     store.save()?;
+    Ok(is_new)
+}
 
+/// The messages `profile add` prints after saving a profile.
+fn print_added(name: &str, is_new: bool, set_active: bool) {
     if is_new {
         println!(
             "{} Profile '{}' successfully created.",
@@ -887,12 +939,22 @@ fn handle_add(
             name.cyan().bold()
         );
     }
-
     if set_active {
         println!("  Active profile set to '{}'.", name.cyan());
     }
+}
 
-    Ok(())
+/// The JSON a changing `profile` subcommand prints: the profile and what
+/// happened to it (`created`, `updated`, `imported`, `activated`,
+/// `removed`). Never carries settings or secrets.
+fn change_json(name: &str, result: &str) -> serde_json::Value {
+    json!({ "profile": name, "result": result })
+}
+
+/// The JSON of `profile secure`: profiles whose passwords moved to the OS
+/// credential store, and those still keeping them in the file.
+fn secure_json(moved: &[String], left: &[String]) -> serde_json::Value {
+    json!({ "moved": moved, "still_in_file": left })
 }
 
 /// What replacing `existing` with `new` (same name) keeps and drops.
@@ -976,9 +1038,13 @@ fn report_replaced(name: &str, replaced: &Replaced) {
     }
 }
 
-fn handle_use(store: &mut ProfileStore, name: &str) -> anyhow::Result<()> {
+fn handle_use(store: &mut ProfileStore, name: &str, json: bool) -> anyhow::Result<()> {
     store.set_active(name)?;
     store.save()?;
+    if json {
+        output::print_json(&change_json(name, "activated"))?;
+        return Ok(());
+    }
     println!(
         "{} Switched active cluster profile to '{}'.",
         "✔".green().bold(),
@@ -987,9 +1053,15 @@ fn handle_use(store: &mut ProfileStore, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn handle_remove(store: &mut ProfileStore, name: &str) -> anyhow::Result<()> {
+fn handle_remove(store: &mut ProfileStore, name: &str, json: bool) -> anyhow::Result<()> {
     store.remove(name)?;
     store.save()?;
+    if json {
+        let mut value = change_json(name, "removed");
+        value["active_profile"] = store.active_profile.clone().into();
+        output::print_json(&value)?;
+        return Ok(());
+    }
     println!(
         "{} Profile '{}' removed from configuration.",
         "✔".green().bold(),
@@ -1006,6 +1078,18 @@ fn handle_remove(store: &mut ProfileStore, name: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_change_json_names_the_profile_and_result_only() {
+        assert_eq!(
+            change_json("prod", "removed"),
+            json!({"profile": "prod", "result": "removed"})
+        );
+        assert_eq!(
+            secure_json(&["a".to_string()], &[]),
+            json!({"moved": ["a"], "still_in_file": []})
+        );
+    }
 
     #[test]
     fn profile_list_shows_the_policy_environment() {

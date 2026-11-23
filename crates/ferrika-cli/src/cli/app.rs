@@ -1111,6 +1111,185 @@ fn write_target(command: &Commands) -> String {
 }
 #[cfg(test)]
 mod tests {
+    /// Every command that prints one JSON document on stdout under
+    /// `-f json` (errors go to stderr). A new command must be added here or
+    /// to [`NO_JSON_DOCUMENT`] with a reason; the test below fails until it is.
+    const JSON_OUTPUT: &[&str] = &[
+        "acl audit",
+        "acl create",
+        "acl delete",
+        "acl list",
+        "audit",
+        "audit forward-test",
+        "audit verify",
+        "bench consume",
+        "bench produce",
+        "cluster diff",
+        "cluster ping",
+        "cluster reconcile-plan",
+        "compact analyze",
+        "compact snapshot",
+        "compact tombstones",
+        "connect apply",
+        "connect delete",
+        "connect list",
+        "connect pause",
+        "connect plugins",
+        "connect restart",
+        "connect restart-task",
+        "connect resume",
+        "connect status",
+        "connect validate",
+        "crypto audit",
+        "diff",
+        "dlq export",
+        "dlq inspect",
+        "dlq redrive",
+        "dump",
+        "generate",
+        "health",
+        "history",
+        "history show",
+        "lint",
+        "lint rules",
+        "mirror",
+        "monitor brokers",
+        "monitor lag",
+        "offset delete",
+        "offset delete-group",
+        "offset reset",
+        "policy example",
+        "policy keygen",
+        "policy show",
+        "policy sign",
+        "policy verify",
+        "probe",
+        "produce",
+        "profile add",
+        "profile import",
+        "profile list",
+        "profile read-only",
+        "profile remove",
+        "profile secure",
+        "profile show",
+        "profile use",
+        "quota list",
+        "quota remove",
+        "quota set",
+        "rabbit bindings",
+        "rabbit dlq inspect",
+        "rabbit dlq redrive",
+        "rabbit exchanges",
+        "rabbit peek",
+        "rabbit profile add",
+        "rabbit profile list",
+        "rabbit profile remove",
+        "rabbit profile show",
+        "rabbit profile use",
+        "rabbit publish",
+        "rabbit queues",
+        "reassign execute",
+        "reassign plan",
+        "reassign rollback",
+        "reassign status",
+        "reassign verify",
+        "report",
+        "restore",
+        "schema check",
+        "schema compat",
+        "schema decode",
+        "schema delete-subject",
+        "schema diff-schema",
+        "schema fields",
+        "schema get",
+        "schema list",
+        "schema register",
+        "schema subject",
+        "top",
+        "topics analyze",
+        "topics clone",
+        "topics config",
+        "topics create",
+        "topics delete",
+        "topics describe",
+        "topics elect-leaders",
+        "topics histogram",
+        "topics list",
+        "topics purge",
+        "topics set-replication",
+        "topology",
+        "trace audit",
+        "trace inject",
+        "trace inspect",
+        "undo",
+        "user create",
+        "user delete",
+        "user list",
+    ];
+
+    /// Commands whose stdout is not one JSON document under `-f json`, and why.
+    const NO_JSON_DOCUMENT: &[(&str, &str)] = &[
+        ("completions", "prints a shell completion script"),
+        (
+            "consume",
+            "streams records: -f json writes JSON Lines, one object per record",
+        ),
+        (
+            "crypto mask",
+            "streams the masked records themselves, one per line",
+        ),
+        ("mcp", "an MCP server: stdout carries the protocol"),
+        (
+            "monitor export",
+            "a Prometheus exporter: -f json prints its URLs as JSON once, then serves",
+        ),
+        (
+            "transform",
+            "a dry run streams preview records as JSON Lines; --execute prints one summary",
+        ),
+    ];
+
+    /// The runnable commands: leaves, and commands whose subcommand is optional.
+    fn runnable_commands(command: &clap::Command, path: &mut Vec<String>, out: &mut Vec<String>) {
+        let subcommands: Vec<_> = command
+            .get_subcommands()
+            .filter(|c| c.get_name() != "help")
+            .collect();
+        if !path.is_empty() && (subcommands.is_empty() || !command.is_subcommand_required_set()) {
+            out.push(path.join(" "));
+        }
+        for sub in subcommands {
+            path.push(sub.get_name().to_string());
+            runnable_commands(sub, path, out);
+            path.pop();
+        }
+    }
+
+    #[test]
+    fn every_command_supports_json_or_says_why_not() {
+        let mut commands = Vec::new();
+        runnable_commands(
+            &<super::Cli as clap::CommandFactory>::command(),
+            &mut Vec::new(),
+            &mut commands,
+        );
+        let exempt: Vec<&str> = NO_JSON_DOCUMENT.iter().map(|(c, _)| *c).collect();
+        for command in &commands {
+            let listed = JSON_OUTPUT.contains(&command.as_str()) as u8
+                + exempt.contains(&command.as_str()) as u8;
+            assert_eq!(
+                listed, 1,
+                "'{command}' must be in exactly one of JSON_OUTPUT and NO_JSON_DOCUMENT"
+            );
+        }
+        for listed in JSON_OUTPUT.iter().chain(&exempt) {
+            assert!(
+                commands.iter().any(|c| c == listed),
+                "'{listed}' is listed but is no command"
+            );
+        }
+        assert!(NO_JSON_DOCUMENT.iter().all(|(_, why)| !why.is_empty()));
+    }
     #[test]
     fn env_brokers_with_a_chosen_profile_are_flagged() {
         use super::env_brokers_warning;

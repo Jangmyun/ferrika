@@ -738,6 +738,22 @@ async fn settled_replicas(
     None
 }
 
+/// `topics set-replication -f json`: whether a change was started and,
+/// per partition, the replicas asked for and any error.
+fn set_replication_json(
+    topic: &str,
+    replication: usize,
+    started: bool,
+    partitions: &[serde_json::Value],
+) -> serde_json::Value {
+    json!({
+        "topic": topic,
+        "replication_factor": replication,
+        "started": started,
+        "partitions": partitions,
+    })
+}
+
 async fn handle_set_replication(
     admin: &KafkaAdminClient,
     global: &GlobalOpts,
@@ -745,15 +761,39 @@ async fn handle_set_replication(
     replication: usize,
     yes: bool,
 ) -> anyhow::Result<()> {
+    let json = global.format == OutputFormat::Json;
     let plan = crate::kafka::reassign::plan_replication_change(admin, topic, replication)?;
     if plan.is_empty() {
+        if json {
+            output::print_json(&set_replication_json(topic, replication, false, &[]))?;
+            return Ok(());
+        }
         println!("'{topic}' already has replication factor {replication}.");
         return Ok(());
     }
-    println!("Planned replica changes for '{}':", topic.cyan().bold());
+    // Under JSON the plan still goes to the terminal (stderr), so the
+    // confirmation question can be answered.
+    let say = |line: String| {
+        if json {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    };
+    say(format!(
+        "Planned replica changes for '{}':",
+        topic.cyan().bold()
+    ));
     for a in &plan {
-        println!("  partition {:>3} -> {:?}", a.partition, a.replicas);
+        say(format!(
+            "  partition {:>3} -> {:?}",
+            a.partition, a.replicas
+        ));
     }
+    let planned: Vec<(i32, Vec<i32>)> = plan
+        .iter()
+        .map(|a| (a.partition, a.replicas.clone()))
+        .collect();
     if !yes {
         confirm(
             "Apply? Data is copied to the new replicas in the background. [y/N]: ",
@@ -790,10 +830,15 @@ async fn handle_set_replication(
         Err(e) => (Err(e), false),
     };
     if via_config {
-        println!(
+        let note = format!(
             "  {} This cluster changes replication through the topic's replication.factor; set it to {replication} (the broker places the replicas).",
             "ℹ".cyan()
         );
+        if json {
+            eprintln!("{note}");
+        } else {
+            println!("{note}");
+        }
     }
     let outcome = results
         .as_ref()
@@ -825,6 +870,29 @@ async fn handle_set_replication(
     }
     let results = results?;
     let failed: Vec<_> = results.iter().filter(|r| r.error.is_some()).collect();
+    if json {
+        let rows: Vec<serde_json::Value> = planned
+            .iter()
+            .map(|(partition, replicas)| {
+                let error = results
+                    .iter()
+                    .find(|r| r.partition == *partition)
+                    .and_then(|r| r.error.clone());
+                json!({ "partition": partition, "replicas": replicas, "error": error })
+            })
+            .collect();
+        let mut value = set_replication_json(topic, replication, true, &rows);
+        value["via_replication_factor"] = via_config.into();
+        output::print_json(&value)?;
+        if failed.is_empty() {
+            return Ok(());
+        }
+        return Err(crate::error::KafkaError::Check(format!(
+            "{} partition(s) were not reassigned",
+            failed.len()
+        ))
+        .into());
+    }
     for r in &failed {
         println!(
             "  {} partition {}: {}",
@@ -1610,6 +1678,18 @@ async fn handle_analyze(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn set_replication_json_says_whether_a_change_started() {
+        let none = super::set_replication_json("orders", 3, false, &[]);
+        assert_eq!(none["started"], false);
+        assert_eq!(none["replication_factor"], 3);
+        assert_eq!(none["partitions"], serde_json::json!([]));
+        let row = serde_json::json!({"partition": 0, "replicas": [1, 2, 3], "error": null});
+        let started = super::set_replication_json("orders", 3, true, &[row]);
+        assert_eq!(started["topic"], "orders");
+        assert_eq!(started["partitions"][0]["replicas"][2], 3);
+    }
+
     #[test]
     fn election_with_refused_partitions_is_recorded_as_failed() {
         use super::election_result;

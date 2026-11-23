@@ -152,6 +152,9 @@ pub fn run(args: UserArgs, global: &GlobalOpts) -> KafkaResult<()> {
                 &format!("Set the {} credential of {name}", hash.mechanism()),
             );
             result?;
+            if global.format == OutputFormat::Json {
+                return output::print_json(&credential_json(&name, hash, "set"));
+            }
             println!(
                 "{} Set the {} credential of '{}'",
                 "✔".green().bold(),
@@ -180,6 +183,9 @@ pub fn run(args: UserArgs, global: &GlobalOpts) -> KafkaResult<()> {
                 &format!("Deleted the {} credential of {name}", hash.mechanism()),
             );
             result?;
+            if global.format == OutputFormat::Json {
+                return output::print_json(&credential_json(&name, hash, "deleted"));
+            }
             println!(
                 "{} Deleted the {} credential of '{}'",
                 "✔".green().bold(),
@@ -189,6 +195,16 @@ pub fn run(args: UserArgs, global: &GlobalOpts) -> KafkaResult<()> {
             Ok(())
         }
     }
+}
+
+/// `user create|delete -f json`: the user, the mechanism and what was
+/// done (`set` or `deleted`). Never the password.
+fn credential_json(user: &str, hash: ScramHash, action: &str) -> serde_json::Value {
+    serde_json::json!({
+        "user": user,
+        "mechanism": hash.mechanism(),
+        "action": action,
+    })
 }
 
 /// The record of setting `user`'s credential: undoable (by deleting it)
@@ -233,6 +249,16 @@ fn credential_change(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn credential_json_names_user_and_mechanism_only() {
+        let hash = mechanism("SCRAM-SHA-512").unwrap();
+        let value = credential_json("alice", hash, "set");
+        assert_eq!(value["user"], "alice");
+        assert_eq!(value["mechanism"], hash.mechanism());
+        assert_eq!(value["action"], "set");
+        assert_eq!(value.as_object().unwrap().len(), 3);
+    }
 
     #[derive(Parser)]
     struct TestCli {
