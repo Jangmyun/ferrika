@@ -90,6 +90,18 @@ for example on a headless Linux host without a Secret Service. Existing
 plain-text passwords move to the store the next time the profiles are saved,
 or at once with `ferrika profile secure`.
 
+Entries are per config directory: under the service `ferrika`, a profile in
+the default directory (`~/.ferrika`) uses the account `<profile>/<field>`
+(upper-case letters marked with `^`, so `Prod` is `^prod`), and a profile in
+another directory (`FERRIKA_CONFIG_DIR`, or the folder of
+`FERRIKA_CONFIG_PATH`) uses `<profile>/<field>@<hash>`, where `<hash>` is the
+first 16 hex digits of the SHA-256 of the directory's absolute, canonical
+path (on Windows without the `\\?\` prefix, with `\` separators, in lower case). So a
+test directory with a `prod` profile never overwrites the password of `prod`
+in `~/.ferrika`. When a profile in another directory has no entry of its own
+yet (saved by Ferrika 0.2.0 or earlier), Ferrika reads `<profile>/<field>`
+once and copies it to the directory's own account; the old entry stays.
+
 ### Health checks (`ferrika health`)
 
 The cluster health checks, for scripts and CI:
@@ -514,7 +526,9 @@ refuses to run on another cluster than the recorded one (the same cluster
 id when one was recorded). A failed undo of several steps is not rolled
 back; its message lists the steps it applied and the ones it did not run.
 The journal is rotated to `history.jsonl.1` once it grows past 1 MiB of
-recent operations; both files are read. Details:
+recent operations; both files are read. Trimming copies the lines it keeps
+byte for byte, so a journal shared with a newer Ferrika keeps the event
+kinds and fields this version does not know. Details:
 [POLICY.md](POLICY.md#history-digests).
 
 ### 2. Topic Management (`ferrika topics`)
