@@ -440,7 +440,7 @@ impl ProfileStore {
     /// `%USERPROFILE%\.ferrika` on Windows, `$HOME/.ferrika` elsewhere,
     /// `.ferrika` when there is no home directory. Credential store entries
     /// of profiles in this directory keep their account names without a
-    /// directory suffix (see [`secrets`](crate::kafka::secrets)).
+    /// directory suffix (see [`secrets`]).
     pub fn home_config_dir() -> PathBuf {
         #[cfg(target_os = "windows")]
         let home = std::env::var("USERPROFILE")
