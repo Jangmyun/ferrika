@@ -14,6 +14,8 @@ categories = ["development-tools", "network-programming"]
 [dependencies]
 ferrika-core.workspace = true
 ferrika-governance.workspace = true
+# RabbitMQ history and undo (management API only, no AMQP client).
+ferrika-rabbitmq.workspace = true
 rdkafka.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -24,3 +26,4 @@ ring.workspace = true
 
 [dev-dependencies]
 ferrika-governance = { path = "../ferrika-governance", features = ["test-util"] }
+ferrika-rabbitmq = { path = "../ferrika-rabbitmq", default-features = false, features = ["test-util"] }

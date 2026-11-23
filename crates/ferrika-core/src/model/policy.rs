@@ -802,10 +802,22 @@ pub enum PolicyAction {
     /// Moving messages between queues, e.g. redriving dead-lettered
     /// RabbitMQ messages to their original exchange.
     MessagesMove,
+    /// Declaring a RabbitMQ queue.
+    QueuesCreate,
+    /// Deleting a RabbitMQ queue (its messages are lost).
+    QueuesDelete,
+    /// Deleting every message of a RabbitMQ queue, keeping the queue.
+    QueuesPurge,
+    /// Declaring a RabbitMQ exchange.
+    ExchangesCreate,
+    /// Deleting a RabbitMQ exchange (its bindings go with it).
+    ExchangesDelete,
+    /// Adding or removing a RabbitMQ binding.
+    BindingsChange,
 }
 
 impl PolicyAction {
-    pub const ALL: [PolicyAction; 16] = [
+    pub const ALL: [PolicyAction; 22] = [
         Self::TopicsCreate,
         Self::TopicsDelete,
         Self::TopicsPurge,
@@ -822,6 +834,12 @@ impl PolicyAction {
         Self::ConnectChange,
         Self::MessagesPeek,
         Self::MessagesMove,
+        Self::QueuesCreate,
+        Self::QueuesDelete,
+        Self::QueuesPurge,
+        Self::ExchangesCreate,
+        Self::ExchangesDelete,
+        Self::BindingsChange,
     ];
 
     /// The name used in a policy's `forbid` list.
@@ -843,6 +861,12 @@ impl PolicyAction {
             Self::ConnectChange => "connect.change",
             Self::MessagesPeek => "messages.peek",
             Self::MessagesMove => "messages.move",
+            Self::QueuesCreate => "queues.create",
+            Self::QueuesDelete => "queues.delete",
+            Self::QueuesPurge => "queues.purge",
+            Self::ExchangesCreate => "exchanges.create",
+            Self::ExchangesDelete => "exchanges.delete",
+            Self::BindingsChange => "bindings.change",
         }
     }
 
@@ -873,7 +897,13 @@ impl PolicyAction {
             | Self::QuotaChange
             | Self::SchemaChange
             | Self::ConnectChange
-            | Self::MessagesPeek => &[],
+            | Self::MessagesPeek
+            | Self::QueuesCreate
+            | Self::QueuesDelete
+            | Self::QueuesPurge
+            | Self::ExchangesCreate
+            | Self::ExchangesDelete
+            | Self::BindingsChange => &[],
         }
     }
 
@@ -895,6 +925,13 @@ impl PolicyAction {
             // the same way.
             "rabbit peek" | "rabbit dlq inspect" | "rabbit dlq redrive" => Self::MessagesPeek,
             "rabbit dlq redrive --execute" => Self::MessagesMove,
+            // RabbitMQ topology.
+            "rabbit queue declare" => Self::QueuesCreate,
+            "rabbit queue delete" => Self::QueuesDelete,
+            "rabbit queue purge" => Self::QueuesPurge,
+            "rabbit exchange declare" => Self::ExchangesCreate,
+            "rabbit exchange delete" => Self::ExchangesDelete,
+            "rabbit bind" | "rabbit unbind" => Self::BindingsChange,
             _ => match head {
                 "topics" | "reassign" => Self::TopicsAlter,
                 "produce" | "generate" | "mirror" | "transform" | "restore" | "probe" | "bench"
@@ -979,6 +1016,17 @@ mod tests {
             PolicyAction::from_cli("rabbit dlq redrive --execute"),
             PolicyAction::MessagesMove
         );
+        for (action, category) in [
+            ("rabbit queue declare", "queues.create"),
+            ("rabbit queue delete", "queues.delete"),
+            ("rabbit queue purge", "queues.purge"),
+            ("rabbit exchange declare", "exchanges.create"),
+            ("rabbit exchange delete", "exchanges.delete"),
+            ("rabbit bind", "bindings.change"),
+            ("rabbit unbind", "bindings.change"),
+        ] {
+            assert_eq!(PolicyAction::from_cli(action).id(), category, "{action}");
+        }
         // Kafka's redrive stays a produce.
         assert_eq!(
             PolicyAction::from_cli("dlq redrive --execute"),

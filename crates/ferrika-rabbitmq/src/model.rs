@@ -112,6 +112,219 @@ pub struct Binding {
     pub routing_key: String,
     #[serde(default, deserialize_with = "object_or_empty")]
     pub arguments: Map<String, Value>,
+    /// The broker's name for the binding among those between the same
+    /// source and destination (routing key and a hash of the arguments),
+    /// used to delete it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub properties_key: String,
+}
+
+/// The longest queue or exchange name RabbitMQ accepts, in bytes.
+pub const MAX_NAME_BYTES: usize = 255;
+
+/// Checks a queue or exchange name (`what`: "queue" or "exchange") before
+/// it is declared or deleted: not empty, at most [`MAX_NAME_BYTES`], and not
+/// in the broker's reserved `amq.` namespace (the default exchange and the
+/// `amq.*` exchanges cannot be declared or deleted by clients).
+pub fn validate_name(what: &str, name: &str) -> RabbitResult<()> {
+    if name.is_empty() {
+        return Err(RabbitError::config(format!("The {what} name is empty")));
+    }
+    if name.len() > MAX_NAME_BYTES {
+        return Err(RabbitError::config(format!(
+            "The {what} name is longer than {MAX_NAME_BYTES} bytes"
+        )));
+    }
+    if name.starts_with("amq.") {
+        return Err(RabbitError::config(format!(
+            "'{name}' is in the reserved amq. namespace; RabbitMQ does not let clients declare \
+             or delete such a {what}"
+        )));
+    }
+    Ok(())
+}
+
+/// What a binding delivers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DestinationType {
+    Queue,
+    Exchange,
+}
+
+impl DestinationType {
+    /// `queue` or `exchange`, as the API's `destination_type` says.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Exchange => "exchange",
+        }
+    }
+
+    /// From the API's `destination_type`.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "queue" => Some(Self::Queue),
+            "exchange" => Some(Self::Exchange),
+            _ => None,
+        }
+    }
+
+    /// `q` or `e`, as binding paths name the destination's kind.
+    pub(crate) fn path_letter(self) -> &'static str {
+        match self {
+            Self::Queue => "q",
+            Self::Exchange => "e",
+        }
+    }
+}
+
+/// The body of `PUT /api/queues/{vhost}/{name}`: how to declare a queue.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct QueueDeclaration {
+    /// `classic`, `quorum` or `stream` (sent as `x-queue-type`); `None`
+    /// leaves it to the vhost's default queue type.
+    pub kind: Option<String>,
+    pub durable: bool,
+    pub auto_delete: bool,
+    /// `x-*` arguments, e.g. `x-dead-letter-exchange`, `x-max-length`.
+    pub arguments: Map<String, Value>,
+}
+
+impl QueueDeclaration {
+    /// How `queue` was declared, to declare it again: its type is named
+    /// explicitly, so a vhost whose default type changed since does not
+    /// make it another kind of queue.
+    pub fn of(queue: &Queue) -> Self {
+        let kind = Some(queue.kind.clone()).filter(|k| !k.is_empty());
+        Self {
+            kind,
+            durable: queue.durable,
+            auto_delete: queue.auto_delete,
+            arguments: queue.arguments.clone(),
+        }
+    }
+
+    pub fn to_request(&self) -> Value {
+        let mut arguments = self.arguments.clone();
+        if let Some(kind) = &self.kind {
+            arguments.insert("x-queue-type".to_string(), Value::from(kind.clone()));
+        }
+        serde_json::json!({
+            "durable": self.durable,
+            "auto_delete": self.auto_delete,
+            "arguments": arguments,
+        })
+    }
+}
+
+/// The body of `PUT /api/exchanges/{vhost}/{name}`: how to declare an
+/// exchange.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExchangeDeclaration {
+    /// `direct`, `fanout`, `topic`, `headers` or a plugin's type.
+    pub kind: String,
+    pub durable: bool,
+    pub auto_delete: bool,
+    /// An internal exchange takes messages only from other exchanges.
+    pub internal: bool,
+    /// e.g. `alternate-exchange`.
+    pub arguments: Map<String, Value>,
+}
+
+impl ExchangeDeclaration {
+    /// How `exchange` was declared, to declare it again.
+    pub fn of(exchange: &Exchange) -> Self {
+        Self {
+            kind: exchange.kind.clone(),
+            durable: exchange.durable,
+            auto_delete: exchange.auto_delete,
+            internal: exchange.internal,
+            arguments: exchange.arguments.clone(),
+        }
+    }
+
+    pub fn to_request(&self) -> Value {
+        serde_json::json!({
+            "type": self.kind,
+            "durable": self.durable,
+            "auto_delete": self.auto_delete,
+            "internal": self.internal,
+            "arguments": self.arguments,
+        })
+    }
+}
+
+/// A binding to add or remove: from exchange `source` to a queue or an
+/// exchange, with a routing key and arguments (the `headers` exchange
+/// matches on them).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BindingDeclaration {
+    pub source: String,
+    pub destination: String,
+    pub destination_type: DestinationType,
+    pub routing_key: String,
+    pub arguments: Map<String, Value>,
+}
+
+impl BindingDeclaration {
+    /// `binding` as the API listed it; `None` for the default exchange's
+    /// implicit bindings, which cannot be added or removed.
+    pub fn of(binding: &Binding) -> Option<Self> {
+        if binding.source.is_empty() {
+            return None;
+        }
+        Some(Self {
+            source: binding.source.clone(),
+            destination: binding.destination.clone(),
+            destination_type: DestinationType::parse(&binding.destination_type)?,
+            routing_key: binding.routing_key.clone(),
+            arguments: binding.arguments.clone(),
+        })
+    }
+
+    /// Checks the names: the default exchange has only implicit bindings.
+    pub fn validate(&self) -> RabbitResult<()> {
+        if self.source.is_empty() || self.source == DEFAULT_EXCHANGE {
+            return Err(RabbitError::config(
+                "The default exchange (amq.default) cannot be bound or unbound: it routes to \
+                 every queue by name",
+            ));
+        }
+        if self.destination.is_empty() {
+            return Err(RabbitError::config("The binding destination is empty"));
+        }
+        Ok(())
+    }
+
+    /// Whether `binding` (as listed) is this one: same ends, routing key
+    /// and arguments.
+    pub fn matches(&self, binding: &Binding) -> bool {
+        binding.source == self.source
+            && binding.destination == self.destination
+            && binding.destination_type == self.destination_type.as_str()
+            && binding.routing_key == self.routing_key
+            && binding.arguments == self.arguments
+    }
+
+    /// The body of `POST /api/bindings/{vhost}/e/{source}/{q|e}/{destination}`.
+    pub fn to_request(&self) -> Value {
+        serde_json::json!({
+            "routing_key": self.routing_key,
+            "arguments": self.arguments,
+        })
+    }
+
+    /// "exchange orders -> queue billing, routing key 'order.*'".
+    pub fn label(&self) -> String {
+        format!(
+            "exchange {} -> {} {}, routing key '{}'",
+            self.source,
+            self.destination_type.as_str(),
+            self.destination,
+            self.routing_key
+        )
+    }
 }
 
 /// One message read with requeueing (`POST /api/queues/{vhost}/{name}/get`).
@@ -572,6 +785,90 @@ mod tests {
 
         let unknown = RedriveDestination::resolve(None, None, Some("k")).unwrap_err();
         assert!(unknown.to_string().contains("--to-exchange"), "{unknown}");
+    }
+
+    #[test]
+    fn declarations_name_the_queue_type_and_keep_arguments() {
+        let queue: Queue = serde_json::from_str(
+            r#"{"name":"orders","vhost":"/","type":"quorum","durable":true,"auto_delete":false,
+                "arguments":{"x-queue-type":"quorum","x-max-length":10}}"#,
+        )
+        .unwrap();
+        let declaration = QueueDeclaration::of(&queue);
+        let body = declaration.to_request();
+        assert_eq!(body["durable"], true);
+        assert_eq!(body["auto_delete"], false);
+        assert_eq!(body["arguments"]["x-queue-type"], "quorum");
+        assert_eq!(body["arguments"]["x-max-length"], 10);
+        // Without a type the vhost's default applies.
+        let plain = QueueDeclaration {
+            durable: true,
+            ..QueueDeclaration::default()
+        }
+        .to_request();
+        assert!(plain["arguments"].get("x-queue-type").is_none());
+
+        let exchange: Exchange = serde_json::from_str(
+            r#"{"name":"shop","vhost":"/","type":"topic","durable":true,"internal":true,
+                "arguments":{"alternate-exchange":"ae"}}"#,
+        )
+        .unwrap();
+        let body = ExchangeDeclaration::of(&exchange).to_request();
+        assert_eq!(body["type"], "topic");
+        assert_eq!(body["internal"], true);
+        assert_eq!(body["arguments"]["alternate-exchange"], "ae");
+    }
+
+    #[test]
+    fn bindings_match_by_ends_key_and_arguments() {
+        let listed: Binding = serde_json::from_str(
+            r#"{"source":"shop","vhost":"/","destination":"billing","destination_type":"queue",
+                "routing_key":"order.*","arguments":{},"properties_key":"order.*"}"#,
+        )
+        .unwrap();
+        assert_eq!(listed.properties_key, "order.*");
+        let binding = BindingDeclaration::of(&listed).unwrap();
+        assert!(binding.matches(&listed));
+        assert_eq!(
+            binding.label(),
+            "exchange shop -> queue billing, routing key 'order.*'"
+        );
+        let other_key = BindingDeclaration {
+            routing_key: "order.#".into(),
+            ..binding.clone()
+        };
+        assert!(!other_key.matches(&listed));
+        let to_exchange = BindingDeclaration {
+            destination_type: DestinationType::Exchange,
+            ..binding.clone()
+        };
+        assert!(!to_exchange.matches(&listed));
+        assert_eq!(binding.to_request()["routing_key"], "order.*");
+        // The default exchange's implicit bindings are not bindings to manage.
+        let implicit = Binding {
+            source: String::new(),
+            ..listed
+        };
+        assert!(BindingDeclaration::of(&implicit).is_none());
+        let default = BindingDeclaration {
+            source: DEFAULT_EXCHANGE.into(),
+            ..binding
+        };
+        assert!(default.validate().is_err());
+    }
+
+    #[test]
+    fn names_are_checked_before_declaring() {
+        assert!(validate_name("queue", "orders").is_ok());
+        assert!(validate_name("queue", "").is_err());
+        assert!(validate_name("queue", &"x".repeat(MAX_NAME_BYTES + 1)).is_err());
+        let reserved = validate_name("exchange", "amq.topic").unwrap_err();
+        assert!(reserved.to_string().contains("reserved"), "{reserved}");
+        assert_eq!(
+            DestinationType::parse("queue"),
+            Some(DestinationType::Queue)
+        );
+        assert_eq!(DestinationType::parse("stream"), None);
     }
 
     #[test]

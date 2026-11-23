@@ -501,7 +501,7 @@ pub async fn prepare_request(
 }
 
 /// The part of [`prepare_request`] before the cluster is read.
-fn check_request(
+pub(crate) fn check_request(
     op: &Operation,
     all: &[Operation],
     current: &Scope,
@@ -532,7 +532,12 @@ fn check_request(
 }
 
 /// The part of [`prepare_request`] after the plan is made.
-fn decide(request: &mut UndoRequest, plan: UndoPlan, policy_active: bool, options: UndoOptions) {
+pub(crate) fn decide(
+    request: &mut UndoRequest,
+    plan: UndoPlan,
+    policy_active: bool,
+    options: UndoOptions,
+) {
     request.refusal = plan
         .refusal(options.force, policy_active)
         .map(UndoRefusal::Plan);

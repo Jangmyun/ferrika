@@ -10,6 +10,12 @@
 //! and `dlq inspect` also show record data, so they pass the export gate.
 //! The gates match the management API's `host:port` and the RabbitMQ
 //! profile, never a Kafka profile.
+//!
+//! Topology writes (`queue declare|delete|purge`, `exchange
+//! declare|delete`, `bind`, `unbind`; categories `queues.*`,
+//! `exchanges.*`, `bindings.change`) are recorded in the operation history;
+//! `rabbit history` lists them and `rabbit undo` reverses them (see
+//! `cli/rabbit_topology.rs`).
 
 use std::time::Duration;
 
@@ -196,7 +202,13 @@ fn needs_connection(command: &RabbitSubcommands) -> bool {
         | RabbitSubcommands::Bindings
         | RabbitSubcommands::Peek { .. }
         | RabbitSubcommands::Publish { .. }
-        | RabbitSubcommands::Dlq(_) => true,
+        | RabbitSubcommands::Dlq(_)
+        | RabbitSubcommands::Queue(_)
+        | RabbitSubcommands::Exchange(_)
+        | RabbitSubcommands::Bind(_)
+        | RabbitSubcommands::Unbind(_)
+        | RabbitSubcommands::History(_)
+        | RabbitSubcommands::Undo(_) => true,
     }
 }
 
@@ -295,9 +307,190 @@ pub enum RabbitSubcommands {
     },
     /// Dead-lettered messages: why they died and moving them back
     Dlq(RabbitDlqArgs),
+    /// Declare, delete or purge a queue (recorded; `rabbit undo` reverses
+    /// declare and delete)
+    Queue(RabbitQueueArgs),
+    /// Declare or delete an exchange (recorded; `rabbit undo` reverses them)
+    Exchange(RabbitExchangeArgs),
+    /// Bind a queue or an exchange to an exchange (recorded; `rabbit undo`
+    /// removes the binding)
+    Bind(RabbitBindingArgs),
+    /// Remove a binding (recorded; `rabbit undo` adds it back)
+    Unbind(RabbitBindingArgs),
+    /// RabbitMQ changes recorded on this broker: queue, exchange and binding
+    /// declarations, deletions and purges
+    History(RabbitHistoryArgs),
+    /// Reverse a recorded RabbitMQ change: delete a declared queue or
+    /// exchange (only while empty and unbound), declare a deleted one again
+    /// with its bindings (its messages are lost), restore a binding
+    Undo(RabbitUndoArgs),
     /// Named RabbitMQ connections (rabbit-profiles.json, passwords in the OS
     /// credential store)
     Profile(crate::cli::rabbit_profile::RabbitProfileArgs),
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct RabbitQueueArgs {
+    #[command(subcommand)]
+    pub command: RabbitQueueSubcommands,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum RabbitQueueSubcommands {
+    /// Declare a new queue (an existing one is refused, so undo never
+    /// deletes a queue this command did not make)
+    Declare {
+        name: String,
+        /// Queue type (default: the vhost's default queue type)
+        #[arg(long = "type", value_name = "TYPE", value_parser = ["classic", "quorum", "stream"])]
+        kind: Option<String>,
+        /// Not durable: the queue does not survive a broker restart
+        #[arg(long)]
+        transient: bool,
+        /// Delete the queue when its last consumer goes away
+        #[arg(long)]
+        auto_delete: bool,
+        /// An x-argument, KEY=VALUE (repeatable), e.g. x-max-length=1000 or
+        /// x-dead-letter-exchange=dlx; whole numbers and true/false are
+        /// sent as numbers and booleans, JSON in quotes as JSON
+        #[arg(long = "arg", value_name = "KEY=VALUE")]
+        arguments: Vec<String>,
+    },
+    /// Delete a queue with its messages and bindings. `rabbit undo`
+    /// declares it again with its bindings, but empty
+    Delete {
+        name: String,
+        /// Refuse when the queue holds messages
+        #[arg(long)]
+        if_empty: bool,
+        /// Refuse when the queue has consumers
+        #[arg(long)]
+        if_unused: bool,
+        /// Do not ask for confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Delete every ready message of a queue, keeping the queue. Cannot be
+    /// undone
+    Purge {
+        name: String,
+        /// Do not ask for confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct RabbitExchangeArgs {
+    #[command(subcommand)]
+    pub command: RabbitExchangeSubcommands,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum RabbitExchangeSubcommands {
+    /// Declare a new exchange (an existing one is refused)
+    Declare {
+        name: String,
+        /// Exchange type: direct, fanout, topic, headers or a plugin's type
+        #[arg(long = "type", value_name = "TYPE", default_value = "direct")]
+        kind: String,
+        /// Not durable: the exchange does not survive a broker restart
+        #[arg(long)]
+        transient: bool,
+        /// Delete the exchange when its last binding goes away
+        #[arg(long)]
+        auto_delete: bool,
+        /// Clients cannot publish to it; only other exchanges route to it
+        #[arg(long)]
+        internal: bool,
+        /// An argument, KEY=VALUE (repeatable), e.g.
+        /// alternate-exchange=unrouted
+        #[arg(long = "arg", value_name = "KEY=VALUE")]
+        arguments: Vec<String>,
+    },
+    /// Delete an exchange with every binding from or to it. `rabbit undo`
+    /// declares it again and restores those bindings
+    Delete {
+        name: String,
+        /// Refuse when the exchange is the source of a binding
+        #[arg(long)]
+        if_unused: bool,
+        /// Do not ask for confirmation
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+}
+
+/// What a binding delivers to.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindingDestinationType {
+    Queue,
+    Exchange,
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct RabbitBindingArgs {
+    /// The exchange messages come from
+    pub source: String,
+    /// The queue (or, with --destination-type exchange, the exchange)
+    /// messages go to
+    pub destination: String,
+    /// Whether the destination is a queue or an exchange
+    #[arg(long, value_enum, default_value = "queue")]
+    pub destination_type: BindingDestinationType,
+    /// Routing key (a pattern for topic exchanges)
+    #[arg(short = 'k', long = "routing-key", default_value = "")]
+    pub routing_key: String,
+    /// A binding argument, KEY=VALUE (repeatable), e.g. x-match=all for a
+    /// headers exchange
+    #[arg(long = "arg", value_name = "KEY=VALUE")]
+    pub arguments: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct RabbitHistoryArgs {
+    #[command(subcommand)]
+    pub command: Option<RabbitHistoryCommand>,
+    /// Number of operations to show (newest first)
+    #[arg(short = 'n', long, default_value_t = 30, value_parser = crate::cli::history::parse_limit)]
+    pub limit: usize,
+    /// Every broker and cluster, not only this RabbitMQ
+    #[arg(long)]
+    pub all: bool,
+    /// Only operations whose resources or target contain this text, e.g.
+    /// `queue:orders`
+    #[arg(long, value_name = "TEXT")]
+    pub resource: Option<String>,
+    /// Only operations that can still be undone
+    #[arg(long)]
+    pub undoable: bool,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum RabbitHistoryCommand {
+    /// One operation in full: before and after values, outcome, what undo
+    /// would do and what it cannot restore
+    Show {
+        /// Operation id (at least 6 characters)
+        id: String,
+    },
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct RabbitUndoArgs {
+    /// Operation id (at least 6 characters); the newest operation you ran on
+    /// this broker that can be undone when left out
+    pub id: Option<String>,
+    /// Show what undo would do and whether it would be refused, changing nothing
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Undo even though the state changed since, or later operations
+    /// touched the same resources (never deletes a queue holding messages)
+    #[arg(long)]
+    pub force: bool,
+    /// Do not ask for confirmation
+    #[arg(short = 'y', long)]
+    pub yes: bool,
 }
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
@@ -361,9 +554,24 @@ pub fn write_action(args: &RabbitArgs) -> Option<&'static str> {
             }
             RabbitDlqSubcommands::Redrive { execute: false, .. } => Some("rabbit dlq redrive"),
         },
-        RabbitSubcommands::Queues | RabbitSubcommands::Exchanges | RabbitSubcommands::Bindings => {
-            None
-        }
+        RabbitSubcommands::Queue(queue) => Some(match &queue.command {
+            RabbitQueueSubcommands::Declare { .. } => "rabbit queue declare",
+            RabbitQueueSubcommands::Delete { .. } => "rabbit queue delete",
+            RabbitQueueSubcommands::Purge { .. } => "rabbit queue purge",
+        }),
+        RabbitSubcommands::Exchange(exchange) => Some(match &exchange.command {
+            RabbitExchangeSubcommands::Declare { .. } => "rabbit exchange declare",
+            RabbitExchangeSubcommands::Delete { .. } => "rabbit exchange delete",
+        }),
+        RabbitSubcommands::Bind(_) => Some("rabbit bind"),
+        RabbitSubcommands::Unbind(_) => Some("rabbit unbind"),
+        // Undo's policy categories depend on the recorded operation, so it
+        // runs the gate itself, once per category of its steps.
+        RabbitSubcommands::Undo(_) => None,
+        RabbitSubcommands::Queues
+        | RabbitSubcommands::Exchanges
+        | RabbitSubcommands::Bindings
+        | RabbitSubcommands::History(_) => None,
         // Local configuration only.
         RabbitSubcommands::Profile(profile) => match &profile.command {
             P::Add(_) | P::List | P::Use { .. } | P::Remove { .. } | P::Show { .. } => None,
@@ -414,15 +622,51 @@ pub fn write_target(args: &RabbitArgs) -> String {
                 redrive_target(to_exchange.as_deref(), routing_key.as_deref())
             ),
         },
-        RabbitSubcommands::Queues | RabbitSubcommands::Exchanges | RabbitSubcommands::Bindings => {
-            String::new()
+        RabbitSubcommands::Queue(queue) => match &queue.command {
+            RabbitQueueSubcommands::Declare { name, .. }
+            | RabbitQueueSubcommands::Delete { name, .. }
+            | RabbitQueueSubcommands::Purge { name, .. } => {
+                format!("queue {name} on vhost {vhost}")
+            }
+        },
+        RabbitSubcommands::Exchange(exchange) => match &exchange.command {
+            RabbitExchangeSubcommands::Declare { name, .. }
+            | RabbitExchangeSubcommands::Delete { name, .. } => {
+                format!("exchange {name} on vhost {vhost}")
+            }
+        },
+        RabbitSubcommands::Bind(binding) | RabbitSubcommands::Unbind(binding) => {
+            format!("{} on vhost {vhost}", binding_label(binding))
         }
+        RabbitSubcommands::Undo(undo) => match &undo.id {
+            Some(id) => format!("op {id}"),
+            None => "the latest undoable operation".to_string(),
+        },
+        RabbitSubcommands::Queues
+        | RabbitSubcommands::Exchanges
+        | RabbitSubcommands::Bindings
+        | RabbitSubcommands::History(_) => String::new(),
         RabbitSubcommands::Profile(profile) => match &profile.command {
             P::Add(_) | P::List | P::Use { .. } | P::Remove { .. } | P::Show { .. } => {
                 String::new()
             }
         },
     }
+}
+
+/// "binding exchange shop -> queue orders, routing key 'order.*'", as the
+/// audit log names it (no argument values).
+fn binding_label(binding: &RabbitBindingArgs) -> String {
+    let kind = match binding.destination_type {
+        BindingDestinationType::Queue => "queue",
+        BindingDestinationType::Exchange => "exchange",
+    };
+    format!(
+        "binding exchange {} -> {kind} {}, routing key '{}'",
+        exchange_name(&binding.source),
+        binding.destination,
+        binding.routing_key
+    )
 }
 
 /// Where a redrive sends messages, in words.
@@ -458,7 +702,14 @@ pub(crate) fn export(args: &RabbitArgs) -> Option<(&'static str, String)> {
         RabbitSubcommands::Queues
         | RabbitSubcommands::Exchanges
         | RabbitSubcommands::Bindings
-        | RabbitSubcommands::Publish { .. } => None,
+        | RabbitSubcommands::Publish { .. }
+        // Topology and history: names and counts, never message bodies.
+        | RabbitSubcommands::Queue(_)
+        | RabbitSubcommands::Exchange(_)
+        | RabbitSubcommands::Bind(_)
+        | RabbitSubcommands::Unbind(_)
+        | RabbitSubcommands::History(_)
+        | RabbitSubcommands::Undo(_) => None,
         RabbitSubcommands::Profile(profile) => match &profile.command {
             P::Add(_) | P::List | P::Use { .. } | P::Remove { .. } | P::Show { .. } => None,
         },
@@ -486,7 +737,20 @@ pub(crate) async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result
         .client(credentials.as_ref(), timeout)
         .map_err(anyhow::Error::msg)?;
     let vhost = resolved.vhost.as_str();
+    let topology = crate::cli::rabbit_topology::Context {
+        args: &args,
+        global,
+        client: &client,
+        resolved,
+        json,
+    };
     match &args.command {
+        RabbitSubcommands::Queue(queue) => topology.queue(&queue.command).await?,
+        RabbitSubcommands::Exchange(exchange) => topology.exchange(&exchange.command).await?,
+        RabbitSubcommands::Bind(binding) => topology.binding(binding, true).await?,
+        RabbitSubcommands::Unbind(binding) => topology.binding(binding, false).await?,
+        RabbitSubcommands::History(history) => topology.history(history)?,
+        RabbitSubcommands::Undo(undo) => topology.undo(undo).await?,
         RabbitSubcommands::Queues => {
             let queues = client.queues(vhost).await?;
             output::emit(json, &queues, |queues| {
@@ -961,6 +1225,8 @@ mod tests {
             &["queues"][..],
             &["exchanges"][..],
             &["bindings"][..],
+            &["history"][..],
+            &["history", "show", "01JBX3K8Q2M7"][..],
             &["profile", "list"][..],
             &["profile", "use", "prod"][..],
             &["profile", "remove", "prod"][..],
@@ -971,6 +1237,75 @@ mod tests {
             assert_eq!(write_action(&parsed), None, "{args:?}");
             assert_eq!(write_target(&parsed), "", "{args:?}");
         }
+    }
+
+    #[test]
+    fn topology_writes_are_gated_by_their_own_categories() {
+        use crate::model::policy::PolicyAction;
+        for (args, label, category, target) in [
+            (
+                &["queue", "declare", "jobs", "--type", "quorum"][..],
+                "rabbit queue declare",
+                "queues.create",
+                "queue jobs on vhost /",
+            ),
+            (
+                &["queue", "delete", "jobs", "-y"][..],
+                "rabbit queue delete",
+                "queues.delete",
+                "queue jobs on vhost /",
+            ),
+            (
+                &["queue", "purge", "jobs", "--vhost", "shop"][..],
+                "rabbit queue purge",
+                "queues.purge",
+                "queue jobs on vhost shop",
+            ),
+            (
+                &["exchange", "declare", "shop.x", "--type", "topic"][..],
+                "rabbit exchange declare",
+                "exchanges.create",
+                "exchange shop.x on vhost /",
+            ),
+            (
+                &["exchange", "delete", "shop.x"][..],
+                "rabbit exchange delete",
+                "exchanges.delete",
+                "exchange shop.x on vhost /",
+            ),
+            (
+                &["bind", "shop.x", "jobs", "-k", "job.*"][..],
+                "rabbit bind",
+                "bindings.change",
+                "binding exchange shop.x -> queue jobs, routing key 'job.*' on vhost /",
+            ),
+            (
+                &[
+                    "unbind",
+                    "shop.x",
+                    "audit.x",
+                    "--destination-type",
+                    "exchange",
+                ][..],
+                "rabbit unbind",
+                "bindings.change",
+                "binding exchange shop.x -> exchange audit.x, routing key '' on vhost /",
+            ),
+        ] {
+            let parsed = parse(args);
+            assert_eq!(write_action(&parsed), Some(label), "{args:?}");
+            assert_eq!(PolicyAction::from_cli(label).id(), category, "{args:?}");
+            assert_eq!(write_target(&parsed), target, "{args:?}");
+            assert_eq!(export(&parsed), None, "{args:?}");
+        }
+        // Undo gates itself per step category.
+        let undo = parse(&["undo", "01JBX3K8Q2M7", "--dry-run"]);
+        assert_eq!(write_action(&undo), None);
+        assert_eq!(write_target(&undo), "op 01JBX3K8Q2M7");
+        // A queue type the broker does not have is refused by the parser.
+        assert!(
+            Wrapper::try_parse_from(["rabbit", "queue", "declare", "q", "--type", "lazy"]).is_err()
+        );
     }
 
     #[test]

@@ -32,3 +32,9 @@ default = ["amqp"]
 # The AMQP client (`amqp` module). Without it the crate has the management
 # API client and the profiles only.
 amqp = ["dep:lapin", "dep:tokio"]
+# `fake`: an in-memory management API over HTTP for tests of code that uses
+# the client. For tests only; never enable it in a shipped binary.
+test-util = ["dep:tokio"]
+
+[dev-dependencies]
+tokio.workspace = true
