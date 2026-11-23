@@ -456,6 +456,63 @@ queue. Redriven messages keep their headers, `x-death` included, and
 get `x-ferrika-redriven-from: <queue>`. The audit log records the counts, the
 source queue and the destinations, never message bodies.
 
+### MQTT (`ferrika mqtt`, preview)
+
+For MQTT 3.1.1 and 5 brokers (Mosquitto, EMQX, HiveMQ, MQTT-to-Kafka
+bridges). Built in with the `ferrika-cli` cargo feature `mqtt` (on by
+default).
+
+Connections are MQTT profiles in `mqtt-profiles.json` next to
+`profiles.json` (separate from the Kafka and RabbitMQ profiles), passwords
+in the OS credential store. A command uses `--mqtt-profile NAME`, else the
+active MQTT profile; `--mqtt-url`, `--mqtt-user`, the password
+(`FERRIKA_MQTT_PASSWORD` or `--mqtt-password-stdin`), `--mqtt-version`
+(`3.1.1`, the default, or `5`) and `--mqtt-ca-file` override the profile's
+values. `--mqtt-url` without `--mqtt-profile` uses no profile. URLs are
+`mqtt://host[:1883]` or `mqtts://host[:8883]` and never carry a user or
+password.
+
+```bash
+ferrika mqtt profile add plant-a --mqtt-url mqtts://broker.plant-a:8883   --mqtt-ca-file ./plant-a-ca.pem --mqtt-user ops --mqtt-password-stdin --use
+ferrika mqtt profile add lab --mqtt-url mqtt://localhost --mqtt-version 5 --read-only
+ferrika mqtt profile list                        # also: use, show, remove
+
+ferrika mqtt sub 'sensors/+/temperature'         # 10 messages or 30 s, whichever first
+ferrika mqtt sub 'devices/#' -n 100 --duration 300 --qos 1
+ferrika -f json mqtt sub 'devices/#' > out.jsonl # JSON Lines, an export under the policy
+ferrika mqtt pub devices/42/cmd -m '{"reboot":true}'               # QoS 1, not retained
+ferrika mqtt pub devices/42/config -m '{"interval":60}' --retain --qos 2
+ferrika mqtt --mqtt-version 5 pub orders/new -m '{}' --content-type application/json -H trace:abc
+
+ferrika mqtt retained 'devices/+/config'         # list retained messages (table or -f json)
+ferrika mqtt retained clear devices/42/config    # asks first; --yes to skip
+```
+
+Every session is clean, with a fresh client id (`ferrika` and 12 random hex
+digits), and sets no last will: it never takes over another client's
+session and leaves nothing on the broker. Shared subscriptions
+(`$share/GROUP/...`, `$queue/...`) are refused, since they would take
+messages from the group's consumers. `sub` stops at `--count` (default 10)
+or `--duration` seconds (default 30); `retained` stops once retained
+messages stop coming for a second, after `--wait` seconds (default 5) or at
+`--count` (default 500), and says when there may be more. `--timeout`
+limits each step (connect, acknowledgement; default 10 s).
+
+Under the company policy: `pub` is the category `produce` (like Kafka's
+`produce` and `rabbit publish`). `retained clear` publishes an empty
+retained message, which deletes the topic's retained message: category
+`messages.delete`, which also needs `produce` allowed. It first looks for
+the retained message; without one it changes nothing. `pub --retain` with an
+empty message is refused (use `retained clear`). `sub` and `retained` are
+reads, but they show message data: their output is a record export like
+`consume`, masked when the policy enforces masking (or with `--mask-pii`:
+payloads, topics and MQTT 5 user properties). Read-only MQTT profiles and
+the policy's broker-address rules (matched on the broker's `host:port`)
+refuse `pub` and `retained clear`. The audit log records topics, QoS, the
+retain flag and cleared sizes, never payloads. On MQTT 3.1.1 a broker that
+drops a message its ACL forbids still acknowledges it; with
+`--mqtt-version 5` the broker's refusal is reported as an error.
+
 ### Client quotas (`ferrika quota`)
 
 ```bash
