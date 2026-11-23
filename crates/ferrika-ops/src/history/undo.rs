@@ -5,11 +5,11 @@
 
 use serde::Serialize;
 
-use ferrika_core::error::KafkaResult;
+use ferrika_core::error::{KafkaError, KafkaResult};
 use ferrika_core::kafka::admin::KafkaAdminClient;
 use ferrika_core::kafka::config::KafkaClientConfig;
 use ferrika_core::kafka::visibility::{await_config, CONFIG_VISIBILITY};
-use ferrika_core::model::history::{Operation, Reversibility, Scope, State};
+use ferrika_core::model::history::{DigestStatus, Operation, Reversibility, Scope, State};
 
 use super::apply::{self, Target};
 use super::capture::recapture;
@@ -70,20 +70,59 @@ pub fn latest_undoable<'a>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DigestCheck {
-    /// The audit entry's `op_digest` matches the journal.
+    /// The audit entry's `op_digest` (version 2) matches the whole journal
+    /// entry.
     Matches,
+    /// A version 1 `op_digest` (Ferrika 0.1) matches: the before- and
+    /// after-state are as recorded, but the scope, action, `undoes` link
+    /// and reversibility are not covered. Undo shows the target cluster
+    /// and asks again (`--accept-legacy`).
+    Legacy,
     /// No audit entry names the operation (log rotated, other location).
     Missing,
     /// The journal no longer matches what was audited: it was edited.
     Mismatch,
 }
 
-/// Compares the journal's digest of `op` with the audit log's.
+impl DigestCheck {
+    /// How `history`, `undo` and `audit verify` name it.
+    pub fn label(self) -> &'static str {
+        self.status().label()
+    }
+
+    fn status(self) -> DigestStatus {
+        match self {
+            Self::Matches => DigestStatus::Verified,
+            Self::Legacy => DigestStatus::Legacy,
+            Self::Missing => DigestStatus::Missing,
+            Self::Mismatch => DigestStatus::Mismatch,
+        }
+    }
+}
+
+/// Compares the journal entry of `op` with the audit log's `op_digest`
+/// (see [`Operation::verify_digest`]).
 pub fn digest_check(op: &Operation, audited: Option<&str>) -> DigestCheck {
-    match audited {
-        None => DigestCheck::Missing,
-        Some(digest) if digest == op.digest() => DigestCheck::Matches,
-        Some(_) => DigestCheck::Mismatch,
+    match op.verify_digest(audited) {
+        DigestStatus::Verified => DigestCheck::Matches,
+        DigestStatus::Legacy => DigestCheck::Legacy,
+        DigestStatus::Missing => DigestCheck::Missing,
+        DigestStatus::Mismatch => DigestCheck::Mismatch,
+    }
+}
+
+/// Whether the journal's claim that `undoer` undid an operation can be
+/// believed, given the audit log's `op_digest` for `undoer`. Only a
+/// version 2 digest covers the `undoes` link; without any audit entry the
+/// claim stands unless a company policy is installed (as for undo itself).
+/// A claim that is not believed does not stop an undo: the current state
+/// is read and compared anyway, so a change that really was undone shows
+/// as already reverted.
+pub fn undo_mark_trusted(undoer: &Operation, audited: Option<&str>, policy_active: bool) -> bool {
+    match digest_check(undoer, audited) {
+        DigestCheck::Matches => true,
+        DigestCheck::Missing => !policy_active,
+        DigestCheck::Legacy | DigestCheck::Mismatch => false,
     }
 }
 
@@ -103,7 +142,8 @@ pub struct UndoPlan {
     /// Later operations on the same resources still in effect.
     pub later: Vec<String>,
     pub digest: DigestCheck,
-    /// The operation ran on the cluster (or registry, Connect) in use now.
+    /// The operation ran on the cluster (or registry, Connect) in use now,
+    /// as [`Scope::check_undo_target`] decides (when not, `steps` says why).
     pub same_scope: bool,
     /// Whether redoing (undoing the undo) will be possible, and why not.
     pub redo: Reversibility,
@@ -134,12 +174,6 @@ impl UndoPlan {
     /// edited journal. With a company policy, an operation the audit log
     /// does not know is refused too.
     pub fn refusal(&self, force: bool, policy_active: bool) -> Option<String> {
-        if !self.same_scope {
-            return Some(
-                "this operation was recorded on another cluster; connect to that one to undo it"
-                    .to_string(),
-            );
-        }
         match self.digest {
             DigestCheck::Mismatch => {
                 return Some(
@@ -154,6 +188,16 @@ impl UndoPlan {
                 )
             }
             _ => {}
+        }
+        // After the digest: an edited scope is reported as an edit.
+        if !self.same_scope {
+            return Some(match &self.steps {
+                Err(reason) => reason.0.clone(),
+                Ok(_) => {
+                    "this operation was recorded on another cluster; connect to that one to undo it"
+                        .to_string()
+                }
+            });
         }
         if let Err(reason) = &self.steps {
             return Some(format!("it cannot be undone: {reason}"));
@@ -241,17 +285,18 @@ pub async fn prepare(
     config: &KafkaClientConfig,
     admin: &KafkaAdminClient,
 ) -> KafkaResult<UndoPlan> {
-    let same_scope = op.begin.scope.same_cluster(current_scope);
+    let scope_check = op.begin.scope.check_undo_target(current_scope);
+    let same_scope = scope_check.is_ok();
     let digest = digest_check(op, audited);
     let later: Vec<String> = conflict::later_overlaps(op, all)
         .iter()
         .map(|o| o.id.clone())
         .collect();
-    let (current, verdict, steps) = if !same_scope {
+    let (current, verdict, steps) = if let Err(reason) = scope_check {
         (
             Vec::new(),
             Verdict::Drift { rows: Vec::new() },
-            Err(NotReversible("recorded on another cluster".to_string())),
+            Err(NotReversible(reason)),
         )
     } else if !op.begin.reversibility.undoable() || op.begin.before.is_empty() {
         // Nothing to read for an operation that cannot be undone anyway.
@@ -311,23 +356,26 @@ pub fn redo_reversibility(current: &[State], restored: &[State]) -> (Reversibili
 }
 
 /// Runs the plan's steps in order, stopping at the first failure. Returns
-/// the outcome text, or the error with how far it got.
+/// the outcome text, or the failure as text (see [`execute_steps`] for the
+/// failure as data). The applied steps are not rolled back.
 pub async fn execute(plan: &UndoPlan, target: &Target<'_>) -> Result<String, String> {
+    execute_steps(plan, target).await.map_err(|e| e.to_string())
+}
+
+/// [`execute`] with the failure as an [`UndoFailure`] (boxed, it is large): which steps were
+/// applied before the failing one (left in place), which were not run, and
+/// the error.
+pub async fn execute_steps(
+    plan: &UndoPlan,
+    target: &Target<'_>,
+) -> Result<String, Box<UndoFailure>> {
     let steps = plan.runnable_steps();
     if steps.is_empty() {
         return Ok("already in its previous state; nothing changed".to_string());
     }
     for (ix, step) in steps.iter().enumerate() {
-        if let Err(e) = apply::run(step, target).await {
-            return Err(if ix == 0 {
-                format!("{}: {e}", step.describe())
-            } else {
-                format!(
-                    "{}: {e} ({ix} of {} step(s) were applied before it)",
-                    step.describe(),
-                    steps.len()
-                )
-            });
+        if let Err(error) = apply::run(step, target).await {
+            return Err(Box::new(UndoFailure::new(steps, ix, error)));
         }
     }
     Ok(format!(
@@ -338,6 +386,71 @@ pub async fn execute(plan: &UndoPlan, target: &Target<'_>) -> Result<String, Str
             .collect::<Vec<_>>()
             .join("; ")
     ))
+}
+
+/// An undo that stopped at a failing step. The steps are their
+/// [`Step::describe`] texts. Its `Display` is the outcome text `ferrika
+/// undo` prints and records: the failed step and error, then the steps
+/// applied before it and the steps not run.
+#[derive(Debug)]
+pub struct UndoFailure {
+    /// The step that failed.
+    pub failed: String,
+    /// Steps applied before it, in order; their changes stay in place.
+    pub applied: Vec<String>,
+    /// Steps after it, never run.
+    pub not_run: Vec<String>,
+    /// Why the failed step failed.
+    pub error: KafkaError,
+}
+
+impl UndoFailure {
+    /// The failure of `steps[failed]` (from 0) with `error`.
+    pub fn new(steps: &[Step], failed: usize, error: KafkaError) -> Self {
+        let describe = |steps: &[Step]| steps.iter().map(Step::describe).collect::<Vec<_>>();
+        let at = failed.min(steps.len());
+        Self {
+            failed: steps.get(failed).map(Step::describe).unwrap_or_default(),
+            applied: describe(&steps[..at]),
+            not_run: describe(steps.get(at + 1..).unwrap_or_default()),
+            error,
+        }
+    }
+
+    /// Whether any step changed the cluster before the failure.
+    pub fn changed_anything(&self) -> bool {
+        !self.applied.is_empty()
+    }
+}
+
+impl std::fmt::Display for UndoFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.failed.is_empty() {
+            return write!(f, "{}", self.error);
+        }
+        write!(f, "{}: {}", self.failed, self.error)?;
+        if self.applied.is_empty() {
+            write!(f, ". Nothing was changed")?;
+        } else {
+            let total = self.applied.len() + 1 + self.not_run.len();
+            write!(
+                f,
+                ". Applied before it and left in place ({} of {total}): {}",
+                self.applied.len(),
+                self.applied.join("; ")
+            )?;
+        }
+        if !self.not_run.is_empty() {
+            write!(f, ". Not run: {}", self.not_run.join("; "))?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for UndoFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 #[cfg(test)]
@@ -503,8 +616,114 @@ mod tests {
     fn digest_check_compares_with_the_audit_log() {
         let op = op("A", "u", true);
         assert_eq!(digest_check(&op, Some(&op.digest())), DigestCheck::Matches);
+        assert_eq!(
+            digest_check(&op, Some(&op.digest_v1())),
+            DigestCheck::Legacy
+        );
         assert_eq!(digest_check(&op, Some("x")), DigestCheck::Mismatch);
         assert_eq!(digest_check(&op, None), DigestCheck::Missing);
+        assert_eq!(
+            DigestCheck::Legacy.label(),
+            "legacy digest (scope not covered)"
+        );
+    }
+
+    #[test]
+    fn an_edited_scope_is_detected_before_undo() {
+        let op = op("A", "u", true);
+        let audited = op.digest();
+        let mut moved = op.clone();
+        moved.begin.scope.bootstrap = "prod:9092".into();
+        assert_eq!(digest_check(&moved, Some(&audited)), DigestCheck::Mismatch);
+        let plan = UndoPlan {
+            digest: digest_check(&moved, Some(&audited)),
+            ..plan(Verdict::Clean)
+        };
+        assert!(plan.refusal(true, false).unwrap().contains("edited"));
+        // Edited to name another cluster: reported as the edit it is.
+        let moved_plan = UndoPlan {
+            same_scope: false,
+            steps: Err(NotReversible("recorded on another cluster".into())),
+            ..plan
+        };
+        assert!(moved_plan.refusal(true, false).unwrap().contains("edited"));
+    }
+
+    #[test]
+    fn an_edited_undoes_link_does_not_block_the_real_undo() {
+        // U really undid nothing; someone pointed its `undoes` at A.
+        let mut undoer = op("U", "u", true);
+        let audited = undoer.digest();
+        undoer.begin.undoes = Some("A".into());
+        assert!(!undo_mark_trusted(&undoer, Some(&audited), false));
+        // A real, untouched undo is believed; without an audit entry only
+        // when no policy is installed; a legacy digest never covers it.
+        let real = op("V", "u", true);
+        assert!(undo_mark_trusted(&real, Some(&real.digest()), true));
+        assert!(undo_mark_trusted(&real, None, false));
+        assert!(!undo_mark_trusted(&real, None, true));
+        assert!(!undo_mark_trusted(&real, Some(&real.digest_v1()), false));
+    }
+
+    #[test]
+    fn a_scope_mismatch_refuses_with_both_clusters_named() {
+        let reason = Scope {
+            bootstrap: "a:9092".into(),
+            cluster_id: "PROD".into(),
+            ..Scope::default()
+        }
+        .check_undo_target(&Scope {
+            bootstrap: "a:9092".into(),
+            cluster_id: "DEV".into(),
+            ..Scope::default()
+        })
+        .unwrap_err();
+        let elsewhere = UndoPlan {
+            same_scope: false,
+            steps: Err(NotReversible(reason)),
+            ..plan(Verdict::Clean)
+        };
+        let refusal = elsewhere.refusal(true, false).unwrap();
+        assert!(
+            refusal.contains("PROD") && refusal.contains("DEV"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_failed_undo_names_the_steps_it_applied_and_the_ones_it_did_not_run() {
+        let step = |key: &str| Step::TopicConfig {
+            topic: "t".into(),
+            set: vec![(key.to_string(), "1".to_string())],
+            delete: vec![],
+        };
+        let steps = vec![step("a"), step("b"), step("c")];
+        let denied = || KafkaError::admin("denied");
+        let failure = UndoFailure::new(&steps, 1, denied());
+        assert_eq!(failure.failed, steps[1].describe());
+        assert_eq!(failure.applied, vec![steps[0].describe()]);
+        assert_eq!(failure.not_run, vec![steps[2].describe()]);
+        assert!(failure.changed_anything());
+        assert!(failure.error.to_string().contains("denied"));
+        let text = failure.to_string();
+        assert_eq!(
+            text,
+            format!(
+                "{}: {}. Applied before it and left in place (1 of 3): {}. Not run: {}",
+                steps[1].describe(),
+                denied(),
+                steps[0].describe(),
+                steps[2].describe()
+            )
+        );
+        let first = UndoFailure::new(&steps, 0, denied());
+        assert!(first.applied.is_empty() && first.not_run.len() == 2);
+        assert!(!first.changed_anything());
+        assert!(first.to_string().contains("Nothing was changed"));
+        let last = UndoFailure::new(&steps, 2, denied());
+        assert_eq!(last.applied.len(), 2);
+        assert!(last.not_run.is_empty());
+        assert!(!last.to_string().contains("Not run"));
     }
 
     #[test]
