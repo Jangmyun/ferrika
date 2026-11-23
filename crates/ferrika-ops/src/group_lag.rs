@@ -1,85 +1,74 @@
 //! Consumer group offsets and lag as the GUI and `monitor lag` show them.
-//!
-//! Semver: [`committed_partition_list`] and [`apply_group_offsets`] use
-//! `rdkafka::TopicPartitionList` (rdkafka 0.39) and change with it; plain
-//! maps are planned for 0.3.
 
 use std::collections::HashMap;
-
-use rdkafka::{Offset, TopicPartitionList};
 
 use ferrika_core::kafka::metrics::calculate_partition_lag;
 use ferrika_core::model::cluster::{
     ConsumerGroupSummary, ConsumerState, GroupPartitionLag, TopicSummary,
 };
 
-/// The offset librdkafka reports for a partition without a committed offset
-/// (`RD_KAFKA_OFFSET_INVALID`); [`calculate_partition_lag`] reads any negative
-/// offset as "no commit".
+/// The committed offset [`calculate_partition_lag`] reads as "no commit" (any
+/// negative offset does).
 const NO_COMMIT: i64 = -1001;
 
 /// Expands a group's committed offsets to every partition of the topics it has
 /// committed to, the shape [`apply_group_offsets`] expects: partitions with no
-/// commit are present with [`Offset::Invalid`] so they count as lag.
-pub fn committed_partition_list(
+/// commit are present with `None` so they count as lag.
+pub fn committed_partition_offsets(
     committed: &HashMap<(String, i32), i64>,
     topics: &[TopicSummary],
-) -> TopicPartitionList {
-    let mut list = TopicPartitionList::new();
+) -> HashMap<(String, i32), Option<i64>> {
+    let mut offsets = HashMap::new();
     for topic in topics.iter().filter(|t| !t.is_internal) {
         if !committed.keys().any(|(name, _)| name == &topic.name) {
             continue;
         }
         for p in &topic.partitions {
-            let offset = committed
-                .get(&(topic.name.clone(), p.partition_id))
-                .map_or(Offset::Invalid, |&o| Offset::Offset(o));
-            if let Err(e) = list.add_partition_offset(&topic.name, p.partition_id, offset) {
-                tracing::debug!(%e, topic = topic.name, "Skipping partition");
-            }
+            let key = (topic.name.clone(), p.partition_id);
+            let offset = committed.get(&key).copied();
+            offsets.insert(key, offset);
         }
     }
-    list
+    offsets
 }
 
-/// Fills offsets, lag, and topics of `summary` from the group's committed offsets.
+/// Fills offsets, lag, and topics of `summary` from the group's committed
+/// offsets, keyed by `(topic, partition)` with `None` for a partition without
+/// a committed offset (the shape
+/// [`KafkaConsumerClient::fetch_committed_offsets_for`] returns).
 ///
 /// Matches `monitor lag`: within a topic the group has committed to, a partition
 /// without a committed offset counts its whole retained range as lag.
 /// Partitions without known watermarks are left out.
+///
+/// [`KafkaConsumerClient::fetch_committed_offsets_for`]: ferrika_core::kafka::consumer::KafkaConsumerClient::fetch_committed_offsets_for
 pub fn apply_group_offsets(
     summary: &mut ConsumerGroupSummary,
-    committed: &TopicPartitionList,
+    committed: &HashMap<(String, i32), Option<i64>>,
     watermarks: &HashMap<(String, i32), (i64, i64)>,
 ) {
     let mut topics: Vec<String> = committed
-        .elements()
         .iter()
-        .filter(|e| matches!(e.offset(), Offset::Offset(_)))
-        .map(|e| e.topic().to_string())
+        .filter(|(_, offset)| offset.is_some())
+        .map(|((topic, _), _)| topic.clone())
         .collect();
     topics.sort();
     topics.dedup();
 
-    for elem in committed.elements() {
-        if !topics.iter().any(|t| t == elem.topic()) {
+    for ((topic, partition), &committed) in committed {
+        if !topics.iter().any(|t| t == topic) {
             continue;
         }
-        let Some(&(low, high)) = watermarks.get(&(elem.topic().to_string(), elem.partition()))
-        else {
+        let Some(&(low, high)) = watermarks.get(&(topic.clone(), *partition)) else {
             continue;
-        };
-        let committed = match elem.offset() {
-            Offset::Offset(offset) => Some(offset),
-            _ => None,
         };
         let lag = calculate_partition_lag(committed.unwrap_or(NO_COMMIT), high, low);
         summary.current_offset += committed.unwrap_or(0);
         summary.end_offset += high;
         summary.total_lag += lag;
         summary.partitions.push(GroupPartitionLag {
-            topic: elem.topic().to_string(),
-            partition: elem.partition(),
+            topic: topic.clone(),
+            partition: *partition,
             committed,
             end_offset: high,
             lag,
@@ -131,7 +120,7 @@ pub fn group_partition_lags(
     };
     apply_group_offsets(
         &mut scratch,
-        &committed_partition_list(committed, topics),
+        &committed_partition_offsets(committed, topics),
         &watermarks,
     );
     let mut rows = scratch.partitions;
@@ -177,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn test_committed_partition_list_expands_consumed_topics_only() {
+    fn test_committed_partition_offsets_expand_consumed_topics_only() {
         let topics: Vec<TopicSummary> = ClusterSnapshot::demo()
             .topics
             .into_iter()
@@ -185,27 +174,20 @@ mod tests {
             .collect();
         let consumed = &topics[0];
         let committed = HashMap::from([((consumed.name.clone(), 0), 7)]);
-        let list = committed_partition_list(&committed, &topics);
-        assert_eq!(list.count(), consumed.partitions.len());
-        assert!(list.elements().iter().all(|e| e.topic() == consumed.name));
-        let p0 = list.find_partition(&consumed.name, 0).map(|e| e.offset());
-        assert_eq!(p0, Some(Offset::Offset(7)));
-        let p1 = list.find_partition(&consumed.name, 1).map(|e| e.offset());
-        assert_eq!(p1, Some(Offset::Invalid));
+        let offsets = committed_partition_offsets(&committed, &topics);
+        assert_eq!(offsets.len(), consumed.partitions.len());
+        assert!(offsets.keys().all(|(topic, _)| topic == &consumed.name));
+        assert_eq!(offsets.get(&(consumed.name.clone(), 0)), Some(&Some(7)));
+        assert_eq!(offsets.get(&(consumed.name.clone(), 1)), Some(&None));
     }
 
     #[test]
     fn test_group_lag_counts_uncommitted_partitions_of_consumed_topics() {
-        let mut committed = TopicPartitionList::new();
-        committed
-            .add_partition_offset("orders", 0, Offset::Invalid)
-            .unwrap();
-        committed
-            .add_partition_offset("orders", 1, Offset::Offset(2))
-            .unwrap();
-        committed
-            .add_partition_offset("audit", 0, Offset::Invalid)
-            .unwrap();
+        let committed = HashMap::from([
+            (("orders".to_string(), 0), None),
+            (("orders".to_string(), 1), Some(2)),
+            (("audit".to_string(), 0), None),
+        ]);
         let watermarks = HashMap::from([
             (("orders".to_string(), 0), (0, 2)),
             (("orders".to_string(), 1), (0, 3)),
@@ -228,16 +210,16 @@ mod tests {
     /// could differ: none of them changes what the GUI shows.
     #[test]
     fn test_group_lag_edge_cases_match_former_gui_formula() {
-        let mut committed = TopicPartitionList::new();
-        for (p, offset) in [
-            (0, Offset::Offset(5)),   // empty partition (high 0) with a stale commit
-            (1, Offset::Invalid),     // no commit, records truncated to 40..100
-            (2, Offset::Offset(10)),  // commit below the low watermark
-            (3, Offset::Offset(120)), // commit past the high watermark
-            (4, Offset::Invalid),     // no commit, empty partition
-        ] {
-            committed.add_partition_offset("t", p, offset).unwrap();
-        }
+        let committed: HashMap<(String, i32), Option<i64>> = [
+            (0, Some(5)),   // empty partition (high 0) with a stale commit
+            (1, None),      // no commit, records truncated to 40..100
+            (2, Some(10)),  // commit below the low watermark
+            (3, Some(120)), // commit past the high watermark
+            (4, None),      // no commit, empty partition
+        ]
+        .into_iter()
+        .map(|(p, offset)| (("t".to_string(), p), offset))
+        .collect();
         let watermarks = HashMap::from([
             (("t".to_string(), 0), (0, 0)),
             (("t".to_string(), 1), (40, 100)),
@@ -256,13 +238,10 @@ mod tests {
 
     #[test]
     fn test_group_lag_skips_partitions_without_watermarks() {
-        let mut committed = TopicPartitionList::new();
-        committed
-            .add_partition_offset("t", 0, Offset::Offset(1))
-            .unwrap();
-        committed
-            .add_partition_offset("t", 1, Offset::Offset(1))
-            .unwrap();
+        let committed = HashMap::from([
+            (("t".to_string(), 0), Some(1)),
+            (("t".to_string(), 1), Some(1)),
+        ]);
         let watermarks = HashMap::from([(("t".to_string(), 0), (0, 4))]);
         let mut summary = empty_summary();
         apply_group_offsets(&mut summary, &committed, &watermarks);

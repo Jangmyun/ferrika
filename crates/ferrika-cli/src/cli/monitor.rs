@@ -267,24 +267,23 @@ async fn handle_lag(
             }
         };
 
-        let mut queried_partitions = rdkafka::TopicPartitionList::new();
+        let mut queried_partitions: Vec<(&str, i32)> = Vec::new();
         for topic in &summaries {
             if topic.is_internal || topic_filter.is_some_and(|filter| topic.name != filter) {
                 continue;
             }
             for partition in &topic.partitions {
-                queried_partitions.add_partition(&topic.name, partition.partition_id);
+                queried_partitions.push((&topic.name, partition.partition_id));
             }
         }
-        let committed_tpl = consumer.fetch_committed_offsets_for(&queried_partitions, None)?;
+        let committed = consumer.fetch_committed_offsets_for(&queried_partitions, None)?;
 
         // Without --topic, only report topics the group has committed offsets for.
         // Counting every topic in the cluster as unconsumed would inflate the group's lag.
-        let consumed_topics: std::collections::HashSet<String> = committed_tpl
-            .elements()
+        let consumed_topics: std::collections::HashSet<&str> = committed
             .iter()
-            .filter(|elem| matches!(elem.offset(), rdkafka::Offset::Offset(_)))
-            .map(|elem| elem.topic().to_string())
+            .filter(|(_, offset)| offset.is_some())
+            .map(|((topic, _), _)| topic.as_str())
             .collect();
 
         let mut partition_lags = Vec::new();
@@ -293,7 +292,7 @@ async fn handle_lag(
                 if topic.name != filter {
                     continue;
                 }
-            } else if !consumed_topics.contains(&topic.name) {
+            } else if !consumed_topics.contains(topic.name.as_str()) {
                 continue;
             }
             if topic.is_internal {
@@ -305,12 +304,10 @@ async fn handle_lag(
                     .fetch_watermarks_async(&topic.name, p.partition_id, None)
                     .await?;
 
-                let current_offset = committed_tpl
-                    .find_partition(&topic.name, p.partition_id)
-                    .map(|elem| match elem.offset() {
-                        rdkafka::Offset::Offset(off) => off,
-                        _ => -1,
-                    })
+                let current_offset = committed
+                    .get(&(topic.name.clone(), p.partition_id))
+                    .copied()
+                    .flatten()
                     .unwrap_or(-1);
 
                 let lag = calculate_partition_lag(current_offset, high, low);

@@ -56,9 +56,7 @@ the other crates as `governance` and `ops`, so CLI code writes `crate::kafka::..
 
 The library crates are meant for crates.io. Until 1.0 their public items can
 still change. `rdkafka` is not re-exported and public signatures use Ferrika
-types (`StartOffset`, `CommitMode`, `ClusterMetadata`); only the
-`TopicPartitionList` group of committed-offset functions still names it (until
-0.3). Keep new public signatures free of `rdkafka` types.
+types (`StartOffset`, `CommitMode`, `ClusterMetadata`, offset maps). Keep new public signatures free of `rdkafka` types.
 
 ## Policy gate: no wildcard arms
 

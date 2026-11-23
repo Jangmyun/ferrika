@@ -628,13 +628,12 @@ impl GroupCommit {
         if next.is_empty() {
             return Ok(());
         }
-        let mut tpl = rdkafka::TopicPartitionList::new();
-        for (&partition, &offset) in next {
-            tpl.add_partition_offset(&self.topic, partition, rdkafka::Offset::Offset(offset))
-                .map_err(|e| KafkaError::Offset(e.to_string()))?;
-        }
+        let offsets: Vec<(&str, i32, i64)> = next
+            .iter()
+            .map(|(&partition, &offset)| (self.topic.as_str(), partition, offset))
+            .collect();
         self.consumer
-            .commit(&tpl, crate::kafka::consumer::CommitMode::Sync)
+            .commit(&offsets, crate::kafka::consumer::CommitMode::Sync)
             .map_err(|e| {
                 KafkaError::Offset(format!(
                     "could not commit the redrive progress to group '{}': {e}; records \

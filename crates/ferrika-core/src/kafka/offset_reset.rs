@@ -145,10 +145,8 @@ pub async fn prepare_offset_reset(
             None => strategy.clone(),
         };
 
-        let mut partition = TopicPartitionList::new();
-        partition.add_partition(topic, p);
         let current_committed = match consumer
-            .fetch_committed_offsets_for(&partition, None)
+            .committed_list_for(&[(topic, p)], None)
             .and_then(|tpl| committed_offset_of(&tpl, topic, p))
         {
             Ok(o) => o,
@@ -256,17 +254,11 @@ pub fn commit_offset_reset(
     consumer_cfg = consumer_cfg.with_group_id(group_id.to_string());
     let client = KafkaConsumerClient::new(&consumer_cfg)?;
 
-    let mut tpl = TopicPartitionList::new();
-    for plan in plans {
-        tpl.add_partition_offset(
-            &plan.topic,
-            plan.partition,
-            Offset::Offset(plan.target_offset),
-        )
-        .map_err(|e| KafkaError::consumer(format!("Failed to add partition offset: {e}")))?;
-    }
-
-    client.commit(&tpl, CommitMode::Sync)?;
+    let offsets: Vec<(&str, i32, i64)> = plans
+        .iter()
+        .map(|plan| (plan.topic.as_str(), plan.partition, plan.target_offset))
+        .collect();
+    client.commit(&offsets, CommitMode::Sync)?;
 
     Ok(())
 }
