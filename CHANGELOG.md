@@ -4,32 +4,166 @@ All notable changes to the Ferrika crates and the `ferrika` CLI. The crates
 share one version. Before 1.0, a minor version (0.x) may break the library
 API; a patch version (0.x.y) does not. Exception: `ferrika-cli`'s Rust `cli`
 module is the command line's own code (argument structs, the command enum),
-not a library API; options added to commands change it in patch versions,
-and 0.2.0 makes it crate-internal.
+not a library API; options added to commands changed it in 0.1 patch
+versions, and 0.2.0 made it crate-internal.
 
-## Unreleased
+## 0.2.0
 
-The RabbitMQ entries below are planned for 0.2.0.
+New: connection presets for Kafka-compatible services, `ferrika transform`,
+an interactive `ferrika top` dashboard, RabbitMQ support (preview), policy
+environments and the `screen_capture` and `mcp_write` rules, MCP transform
+and RabbitMQ tools, Schema Registry references, `-f json` for every command
+and a stronger history digest. The library API no longer exposes `rdkafka`
+types. This release breaks a few CLI defaults, the library API and older
+builds' reading of new policies and history entries; read "Upgrading from
+0.1" first.
+
+### Upgrading from 0.1
+
+Toolchain:
+
+- Building from source needs Rust 1.89 or newer (`lapin` and its AMQP
+  crates); the crates declare `rust-version = "1.89"`. Prebuilt binaries are
+  not affected.
+
+Command line (scripts may need a change):
+
+- `acl delete` without a filter (every binding) needs `--all`; `-f` alone is
+  refused.
+- `quota set/remove --user default` and `--client-id default` now name an
+  entity called `default`. For the default quota use `--user-default`,
+  `--client-id-default` or `--ip-default`.
+- `ferrika top` at a terminal opens the interactive dashboard. Scripts that
+  read its output should pass `--plain` (or `-n`/`--json`; a stdout that is
+  not a terminal still gets the printed view). `--interval-secs` is now
+  `--interval` (the old name still works) and defaults to 5 s instead of 2.
+- A profile's `request_timeout_ms` now applies unless `--timeout` is given;
+  before, the 30 s default of `--timeout` always replaced it. Pass
+  `--timeout 30` to keep the old value for such a profile.
+- `--header-filter KEY=VALUE` matches the exact value (`KEY:VALUE` still
+  means "contains"), and repeated filters must all match.
+- `monitor lag GROUP --topic NAME` fails when the topic does not exist
+  instead of reporting 0 lag.
+- `dlq export` records carry the whole value (`payload` or
+  `payload_base64`) besides `payload_preview`.
+- `topics create` without `-p`/`-r` uses the broker's `num.partitions` and
+  `default.replication.factor` instead of 1 (a broker older than Kafka 2.4
+  still gets 1). Pass `-p 1 -r 1` to keep the old result.
+- `health` exits with status 3 when a check could not be completed (group
+  listing, committed or end offsets unreadable) and no finding failed
+  `--fail-on` first; before, such a cluster passed as "no groups". Treat 3
+  as "unknown" in scripts, or pass `--fail-on never`.
+- `health --watch -f json` writes JSON Lines (one object per finding that
+  appears or clears); `monitor --watch -f json` is refused.
+- `-f json` now prints one JSON document (notes on stderr) for the commands
+  that used to print text regardless, such as `acl create/delete`, `undo`,
+  `profile add`, `quota set` and `schema register` (list under Fixed).
+- Audit forwarding writes `ferrika-audit-<host>-<user>.<random>.jsonl`
+  spool files instead of one fixed name; point collectors at
+  `ferrika-audit-*.jsonl`. A shared spool folder that group or others may
+  write (without the sticky bit) is refused. On Windows a spool folder
+  whose DACL lets other accounts delete files, change its permissions or
+  write to the files created in it (for example one inheriting broad rights
+  under `C:\ProgramData`) is refused; create it with
+  `Install-FerrikaPolicy.ps1 -SpoolDir` or tighten its permissions.
+- Profiles in a config directory other than `~/.ferrika`
+  (`FERRIKA_CONFIG_DIR`, `FERRIKA_CONFIG_PATH`) keep their secrets in the
+  credential store as `<profile>/<field>@<hash>`. The first read copies an
+  existing `<profile>/<field>` entry, which stays in place; a 0.1 build on
+  that directory still reads only the old entry, so secrets changed with
+  0.2.0 are not seen there.
+
+Library API (Rust users of the crates):
+
+- New public paths for logic that was private to the CLI (presets,
+  transform options, the copy policy check, RabbitMQ connection and view):
+  see "Library API for front ends" under Added (#96).
+- `ferrika-cli` (#23): the command modules, their argument structs (with
+  `ProfileAddArgs::security_protocol`, which became `Option<String>` for
+  `--preset`), `Commands` and the fields of `Cli` are crate-internal. Run
+  the command line in-process with `cli::app::{Cli, run}` (`Cli::parse_from`)
+  or use the library crates; `rabbit` and `transform` keep the few items GUI
+  front ends need.
+- `ferrika-core` (#25): the SASL OAUTHBEARER and AWS MSK IAM internals
+  (SigV4 presigning, credential-file and `credential_process` parsing,
+  region guessing, JWT and form encoding, `OidcSource`, `MskIamSource`),
+  `parse_properties` and the expression-completion helpers are
+  crate-internal. Set `sasl_mechanism` (`OAUTHBEARER`, `AWS_MSK_IAM`) on a
+  `ClusterProfile` and let the clients build the token source; read a
+  `.properties` file with `ClusterProfile::from_properties`.
+- `ferrika-governance` and `ferrika-ops` (#24): about 50 items only their
+  own crate used are crate-internal, among them the policy directory
+  override helpers (use `policy::policy_dir`, `load_from`),
+  `resolve_brokers` and `broker_glob_match` (use `glob_match`,
+  `normalize_broker`, `brokers_for_with`), syslog framing, the topology and
+  time-histogram building blocks (use `topology::from_metadata` or
+  `topology::collect`, `time_histogram::run`/`compute`), lint fix undo files, history constants,
+  `dlq::build_redrive_plan` (use `build_redrive_plan_from`),
+  `mirror::Verbatim`, `transform::MAX_STEPS` and `Pipeline::uses_fields`.
+- `rdkafka` types are gone from the public API (#109, #111):
+  `ferrika_core::rdkafka` is removed (depend on `rdkafka` directly if you
+  need it); `kafka::consumer::StartOffset` replaces `rdkafka::Offset`,
+  `CommitMode` rdkafka's commit mode and `PendingDelivery` its
+  `DeliveryFuture`; `KafkaAdminClient::fetch_metadata` returns
+  `ClusterMetadata` (`fetch_raw_metadata` is crate-internal) and
+  `topology::from_rdkafka_metadata` becomes `from_metadata`/`collect`;
+  `KafkaConsumerClient::inner` is removed and `positions()` returns a map.
+  Committed offsets are maps: `fetch_committed_offsets(_for)` return
+  `HashMap<(String, i32), Option<i64>>`, `commit` takes
+  `&[(&str, i32, i64)]`, and `group_lag::committed_partition_list` is now
+  `committed_partition_offsets`.
+- `ferrika_core::kafka::bounded_read::topic_watermarks` is `async`.
+- `PolicyAction` has new variants `MessagesPeek` and `MessagesMove`; a
+  `match` on it needs arms for them.
+- `PolicyRules` has new fields (`screen_capture`, `mcp_write`,
+  `environments`, `default_environment`, `copy_down`); struct literals need
+  them or `..Default::default()`.
+- `MessageFilter::header_filters` is a `Vec<HeaderFilter>` instead of a
+  map, and `with_header` adds a filter instead of replacing one for the
+  same key.
+- `ferrika_ops::report::ReportContext` takes `product` and
+  `product_version`; `Report::ferrika_version` is replaced by `product`,
+  `product_version` and `ops_version` (also in `report --format json`).
+- `ClusterSnapshot` has a new `warnings` field; struct literals need it
+  (`ClusterSnapshot::empty` leaves it empty).
+- `ferrika_governance::audit_forward::spool_file` returns
+  `Option<PathBuf>` (`None` before the first entry).
+- `undo::DigestCheck` has a new `Legacy` variant, and
+  `Operation::digest` returns the v2 digest (`digest_v1` is the old one).
+  Front ends that decide an undo themselves can use the new
+  `undo::prepare_request` (and `undo_eligibility` for lists) to apply the
+  same checks as `ferrika undo` (additive).
+
+Company policy:
+
+- The new rules `screen_capture`, `mcp_write`, `environments`,
+  `default_environment` and `copy_down` make a policy format 2, and the
+  categories `messages.peek` and `messages.move` are new. Builds before
+  0.2.0 treat a policy that uses any of them as invalid (unknown rule or
+  category) and fall back to the strictest mode. Update every client (CLI,
+  MCP servers and other front ends) to 0.2.0 first, then roll out such a
+  policy. Policies without them keep working on both versions.
+
+History and undo:
+
+- Entries recorded by 0.2.0 carry a `v2:` digest. A 0.1 build refuses to
+  undo them (it reports them as edited), so undo with 0.2.0 or later once
+  any client was upgraded. 0.1 entries still verify and undo, shown as
+  `legacy digest`; with `-y` undoing one needs `--accept-legacy`.
+- `undo` refuses unless the cluster in use is the recorded one (cluster id
+  when recorded, else the bootstrap set).
+
+MCP:
+
+- `ferrika mcp --allow-write` also offers the RabbitMQ write tools
+  (`rabbit_peek`, `rabbit_dlq_inspect`, `rabbit_publish`,
+  `rabbit_dlq_redrive`). Limit them with the
+  new `--queues GLOB` and `--exchanges GLOB`; with either set, a redrive
+  must name `to_exchange`. `mcp_write` and read-only RabbitMQ profiles
+  apply.
 
 ### Security
 
-- Audit forwarding spool on Windows: the spool folder and spool files are
-  now checked against their DACL, not only their owner and reparse points.
-  A spool file whose DACL (explicit or inherited entries, evaluated in
-  order with deny entries) lets another account than the current one,
-  SYSTEM or Administrators write, append, delete or change its permissions
-  or owner is skipped with a warning and a new file is used. An existing
-  spool folder that lets other accounts delete files, change its
-  permissions or owner, or write to the files created in it (an
-  inheritable entry) is refused with a clear error; letting them only add
-  files (the `Install-FerrikaPolicy.ps1 -SpoolDir` folder) stays accepted.
-  A missing spool folder is created with a protected owner-only DACL.
-  Before, a spool folder under e.g. `C:\ProgramData` that inherited broad
-  permissions let other local accounts modify audit spool files already
-  written. The policy directory warning of `ferrika policy show` and the
-  spool checks now share one implementation, so the policy check also
-  honours deny entries before allow entries and reports a symbolic link or
-  junction.
 - Audit forwarding spool: new spool files are named
   `ferrika-audit-<host>-<user>.<16 random hex>.jsonl` and created with
   create-new semantics (`0600` on Unix). An existing file is appended to
@@ -47,6 +181,23 @@ The RabbitMQ entries below are planned for 0.2.0.
 - `ferrika_governance::audit_forward::spool_file` now returns
   `Option<PathBuf>`: the file this account would append to, `None` before
   the first entry.
+- Audit forwarding spool on Windows: the spool folder and spool files are
+  now checked against their DACL, not only their owner and reparse points.
+  A spool file whose DACL (explicit or inherited entries, evaluated in
+  order with deny entries) lets another account than the current one,
+  SYSTEM or Administrators write, append, delete or change its permissions
+  or owner is skipped with a warning and a new file is used. An existing
+  spool folder that lets other accounts delete files, change its
+  permissions or owner, or write to the files created in it (an
+  inheritable entry) is refused with a clear error; letting them only add
+  files (the `Install-FerrikaPolicy.ps1 -SpoolDir` folder) stays accepted.
+  A missing spool folder is created with a protected owner-only DACL.
+  Before, a spool folder under e.g. `C:\ProgramData` that inherited broad
+  permissions let other local accounts modify audit spool files already
+  written. The policy directory warning of `ferrika policy show` and the
+  spool checks now share one implementation, so the policy check also
+  honours deny entries before allow entries and reports a symbolic link or
+  junction.
 - Policy directory: `packaging/windows/Install-FerrikaPolicy.ps1` verifies
   after locking that only Administrators, SYSTEM and TrustedInstaller own
   the folder and policy files or hold write/create/delete/permission rights
@@ -65,9 +216,51 @@ The RabbitMQ entries below are planned for 0.2.0.
   bracketed IPv6, duplicates ignored), and `read_only` globs also see each
   broker in its normalized form (`KAFKA1.prod.corp.` is caught by
   `kafka1.prod.corp:*`).
+- History digest version 2. The audit log's `op_digest` used to cover only
+  an operation's before- and after-state, so an edited journal line could
+  move a recorded change to another cluster (`scope`), mark another
+  operation as undone (`undoes`, blocking its undo) or change its `action`
+  or `reversibility` without being noticed. New entries record
+  `op_digest: "v2:<sha256>"`, which covers every field of the entry (id,
+  source, user, scope, action, target, reversibility, limits, info,
+  before-state, `undoes`, final after-state and result). The audit log's
+  digest decides which rule applies, so an edited journal cannot choose the
+  weaker one; 0.1 readers compare the whole string and so refuse a v2
+  entry instead of accepting it.
+- Entries recorded by 0.1 (64 hex digits, no prefix) still verify with the
+  old rule but are shown as `legacy digest (scope not covered)` in
+  `history` (new AUDIT column, `digest` in JSON), `history show` and
+  `audit verify`. Undoing one prints the recorded and the current cluster
+  and asks again; with `-y` it needs `--accept-legacy`.
+- `undo` now refuses unless the cluster in use is the recorded one: when
+  the entry has a cluster id, the current cluster's id must be read and
+  equal (matching bootstrap servers are no longer enough); otherwise the
+  bootstrap set must match. The message names both clusters.
+- An `undoes` link counts only when the undoing entry's v2 digest matches
+  (or, without a policy, when the audit log has no entry for it); an edited
+  or legacy link no longer blocks undoing the original, and an edited one
+  is logged as `history.tampered`.
+- `audit verify` also checks every history entry against its `op_digest`
+  and exits 2 when one was edited.
 
 ### Added
 
+- `ferrika profile add --preset NAME` fills in the security protocol and
+  SASL mechanism for Kafka-compatible services: `confluent-cloud`
+  (SASL_SSL + PLAIN), `msk-iam` (SASL_SSL + AWS-MSK-IAM), `msk-scram`
+  (SASL_SSL + SCRAM-SHA-512), `redpanda-cloud` (SASL_SSL + SCRAM-SHA-256),
+  `warpstream` and `automq` (plaintext). Explicit flags win; the output
+  lists what the preset filled in and notes for the service.
+- `profile add --schema-registry-user` with `--schema-registry-password-stdin`
+  (or `--schema-registry-password`): Schema Registry basic auth such as a
+  Confluent Cloud Schema Registry API key, kept in the OS credential store.
+- Partition reassignment, SCRAM user and client quota commands check the
+  broker's ApiVersions first and say "this cluster does not support ..."
+  when a Kafka-compatible broker leaves the API out, instead of failing
+  with a dropped connection.
+- `docs/COMPATIBILITY.md`: what is tested against which Kafka-compatible
+  broker, the presets and known limitations; `docs/e2e/automq-compose.yml`
+  for the AutoMQ end-to-end test (see Changed).
 - `schema register` and `schema check` take `--reference NAME=SUBJECT:VERSION`
   (repeatable) for Avro named types, Protobuf imports and JSON Schema `$ref`s
   in other subjects, sent as the Schema Registry API's `references`.
@@ -84,7 +277,94 @@ The RabbitMQ entries below are planned for 0.2.0.
   that appears or clears; `monitor export` prints its URLs as JSON.
 - A test walks the command tree and fails for a command that is neither
   known to print JSON under `-f json` nor listed with a reason why not.
-
+- `ferrika top` (new alias `ferrika tui`) opens an interactive, read-only
+  terminal dashboard when run at a terminal: Overview (brokers online and
+  offline, controller, under-replicated and leaderless partitions, health
+  findings), Topics (replication, records, produce rate from watermark
+  deltas), Consumer groups (state, members, lag with a trend arrow) and
+  Findings, with keys to switch views, filter (`/`), sort (`s`), refresh
+  (`r`) and quit (`q`). The cluster is read on a background thread, so a
+  slow cluster does not freeze the screen; the status line shows the age of
+  the data and the last error. The terminal is restored on exit and on a
+  panic. It is the default-on `tui` feature of `ferrika-cli` (ratatui 0.30,
+  crossterm 0.29). `--plain` keeps the previous printed view, which is also
+  used with `-n`, `--json` or when stdout is not a terminal.
+- `ferrika transform SRC --to DST`: copy records to another topic (also on
+  another cluster with `--dst-profile` or `--dst-bootstrap-servers`) through
+  steps applied in the order given: `--filter EXPR` (the `consume --where`
+  syntax), `--drop FIELD`, `--rename OLD=NEW`, `--set FIELD=JSON`,
+  `--rekey FIELD`, `--mask[=redact]` and `--sample N`. Without `--execute` it
+  is a dry run that prints the transformed records. Bounded runs with
+  `--from-beginning`, `--from-timestamp`, `--max-records` and `--until-end`;
+  `-g` commits offsets only after the destination acknowledged the record;
+  `-D` decodes Schema Registry values to JSON first. Writes pass the same
+  policy checks as `mirror`; under enforced PII masking a run is allowed when
+  `--mask` is its first step. The audit result entry records the counts and
+  a SHA-256 of the steps, never the steps or record data.
+- `ferrika mirror --mask[=redact]`: masks PII in keys, values and header
+  values (the transform mask step) before writing, so a mirror passes
+  enforced masking and `copy_down: masked`. It cannot be combined with
+  `--grep`, `-k` or `--header-filter`, which read raw values.
+- Preview: RabbitMQ support in the new crate `ferrika-rabbitmq` and the
+  command `ferrika rabbit`, through the management HTTP API: `queues`,
+  `exchanges` and `bindings` of a vhost, `peek <queue> -n N` (reads and
+  requeues, so the messages are marked redelivered) and `publish <exchange>
+  -k <routing-key> -m <body>`, with table and `--format json` output.
+  Commands and output may change; design and decisions in
+  `docs/plans/multi-broker.md`.
+- RabbitMQ profiles: `ferrika rabbit profile add|list|use|remove|show`,
+  stored in `rabbit-profiles.json` next to `profiles.json` (separate from
+  the Kafka profiles; `ClusterProfile` is unchanged), passwords in the OS
+  credential store under `<profile>/rabbitmq_password`. Commands take
+  `--rabbit-profile` (default: the active RabbitMQ profile); `--rabbit-url`,
+  `--vhost`, `--rabbit-user`, `FERRIKA_RABBIT_PASSWORD` /
+  `--rabbit-password-stdin` and `--amqp-url` override it. `--read-only` on
+  a profile refuses its writes.
+- `ferrika rabbit dlq inspect <queue>`: dead-lettered messages grouped by
+  original queue, reason, exchange and routing key from `x-death`, masked
+  under the policy. `ferrika rabbit dlq redrive <queue> [--to-exchange X]
+  [-k K] [-n N]`: a preview of where each message would go; with
+  `--execute` (asks first unless `--yes`) the messages are moved over AMQP
+  0-9-1, one at a time, acknowledged only after the broker confirmed the
+  republished copy, stopping at the first failure. Redriven messages keep
+  their headers (`x-death` included). Credentials in `--rabbit-url` are
+  used for AMQP too, with a warning that they can end up in shell
+  history. New dependency `lapin` (MIT) in `ferrika-rabbitmq`, behind its
+  default feature `amqp`.
+- Policy categories `messages.peek` (`rabbit peek`, `rabbit dlq inspect`,
+  the `rabbit dlq redrive` preview) and `messages.move` (`rabbit dlq redrive
+  --execute`). `rabbit publish` is `produce`, so `forbid: ["produce"]`
+  covers both brokers, and a RabbitMQ redrive needs `produce` allowed as
+  well as `messages.move`. For `rabbit` commands the policy's
+  broker-address rules match both the management and the AMQP
+  `host:port`. `PolicyAction` gains `MessagesPeek` and `MessagesMove`.
+- Policy environments (format 2): `rules.environments` names environment
+  tiers (`"prod": {"tier": 3, "brokers": ["*.prod.corp"], "profiles":
+  ["prod-*"]}`), each matched by broker-address and/or profile-name globs,
+  with an optional `default_environment` for unmatched clusters. Each
+  environment can add `read_only: true` and its own `forbid` categories on
+  top of the global ones. `copy_down: allow | masked | forbid` (default
+  `allow`) governs record copies from a higher tier to a lower one (or to a
+  cluster in no environment): `masked` needs `transform --mask` as the
+  first step or `mirror --mask`, `forbid` refuses them. Checked in the
+  shared `authorize_copy` and `EffectivePolicy::check`, so `mirror`,
+  `transform --execute`, MCP write tools and other front ends apply the
+  same rules. `policy show` lists the environments, `profile list` gains an
+  `ENV` column (and an `environment` JSON field), and an allowed change's
+  audit request entry reads `requested (environment prod)`. See
+  docs/POLICY.md "Environments".
+- Policy rule `screen_capture: allowed | blocked` (format 2, opt-in, default
+  `allowed`): `blocked` asks a desktop front end to keep its window out of
+  screenshots, screen recordings and screen shares. No effect in the CLI;
+  `policy show` lists it. Library: `ScreenCaptureRule` and
+  `EffectivePolicy::screen_capture_blocked_at`.
+- Policy rule `mcp_write: allowed | confirm_human | forbidden` (format 2,
+  default `allowed`) for AI assistants using `ferrika mcp --allow-write`:
+  `forbidden` leaves the write tools out of `tools/list` and refuses a call,
+  audited as `policy.blocked` like other policy refusals; `confirm_human` has the server confirm every write through
+  MCP elicitation whatever `--confirm` says (a client without elicitation
+  gets no write tools). The CLI is unaffected; `policy show` lists it.
+  Library: `McpWriteRule` and `EffectivePolicy::mcp_write_at`.
 - MCP: `transform_preview` (read tool) runs `ferrika transform` steps
   (`[{"filter": ...}, {"drop": ...}, {"mask": "partial"}, ...]`) on a topic
   from the beginning or `from_timestamp` up to its current end and returns
@@ -139,7 +419,7 @@ The RabbitMQ entries below are planned for 0.2.0.
   builds without the AMQP client.
 - Library API for front ends (GUI front ends and other library users), so
   they reuse the CLI's own checks instead of copies that could drift. The
-  CLI now calls these itself; its behaviour is unchanged.
+  CLI now calls these itself; its behaviour is unchanged (#96).
   - `ferrika_core::kafka::preset`: the connection presets with
     `display_name`, `credential_fields` (what the service calls each
     credential), `credentials_hint` and `notes` that name no CLI flags,
@@ -150,10 +430,10 @@ The RabbitMQ entries below are planned for 0.2.0.
   - `ferrika_core::model::policy::PolicyAction::also_requires` and
     `ferrika_governance::policy::extra_category_refusal`: a RabbitMQ redrive
     needs `produce` allowed as well as `messages.move`, in every front end.
-  - `ferrika_ops::transform::{check_options, RunOptions, DecodingTransform,
-    TransformSummary}`: option checks on plain data, the per-record
-    decode-then-steps hook and the serializable run summary with its audit
-    detail.
+  - `ferrika_ops::transform::{check_options, RunOptions, OptionsProblem,
+    DecodingTransform, TransformSummary}`: option checks on plain data, the
+    per-record decode-then-steps hook and the serializable run summary with
+    its audit detail.
   - `ferrika_ops::mirror::authorize_copy` (`CopyCheck`, `CopyCluster`,
     `CopyAuthorized`): the policy checks for copying records between
     clusters (enforced masking unless the copy masks first, the export gate
@@ -163,111 +443,11 @@ The RabbitMQ entries below are planned for 0.2.0.
     `credentials`, `client`, `amqp_target`) and `ferrika_rabbitmq::view`
     (`ShownMessage` with PII masking, `mask_properties`, `Inspection`,
     `RedrivePreview`, `redrive_outcome`, `parse_headers`).
-- `ferrika profile add --preset NAME` fills in the security protocol and
-  SASL mechanism for Kafka-compatible services: `confluent-cloud`
-  (SASL_SSL + PLAIN), `msk-iam` (SASL_SSL + AWS-MSK-IAM), `msk-scram`
-  (SASL_SSL + SCRAM-SHA-512), `redpanda-cloud` (SASL_SSL + SCRAM-SHA-256),
-  `warpstream` and `automq` (plaintext). Explicit flags win; the output
-  lists what the preset filled in and notes for the service.
-- `profile add --schema-registry-user` with `--schema-registry-password-stdin`
-  (or `--schema-registry-password`): Schema Registry basic auth such as a
-  Confluent Cloud Schema Registry API key, kept in the OS credential store.
-- Partition reassignment, SCRAM user and client quota commands check the
-  broker's ApiVersions first and say "this cluster does not support ..."
-  when a Kafka-compatible broker leaves the API out, instead of failing
-  with a dropped connection.
-- `docs/COMPATIBILITY.md`: what is tested against which Kafka-compatible
-  broker, the presets and known limitations; `docs/e2e/automq-compose.yml`
-  (not run yet) for a later AutoMQ end-to-end test.
-- `ferrika top` (new alias `ferrika tui`) opens an interactive, read-only
-  terminal dashboard when run at a terminal: Overview (brokers online and
-  offline, controller, under-replicated and leaderless partitions, health
-  findings), Topics (replication, records, produce rate from watermark
-  deltas), Consumer groups (state, members, lag with a trend arrow) and
-  Findings, with keys to switch views, filter (`/`), sort (`s`), refresh
-  (`r`) and quit (`q`). The cluster is read on a background thread, so a
-  slow cluster does not freeze the screen; the status line shows the age of
-  the data and the last error. The terminal is restored on exit and on a
-  panic. It is the default-on `tui` feature of `ferrika-cli` (ratatui 0.30,
-  crossterm 0.29). `--plain` keeps the previous printed view, which is also
-  used with `-n`, `--json` or when stdout is not a terminal.
-- `ferrika transform SRC --to DST`: copy records to another topic (also on
-  another cluster with `--dst-profile` or `--dst-bootstrap-servers`) through
-  steps applied in the order given: `--filter EXPR` (the `consume --where`
-  syntax), `--drop FIELD`, `--rename OLD=NEW`, `--set FIELD=JSON`,
-  `--rekey FIELD`, `--mask[=redact]` and `--sample N`. Without `--execute` it
-  is a dry run that prints the transformed records. Bounded runs with
-  `--from-beginning`, `--from-timestamp`, `--max-records` and `--until-end`;
-  `-g` commits offsets only after the destination acknowledged the record;
-  `-D` decodes Schema Registry values to JSON first. Writes pass the same
-  policy checks as `mirror`; under enforced PII masking a run is allowed when
-  `--mask` is its first step. The audit result entry records the counts and
-  a SHA-256 of the steps, never the steps or record data.
-- `ferrika-ops`: `transform` (the step pipeline), and
-  `mirror::run_copy_pipeline` with a `RecordTransform` hook, a preview
-  destination and `MirrorConfig::from_timestamp` / `until_end`.
-- `ferrika-core`: `Expr::matches_parsed` (evaluate an expression on an
-  already parsed JSON value) and `DriverError::partition_eof`.
-
-- Preview: RabbitMQ support in the new crate `ferrika-rabbitmq` and the
-  command `ferrika rabbit`, through the management HTTP API: `queues`,
-  `exchanges` and `bindings` of a vhost, `peek <queue> -n N` (reads and
-  requeues, so the messages are marked redelivered) and `publish <exchange>
-  -k <routing-key> -m <body>`, with table and `--format json` output.
-  Commands and output may change; design and decisions in
-  `docs/plans/multi-broker.md`.
-- RabbitMQ profiles: `ferrika rabbit profile add|list|use|remove|show`,
-  stored in `rabbit-profiles.json` next to `profiles.json` (separate from
-  the Kafka profiles; `ClusterProfile` is unchanged), passwords in the OS
-  credential store under `<profile>/rabbitmq_password`. Commands take
-  `--rabbit-profile` (default: the active RabbitMQ profile); `--rabbit-url`,
-  `--vhost`, `--rabbit-user`, `FERRIKA_RABBIT_PASSWORD` /
-  `--rabbit-password-stdin` and `--amqp-url` override it. `--read-only` on
-  a profile refuses its writes.
-- `ferrika rabbit dlq inspect <queue>`: dead-lettered messages grouped by
-  original queue, reason, exchange and routing key from `x-death`, masked
-  under the policy. `ferrika rabbit dlq redrive <queue> [--to-exchange X]
-  [-k K] [-n N]`: a preview of where each message would go; with
-  `--execute` (asks first unless `--yes`) the messages are moved over AMQP
-  0-9-1, one at a time, acknowledged only after the broker confirmed the
-  republished copy, stopping at the first failure. Redriven messages keep
-  their headers (`x-death` included). Credentials in `--rabbit-url` are
-  used for AMQP too, with a warning that they can end up in shell
-  history. New dependency `lapin`
-  (MIT) in `ferrika-rabbitmq`, behind its default feature `amqp`.
-- Policy categories `messages.peek` (`rabbit peek`, `rabbit dlq inspect`,
-  the `rabbit dlq redrive` preview) and `messages.move` (`rabbit dlq redrive
-  --execute`). `rabbit publish` is `produce`, so `forbid: ["produce"]`
-  covers both brokers, and a RabbitMQ redrive needs `produce` allowed as
-  well as `messages.move`. For `rabbit` commands the policy's
-  broker-address rules match both the management and the AMQP
-  `host:port`. `PolicyAction` gains `MessagesPeek` and `MessagesMove` (a
-  breaking change for code that matches on it).
-- Policy environments (format 2): `rules.environments` names environment
-  tiers (`"prod": {"tier": 3, "brokers": ["*.prod.corp"], "profiles":
-  ["prod-*"]}`), each matched by broker-address and/or profile-name globs,
-  with an optional `default_environment` for unmatched clusters. Each
-  environment can add `read_only: true` and its own `forbid` categories on
-  top of the global ones. `copy_down: allow | masked | forbid` (default
-  `allow`) governs record copies from a higher tier to a lower one (or to a
-  cluster in no environment): `masked` needs `transform --mask` as the
-  first step or `mirror --mask`, `forbid` refuses them. Checked in the
-  shared `authorize_copy` and `EffectivePolicy::check`, so `mirror`,
-  `transform --execute`, MCP write tools and the desktop app apply the same
-  rules. `policy show` lists the environments, `profile list` gains an
-  `ENV` column (and an `environment` JSON field), and an allowed change's
-  audit request entry reads `requested (environment prod)`. See
-  docs/POLICY.md "Environments".
-- `ferrika mirror --mask[=redact]`: masks PII in keys, values and header
-  values (the transform mask step) before writing, so a mirror passes
-  enforced masking and `copy_down: masked`. It cannot be combined with
-  `--grep`, `-k` or `--header-filter`, which read raw values.
 - Library: `ferrika_core::model::policy::{Environment, CopyDownRule}` and
   the `PolicyRules` fields `environments`, `default_environment` and
   `copy_down`; `ferrika_governance::policy::{EnvironmentMatch, CopyDown}`
   with `EffectivePolicy::{environment, copy_down,
-  copy_down_needs_broker_metadata}`. Code that builds `PolicyRules`
-  without `..Default::default()` must add the new fields.
+  copy_down_needs_broker_metadata}`.
 - Library: `ferrika_ops::history::undo::prepare_request` makes the whole
   undo decision in one place, so the CLI and other front ends cannot
   decide differently: whether the "undone by" mark is believed
@@ -282,80 +462,14 @@ The RabbitMQ entries below are planned for 0.2.0.
   a list can mark an entry whose undo would be refused; `listed_on` is the
   rule for which entries a cluster's history lists. `ferrika undo` and
   `ferrika history` use them; their behaviour and output are unchanged.
-
-### Security
-
-- History digest version 2. The audit log's `op_digest` used to cover only
-  an operation's before- and after-state, so an edited journal line could
-  move a recorded change to another cluster (`scope`), mark another
-  operation as undone (`undoes`, blocking its undo) or change its `action`
-  or `reversibility` without being noticed. New entries record
-  `op_digest: "v2:<sha256>"`, which covers every field of the entry (id,
-  source, user, scope, action, target, reversibility, limits, info,
-  before-state, `undoes`, final after-state and result). The audit log's
-  digest decides which rule applies, so an edited journal cannot choose the
-  weaker one; 0.1 readers compare the whole string and so refuse a v2
-  entry instead of accepting it.
-- Entries recorded by 0.1 (64 hex digits, no prefix) still verify with the
-  old rule but are shown as `legacy digest (scope not covered)` in
-  `history` (new AUDIT column, `digest` in JSON), `history show` and
-  `audit verify`. Undoing one prints the recorded and the current cluster
-  and asks again; with `-y` it needs `--accept-legacy`.
-- `undo` now refuses unless the cluster in use is the recorded one: when
-  the entry has a cluster id, the current cluster's id must be read and
-  equal (matching bootstrap servers are no longer enough); otherwise the
-  bootstrap set must match. The message names both clusters.
-- An `undoes` link counts only when the undoing entry's v2 digest matches
-  (or, without a policy, when the audit log has no entry for it); an edited
-  or legacy link no longer blocks undoing the original, and an edited one
-  is logged as `history.tampered`.
-- `audit verify` also checks every history entry against its `op_digest`
-  and exits 2 when one was edited.
+- `ferrika-ops`: `transform` (the step pipeline), and
+  `mirror::run_copy_pipeline` with a `RecordTransform` hook, a preview
+  destination and `MirrorConfig::from_timestamp` / `until_end`.
+- `ferrika-core`: `Expr::matches_parsed` (evaluate an expression on an
+  already parsed JSON value) and `DriverError::partition_eof`.
 
 ### Changed
 
-- Leader-change retries: `ferrika_core::kafka::retry` has one retry policy
-  (which errors, how many tries, backoff) with a blocking executor
-  (`retry_leader_change`, `retry_metadata`) and a new async one
-  (`retry_leader_change_async`, waits with `tokio::time::sleep`).
-  `KafkaConsumerClient` gains `fetch_watermarks_async` and
-  `fetch_watermarks_batch_async`; the blocking versions now document that
-  they may sleep the calling thread for up to 3.5 s while a partition
-  leader moves. `bounded_read::topic_watermarks` is now `async`.
-- Credential store entries are per config directory. Profiles in the
-  default directory (`~/.ferrika`) keep their account names
-  (`<profile>/<field>`); profiles in another directory (`FERRIKA_CONFIG_DIR`,
-  `FERRIKA_CONFIG_PATH`) use `<profile>/<field>@<hash>`, where `<hash>` is
-  the first 16 hex digits of the SHA-256 of the directory's canonical path.
-  Two directories with a profile of the same name (for example `prod` in a
-  test directory and in `~/.ferrika`) no longer read and overwrite each
-  other's passwords. This covers Kafka profile secrets, RabbitMQ passwords
-  (`<profile>/rabbitmq_password`) and the connector secrets the history
-  keeps for undo. A profile in another directory whose own entry is missing
-  reads the old `<profile>/<field>` entry once and copies it to its own; the
-  old entry is left for the default directory. Library: `secrets::Namespace`,
-  `secrets::delete_with_legacy` and `ProfileStore::home_config_dir` are new.
-
-- Tests: CI runs two more end-to-end smoke tests (Python, standard library
-  only). `tools/e2e/mcp_smoke.py` drives `ferrika mcp --allow-write` over
-  stdio JSON-RPC in the Kafka job (tools/list, read tools,
-  `transform_preview` masking, `transform_execute` plan, token and execute,
-  the `--topics` scope, audit entries). `tools/e2e/rabbit_smoke.py` runs in
-  a new RabbitMQ job (`rabbitmq:4-management`): profiles and where the
-  password is kept, queues/exchanges/bindings JSON, publish (routed and
-  unroutable), peek, `dlq inspect` grouping, `dlq redrive` preview and
-  `--execute` (x-death kept), read-only profile refusals and an audit log
-  without message bodies. See `docs/e2e/README.md`.
-- **Breaking (library):** committed offsets no longer pass through
-  `rdkafka::TopicPartitionList`, so these signatures do not change with
-  rdkafka. `KafkaConsumerClient::fetch_committed_offsets` and
-  `fetch_committed_offsets_for` return `HashMap<(String, i32), Option<i64>>`
-  (`None`: no committed offset), and `fetch_committed_offsets_for` takes the
-  partitions as `&[(&str, i32)]`. `KafkaConsumerClient::commit` takes
-  `&[(&str, i32, i64)]` (topic, partition, next offset to read).
-  `ferrika_ops::group_lag::committed_partition_list` is now
-  `committed_partition_offsets` and returns that map, which
-  `apply_group_offsets` takes. Lag numbers are unchanged.
 - **Breaking:** `topics create` without `-p/--partitions` or
   `-r/--replication` leaves them to the broker (`num.partitions`,
   `default.replication.factor`, KIP-464), like `kafka-topics.sh`, instead of
@@ -388,13 +502,23 @@ The RabbitMQ entries below are planned for 0.2.0.
   `Report::ferrika_version` is replaced by `product`, `product_version` and
   `ops_version` (also in `report --format json`); new
   `Report::product_line` and `report::OPS_VERSION`.
+- Tests: CI runs two more end-to-end smoke tests (Python, standard library
+  only). `tools/e2e/mcp_smoke.py` drives `ferrika mcp --allow-write` over
+  stdio JSON-RPC in the Kafka job (tools/list, read tools,
+  `transform_preview` masking, `transform_execute` plan, token and execute,
+  the `--topics` scope, audit entries). `tools/e2e/rabbit_smoke.py` runs in
+  a new RabbitMQ job (`rabbitmq:4-management`): profiles and where the
+  password is kept, queues/exchanges/bindings JSON, publish (routed and
+  unroutable), peek, `dlq inspect` grouping, `dlq redrive` preview and
+  `--execute` (x-death kept), read-only profile refusals and an audit log
+  without message bodies. `tools/e2e/policy_smoke.py` checks a signed
+  company policy against two clusters (forbid rules, environments and
+  `copy_down`, export and masking, `mcp_write`, history tampering), and
+  every smoke command runs in a throwaway home. See `docs/e2e/README.md`.
+- Building needs Rust 1.89 or newer (`lapin` and its AMQP crates); the
+  crates declare `rust-version = "1.89"` and CI checks it.
 - `ferrika top`: the refresh interval option is now `--interval` (the old
   `--interval-secs` still works) and defaults to 5 seconds instead of 2.
-- `rabbit peek` is a write: it changes the messages it reads (redelivered
-  flag, quorum-queue delivery count), so read-only rules and profiles refuse
-  it and it is audited like other writes, besides being a record export.
-- Building now needs Rust 1.89 or newer (`lapin` and its AMQP crates);
-  the crates declare `rust-version = "1.89"` and CI checks it.
 - **Breaking:** `acl delete` without a filter (which removes every binding)
   now needs `--all`; `-f/--force` alone is refused. `--all` cannot be
   combined with a filter, still only previews without `-f`, and its preview
@@ -406,9 +530,6 @@ The RabbitMQ entries below are planned for 0.2.0.
   `--ip default` keeps its meaning). Passing `--user default` or
   `--client-id default` prints a note about the change. Listings show the
   default entity as `<default>`.
-- **Breaking (library):** `ferrika_core::kafka::filter::MessageFilter::header_filters`
-  is a `Vec<HeaderFilter>` instead of a map, and `with_header` adds a filter
-  instead of replacing an earlier one for the same key.
 - `consume`/`mirror --header-filter`: `KEY=VALUE` matches the exact
   (case-sensitive) value besides `KEY:VALUE` (value contains, unchanged).
   Repeated filters must all match; before, a repeated key kept only the
@@ -444,6 +565,43 @@ The RabbitMQ entries below are planned for 0.2.0.
   steps of a failed undo as data), `Journal::rotated_path` and
   `audit::op_digests` are new, and `undo::DigestCheck` has a `Legacy`
   variant.
+- `rabbit peek` is a write: it changes the messages it reads (redelivered
+  flag, quorum-queue delivery count), so read-only rules and profiles refuse
+  it and it is audited like other writes, besides being a record export.
+- Credential store entries are per config directory. Profiles in the
+  default directory (`~/.ferrika`) keep their account names
+  (`<profile>/<field>`); profiles in another directory (`FERRIKA_CONFIG_DIR`,
+  `FERRIKA_CONFIG_PATH`) use `<profile>/<field>@<hash>`, where `<hash>` is
+  the first 16 hex digits of the SHA-256 of the directory's canonical path.
+  Two directories with a profile of the same name (for example `prod` in a
+  test directory and in `~/.ferrika`) no longer read and overwrite each
+  other's passwords. This covers Kafka profile secrets, RabbitMQ passwords
+  (`<profile>/rabbitmq_password`) and the connector secrets the history
+  keeps for undo. A profile in another directory whose own entry is missing
+  reads the old `<profile>/<field>` entry once and copies it to its own; the
+  old entry is left for the default directory. Library: `secrets::Namespace`,
+  `secrets::delete_with_legacy` and `ProfileStore::home_config_dir` are new.
+- Leader-change retries: `ferrika_core::kafka::retry` has one retry policy
+  (which errors, how many tries, backoff) with a blocking executor
+  (`retry_leader_change`, `retry_metadata`) and a new async one
+  (`retry_leader_change_async`, waits with `tokio::time::sleep`).
+  `KafkaConsumerClient` gains `fetch_watermarks_async` and
+  `fetch_watermarks_batch_async`; the blocking versions now document that
+  they may sleep the calling thread for up to 3.5 s while a partition
+  leader moves. `bounded_read::topic_watermarks` is now `async`.
+- **Breaking (library):** `ferrika-cli`'s command modules, argument structs,
+  `Commands` and `Cli`'s fields are crate-internal (#23).
+- **Breaking (library):** 21 internals of `ferrika-core`'s AWS MSK IAM,
+  OIDC and profile code (#25) and about 50 items of `ferrika-governance`
+  and `ferrika-ops` that only their own crate used (#24) are crate-internal.
+  See "Upgrading from 0.1" for what to use instead.
+- **Breaking (library):** `ferrika_core::kafka::filter::MessageFilter::header_filters`
+  is a `Vec<HeaderFilter>` instead of a map, and `with_header` adds a filter
+  instead of replacing an earlier one for the same key.
+- **Breaking (library):** `PolicyAction` gains `MessagesPeek` and
+  `MessagesMove`; `PolicyRules` gains `screen_capture`, `mcp_write`,
+  `environments`, `default_environment` and `copy_down`, so code that builds
+  it without `..Default::default()` must add them.
 - **Breaking (library):** `rdkafka` is no longer part of the documented API:
   - `ferrika_core::rdkafka` (the re-export) is removed.
   - New `kafka::consumer::StartOffset` (`Beginning`, `End`, `At(i64)`,
@@ -468,6 +626,16 @@ The RabbitMQ entries below are planned for 0.2.0.
   - Committed offsets use plain maps too (see the next entry), so no public
     signature names an `rdkafka` type.
   - `ferrika-mcp` no longer depends on `rdkafka`.
+- **Breaking (library):** committed offsets no longer pass through
+  `rdkafka::TopicPartitionList`, so these signatures do not change with
+  rdkafka. `KafkaConsumerClient::fetch_committed_offsets` and
+  `fetch_committed_offsets_for` return `HashMap<(String, i32), Option<i64>>`
+  (`None`: no committed offset), and `fetch_committed_offsets_for` takes the
+  partitions as `&[(&str, i32)]`. `KafkaConsumerClient::commit` takes
+  `&[(&str, i32, i64)]` (topic, partition, next offset to read).
+  `ferrika_ops::group_lag::committed_partition_list` is now
+  `committed_partition_offsets` and returns that map, which
+  `apply_group_offsets` takes. Lag numbers are unchanged.
 
 ### Compatibility
 
@@ -475,11 +643,12 @@ The RabbitMQ entries below are planned for 0.2.0.
   is invalid for builds before 0.2.0 (unknown category), so they fall back
   to the strictest mode. Roll such a policy out only once every client runs
   0.2.0 or later.
-- A signed policy that uses `environments`, `default_environment` or
-  `copy_down` is format 2, and builds without environment support refuse
-  it as having unknown rules (they do not ignore the section), so they run
-  in the strictest mode until updated. Update every client first. Policies
-  without these fields are unchanged and still signed as format 1.
+- A signed policy that uses `screen_capture`, `mcp_write`, `environments`,
+  `default_environment` or `copy_down` is format 2, and builds without
+  these rules refuse it as having unknown rules (they do not ignore them),
+  so they run in the strictest mode until updated. Update every client
+  first. Policies without these fields are unchanged and still signed as
+  format 1 (unless they use other format-2 rules such as `export`).
 - Under enforced masking `mirror --mask` is now allowed (plain `mirror`
   is still refused).
 - History entries written by 0.2.0 carry a `v2:` digest in the audit log.
@@ -488,33 +657,6 @@ The RabbitMQ entries below are planned for 0.2.0.
   stay readable and verifiable (as legacy digests).
 
 ### Fixed
-
-- Async commands and MCP tools no longer sleep a tokio worker thread while
-  a partition leader moves: `consume`, `dump`, `monitor`, `probe`, `top`,
-  the TUI, `topics list`/`describe` message counts, `diff`, `dlq`,
-  `offset reset`, `mirror`/copy pipelines, topic statistics, the metrics
-  scrape behind `top`/`health`, and the MCP `list_topics`,
-  `describe_topic`, `peek_messages` and `transform_preview` tools use the
-  async watermark lookups, which wait between tries with
-  `tokio::time::sleep` (up to 3.5 s used to block the thread).
-- History: trimming the journal (`history.jsonl`) no longer rewrites the
-  lines it keeps. It copied them through this version's event types, so a
-  journal shared with a newer Ferrika lost the event kinds and fields this
-  version does not know, and could change bytes a digest covers. Kept lines
-  are now copied byte for byte; only the lines of the operations dropped by
-  age or count go (whatever their event kind), and lines that are not JSON
-  at all (cut short by a crash). Rotation renames the file as it is.
-- `-f json` is now honoured by every command that printed text or tables
-  regardless: `schema register`, `schema compat`, `schema delete-subject`,
-  `acl create`, `acl delete`, `cluster ping` (without profiles), `compact
-  snapshot`, `connect apply/validate/delete/pause/resume/restart/
-  restart-task`, `dlq export`, `undo`, `lint --fix`, `policy keygen`,
-  `policy sign`, `policy example --out`, `produce` from stdin, `profile
-  add/use/remove/secure/read-only/import`, `quota set/remove`, `reassign
-  execute/verify/rollback`, `topics set-replication`, `user create/delete`
-  and `rabbit profile use/remove`. Each prints one JSON document; notes go
-  to stderr. `monitor --watch` refuses `-f json` instead of mixing a
-  redrawn screen into it. See "JSON output" in docs/CLI.md.
 
 - Watermark lookups (`topics describe` and `list` message counts,
   `consume`, `monitor`, `undo` of a topic creation, and the other users of
@@ -526,6 +668,14 @@ The RabbitMQ entries below are planned for 0.2.0.
   creation failed. Timeouts and unknown topics are not retried.
   `ferrika_core::kafka::retry` has the new `is_leader_change` and
   `retry_leader_change`.
+- Async commands and MCP tools no longer sleep a tokio worker thread while
+  a partition leader moves: `consume`, `dump`, `monitor`, `probe`, `top`,
+  the TUI, `topics list`/`describe` message counts, `diff`, `dlq`,
+  `offset reset`, `mirror`/copy pipelines, topic statistics, the metrics
+  scrape behind `top`/`health`, and the MCP `list_topics`,
+  `describe_topic`, `peek_messages` and `transform_preview` tools use the
+  async watermark lookups, which wait between tries with
+  `tokio::time::sleep` (up to 3.5 s used to block the thread).
 - `consume --group` whose reader closed the pipe (`| head`) ended without
   committing, so the next run read the same records again. It now commits,
   per partition, the offset after the last record whose whole line reached
@@ -541,6 +691,13 @@ The RabbitMQ entries below are planned for 0.2.0.
   and a second Ctrl+C (or one after the input ended) stops waiting: the
   command reports how many messages were delivered and how many are not
   confirmed, exits with an error and is audited as interrupted.
+- History: trimming the journal (`history.jsonl`) no longer rewrites the
+  lines it keeps. It copied them through this version's event types, so a
+  journal shared with a newer Ferrika lost the event kinds and fields this
+  version does not know, and could change bytes a digest covers. Kept lines
+  are now copied byte for byte; only the lines of the operations dropped by
+  age or count go (whatever their event kind), and lines that are not JSON
+  at all (cut short by a crash). Rotation renames the file as it is.
 - `dlq export` saved only a 120-character preview of each value; records
   now carry the whole value as `payload` (or `payload_base64` when it is not
   UTF-8, with `payload` null), masked while the policy enforces masking.
@@ -565,6 +722,17 @@ The RabbitMQ entries below are planned for 0.2.0.
 - `trace inject --sampled` and `compact analyze --from-beginning` could not
   be turned off (`--sampled false`, `--from-beginning=false`).
 - `consume --save` says when it appends to a file that already has records.
+- `-f json` is now honoured by every command that printed text or tables
+  regardless: `schema register`, `schema compat`, `schema delete-subject`,
+  `acl create`, `acl delete`, `cluster ping` (without profiles), `compact
+  snapshot`, `connect apply/validate/delete/pause/resume/restart/
+  restart-task`, `dlq export`, `undo`, `lint --fix`, `policy keygen`,
+  `policy sign`, `policy example --out`, `produce` from stdin, `profile
+  add/use/remove/secure/read-only/import`, `quota set/remove`, `reassign
+  execute/verify/rollback`, `topics set-replication`, `user create/delete`
+  and `rabbit profile use/remove`. Each prints one JSON document; notes go
+  to stderr. `monitor --watch` refuses `-f json` instead of mixing a
+  redrawn screen into it. See "JSON output" in docs/CLI.md.
 - `compact` read keys as lossy text, so binary keys (Avro, varints) that
   differed only in invalid UTF-8 bytes counted as one; such keys are now
   compared and shown as `0x` and hex.
