@@ -19,17 +19,22 @@ python3 tools/e2e/smoke.py target/debug/ferrika --broker localhost:9092
 ```
 
 Two more smoke tests cover the MCP server and the RabbitMQ commands; CI runs
-the MCP one in the Kafka job and the RabbitMQ one against a
-`rabbitmq:4-management` service container:
+the MCP one in the Kafka job, the RabbitMQ one against a
+`rabbitmq:4-management` service container, and the MCP one again with the
+RabbitMQ tools in that job (which gets a Kafka service for it):
 
 ```bash
 # MCP: `ferrika mcp --allow-write --topics "<run>*"` over stdio JSON-RPC
 # (tools/list, read tools, transform_preview, transform_execute with its
 # confirmation token, a destination outside --topics, the audit entries).
 python3 tools/e2e/mcp_smoke.py target/debug/ferrika --broker localhost:9092
-# Optional: also call the RabbitMQ read tools through a temporary profile.
+# Optional: also call the RabbitMQ tools through a temporary profile: the
+# read tools, and rabbit_publish, rabbit_peek, rabbit_dlq_inspect and
+# rabbit_dlq_redrive (plan, token, execute) under --queues/--exchanges,
+# plus refusals outside them.
 python3 tools/e2e/mcp_smoke.py target/debug/ferrika --broker localhost:9092 \
-  --rabbit-url http://localhost:15672 --rabbit-user zz --rabbit-password zz-pw
+  --rabbit-url http://localhost:15672 --rabbit-user zz --rabbit-password zz-pw \
+  --rabbit-amqp-url amqp://localhost:5672
 
 # RabbitMQ: profiles, queues/exchanges/bindings, publish, peek, dead-lettering,
 # dlq inspect and redrive (preview and --execute), read-only profiles, audit.
@@ -39,7 +44,36 @@ python3 tools/e2e/rabbit_smoke.py target/debug/ferrika --url http://localhost:15
   --user zz --password zz-pw --amqp-url amqp://localhost:5672
 ```
 
-Both scripts need only the Python 3 standard library, run the CLI with their
+A third one covers the signed company policy ([docs/POLICY.md](../POLICY.md))
+with two clusters, `--broker` as the `prod` environment and `--broker2` as
+`dev`: keygen, sign, `policy show`/`verify`, `forbid`, `read_only_brokers`,
+per-environment `forbid`, `copy_down: masked` and `forbid` for `mirror` and
+`transform --execute` (refused without `--mask`, masked values arrive),
+`(environment …)` in audit entries, `export: forbidden` (consume to a pipe,
+`--save`, `dump`), enforced masking, `mcp_write: forbidden` and
+`confirm_human` over stdio, a tampered policy (strictest mode), history and
+undo with an edited journal entry (EDITED, undo refused), and `audit verify`
+on an edited audit line. It needs a debug build (or `--features
+dev-policy-dir`), which reads the policy from `FERRIKA_POLICY_DIR`; the
+script signs its own policies with a throw-away key into a temporary
+directory and never sets `audit: required` (which would move the audit log
+to the account's real `~/.ferrika`). The environments match the exact
+`host:port` given, so the two must differ. It runs in about 30 seconds:
+
+```bash
+docker run -d --name ferrika-redpanda-test -p 29092:29092 docker.redpanda.com/redpandadata/redpanda:v26.3.1 \
+  redpanda start --mode dev-container --smp 1 --memory 1G --overprovisioned \
+  --kafka-addr 0.0.0.0:29092 --advertise-kafka-addr localhost:29092
+python3 tools/e2e/policy_smoke.py target/debug/ferrika --broker localhost:9092 --broker2 localhost:29092
+```
+
+CI runs it in the Kafka job against a second `apache/kafka:3.9.0` service
+container on `localhost:29092` (KRaft settings and its own `CLUSTER_ID` in
+`.github/workflows/ci.yml`) as `dev`. A service container cannot take
+Redpanda's start arguments, so a second Kafka service is the simplest
+second cluster: it starts next to the first one with no extra step.
+
+All the scripts need only the Python 3 standard library, run the CLI with their
 own `FERRIKA_CONFIG_DIR` (and `HOME`/`USERPROFILE`), name everything they
 create `<prefix><run id>-...` (`--prefix`, default `zz-`) and delete only
 that at the end, so runs can share a broker. `rabbit_smoke.py` builds its

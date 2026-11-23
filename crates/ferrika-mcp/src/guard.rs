@@ -537,7 +537,13 @@ impl WriteGuard {
         known_brokers: &[String],
     ) -> Result<(), ToolError> {
         if let Some(reason) = self.mcp_write_refusal() {
-            let _ = self.record_result(tool, target, &reason, false, None);
+            // A company-policy refusal like any other: `policy.blocked`,
+            // with the attempted change as `mcp <tool> <target>`.
+            let attempted = format!("mcp {tool} {target}").trim().to_string();
+            let entry = self.entry("policy.blocked".to_string(), &attempted, &reason, false);
+            if let Err(e) = self.sink.record(&entry) {
+                tracing::warn!(%e, "Could not write the audit log");
+            }
             return Err(ToolError::new("policy_refused", reason));
         }
         let brokers =

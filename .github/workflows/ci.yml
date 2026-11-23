@@ -91,6 +91,8 @@ jobs:
       - run: cargo test -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq
 
   # End-to-end smoke test of the CLI against a real broker (Linux only).
+  # A second single-node Kafka (localhost:29092, its own cluster id) is the
+  # "dev" cluster of the company-policy test, the first one its "prod".
   e2e:
     name: End-to-end smoke test
     runs-on: ubuntu-latest
@@ -101,6 +103,29 @@ jobs:
           - 9092:9092
         options: >-
           --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 20
+      kafka2:
+        image: apache/kafka:3.9.0
+        env:
+          CLUSTER_ID: u090P2O1ots4JXdg60zrew
+          KAFKA_NODE_ID: "1"
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:29092,CONTROLLER://:29093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:29092
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:29093
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+          KAFKA_HEAP_OPTS: -Xmx512m -Xms512m
+        ports:
+          - 29092:29092
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:29092"
           --health-interval 5s
           --health-timeout 10s
           --health-retries 20
@@ -115,6 +140,9 @@ jobs:
         run: python3 tools/e2e/smoke.py target/debug/ferrika --broker localhost:9092
       - name: MCP smoke test
         run: python3 tools/e2e/mcp_smoke.py target/debug/ferrika --broker localhost:9092
+      - name: Company policy smoke test
+        # Debug build: reads the policy from FERRIKA_POLICY_DIR (a temp dir).
+        run: python3 tools/e2e/policy_smoke.py target/debug/ferrika --broker localhost:9092 --broker2 localhost:29092
 
   # The same smoke test against Redpanda, a Kafka API compatible broker.
   # (A service container cannot take Redpanda's start arguments.)
@@ -147,10 +175,20 @@ jobs:
 
   # End-to-end smoke test of `ferrika rabbit` against RabbitMQ (management
   # API and AMQP). The test user comes from the image's default-user env.
+  # Kafka is here for the MCP smoke test, which needs a Kafka cluster too.
   e2e-rabbitmq:
     name: End-to-end smoke test (RabbitMQ)
     runs-on: ubuntu-latest
     services:
+      kafka:
+        image: apache/kafka:3.9.0
+        ports:
+          - 9092:9092
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 5s
+          --health-timeout 10s
+          --health-retries 20
       rabbitmq:
         image: rabbitmq:4-management
         env:
@@ -179,6 +217,11 @@ jobs:
         run: |
           python3 tools/e2e/rabbit_smoke.py target/debug/ferrika --url http://localhost:15672 \
             --user ferrika-e2e --password ferrika-e2e-pw --amqp-url amqp://localhost:5672
+      - name: MCP smoke test with the RabbitMQ tools
+        env:
+          FERRIKA_SECRET_STORE: file
+        run: |
+          python3 tools/e2e/mcp_smoke.py target/debug/ferrika --broker localhost:9092             --rabbit-url http://localhost:15672 --rabbit-user ferrika-e2e --rabbit-password ferrika-e2e-pw             --rabbit-amqp-url amqp://localhost:5672
 
   # The same smoke test against AutoMQ (one node on an S3-compatible store);
   # the stack is docs/e2e/automq-compose.yml and starts in under a minute.

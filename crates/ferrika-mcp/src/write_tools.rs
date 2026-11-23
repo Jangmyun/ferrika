@@ -2617,11 +2617,17 @@ pub(super) mod tests {
             .await;
         assert_eq!(code(&result), "policy_refused", "{result}");
         assert!(c.changes.borrow().is_empty());
-        assert!(log
-            .entries
-            .borrow()
+        let entries = log.entries.borrow();
+        let blocked = entries
             .iter()
-            .any(|e| !e.ok && e.outcome.contains("mcp_write: forbidden")));
+            .find(|e| e.outcome.contains("mcp_write: forbidden"))
+            .expect("the refusal is audited");
+        // Recorded like every other company-policy refusal.
+        assert_eq!(blocked.action, "policy.blocked");
+        assert_eq!(blocked.target, "mcp create_topic t");
+        assert_eq!(blocked.source, "mcp");
+        assert!(!blocked.ok);
+        assert!(blocked.actor.is_some());
     }
 
     #[tokio::test]
