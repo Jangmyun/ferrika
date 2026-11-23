@@ -234,9 +234,23 @@ async fn serve(mut stream: TcpStream, state: Arc<Mutex<Broker>>) {
     let mut words = head.split_whitespace();
     let method = words.next().unwrap_or_default().to_string();
     let target = words.next().unwrap_or_default().to_string();
+    let accept = head
+        .lines()
+        .find_map(|l| {
+            l.split_once(':')
+                .filter(|(name, _)| name.trim().eq_ignore_ascii_case("accept"))
+                .map(|(_, value)| value.trim().to_string())
+        })
+        .unwrap_or_default();
     let (status, answer) = {
         let mut broker = state.lock().unwrap_or_else(|e| e.into_inner());
-        handle(&mut broker, &method, &target, &body)
+        // Like the real API: the purge resource offers no JSON.
+        if target.ends_with("/contents") && !accept.contains("*/*") {
+            broker.requests.push(format!("{method} {target}"));
+            (406, None)
+        } else {
+            handle(&mut broker, &method, &target, &body)
+        }
     };
     let text = answer.map(|v| v.to_string()).unwrap_or_default();
     let response = format!(
@@ -362,8 +376,12 @@ fn handle(broker: &mut Broker, method: &str, target: &str, body: &str) -> (u16, 
             }
         }
         ("DELETE", ["queues", vhost, name]) => {
-            if !broker.queues.contains_key(&key(vhost, name)) {
+            let Some(queue) = broker.queues.get(&key(vhost, name)) else {
                 return not_found();
+            };
+            // Like RabbitMQ 4: quorum and stream queues take neither flag.
+            if queue.kind != "classic" && (flag("if-empty") || flag("if-unused")) {
+                return bad_request("if-empty / if-unused are not supported by quorum queues");
             }
             if flag("if-empty") && broker.messages.get(&key(vhost, name)).copied().unwrap_or(0) > 0
             {

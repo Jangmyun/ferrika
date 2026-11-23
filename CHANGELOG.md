@@ -7,6 +7,67 @@ module is the command line's own code (argument structs, the command enum),
 not a library API; options added to commands changed it in 0.1 patch
 versions, and 0.2.0 made it crate-internal.
 
+## Unreleased
+
+### Added
+
+- RabbitMQ topology changes (preview): `ferrika rabbit queue
+  declare|delete|purge`, `ferrika rabbit exchange declare|delete`,
+  `ferrika rabbit bind` and `ferrika rabbit unbind`, with `-f json`
+  output. Deletions and purges ask first (`-y` to skip); declaring a queue
+  or exchange that exists is refused. Every change passes the company
+  policy and the read-only checks and is audited.
+- New policy categories `queues.create`, `queues.delete`, `queues.purge`,
+  `exchanges.create`, `exchanges.delete` and `bindings.change`.
+- RabbitMQ changes are recorded in the operation history:
+  `ferrika rabbit history` and `ferrika rabbit undo` (a declared queue or
+  exchange is deleted while empty and unbound; a deleted one is declared
+  again with its bindings, its messages lost; bindings are restored or
+  removed; purges cannot be undone). `ferrika history --all` lists them;
+  `ferrika undo` points them to `ferrika rabbit undo`.
+- `tools/e2e/rabbit_smoke.py` checks declare, delete, purge, bind, unbind,
+  their undo and read-only refusals against a live broker.
+
+### Compatibility
+
+- A signed policy that names one of the six new categories is invalid for
+  builds that do not know them (0.2.0 and older), which then run in the
+  strictest mode. Roll such a policy out only once every client runs a
+  build with these categories.
+- History entries of RabbitMQ changes hold `rabbit_*` state kinds. Ferrika
+  0.2.0 cannot parse those journal lines and skips them, so its `history`,
+  `undo` and `audit verify` do not see these operations (rather than
+  report them as edited); its trimming keeps the lines byte for byte.
+
+### Library API
+
+- `ferrika-core`: `PolicyAction` has six more variants (`ALL` has 22
+  entries); `model::history::Scope` has a `rabbitmq` field; `State` has
+  `RabbitQueue`, `RabbitQueueMessages`, `RabbitExchange` and
+  `RabbitBinding`, with the new types `RabbitQueueDeclaration`,
+  `RabbitExchangeDeclaration` and `RabbitBindingKey`; `State::is_rabbitmq`.
+- `ferrika-ops` depends on `ferrika-rabbitmq` (without its `amqp`
+  feature). `history::inverse::Step` has `DeclareQueue`, `DeleteQueue`,
+  `DeclareExchange`, `DeleteExchange`, `Bind` and `Unbind`, and
+  `Step::is_rabbitmq`; the new module `history::rabbit` reads RabbitMQ
+  states, plans and runs their undo (`prepare_request`, `execute_steps`)
+  with the same rules as `history::undo`. The Kafka `undo::prepare` refuses
+  a RabbitMQ operation (another scope).
+- `ferrika-rabbitmq`: `ManagementClient::{queue, exchange,
+  queue_bindings, exchange_bindings, bindings_between, declare_queue,
+  delete_queue, purge_queue, declare_exchange, delete_exchange, bind,
+  unbind}`; `model::{QueueDeclaration, ExchangeDeclaration,
+  BindingDeclaration, DestinationType, validate_name, MAX_NAME_BYTES}`;
+  `Binding` has a `properties_key` field; bodiless `DELETE` requests send
+  `Accept: */*` (the purge resource answers 406 to JSON-only). Feature
+  `test-util` adds `fake`, an in-memory management API for tests.
+- `ferrika-cli`: `cli::rabbit::RabbitSubcommands` has `Queue`, `Exchange`,
+  `Bind`, `Unbind`, `History` and `Undo` (front ends that match it
+  exhaustively must classify them).
+- The neutral gate target (`GateTarget`) proposed in
+  `docs/plans/multi-broker.md` is still not added: the CLI gates RabbitMQ
+  writes with its RabbitMQ profile and addresses as before.
+
 ## 0.2.0
 
 New: connection presets for Kafka-compatible services, `ferrika transform`,

@@ -41,15 +41,15 @@ python3 tools/e2e/smoke.py            # 35 checks against target/release/ferrika
 | --- | --- |
 | `crates/ferrika-core` | `src/error.rs`, `src/model` (domain data, no I/O), `src/codec` (Base64, Avro, Protobuf, JSON Schema, wire format, PII masking; no I/O), `src/files.rs`, `src/notice.rs` and `src/kafka` (cluster, Schema Registry and Connect clients) |
 | `crates/ferrika-governance` | Company policy, hash-chained audit log, audit anchors, SIEM forwarding |
-| `crates/ferrika-ops` | Operations on top of the clients: backup, mirror, DLQ, diff, lint, health, report, change history and undo |
+| `crates/ferrika-ops` | Operations on top of the clients: backup, mirror, DLQ, diff, lint, health, report, change history and undo (Kafka, and RabbitMQ topology in `history::rabbit`) |
 | `crates/ferrika-mcp` | The MCP server (`ferrika mcp`): read tools (Kafka, transform preview, RabbitMQ listings), policy-gated write tools |
 | `crates/ferrika-cli` | `src/cli` (command definitions, console I/O, the policy gate in `cli/app.rs`) and `src/main.rs` (the `ferrika` binary) |
 | `crates/ferrika-rabbitmq` | Preview: RabbitMQ management HTTP API client (`client`), typed responses and `x-death` (`model`), RabbitMQ profiles in `rabbit-profiles.json` (`profile`), AMQP dead-letter redrive with lapin (`amqp`, default feature `amqp`); no policy, audit or masking (the CLI applies them). See `docs/plans/multi-broker.md` |
 
 Dependencies point one way: `ferrika-cli` → `ferrika-mcp` → `ferrika-ops` →
-`ferrika-governance` → `ferrika-core`; `ferrika-cli` and `ferrika-mcp` →
-`ferrika-rabbitmq` → `ferrika-core` (`ferrika-mcp` without the `amqp`
-feature). Inside `ferrika-core`, `model` and `codec` never use `kafka`. The CLI
+`ferrika-governance` → `ferrika-core`; `ferrika-cli`, `ferrika-mcp` and
+`ferrika-ops` → `ferrika-rabbitmq` → `ferrika-core` (`ferrika-mcp` and
+`ferrika-ops` without the `amqp` feature). Inside `ferrika-core`, `model` and `codec` never use `kafka`. The CLI
 crate root re-exports `ferrika_core::{codec, error, files, kafka, model, notice}` and
 the other crates as `governance` and `ops`, so CLI code writes `crate::kafka::...`,
 `crate::governance::policy::...` and `crate::ops::mirror::...`.

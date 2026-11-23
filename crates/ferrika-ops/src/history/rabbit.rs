@@ -262,7 +262,8 @@ pub async fn queue_declared(
     Ok(
         Change::new(Reversibility::Conditional, vec![before], vec![after]).limit(
             "undo deletes the queue, only while it holds no messages, has no consumers and no \
-         bindings added since",
+         bindings added since (for quorum and stream queues, as the broker's statistics \
+         report them, which lag a few seconds)",
         ),
     )
 }
@@ -287,7 +288,9 @@ pub async fn queue_deleted(
         &client.queue_bindings(vhost, name).await?,
     ));
     let after = all_gone(&before);
-    let messages = queue.messages.unwrap_or(0);
+    let messages = queue.messages.map_or_else(String::new, |n| {
+        format!(" (the broker's statistics reported {n} when it was read)")
+    });
     if queue.exclusive {
         return Ok(
             Change::new(Reversibility::Irreversible, before, after).limit(
@@ -298,8 +301,8 @@ pub async fn queue_deleted(
     }
     Ok(
         Change::new(Reversibility::Partial, before, after).limit(format!(
-            "undo declares the queue and its bindings again, empty: its messages ({messages} when \
-         it was read) are not restored"
+            "undo declares the queue and its bindings again, empty: its messages are not \
+             restored{messages}"
         )),
     )
 }
@@ -310,14 +313,14 @@ pub async fn queue_purged(
     vhost: &str,
     name: &str,
 ) -> RabbitResult<Change> {
-    let before = messages_state(client, vhost, name).await?;
-    let State::RabbitQueueMessages {
-        messages: Some(_), ..
-    } = &before
-    else {
-        return Err(RabbitError::config(format!(
-            "Queue '{name}' does not exist on vhost '{vhost}'"
-        )));
+    let queue = client.queue(vhost, name).await?.ok_or_else(|| {
+        RabbitError::config(format!("Queue '{name}' does not exist on vhost '{vhost}'"))
+    })?;
+    // The broker's statistics; absent for a queue declared moments ago.
+    let before = State::RabbitQueueMessages {
+        vhost: vhost.to_string(),
+        name: name.to_string(),
+        messages: queue.messages,
     };
     let after = State::RabbitQueueMessages {
         vhost: vhost.to_string(),
@@ -442,8 +445,9 @@ pub async fn recapture_all(states: &[State], client: &ManagementClient) -> Kafka
 /// never holds credentials).
 pub fn rabbit_error(error: RabbitError) -> KafkaError {
     match error {
-        RabbitError::Config(message) => KafkaError::config(message),
-        other => KafkaError::admin(other.to_string()),
+        RabbitError::Unreachable { .. } => KafkaError::Io(error.to_string()),
+        RabbitError::Config(message) => KafkaError::Check(message),
+        RabbitError::Api { .. } | RabbitError::Response(_) => KafkaError::Check(error.to_string()),
     }
 }
 
@@ -583,9 +587,11 @@ fn labels(bindings: &[BindingDeclaration]) -> String {
         .join("; ")
 }
 
-/// Runs one RabbitMQ step. Deleting a queue sends `if-empty` and
-/// `if-unused`, so a queue that got messages or consumers after the
-/// blockers were checked is refused by the broker, not emptied.
+/// Runs one RabbitMQ step. Deleting a queue sends `if-empty` (and, for a
+/// classic queue, `if-unused`, which quorum queues do not support), so a
+/// queue that got messages after the blockers were checked is refused by
+/// the broker, not emptied: the blockers read the broker's statistics,
+/// which lag by a few seconds.
 pub async fn run(step: &Step, client: &ManagementClient) -> KafkaResult<()> {
     let result = match step {
         Step::DeclareQueue {
@@ -597,7 +603,7 @@ pub async fn run(step: &Step, client: &ManagementClient) -> KafkaResult<()> {
                 .declare_queue(vhost, name, &queue_request(declaration))
                 .await
         }
-        Step::DeleteQueue { vhost, name } => client.delete_queue(vhost, name, true, true).await,
+        Step::DeleteQueue { vhost, name } => delete_unused_queue(client, vhost, name).await,
         Step::DeclareExchange {
             vhost,
             name,
@@ -624,6 +630,34 @@ pub async fn run(step: &Step, client: &ManagementClient) -> KafkaResult<()> {
         }
     };
     result.map_err(rabbit_error)
+}
+
+/// Deletes a queue only while it is empty and unused. A classic queue is
+/// deleted with `if-empty` and `if-unused`, so the broker itself refuses
+/// one that got messages or consumers since the blockers were checked.
+/// Quorum and stream queues support neither flag: they are read again
+/// just before the delete instead, which relies on the broker's statistics
+/// (refreshed every few seconds).
+async fn delete_unused_queue(
+    client: &ManagementClient,
+    vhost: &str,
+    name: &str,
+) -> RabbitResult<()> {
+    let Some(queue) = client.queue(vhost, name).await? else {
+        return Ok(());
+    };
+    if queue.kind.is_empty() || queue.kind == "classic" {
+        return client.delete_queue(vhost, name, true, true).await;
+    }
+    let messages = queue.messages.unwrap_or(0);
+    let consumers = queue.consumers.unwrap_or(0);
+    if messages > 0 || consumers > 0 {
+        return Err(RabbitError::config(format!(
+            "queue {name} now holds {messages} message(s) and has {consumers} consumer(s); \
+             not deleted"
+        )));
+    }
+    client.delete_queue(vhost, name, false, false).await
 }
 
 /// [`undo::prepare_request`] for an operation on RabbitMQ: the same checks
@@ -854,7 +888,23 @@ mod tests {
         assert_eq!(fake.with(|b| b.messages_of("/", "jobs")), None);
         assert!(fake
             .with(|b| b.writes())
-            .contains(&"DELETE /api/queues/%2F/jobs?if-empty=true&if-unused=true".to_string()));
+            .contains(&"DELETE /api/queues/%2F/jobs".to_string()));
+
+        // A classic queue is deleted with the broker's own conditions.
+        let classic = QueueDeclaration {
+            durable: true,
+            ..QueueDeclaration::default()
+        };
+        let change = queue_declared(&client, "/", "jobs2", &classic)
+            .await
+            .unwrap();
+        client.declare_queue("/", "jobs2", &classic).await.unwrap();
+        let op = recorded("B", change, &client).await;
+        let plan = plan_for(&op, &client).await.plan.unwrap();
+        execute_steps(&plan, &client).await.unwrap();
+        assert!(fake
+            .with(|b| b.writes())
+            .contains(&"DELETE /api/queues/%2F/jobs2?if-empty=true&if-unused=true".to_string()));
     }
 
     #[tokio::test]

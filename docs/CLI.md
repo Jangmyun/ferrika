@@ -456,6 +456,53 @@ queue. Redriven messages keep their headers, `x-death` included, and
 get `x-ferrika-redriven-from: <queue>`. The audit log records the counts, the
 source queue and the destinations, never message bodies.
 
+Queues, exchanges and bindings (recorded in the operation history, so
+`rabbit undo` can reverse them):
+
+```bash
+ferrika rabbit queue declare orders --type quorum --arg x-delivery-limit=5
+ferrika rabbit exchange declare shop --type topic
+ferrika rabbit bind shop orders -k 'order.*'          # exchange -> queue
+ferrika rabbit bind shop audit --destination-type exchange
+ferrika rabbit unbind shop orders -k 'order.*'
+ferrika rabbit queue purge orders                    # asks first; cannot be undone
+ferrika rabbit queue delete orders                   # asks first; --if-empty, --if-unused, -y
+ferrika rabbit exchange delete shop -y               # removes its bindings too
+ferrika rabbit history                               # this broker's changes, newest first
+ferrika rabbit history show 01K9ABCDEF12
+ferrika rabbit undo --dry-run                        # your latest undoable change here
+ferrika rabbit undo 01K9AB                           # asks first; -y to skip
+```
+
+Policy categories: `queues.create`, `queues.delete`, `queues.purge`,
+`exchanges.create`, `exchanges.delete` and `bindings.change`; a read-only
+RabbitMQ profile or broker refuses them all. Declaring a queue or exchange
+that exists already is refused, so undoing a declaration never deletes
+something the command did not make. `--arg KEY=VALUE` sends whole numbers
+and `true`/`false` as numbers and booleans, JSON in quotes as JSON.
+
+What undo does:
+
+- a declared queue is deleted again, only while it holds no messages and
+  has no consumers or bindings added since (`--force` does not override
+  this; purge it first if the messages are not needed). Classic queues are
+  deleted with the broker's `if-empty` and `if-unused` checks; quorum and
+  stream queues support neither, so for them the check relies on the
+  broker's statistics, which lag a few seconds;
+- a deleted queue is declared again with its type, arguments and bindings,
+  empty: its messages are lost (the history marks it `partial`);
+- a declared exchange is deleted again while it has no bindings added
+  since; a deleted exchange is declared again with every binding from and
+  to it (where the other end still exists);
+- a binding is added back or removed;
+- a purge cannot be undone; it is recorded with the message count the
+  broker's statistics reported.
+
+`ferrika history --all` lists these operations too; `ferrika undo` points a
+RabbitMQ operation to `ferrika rabbit undo`, which needs that broker's
+connection (`--rabbit-profile` or `--rabbit-url`): it refuses another
+broker than the one recorded.
+
 ### Client quotas (`ferrika quota`)
 
 ```bash

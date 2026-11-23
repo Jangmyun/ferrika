@@ -241,9 +241,9 @@ impl Context<'_> {
                 if !*yes {
                     confirm(
                         &format!(
-                            "Delete queue '{}' on vhost '{vhost}' with its {messages} message(s) \
-                             and its bindings? `ferrika rabbit undo` declares it again, empty. \
-                             [y/N]: ",
+                            "Delete queue '{}' on vhost '{vhost}' with its messages (about \
+                             {messages}) and its bindings? `ferrika rabbit undo` declares it \
+                             again, empty. [y/N]: ",
                             name.red().bold()
                         ),
                         "Aborted queue deletion.",
@@ -256,12 +256,13 @@ impl Context<'_> {
                 self.recorded(
                     change,
                     self.client.delete_queue(vhost, name, *if_empty, *if_unused),
-                    &format!("Deleted queue {name} ({messages} message(s) when read)"),
+                    &format!("Deleted queue {name} (the broker reported {messages} message(s))"),
                 )
                 .await?;
                 self.done(
                     format!(
-                        "Deleted queue '{}' on vhost '{vhost}' ({messages} message(s) dropped).",
+                        "Deleted queue '{}' on vhost '{vhost}' (the broker reported {messages} \
+                         message(s)).",
                         name.cyan()
                     ),
                     json!({"queue": name, "vhost": vhost, "deleted": true, "messages": messages}),
@@ -285,8 +286,8 @@ impl Context<'_> {
                 if !*yes {
                     confirm(
                         &format!(
-                            "Delete the {messages} ready message(s) of queue '{}' on vhost \
-                             '{vhost}'? {} [y/N]: ",
+                            "Delete every ready message (about {messages}) of queue '{}' on \
+                             vhost '{vhost}'? {} [y/N]: ",
                             name.red().bold(),
                             record::CANNOT_UNDO
                         ),
@@ -297,12 +298,13 @@ impl Context<'_> {
                 self.recorded(
                     change,
                     self.client.purge_queue(vhost, name),
-                    &format!("Purged queue {name} ({messages} message(s) when read)"),
+                    &format!("Purged queue {name} (the broker reported {messages} message(s))"),
                 )
                 .await?;
                 self.done(
                     format!(
-                        "Purged queue '{}' on vhost '{vhost}' ({messages} message(s)).",
+                        "Purged queue '{}' on vhost '{vhost}' (the broker reported {messages} \
+                         message(s)).",
                         name.cyan()
                     ),
                     json!({"queue": name, "vhost": vhost, "purged": messages}),
@@ -471,6 +473,19 @@ impl Context<'_> {
     }
 
     pub async fn undo(&self, args: &RabbitUndoArgs) -> anyhow::Result<()> {
+        // A read-only RabbitMQ profile can never undo: say so before
+        // reading the journal and the broker (the gate checks it again).
+        if !args.dry_run {
+            if let Err(reason) = crate::cli::rabbit::ensure_writable(self.args, "rabbit undo") {
+                crate::governance::policy::record_blocked(
+                    "cli",
+                    &self.audit_profile(),
+                    "rabbit undo",
+                    &reason,
+                );
+                anyhow::bail!(reason);
+            }
+        }
         let ops = Journal::default().load();
         let scope = self.scope()?;
         let op = match &args.id {

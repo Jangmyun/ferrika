@@ -300,8 +300,15 @@ impl ManagementClient {
             .map(|auth| ("Authorization", auth))
             .into_iter()
             .collect();
+        // Some DELETE resources (a queue's `contents`, the purge) offer no
+        // JSON and answer `Accept: application/json` with 406.
+        let content_type = if method == "DELETE" && body.is_none() {
+            "*/*"
+        } else {
+            "application/json"
+        };
         self.endpoint
-            .send_with_headers(method, path, "application/json", body, &headers)
+            .send_with_headers(method, path, content_type, body, &headers)
             .await
             .map_err(|e| RabbitError::Unreachable {
                 target: self.address(),
@@ -562,7 +569,7 @@ mod tests {
         let client = fake.client();
         assert_eq!(client.queue("/", "orders").await.unwrap(), None);
         let declaration = QueueDeclaration {
-            kind: Some("quorum".into()),
+            kind: Some("classic".into()),
             durable: true,
             ..QueueDeclaration::default()
         };
@@ -571,7 +578,7 @@ mod tests {
             .await
             .unwrap();
         let queue = client.queue("/", "orders").await.unwrap().unwrap();
-        assert_eq!(queue.kind, "quorum");
+        assert_eq!(queue.kind, "classic");
         assert!(queue.durable);
         // Another declaration of the same queue is refused by the broker.
         let other = QueueDeclaration {
