@@ -6,8 +6,10 @@
 //!
 //! Passwords go to the OS credential store through
 //! `ferrika_core::kafka::secrets`, under the account
-//! `<profile>/rabbitmq_password`. No Kafka profile field has that name, so a
-//! RabbitMQ and a Kafka profile with the same name never share an entry.
+//! `<profile>/rabbitmq_password` (with the config directory's suffix outside
+//! the default directory, see `ferrika_core::kafka::secrets`). No Kafka
+//! profile field has that name, so a RabbitMQ and a Kafka profile with the
+//! same name never share an entry.
 //! Where no credential store is available (or `FERRIKA_SECRET_STORE=file`),
 //! the password stays in the file, as for Kafka profiles.
 //!

@@ -291,6 +291,20 @@ The RabbitMQ entries below are planned for 0.2.0.
   `fetch_watermarks_batch_async`; the blocking versions now document that
   they may sleep the calling thread for up to 3.5 s while a partition
   leader moves. `bounded_read::topic_watermarks` is now `async`.
+- Credential store entries are per config directory. Profiles in the
+  default directory (`~/.ferrika`) keep their account names
+  (`<profile>/<field>`); profiles in another directory (`FERRIKA_CONFIG_DIR`,
+  `FERRIKA_CONFIG_PATH`) use `<profile>/<field>@<hash>`, where `<hash>` is
+  the first 16 hex digits of the SHA-256 of the directory's canonical path.
+  Two directories with a profile of the same name (for example `prod` in a
+  test directory and in `~/.ferrika`) no longer read and overwrite each
+  other's passwords. This covers Kafka profile secrets, RabbitMQ passwords
+  (`<profile>/rabbitmq_password`) and the connector secrets the history
+  keeps for undo. A profile in another directory whose own entry is missing
+  reads the old `<profile>/<field>` entry once and copies it to its own; the
+  old entry is left for the default directory. Library: `secrets::Namespace`,
+  `secrets::delete_with_legacy` and `ProfileStore::home_config_dir` are new.
+
 - Tests: CI runs two more end-to-end smoke tests (Python, standard library
   only). `tools/e2e/mcp_smoke.py` drives `ferrika mcp --allow-write` over
   stdio JSON-RPC in the Kafka job (tools/list, read tools,
@@ -443,6 +457,14 @@ The RabbitMQ entries below are planned for 0.2.0.
   `describe_topic`, `peek_messages` and `transform_preview` tools use the
   async watermark lookups, which wait between tries with
   `tokio::time::sleep` (up to 3.5 s used to block the thread).
+- History: trimming the journal (`history.jsonl`) no longer rewrites the
+  lines it keeps. It copied them through this version's event types, so a
+  journal shared with a newer Ferrika lost the event kinds and fields this
+  version does not know, and could change bytes a digest covers. Kept lines
+  are now copied byte for byte; only the lines of the operations dropped by
+  age or count go (whatever their event kind), and lines that are not JSON
+  at all (cut short by a crash). Rotation renames the file as it is.
+
 - Watermark lookups (`topics describe` and `list` message counts,
   `consume`, `monitor`, `undo` of a topic creation, and the other users of
   `KafkaConsumerClient::fetch_watermarks` and `fetch_watermarks_batch`) are

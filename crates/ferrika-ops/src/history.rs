@@ -17,6 +17,8 @@
 //! entry's `op` and `op_digest` (see [`ferrika_governance::audit::AuditEntry`]).
 
 use std::io::{BufRead, Write};
+
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
 use ferrika_core::model::history::{
@@ -163,9 +165,15 @@ impl Journal {
     /// Connector secrets of dropped operations leave the credential store.
     /// Only the current file is trimmed; lines of operations that began in
     /// the rotated file are kept.
+    ///
+    /// Kept lines are copied byte for byte, never re-serialized: a journal
+    /// shared with a newer Ferrika may hold event kinds and fields this
+    /// version does not know, and digests cover what was written. Only the
+    /// lines of dropped operations (by id, whatever their event kind) go,
+    /// plus lines that are not JSON at all (cut short by a crash).
     fn trim_locked(&self, now_ms: i64) -> std::io::Result<()> {
-        let events = self.events();
-        let ops = fold(events.clone());
+        let lines = read_lines(&self.path);
+        let ops = fold(lines.iter().filter_map(|line| line.event.clone()));
         let cutoff = now_ms - KEEP_DAYS * 24 * 60 * 60 * 1000;
         let keep_from = ops.len().saturating_sub(KEEP_OPERATIONS);
         let mut dropped = Vec::new();
@@ -179,17 +187,18 @@ impl Journal {
         if dropped.is_empty() {
             return Ok(());
         }
-        let lines: Vec<String> = events
-            .into_iter()
-            .filter(|event| !dropped_ids.contains(event.id.as_str()))
-            .filter_map(|event| serde_json::to_string(&event).ok())
-            .collect();
         let tmp = self.path.with_extension("jsonl.tmp");
         {
             let mut file = private_options().write(true).truncate(true).open(&tmp)?;
             for line in &lines {
-                file.write_all(line.as_bytes())?;
-                file.write_all(b"\n")?;
+                let keep = match &line.id {
+                    Some(id) => !dropped_ids.contains(id.as_str()),
+                    None => line.is_json,
+                };
+                if keep {
+                    file.write_all(&line.raw)?;
+                    file.write_all(b"\n")?;
+                }
             }
             file.flush()?;
         }
@@ -201,31 +210,90 @@ impl Journal {
     }
 }
 
-/// The events of one journal file; nothing when it cannot be opened.
-fn read_events(path: &Path) -> Vec<HistoryEvent> {
+/// One line of a journal file as read, for writing it back unchanged.
+struct RawLine {
+    /// The bytes without the trailing newline.
+    raw: Vec<u8>,
+    /// The line as an event this version understands.
+    event: Option<HistoryEvent>,
+    /// The operation id of a JSON line that has one, known event or not.
+    id: Option<String>,
+    /// Whether the line is JSON at all (not cut short by a crash).
+    is_json: bool,
+}
+
+/// Just the id of a journal line, whatever its event kind.
+#[derive(serde::Deserialize)]
+struct LineId {
+    id: String,
+}
+
+/// The text of a line without a byte-order mark and `\r`; `None` when it
+/// is not UTF-8.
+fn line_text(bytes: &[u8]) -> Option<&str> {
+    let line = std::str::from_utf8(bytes).ok()?;
+    Some(line.trim_start_matches('\u{feff}').trim_end_matches('\r'))
+}
+
+/// The lines of a journal file, split on bytes: a line a crash cut inside
+/// a multi-byte character is not UTF-8, and `lines()` would stop there,
+/// losing every later operation (and the trim would then rewrite the file
+/// without them). Nothing when the file cannot be opened.
+fn split_lines(path: &Path) -> Vec<Vec<u8>> {
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
-    // Split on bytes: a line a crash cut inside a multi-byte character
-    // is not UTF-8, and `lines()` would stop there, losing every later
-    // operation (and the trim would then rewrite the file without them).
     std::io::BufReader::new(file)
         .split(b'\n')
         .map_while(Result::ok)
-        .filter_map(|bytes| {
-            let line = String::from_utf8(bytes).ok()?;
-            serde_json::from_str(line.trim_start_matches('\u{feff}').trim_end_matches('\r')).ok()
+        .collect()
+}
+
+/// Every non-blank line of a journal file with what it says.
+fn read_lines(path: &Path) -> Vec<RawLine> {
+    split_lines(path)
+        .into_iter()
+        .filter_map(|raw| {
+            let text = line_text(&raw);
+            if text.is_some_and(|t| t.trim().is_empty()) {
+                return None;
+            }
+            let value = text.and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok());
+            let event = value
+                .as_ref()
+                .and_then(|v| HistoryEvent::deserialize(v).ok());
+            let id = value
+                .as_ref()
+                .and_then(|v| LineId::deserialize(v).ok())
+                .map(|line| line.id);
+            Some(RawLine {
+                raw,
+                event,
+                id,
+                is_json: value.is_some(),
+            })
         })
         .collect()
 }
 
-/// Removes the connector secrets an operation kept in the credential store.
+/// The events of one journal file; nothing when it cannot be opened.
+/// Lines this version does not understand are skipped.
+fn read_events(path: &Path) -> Vec<HistoryEvent> {
+    split_lines(path)
+        .iter()
+        .filter_map(|bytes| serde_json::from_str(line_text(bytes)?).ok())
+        .collect()
+}
+
+/// Removes the connector secrets an operation kept in the credential store
+/// (also where versions before per-directory entries kept them: an
+/// operation id belongs to one journal only).
 pub fn forget_secrets(op: &Operation) {
     let profile = secret_store_profile(&op.id);
     for state in op.begin.before.iter().chain(op.after()) {
         if let State::Connector { secret_keys, .. } = state {
             for key in secret_keys {
-                let _ = ferrika_core::kafka::secrets::delete(&profile, key);
+                let _ = ferrika_core::kafka::secrets::delete_with_legacy(&profile, key);
             }
         }
     }
@@ -735,6 +803,61 @@ mod tests {
                 .find(|op| op.id == "N01001")
                 .and_then(|op| op.ok()),
             Some(true)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn trimming_and_rotation_keep_lines_of_unknown_kinds_and_fields_byte_for_byte() {
+        let (dir, journal) = temp_journal("trim-unknown");
+        std::fs::create_dir_all(&dir).unwrap();
+        let day = 24 * 60 * 60 * 1000;
+        let now = 200 * day;
+        let line = |event: &HistoryEvent| serde_json::to_string(event).unwrap();
+        // A known `begin` with a field only a newer version writes, in a
+        // key order and spacing this version would not produce.
+        let mut known: serde_json::Value =
+            serde_json::to_value(begin_event("NEW", now - day)).unwrap();
+        known["future_field"] = serde_json::json!({"nested": [1, 2]});
+        let known = format!("{{\"future_first\": true, {}", &known.to_string()[1..]);
+        let kept = [
+            known.clone(),
+            // An event kind this version does not know, of a kept operation.
+            format!(r#"{{"v":9,"id":"NEW","time_ms":{now},"ev":"checkpoint","data":{{"x":1}}}}"#),
+            line(&end_event("NEW")),
+            // An unknown kind of an operation this version never saw begin.
+            r#"{"v":9,"id":"OTHER","time_ms":0,"ev":"begin_v9","what":"?"}"#.to_string(),
+            // JSON without an id.
+            r#"{"v":9,"ev":"marker"}"#.to_string(),
+        ];
+        let text = [
+            line(&begin_event("OLD", now - 91 * day)),
+            r#"{"v":9,"id":"OLD","time_ms":1,"ev":"checkpoint"}"#.to_string(),
+            kept[0].clone(),
+            kept[1].clone(),
+            r#"{"v":1,"id":"TORN","ev":"en"#.to_string(),
+            kept[2].clone(),
+            kept[3].clone(),
+            line(&end_event("OLD")),
+            kept[4].clone(),
+        ]
+        .join("\n")
+            + "\n";
+        std::fs::write(journal.path(), text).unwrap();
+        // The known `begin` with an unknown field is still read.
+        assert_eq!(journal.load().len(), 2);
+        journal.trim_locked(now).unwrap();
+        let expected = kept.join("\n") + "\n";
+        assert_eq!(std::fs::read_to_string(journal.path()).unwrap(), expected);
+        let ops = journal.load();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].id, "NEW");
+        assert_eq!(ops[0].ok(), Some(true));
+        // Rotation moves the file as it is.
+        journal.rotate_locked().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(journal.rotated_path()).unwrap(),
+            expected
         );
         let _ = std::fs::remove_dir_all(dir);
     }

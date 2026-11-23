@@ -433,6 +433,15 @@ impl ProfileStore {
             return PathBuf::from(dir).join("profiles.json");
         }
 
+        Self::home_config_dir().join("profiles.json")
+    }
+
+    /// The default config directory, without the environment overrides:
+    /// `%USERPROFILE%\.ferrika` on Windows, `$HOME/.ferrika` elsewhere,
+    /// `.ferrika` when there is no home directory. Credential store entries
+    /// of profiles in this directory keep their account names without a
+    /// directory suffix (see [`secrets`]).
+    pub fn home_config_dir() -> PathBuf {
         #[cfg(target_os = "windows")]
         let home = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
@@ -441,10 +450,9 @@ impl ProfileStore {
         #[cfg(not(target_os = "windows"))]
         let home = std::env::var("HOME").ok();
 
-        if let Some(h) = home {
-            PathBuf::from(h).join(".ferrika").join("profiles.json")
-        } else {
-            PathBuf::from(".ferrika").join("profiles.json")
+        match home {
+            Some(h) => PathBuf::from(h).join(".ferrika"),
+            None => PathBuf::from(".ferrika"),
         }
     }
 
