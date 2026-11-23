@@ -34,6 +34,12 @@ Administrators and replace its ACL, and that of everything in it.
 | Existing folder or files | owner taken (`takeown /A`), ACL replaced | owner and mode reset |
 | Junction / symlink at the policy path | refused | refused |
 | `policy.keys` not in the source folder | removed from the target (a retired key stops being trusted) | removed |
+| Verified at the end | owner and every allow entry with write/create/delete/permission rights is Administrators, SYSTEM or TrustedInstaller (the `spool` folder aside), or the script fails | everything owned by root and not writable by group or others, or the script fails |
+
+The final check exists because a folder that still lets ordinary users
+create files (for example an inherited "Users: create files" entry from
+ProgramData) lets anyone drop a broken `policy.keys` and force every user
+into strictest mode.
 
 ## Windows: PowerShell (Intune, GPO)
 
@@ -72,7 +78,9 @@ and SCCM report it. `-Verbose` prints each step.
 The `spool` folder (`-SpoolDir`) keeps the policy folder's rights plus:
 Users may create files in it, and the account that created a file may write
 to it (`CREATOR OWNER` modify). Users can read, but not change or delete,
-other accounts' spool files.
+other accounts' spool files. Ferrika names each new spool file with a
+random suffix and only appends to its own files (see
+[Spool folder security](../docs/POLICY.md#spool-folder-security)).
 
 ### Event log source
 
@@ -139,7 +147,9 @@ log show --predicate 'process == "ferrika"'  # macOS unified log
 ferrika policy show
 ```
 
-shows the active policy, its issuer and the trusted keys. On Windows,
+shows the active policy, its issuer and the trusted keys, and warns when
+the policy directory or a policy file may be written by non-administrators
+(`-f json`: `dir_warnings`). On Windows,
 `icacls "%ProgramData%\Ferrika"` should list exactly `BUILTIN\Administrators:(OI)(CI)(F)`,
 `NT AUTHORITY\SYSTEM:(OI)(CI)(F)` and `BUILTIN\Users:(OI)(CI)(RX)`, and
 `(Get-Acl "$env:ProgramData\Ferrika").Owner` should be `BUILTIN\Administrators`.

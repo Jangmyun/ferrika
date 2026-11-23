@@ -10,6 +10,12 @@
       Administrators and SYSTEM full control, Users read and execute only.
       A folder that already exists (for example one a user created first, and
       therefore owns) gets its owner and ACL reset, and so does everything in it.
+    - Verifies the result: the folder and every policy file must be owned by
+      Administrators (or SYSTEM / TrustedInstaller) and no other account may
+      create, change or delete files in it or change its permissions. A
+      folder that still lets ordinary users create files (for example through
+      an inherited "Users: create files" entry) fails the install, because
+      anyone could then drop a broken policy.keys and force strictest mode.
     - Registers the Application event log source "Ferrika" used by the audit
       anchor (policy "audit_anchor": "os_log").
     - With -SpoolDir, creates Ferrika\spool for rules.audit_forward.spool_dir:
@@ -138,6 +144,64 @@ function Set-SpoolAcl([string]$Path) {
     [System.IO.Directory]::SetAccessControl($Path, $security)
 }
 
+# Rights that change what Ferrika reads: write/create files, append/create
+# folders, delete children, delete, change permissions, take ownership,
+# GENERIC_ALL and GENERIC_WRITE.
+$WriteRights = 0x2 -bor 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+$TrustedInstaller = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+
+function Get-SidText($Identity) {
+    try {
+        return $Identity.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        return [string]$Identity
+    }
+}
+
+function Test-TrustedSid([string]$Sid) {
+    return ($Sid -eq $Administrators.Value) -or ($Sid -eq $System.Value) -or ($Sid -eq $TrustedInstaller)
+}
+
+# Why $Path may be changed by a non-administrator, or an empty list.
+function Get-WriteProblems([string]$Path) {
+    $problems = @()
+    $acl = Get-Acl -LiteralPath $Path
+    $owner = Get-SidText (New-Object System.Security.Principal.NTAccount $acl.Owner)
+    if ($acl.Owner -and -not (Test-TrustedSid $owner)) {
+        $problems += "owner is $($acl.Owner), not Administrators"
+    }
+    foreach ($rule in $acl.Access) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+        # Inherit-only entries do not apply to this object itself.
+        if ($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        if (([int64]$rule.FileSystemRights -band $WriteRights) -eq 0) { continue }
+        $sid = Get-SidText $rule.IdentityReference
+        if (-not (Test-TrustedSid $sid)) {
+            $problems += "$($rule.IdentityReference) has $($rule.FileSystemRights)"
+        }
+    }
+    return ,$problems
+}
+
+function Assert-LockedDown([string]$Dir, [string]$Spool) {
+    $paths = @($Dir)
+    foreach ($item in Get-ChildItem -LiteralPath $Dir -Force -Recurse) {
+        if ($item.FullName -eq $Spool -or $item.FullName.StartsWith($Spool + [System.IO.Path]::DirectorySeparatorChar)) { continue }
+        $paths += $item.FullName
+    }
+    $failures = @()
+    foreach ($path in $paths) {
+        foreach ($problem in (Get-WriteProblems $path)) {
+            $failures += "${path}: $problem"
+        }
+    }
+    if ($failures.Count -gt 0) {
+        throw ("The policy folder is still writable by non-administrators; anyone could " +
+            "replace policy.keys and force strictest mode:`n  " + ($failures -join "`n  "))
+    }
+    Write-Verbose "Verified: only Administrators, SYSTEM and TrustedInstaller can change $Dir"
+}
+
 function Reset-Owner([string]$Path) {
     # takeown uses SeTakeOwnershipPrivilege, so it works even when a user who
     # owns the folder has removed the administrators' access to it.
@@ -239,6 +303,8 @@ try {
         }
         Set-SpoolAcl $spool
     }
+
+    if (-not $whatIf) { Assert-LockedDown $dir $spool }
 
     if (-not $NoEventSource) { Register-EventSource }
 

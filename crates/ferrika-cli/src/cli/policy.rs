@@ -471,6 +471,8 @@ fn rules_json(rules: &PolicyRules) -> serde_json::Value {
 
 fn show(policy: &EffectivePolicy, global: &GlobalOpts) {
     let now = jiff::Timestamp::now();
+    // Anyone who can write here can at least force strictest mode.
+    let dir_warnings = policy::dir_write_warnings(&policy.dir);
     if global.wants_json(false) {
         let (status, issuer, key_id, error) = match &policy.status {
             PolicyStatus::Absent => ("absent", None, None, None),
@@ -490,6 +492,7 @@ fn show(policy: &EffectivePolicy, global: &GlobalOpts) {
         let value = serde_json::json!({
             "status": status, "dir": policy.dir, "issuer": issuer, "key_id": key_id,
             "issued_at": policy.issued_at, "error": error,
+            "dir_warnings": dir_warnings,
             "expires_at": policy.expiry.as_ref().map(|e| &e.text),
             "on_expiry": policy.expiry.as_ref().map(|e| e.on_expiry),
             "expiry": policy.expiry.as_ref().map(|_| expiry_state),
@@ -505,6 +508,9 @@ fn show(policy: &EffectivePolicy, global: &GlobalOpts) {
         return;
     }
     println!("Policy directory: {}", policy.dir.display());
+    for line in dir_warning_lines(&dir_warnings) {
+        println!("{}", line.yellow());
+    }
     match &policy.status {
         PolicyStatus::Absent => {
             println!(
@@ -605,8 +611,32 @@ fn show(policy: &EffectivePolicy, global: &GlobalOpts) {
     );
 }
 
+/// `policy show` lines for [`policy::dir_write_warnings`].
+fn dir_warning_lines(warnings: &[String]) -> Vec<String> {
+    if warnings.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        "warning: the policy directory may be writable by non-administrators; \
+         anyone who can change it can at least force strictest mode \
+         (re-run the install script in packaging/ to lock it down):"
+            .to_string(),
+    ];
+    lines.extend(warnings.iter().map(|w| format!("  {w}")));
+    lines
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dir_warnings_are_listed_under_one_heading() {
+        assert!(super::dir_warning_lines(&[]).is_empty());
+        let lines = super::dir_warning_lines(&["/etc/ferrika: owned by uid 1000, not root".into()]);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("warning: the policy directory"));
+        assert_eq!(lines[1], "  /etc/ferrika: owned by uid 1000, not root");
+    }
+
     #[cfg(unix)]
     mod key_files {
         use super::super::write_key_file;
