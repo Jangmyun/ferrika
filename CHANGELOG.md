@@ -332,6 +332,16 @@ The RabbitMQ entries below are planned for 0.2.0.
   unroutable), peek, `dlq inspect` grouping, `dlq redrive` preview and
   `--execute` (x-death kept), read-only profile refusals and an audit log
   without message bodies. See `docs/e2e/README.md`.
+- **Breaking (library):** committed offsets no longer pass through
+  `rdkafka::TopicPartitionList`, so these signatures do not change with
+  rdkafka. `KafkaConsumerClient::fetch_committed_offsets` and
+  `fetch_committed_offsets_for` return `HashMap<(String, i32), Option<i64>>`
+  (`None`: no committed offset), and `fetch_committed_offsets_for` takes the
+  partitions as `&[(&str, i32)]`. `KafkaConsumerClient::commit` takes
+  `&[(&str, i32, i64)]` (topic, partition, next offset to read).
+  `ferrika_ops::group_lag::committed_partition_list` is now
+  `committed_partition_offsets` and returns that map, which
+  `apply_group_offsets` takes. Lag numbers are unchanged.
 - **Breaking:** `topics create` without `-p/--partitions` or
   `-r/--replication` leaves them to the broker (`num.partitions`,
   `default.replication.factor`, KIP-464), like `kafka-topics.sh`, instead of

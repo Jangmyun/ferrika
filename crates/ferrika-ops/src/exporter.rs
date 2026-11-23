@@ -367,10 +367,6 @@ fn committed_via_clients(
     groups: &[String],
     partitions: &[(&str, i32)],
 ) -> wire::GroupOffsets {
-    let mut queried = rdkafka::TopicPartitionList::new();
-    for &(topic, partition) in partitions {
-        queried.add_partition(topic, partition);
-    }
     let mut result = wire::GroupOffsets::new();
     for group_id in groups {
         let mut consumer_cfg = config.clone();
@@ -379,17 +375,13 @@ fn committed_via_clients(
             continue;
         };
         let Ok(committed) =
-            consumer.fetch_committed_offsets_for(&queried, Some(Duration::from_secs(5)))
+            consumer.fetch_committed_offsets_for(partitions, Some(Duration::from_secs(5)))
         else {
             continue;
         };
         let offsets = committed
-            .elements()
-            .iter()
-            .filter_map(|e| match e.offset() {
-                rdkafka::Offset::Offset(off) => Some(((e.topic().to_string(), e.partition()), off)),
-                _ => None,
-            })
+            .into_iter()
+            .filter_map(|(key, offset)| offset.map(|off| (key, off)))
             .collect();
         result.insert(group_id.clone(), offsets);
     }

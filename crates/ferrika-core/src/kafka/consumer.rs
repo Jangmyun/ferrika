@@ -1072,28 +1072,47 @@ impl KafkaConsumerClient {
             .collect())
     }
 
-    /// Fetches committed offsets for the currently assigned partitions.
+    /// Fetches committed offsets for the currently assigned partitions, keyed
+    /// by `(topic, partition)`; `None` means the group has no committed offset
+    /// for that partition.
     pub fn fetch_committed_offsets(
         &self,
         timeout: Option<Duration>,
-    ) -> KafkaResult<TopicPartitionList> {
+    ) -> KafkaResult<HashMap<(String, i32), Option<i64>>> {
         let to = timeout.unwrap_or(self.config.request_timeout);
         let committed = self.consumer.committed(to)?;
-        Ok(committed)
+        Ok(committed_offsets_map(&committed))
     }
 
-    /// Fetches committed offsets for the supplied partitions.
+    /// Fetches the group's committed offsets for `partitions`, keyed by
+    /// `(topic, partition)`; `None` means the group has no committed offset
+    /// for that partition (or the lookup failed for that partition alone).
     ///
     /// Use this for administrative lag inspection. A newly-created consumer has
     /// no assignment, so [`Self::fetch_committed_offsets`] would otherwise
-    /// return an empty list even when the group has committed offsets.
+    /// return an empty map even when the group has committed offsets.
     pub fn fetch_committed_offsets_for(
         &self,
-        partitions: &TopicPartitionList,
+        partitions: &[(&str, i32)],
+        timeout: Option<Duration>,
+    ) -> KafkaResult<HashMap<(String, i32), Option<i64>>> {
+        let committed = self.committed_list_for(partitions, timeout)?;
+        Ok(committed_offsets_map(&committed))
+    }
+
+    /// Like [`Self::fetch_committed_offsets_for`], but keeps librdkafka's
+    /// per-partition results (errors included) for callers in this crate.
+    pub(crate) fn committed_list_for(
+        &self,
+        partitions: &[(&str, i32)],
         timeout: Option<Duration>,
     ) -> KafkaResult<TopicPartitionList> {
         let to = timeout.unwrap_or(self.config.request_timeout);
-        let committed = self.consumer.committed_offsets(partitions.clone(), to)?;
+        let mut tpl = TopicPartitionList::new();
+        for &(topic, partition) in partitions {
+            tpl.add_partition(topic, partition);
+        }
+        let committed = self.consumer.committed_offsets(tpl, to)?;
         Ok(committed)
     }
 
@@ -1161,10 +1180,16 @@ impl KafkaConsumerClient {
         }
     }
 
-    /// Commits offsets specified in a TopicPartitionList.
-    pub fn commit(&self, tpl: &TopicPartitionList, mode: CommitMode) -> KafkaResult<()> {
+    /// Commits `offsets`, each `(topic, partition, offset)` where `offset` is
+    /// the next record the group should read on that partition.
+    pub fn commit(&self, offsets: &[(&str, i32, i64)], mode: CommitMode) -> KafkaResult<()> {
+        let mut tpl = TopicPartitionList::new();
+        for &(topic, partition, offset) in offsets {
+            tpl.add_partition_offset(topic, partition, Offset::Offset(offset))
+                .map_err(|e| KafkaError::Offset(e.to_string()))?;
+        }
         self.pin();
-        self.consumer.commit(tpl, mode.to_driver())?;
+        self.consumer.commit(&tpl, mode.to_driver())?;
         Ok(())
     }
 
@@ -1184,6 +1209,22 @@ fn explicit_offsets(tpl: &TopicPartitionList) -> HashMap<(String, i32), i64> {
         .filter_map(|e| match e.offset() {
             Offset::Offset(o) => Some(((e.topic().to_string(), e.partition()), o)),
             _ => None,
+        })
+        .collect()
+}
+
+/// `(topic, partition) -> committed offset` from a committed-offsets lookup:
+/// `None` where librdkafka reports no offset (`RD_KAFKA_OFFSET_INVALID`) or
+/// another special offset.
+fn committed_offsets_map(list: &TopicPartitionList) -> HashMap<(String, i32), Option<i64>> {
+    list.elements()
+        .iter()
+        .map(|e| {
+            let offset = match e.offset() {
+                Offset::Offset(o) => Some(o),
+                _ => None,
+            };
+            ((e.topic().to_string(), e.partition()), offset)
         })
         .collect()
 }
@@ -1249,6 +1290,21 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[&("t".to_string(), 0)], 12);
         assert_eq!(got[&("u".to_string(), 0)], 0);
+    }
+
+    #[test]
+    fn committed_offsets_map_marks_missing_commits_as_none() {
+        let mut list = TopicPartitionList::new();
+        list.add_partition_offset("t", 0, Offset::Offset(7))
+            .unwrap();
+        list.add_partition_offset("t", 1, Offset::Invalid).unwrap();
+        list.add_partition_offset("u", 0, Offset::Offset(0))
+            .unwrap();
+        let map = committed_offsets_map(&list);
+        assert_eq!(map.len(), 3);
+        assert_eq!(map[&("t".to_string(), 0)], Some(7));
+        assert_eq!(map[&("t".to_string(), 1)], None);
+        assert_eq!(map[&("u".to_string(), 0)], Some(0));
     }
 
     #[test]

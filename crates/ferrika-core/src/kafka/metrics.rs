@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use rdkafka::{Offset, TopicPartitionList};
 use serde::{Deserialize, Serialize};
 
 use crate::error::KafkaResult;
@@ -187,22 +186,15 @@ impl MetricsService {
         topic_partitions: &[(&str, i32)],
         timeout: Option<Duration>,
     ) -> KafkaResult<ConsumerGroupLag> {
-        let mut tpl = TopicPartitionList::new();
-        for &(t, p) in topic_partitions {
-            tpl.add_partition(t, p);
-        }
-
-        let committed_tpl = consumer.fetch_committed_offsets_for(&tpl, timeout)?;
+        let committed = consumer.fetch_committed_offsets_for(topic_partitions, timeout)?;
 
         let mut partition_lags = Vec::new();
         for &(t, p) in topic_partitions {
             let (low, high) = consumer.fetch_watermarks(t, p, timeout)?;
-            let current_offset = committed_tpl
-                .find_partition(t, p)
-                .map(|elem| match elem.offset() {
-                    Offset::Offset(off) => off,
-                    _ => -1,
-                })
+            let current_offset = committed
+                .get(&(t.to_string(), p))
+                .copied()
+                .flatten()
                 .unwrap_or(-1);
 
             partition_lags.push(Self::compute_partition_lag(t, p, current_offset, high, low));
