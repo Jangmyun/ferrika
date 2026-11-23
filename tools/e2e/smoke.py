@@ -70,6 +70,10 @@ LIMIT = limit if resource else None
 
 def run(args, env=None, timeout=30, stdin=None, broker=True):
     e = dict(os.environ)
+    # Every command runs against a throwaway home: the test must never write
+    # to the user's own ~/.ferrika (audit log, history, profiles) or to the
+    # OS credential store.
+    e.update(ISOLATED)
     if env:
         e.update(env)
     cmd = [F] + (["-b", BROKER] if broker else []) + args
@@ -145,6 +149,15 @@ srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Registry)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 REG = f"http://127.0.0.1:{srv.server_address[1]}"
 tmp = Path(tempfile.mkdtemp(prefix="ferrika-smoke-"))
+_iso_home = tmp / "isolated-home"
+_iso_home.mkdir()
+ISOLATED = {
+    "HOME": str(_iso_home),
+    # On Windows USERPROFILE comes before HOME.
+    "USERPROFILE": str(_iso_home),
+    "FERRIKA_CONFIG_DIR": str(_iso_home / ".ferrika"),
+    "FERRIKA_SECRET_STORE": "file",
+}
 
 
 def scenarios():
@@ -346,7 +359,7 @@ def scenarios():
     po, wo = os.pipe()
     pe, we = os.pipe()
     pr = subprocess.Popen([F, "-b", BROKER, "consume", p, "-b", "-n", "3", "-t", "3000", "-g", f"{p}-pipe"],
-                          stdout=wo, stderr=we, preexec_fn=LIMIT)
+                          stdout=wo, stderr=we, preexec_fn=LIMIT, env={**os.environ, **ISOLATED})
     for fd in (po, pe, wo, we):
         os.close(fd)
     try:
@@ -359,7 +372,8 @@ def scenarios():
     # --- monitor export: /metrics without duplicate series --------------
     port = free_port()
     ex = subprocess.Popen([F, "-b", BROKER, "monitor", "export", "-P", str(port), "-i", "2"],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=LIMIT)
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=LIMIT,
+                          env={**os.environ, **ISOLATED})
     try:
         body, code = None, None
         for _ in range(40):
