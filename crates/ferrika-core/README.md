@@ -14,9 +14,8 @@ formats and the domain model.
 
 Producing, consuming and metadata go through librdkafka (the
 [`rdkafka`](https://crates.io/crates/rdkafka) crate, not re-exported; the API
-uses Ferrika's own offset, commit mode and metadata types, except for the
-committed-offset functions that take an `rdkafka::TopicPartitionList` until
-0.3); admin requests, Schema Registry and Connect are native Rust over rustls.
+uses Ferrika's own offset, commit mode and metadata types, and committed
+offsets as plain maps); admin requests, Schema Registry and Connect are native Rust over rustls.
 
 ## Example
 

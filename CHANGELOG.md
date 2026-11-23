@@ -451,9 +451,8 @@ The RabbitMQ entries below are planned for 0.2.0.
   - `KafkaClientConfig::to_rdkafka_config` and
     `kafka::oauth_refresh::{prepare, OAuthSetup, with_oauth}` are
     crate-internal.
-  - Still on rdkafka 0.39 types until 0.3: `KafkaConsumerClient::{fetch_committed_offsets,
-    fetch_committed_offsets_for, commit}` (`TopicPartitionList`) and
-    `ferrika_ops::group_lag::{committed_partition_list, apply_group_offsets}`.
+  - Committed offsets use plain maps too (see the next entry), so no public
+    signature names an `rdkafka` type.
   - `ferrika-mcp` no longer depends on `rdkafka`.
 
 ### Compatibility
