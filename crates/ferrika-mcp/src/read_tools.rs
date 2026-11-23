@@ -223,7 +223,7 @@ pub(super) async fn call_tool(
             .await
         }
         "list_brokers" => list_brokers(context),
-        "list_topics" => list_topics(context, &args),
+        "list_topics" => list_topics(context, &args).await,
         "describe_topic" => describe_topic(context, &args).await,
         "list_consumer_groups" => list_consumer_groups(context, &args).await,
         "consumer_group_lag" => consumer_group_lag(context, &args).await,
@@ -474,7 +474,7 @@ fn list_brokers(context: &ResolvedContext) -> KafkaResult<Value> {
 
 /// Metadata carries no offsets; fills in each partition's watermarks and
 /// the topic's message count (best effort).
-fn add_watermarks(context: &ResolvedContext, topics: &mut [TopicSummary]) {
+async fn add_watermarks(context: &ResolvedContext, topics: &mut [TopicSummary]) {
     let Ok(lookup) = KafkaConsumerClient::lookup(&context.config.clone()) else {
         return;
     };
@@ -486,7 +486,10 @@ fn add_watermarks(context: &ResolvedContext, topics: &mut [TopicSummary]) {
                 .map(|p| (t.name.as_str(), p.partition_id))
         })
         .collect();
-    let Ok(marks) = lookup.fetch_watermarks_batch(&wanted, timeout()) else {
+    let Ok(marks) = lookup
+        .fetch_watermarks_batch_async(&wanted, timeout())
+        .await
+    else {
         return;
     };
     for topic in topics.iter_mut() {
@@ -505,7 +508,7 @@ fn add_watermarks(context: &ResolvedContext, topics: &mut [TopicSummary]) {
     }
 }
 
-fn list_topics(context: &ResolvedContext, args: &Value) -> KafkaResult<Value> {
+async fn list_topics(context: &ResolvedContext, args: &Value) -> KafkaResult<Value> {
     let filter = str_arg(args, "filter");
     let internal = args
         .get("include_internal")
@@ -517,7 +520,7 @@ fn list_topics(context: &ResolvedContext, args: &Value) -> KafkaResult<Value> {
         .filter(|t| internal || !t.is_internal)
         .filter(|t| filter.is_none_or(|f| t.name.contains(f)))
         .collect();
-    add_watermarks(context, &mut topics);
+    add_watermarks(context, &mut topics).await;
     let topics: Vec<Value> = topics
         .into_iter()
         .map(|t| {
@@ -602,7 +605,7 @@ async fn describe_topic(context: &ResolvedContext, args: &Value) -> KafkaResult<
     let topic = required(args, "topic")?;
     let admin = admin(context)?;
     let mut summary = [admin.describe_topic(topic, timeout())?];
-    add_watermarks(context, &mut summary);
+    add_watermarks(context, &mut summary).await;
     let [summary] = summary;
     let configs: BTreeMap<String, String> = admin
         .describe_topic_overrides(topic, timeout())
@@ -794,7 +797,7 @@ async fn peek_messages(context: &ResolvedContext, args: &Value) -> KafkaResult<V
     let mut starts = Vec::new();
     let mut ends = BTreeMap::new();
     for &p in &partitions {
-        let (low, high) = consumer.fetch_watermarks(topic, p, timeout())?;
+        let (low, high) = consumer.fetch_watermarks_async(topic, p, timeout()).await?;
         let start = match from.as_str() {
             "latest" => (high - (scan / partitions.len() as i64).max(limit)).max(low),
             "earliest" => low,

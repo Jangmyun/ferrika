@@ -293,7 +293,7 @@ async fn fetch_redrive_messages(
     global: &GlobalOpts,
 ) -> KafkaResult<Vec<DlqMessage>> {
     let config = global.to_kafka_config();
-    let marks = topic_watermarks(&config, topic, None)?;
+    let marks = topic_watermarks(&config, topic, None).await?;
     let known = |p: &i32| marks.marks.contains_key(p) || marks.unavailable.contains(p);
     if let Some(missing) = start.partitions.keys().find(|p| !known(p)) {
         return Err(KafkaError::PartitionNotFound {

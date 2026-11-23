@@ -277,12 +277,17 @@ pub(crate) async fn scrape(
                     .map(move |p| (t.name.as_str(), p.partition_id))
             })
             .collect();
-        let watermarks = KafkaConsumerClient::lookup(config)
-            .and_then(|c| c.fetch_watermarks_batch(&partitions, Some(Duration::from_secs(5))))
-            .unwrap_or_else(|_| {
-                failed.push("watermarks");
-                Default::default()
-            });
+        let fetched = match KafkaConsumerClient::lookup(config) {
+            Ok(c) => {
+                c.fetch_watermarks_batch_async(&partitions, Some(Duration::from_secs(5)))
+                    .await
+            }
+            Err(e) => Err(e),
+        };
+        let watermarks = fetched.unwrap_or_else(|_| {
+            failed.push("watermarks");
+            Default::default()
+        });
         // One OffsetFetch per coordinator for all groups; librdkafka needs a
         // client per group, so that path is only the fallback.
         let committed = match wire::fetch_group_offsets(config, &groups) {

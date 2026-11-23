@@ -505,7 +505,7 @@ where
     // With `until_end`, the offset each unfinished partition stops before.
     let mut ends: HashMap<i32, i64> = HashMap::new();
     if mirror_config.until_end {
-        let marks = consumer.fetch_watermarks_batch(&keys, None)?;
+        let marks = consumer.fetch_watermarks_batch_async(&keys, None).await?;
         for &p in &partitions {
             let Some(&(low, high)) = marks.get(&(topic.to_string(), p)) else {
                 return Err(KafkaError::Consumer(format!(

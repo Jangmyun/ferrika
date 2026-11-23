@@ -127,7 +127,7 @@ pub async fn prepare_offset_reset(
             failures.push((p, format!("partition does not exist in '{topic}'")));
             continue;
         }
-        let (low, high) = match consumer.fetch_watermarks(topic, p, None) {
+        let (low, high) = match consumer.fetch_watermarks_async(topic, p, None).await {
             Ok(marks) => marks,
             Err(e) => {
                 failures.push((p, format!("cannot read watermarks: {e}")));

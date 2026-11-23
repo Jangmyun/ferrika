@@ -262,7 +262,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                 starts
             }
             (Some(off), None) if off >= 0 => {
-                clamped_starts(&consumer, &args.topic, &partitions, off)?
+                clamped_starts(&consumer, &args.topic, &partitions, off).await?
             }
             _ => {
                 let start = start_offset(args.offset, args.from_beginning, use_group);
@@ -291,7 +291,7 @@ pub async fn run(mut args: ConsumeArgs, global: &GlobalOpts) -> anyhow::Result<(
                 .unwrap_or_default(),
                 _ => Default::default(),
             };
-            for ((_, p), (low, high)) in consumer.fetch_watermarks_batch(&keys, None)? {
+            for ((_, p), (low, high)) in consumer.fetch_watermarks_batch_async(&keys, None).await? {
                 let at_end = starts.iter().any(|&(sp, start)| {
                     sp == p
                         && match start {
@@ -1017,7 +1017,7 @@ pub(crate) fn clamp_offset(requested: i64, low: i64, high: i64) -> Option<Offset
 
 /// Start offsets for `--offset N` (N >= 0) per partition, clamped to each
 /// partition's watermarks, with one stderr warning per adjusted partition.
-fn clamped_starts(
+async fn clamped_starts(
     consumer: &KafkaConsumerClient,
     topic: &str,
     partitions: &[i32],
@@ -1025,7 +1025,7 @@ fn clamped_starts(
 ) -> anyhow::Result<Vec<(i32, StartOffset)>> {
     let mut starts = Vec::with_capacity(partitions.len());
     for &p in partitions {
-        let (low, high) = consumer.fetch_watermarks(topic, p, None)?;
+        let (low, high) = consumer.fetch_watermarks_async(topic, p, None).await?;
         let start = match clamp_offset(requested, low, high) {
             Some(c) => {
                 eprintln!(

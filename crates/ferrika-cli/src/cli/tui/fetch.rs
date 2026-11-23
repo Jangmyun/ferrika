@@ -116,7 +116,8 @@ async fn read(
         .collect();
     let (watermarks, watermark_warning) = match c
         .probe
-        .fetch_watermarks_batch(&keys, Some(global.request_timeout()))
+        .fetch_watermarks_batch_async(&keys, Some(global.request_timeout()))
+        .await
     {
         Ok(w) => (w, None),
         Err(e) => (

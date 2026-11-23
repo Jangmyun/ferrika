@@ -13,6 +13,23 @@ The RabbitMQ entries below are planned for 0.2.0.
 
 ### Security
 
+- Audit forwarding spool on Windows: the spool folder and spool files are
+  now checked against their DACL, not only their owner and reparse points.
+  A spool file whose DACL (explicit or inherited entries, evaluated in
+  order with deny entries) lets another account than the current one,
+  SYSTEM or Administrators write, append, delete or change its permissions
+  or owner is skipped with a warning and a new file is used. An existing
+  spool folder that lets other accounts delete files, change its
+  permissions or owner, or write to the files created in it (an
+  inheritable entry) is refused with a clear error; letting them only add
+  files (the `Install-FerrikaPolicy.ps1 -SpoolDir` folder) stays accepted.
+  A missing spool folder is created with a protected owner-only DACL.
+  Before, a spool folder under e.g. `C:\ProgramData` that inherited broad
+  permissions let other local accounts modify audit spool files already
+  written. The policy directory warning of `ferrika policy show` and the
+  spool checks now share one implementation, so the policy check also
+  honours deny entries before allow entries and reports a symbolic link or
+  junction.
 - Audit forwarding spool: new spool files are named
   `ferrika-audit-<host>-<user>.<16 random hex>.jsonl` and created with
   create-new semantics (`0600` on Unix). An existing file is appended to
@@ -266,6 +283,14 @@ The RabbitMQ entries below are planned for 0.2.0.
 
 ### Changed
 
+- Leader-change retries: `ferrika_core::kafka::retry` has one retry policy
+  (which errors, how many tries, backoff) with a blocking executor
+  (`retry_leader_change`, `retry_metadata`) and a new async one
+  (`retry_leader_change_async`, waits with `tokio::time::sleep`).
+  `KafkaConsumerClient` gains `fetch_watermarks_async` and
+  `fetch_watermarks_batch_async`; the blocking versions now document that
+  they may sleep the calling thread for up to 3.5 s while a partition
+  leader moves. `bounded_read::topic_watermarks` is now `async`.
 - Tests: CI runs two more end-to-end smoke tests (Python, standard library
   only). `tools/e2e/mcp_smoke.py` drives `ferrika mcp --allow-write` over
   stdio JSON-RPC in the Kafka job (tools/list, read tools,
@@ -410,6 +435,14 @@ The RabbitMQ entries below are planned for 0.2.0.
 
 ### Fixed
 
+- Async commands and MCP tools no longer sleep a tokio worker thread while
+  a partition leader moves: `consume`, `dump`, `monitor`, `probe`, `top`,
+  the TUI, `topics list`/`describe` message counts, `diff`, `dlq`,
+  `offset reset`, `mirror`/copy pipelines, topic statistics, the metrics
+  scrape behind `top`/`health`, and the MCP `list_topics`,
+  `describe_topic`, `peek_messages` and `transform_preview` tools use the
+  async watermark lookups, which wait between tries with
+  `tokio::time::sleep` (up to 3.5 s used to block the thread).
 - Watermark lookups (`topics describe` and `list` message counts,
   `consume`, `monitor`, `undo` of a topic creation, and the other users of
   `KafkaConsumerClient::fetch_watermarks` and `fetch_watermarks_batch`) are

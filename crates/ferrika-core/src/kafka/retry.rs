@@ -15,17 +15,71 @@ pub fn backoff(attempt: u32) -> Duration {
 
 /// Runs `op`, retrying with [`backoff`] while it fails with a retriable
 /// metadata error, at most [`TRIES`] times.
-pub fn retry_metadata<T>(mut op: impl FnMut() -> KafkaResult<T>) -> KafkaResult<T> {
-    for attempt in 0..TRIES - 1 {
+///
+/// Blocking: sleeps the calling thread between tries (up to 3.5 s in all,
+/// on top of the tries themselves). From async code, call it inside
+/// `tokio::task::spawn_blocking`.
+pub fn retry_metadata<T>(op: impl FnMut() -> KafkaResult<T>) -> KafkaResult<T> {
+    retry_blocking(op, |e| e.class() == ErrorClass::Retriable)
+}
+
+/// The retry policy shared by the blocking and the async executors: after
+/// try `attempt` (0-based) failed with `error`, how long to wait before the
+/// next try, or `None` to return the error (not `retriable`, or the last of
+/// [`TRIES`]).
+fn next_delay(
+    attempt: u32,
+    error: &KafkaError,
+    retriable: impl Fn(&KafkaError) -> bool,
+) -> Option<Duration> {
+    (attempt + 1 < TRIES && retriable(error)).then(|| backoff(attempt))
+}
+
+/// The blocking executor of [`next_delay`]: sleeps with `std::thread::sleep`.
+fn retry_blocking<T>(
+    mut op: impl FnMut() -> KafkaResult<T>,
+    retriable: impl Fn(&KafkaError) -> bool,
+) -> KafkaResult<T> {
+    let mut attempt = 0;
+    loop {
         match op() {
-            Err(e) if e.class() == ErrorClass::Retriable => {
-                tracing::debug!(%e, "retrying after a metadata error");
-                std::thread::sleep(backoff(attempt));
-            }
-            other => return other,
+            Err(e) => match next_delay(attempt, &e, &retriable) {
+                Some(delay) => {
+                    tracing::debug!(%e, ?delay, "retrying after a transient metadata error");
+                    std::thread::sleep(delay);
+                    attempt += 1;
+                }
+                None => return Err(e),
+            },
+            ok => return ok,
         }
     }
-    op()
+}
+
+/// The async executor of [`next_delay`]: waits with `tokio::time::sleep`,
+/// so the runtime thread is free between tries.
+async fn retry_async<T, F, Fut>(
+    mut op: F,
+    retriable: impl Fn(&KafkaError) -> bool,
+) -> KafkaResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = KafkaResult<T>>,
+{
+    let mut attempt = 0;
+    loop {
+        match op().await {
+            Err(e) => match next_delay(attempt, &e, &retriable) {
+                Some(delay) => {
+                    tracing::debug!(%e, ?delay, "retrying after a transient metadata error");
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                None => return Err(e),
+            },
+            ok => return ok,
+        }
+    }
 }
 
 /// The error says a partition has no ready leader yet or its leader just
@@ -52,17 +106,26 @@ pub fn is_leader_change(error: &KafkaError) -> bool {
 /// Runs `op`, retrying with [`backoff`] while it fails with a
 /// [leader change](is_leader_change), at most [`TRIES`] times. Other errors,
 /// timeouts included, are returned at once.
-pub fn retry_leader_change<T>(mut op: impl FnMut() -> KafkaResult<T>) -> KafkaResult<T> {
-    for attempt in 0..TRIES - 1 {
-        match op() {
-            Err(e) if is_leader_change(&e) => {
-                tracing::debug!(%e, "retrying while the partition leader settles");
-                std::thread::sleep(backoff(attempt));
-            }
-            other => return other,
-        }
-    }
-    op()
+///
+/// Blocking: while a partition leader moves, this sleeps the calling thread
+/// for up to 3.5 s (0.5 + 1 + 2 s) besides the tries themselves. Call it from
+/// a blocking context (a plain thread, or `tokio::task::spawn_blocking` in
+/// async code), or use [`retry_leader_change_async`].
+pub fn retry_leader_change<T>(op: impl FnMut() -> KafkaResult<T>) -> KafkaResult<T> {
+    retry_blocking(op, is_leader_change)
+}
+
+/// [`retry_leader_change`] for async code: the same errors, tries and
+/// backoff, but it waits with `tokio::time::sleep` (it must run inside a
+/// tokio runtime with the time driver enabled). `op` itself runs on the
+/// calling task; a blocking call inside it still holds the thread for that
+/// one try.
+pub async fn retry_leader_change_async<T, F, Fut>(op: F) -> KafkaResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = KafkaResult<T>>,
+{
+    retry_async(op, is_leader_change).await
 }
 
 #[cfg(test)]
@@ -109,6 +172,72 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn the_policy_retries_leader_changes_up_to_the_last_try() {
+        let leader = driver(Code::NotLeaderForPartition);
+        let timeout = driver(Code::RequestTimedOut);
+        assert_eq!(
+            next_delay(0, &leader, is_leader_change),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            next_delay(TRIES - 2, &leader, is_leader_change),
+            Some(backoff(TRIES - 2))
+        );
+        assert_eq!(next_delay(TRIES - 1, &leader, is_leader_change), None);
+        assert_eq!(next_delay(0, &timeout, is_leader_change), None);
+    }
+
+    #[test]
+    fn a_lasting_leader_change_gives_up_after_all_tries() {
+        let mut calls = 0;
+        let result: KafkaResult<()> = retry_leader_change(|| {
+            calls += 1;
+            Err(driver(Code::LeaderNotAvailable))
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, TRIES);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_async_executor_waits_the_same_backoff_without_blocking() {
+        let start = tokio::time::Instant::now();
+        let mut calls = 0;
+        let result = retry_leader_change_async(|| {
+            calls += 1;
+            let n = calls;
+            async move {
+                if n < 3 {
+                    Err(driver(Code::NotLeaderForPartition))
+                } else {
+                    Ok(n)
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 3);
+        // 0.5 s + 1 s of paused (virtual) time.
+        assert_eq!(start.elapsed(), Duration::from_millis(1500));
+
+        let mut calls = 0;
+        let result: KafkaResult<()> = retry_leader_change_async(|| {
+            calls += 1;
+            async { Err(driver(Code::RequestTimedOut)) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+
+        let mut calls = 0;
+        let result: KafkaResult<()> = retry_leader_change_async(|| {
+            calls += 1;
+            async { Err(driver(Code::OffsetNotAvailable)) }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls, TRIES);
     }
 
     #[test]

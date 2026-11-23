@@ -372,7 +372,7 @@ pub(super) async fn preview(
     let mut assign = Vec::new();
     let mut ends = BTreeMap::new();
     for (p, from) in starts {
-        let (low, high) = consumer.fetch_watermarks(topic, p, timeout())?;
+        let (low, high) = consumer.fetch_watermarks_async(topic, p, timeout()).await?;
         let first = from.unwrap_or(low).clamp(low, high);
         if first < high {
             assign.push((topic, p, StartOffset::At(first)));

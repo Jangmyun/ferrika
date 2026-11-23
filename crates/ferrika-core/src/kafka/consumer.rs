@@ -625,6 +625,58 @@ impl ReadWorker {
     }
 }
 
+/// One topic and its partitions.
+type TopicPartitions<'a> = (&'a str, Vec<(&'a str, i32)>);
+
+/// `partitions` grouped by topic, or `None` when they are all of one topic
+/// (a per-topic retry would repeat the failed request).
+fn per_topic<'a>(partitions: &[(&'a str, i32)]) -> Option<Vec<TopicPartitions<'a>>> {
+    let mut topics: Vec<&str> = partitions.iter().map(|(t, _)| *t).collect();
+    topics.sort_unstable();
+    topics.dedup();
+    if topics.len() < 2 {
+        return None;
+    }
+    Some(
+        topics
+            .into_iter()
+            .map(|topic| {
+                let part = partitions
+                    .iter()
+                    .filter(|(t, _)| *t == topic)
+                    .copied()
+                    .collect();
+                (topic, part)
+            })
+            .collect(),
+    )
+}
+
+/// The `(low, high)` watermarks from the earliest (`low`) and latest
+/// (`high`) offset lookups; partitions without a latest offset are left out
+/// and a missing earliest offset counts as 0.
+fn watermarks_from(
+    capacity: usize,
+    low: &TopicPartitionList,
+    high: &TopicPartitionList,
+) -> HashMap<(String, i32), (i64, i64)> {
+    let mut watermarks = HashMap::with_capacity(capacity);
+    for elem in high.elements() {
+        let Offset::Offset(high) = elem.offset() else {
+            continue;
+        };
+        let low = match low
+            .find_partition(elem.topic(), elem.partition())
+            .map(|e| e.offset())
+        {
+            Some(Offset::Offset(low)) => low,
+            _ => 0,
+        };
+        watermarks.insert((elem.topic().to_string(), elem.partition()), (low, high));
+    }
+    watermarks
+}
+
 /// Asynchronous Kafka consumer client built on top of rdkafka's `StreamConsumer`.
 pub struct KafkaConsumerClient {
     // Declared before `consumer` so it stops before the client is destroyed.
@@ -821,6 +873,14 @@ impl KafkaConsumerClient {
 
     /// Fetches low and high watermarks for a given topic partition, retrying
     /// for a few seconds while its leader is not ready yet.
+    ///
+    /// Blocking: one broker round trip (up to `timeout`, default the request
+    /// timeout) per try, and while a partition leader moves it also sleeps
+    /// the calling thread for up to 3.5 s between tries
+    /// ([`retry_leader_change`](crate::kafka::retry::retry_leader_change)).
+    /// Call it from a blocking context (a plain thread, or
+    /// `tokio::task::spawn_blocking`); async code can use
+    /// [`Self::fetch_watermarks_async`].
     pub fn fetch_watermarks(
         &self,
         topic: &str,
@@ -833,6 +893,23 @@ impl KafkaConsumerClient {
         })
     }
 
+    /// [`Self::fetch_watermarks`] for async code: it waits between tries
+    /// with `tokio::time::sleep` instead of sleeping the thread. Each try is
+    /// still a blocking librdkafka call of up to `timeout`.
+    pub async fn fetch_watermarks_async(
+        &self,
+        topic: &str,
+        partition: i32,
+        timeout: Option<Duration>,
+    ) -> KafkaResult<(i64, i64)> {
+        let to = timeout.unwrap_or(self.config.request_timeout);
+        crate::kafka::retry::retry_leader_change_async(|| {
+            let result = self.consumer.fetch_watermarks(topic, partition, to);
+            async move { Ok(result?) }
+        })
+        .await
+    }
+
     /// Fetches low and high watermarks for many partitions at once.
     ///
     /// Uses two ListOffsets lookups (earliest and latest) that librdkafka batches
@@ -840,6 +917,12 @@ impl KafkaConsumerClient {
     /// Partitions whose offsets could not be resolved are omitted. A
     /// partition whose leader is not ready yet (a topic created a moment ago)
     /// is retried for a few seconds first.
+    ///
+    /// Blocking, like [`Self::fetch_watermarks`]: broker round trips of up
+    /// to `timeout` each, and up to 3.5 s of thread sleep per lookup while a
+    /// partition leader moves. Call it from a blocking context (e.g.
+    /// `tokio::task::spawn_blocking`); async code can use
+    /// [`Self::fetch_watermarks_batch_async`].
     pub fn fetch_watermarks_batch(
         &self,
         partitions: &[(&str, i32)],
@@ -851,20 +934,38 @@ impl KafkaConsumerClient {
             // down) fails the whole request; retry per topic so the others
             // still get their watermarks.
             Err(e) => {
-                let mut topics: Vec<&str> = partitions.iter().map(|(t, _)| *t).collect();
-                topics.sort_unstable();
-                topics.dedup();
-                if topics.len() < 2 {
+                let Some(per_topic) = per_topic(partitions) else {
                     return Err(e);
-                }
+                };
                 let mut marks = HashMap::new();
-                for topic in topics {
-                    let part: Vec<(&str, i32)> = partitions
-                        .iter()
-                        .filter(|(t, _)| *t == topic)
-                        .copied()
-                        .collect();
+                for (topic, part) in per_topic {
                     match self.fetch_watermarks_once(&part, timeout) {
+                        Ok(m) => marks.extend(m),
+                        Err(e) => tracing::debug!(topic, %e, "Watermarks unavailable"),
+                    }
+                }
+                Ok(marks)
+            }
+        }
+    }
+
+    /// [`Self::fetch_watermarks_batch`] for async code: it waits between
+    /// tries with `tokio::time::sleep` instead of sleeping the thread. Each
+    /// try is still a blocking librdkafka call of up to `timeout`.
+    pub async fn fetch_watermarks_batch_async(
+        &self,
+        partitions: &[(&str, i32)],
+        timeout: Option<Duration>,
+    ) -> KafkaResult<HashMap<(String, i32), (i64, i64)>> {
+        match self.fetch_watermarks_once_async(partitions, timeout).await {
+            Ok(marks) => Ok(marks),
+            Err(e) => {
+                let Some(per_topic) = per_topic(partitions) else {
+                    return Err(e);
+                };
+                let mut marks = HashMap::new();
+                for (topic, part) in per_topic {
+                    match self.fetch_watermarks_once_async(&part, timeout).await {
                         Ok(m) => marks.extend(m),
                         Err(e) => tracing::debug!(topic, %e, "Watermarks unavailable"),
                     }
@@ -882,6 +983,36 @@ impl KafkaConsumerClient {
         if partitions.is_empty() {
             return Ok(HashMap::new());
         }
+        // Right after a topic is created (or while a leader moves) the
+        // lookup can fail with NotLeaderForPartition for a moment.
+        let (low, high) = crate::kafka::retry::retry_leader_change(|| {
+            self.watermark_lookup(partitions, timeout)
+        })?;
+        Ok(watermarks_from(partitions.len(), &low, &high))
+    }
+
+    async fn fetch_watermarks_once_async(
+        &self,
+        partitions: &[(&str, i32)],
+        timeout: Option<Duration>,
+    ) -> KafkaResult<HashMap<(String, i32), (i64, i64)>> {
+        if partitions.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let (low, high) = crate::kafka::retry::retry_leader_change_async(|| {
+            let result = self.watermark_lookup(partitions, timeout);
+            async move { result }
+        })
+        .await?;
+        Ok(watermarks_from(partitions.len(), &low, &high))
+    }
+
+    /// One try of the earliest and latest offset lookups of `partitions`.
+    fn watermark_lookup(
+        &self,
+        partitions: &[(&str, i32)],
+        timeout: Option<Duration>,
+    ) -> KafkaResult<(TopicPartitionList, TopicPartitionList)> {
         let to = timeout.unwrap_or(self.config.request_timeout);
         // offsets_for_times treats the special offsets as "earliest" / "latest".
         let lookup = |offset: Offset| -> KafkaResult<TopicPartitionList> {
@@ -891,27 +1022,7 @@ impl KafkaConsumerClient {
             }
             Ok(self.consumer.offsets_for_times(tpl, to)?)
         };
-        // Right after a topic is created (or while a leader moves) the
-        // lookup can fail with NotLeaderForPartition for a moment.
-        let (low, high) = crate::kafka::retry::retry_leader_change(|| {
-            Ok((lookup(Offset::Beginning)?, lookup(Offset::End)?))
-        })?;
-
-        let mut watermarks = HashMap::with_capacity(partitions.len());
-        for elem in high.elements() {
-            let Offset::Offset(high) = elem.offset() else {
-                continue;
-            };
-            let low = match low
-                .find_partition(elem.topic(), elem.partition())
-                .map(|e| e.offset())
-            {
-                Some(Offset::Offset(low)) => low,
-                _ => 0,
-            };
-            watermarks.insert((elem.topic().to_string(), elem.partition()), (low, high));
-        }
-        Ok(watermarks)
+        Ok((lookup(Offset::Beginning)?, lookup(Offset::End)?))
     }
 
     /// Resolves, per partition, the first offset whose timestamp is at or after
@@ -1310,5 +1421,31 @@ mod tests {
             .insert(FETCH_QUEUE_BACKOFF.to_string(), "500".to_string());
         let rd = consumer_config(&config).unwrap();
         assert_eq!(rd.get(FETCH_QUEUE_BACKOFF), Some("500"));
+    }
+
+    #[test]
+    fn per_topic_splits_only_requests_with_several_topics() {
+        assert!(per_topic(&[("a", 0), ("a", 1)]).is_none());
+        let split = per_topic(&[("b", 0), ("a", 1), ("b", 2)]).unwrap();
+        assert_eq!(
+            split,
+            vec![("a", vec![("a", 1)]), ("b", vec![("b", 0), ("b", 2)])]
+        );
+    }
+
+    #[test]
+    fn watermarks_pair_the_earliest_and_latest_lookups() {
+        let mut low = TopicPartitionList::new();
+        low.add_partition_offset("t", 0, Offset::Offset(5)).unwrap();
+        let mut high = TopicPartitionList::new();
+        high.add_partition_offset("t", 0, Offset::Offset(9))
+            .unwrap();
+        high.add_partition_offset("t", 1, Offset::Offset(3))
+            .unwrap();
+        high.add_partition_offset("t", 2, Offset::End).unwrap();
+        let marks = watermarks_from(3, &low, &high);
+        assert_eq!(marks.len(), 2);
+        assert_eq!(marks[&("t".to_string(), 0)], (5, 9));
+        assert_eq!(marks[&("t".to_string(), 1)], (0, 3));
     }
 }

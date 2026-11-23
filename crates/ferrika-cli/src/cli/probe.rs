@@ -230,7 +230,7 @@ async fn execute_probes(
         .iter()
         .map(|&p| (args.topic.as_str(), p))
         .collect();
-    let ends = consumer.fetch_watermarks_batch(&keys, None)?;
+    let ends = consumer.fetch_watermarks_batch_async(&keys, None).await?;
     let assignments: Vec<(&str, i32, StartOffset)> = partitions
         .iter()
         .map(|&p| {

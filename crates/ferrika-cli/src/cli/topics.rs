@@ -316,7 +316,7 @@ async fn handle_list(
                 .into_iter()
                 .filter(|t| include_internal || !t.is_internal)
                 .collect();
-            let counted = fill_message_counts(global, &mut filtered);
+            let counted = fill_message_counts(global, &mut filtered).await;
 
             match global.format {
                 OutputFormat::Table => {
@@ -378,7 +378,7 @@ async fn handle_describe(
                     None
                 }
             };
-            let counted = fill_message_counts(global, std::slice::from_mut(&mut topic));
+            let counted = fill_message_counts(global, std::slice::from_mut(&mut topic)).await;
             match global.format {
                 OutputFormat::Table => {
                     println!("{}", format!("Topic: {}", topic.name).cyan().bold());
@@ -1066,7 +1066,7 @@ pub fn parse_topic_configs(configs: &[String]) -> anyhow::Result<HashMap<String,
 /// Fills `total_messages` and each partition's `high_watermark` from one
 /// batched watermark lookup. Best effort: returns `false` (leaving the zeros)
 /// when the lookup fails, e.g. without Describe permission on a topic.
-fn fill_message_counts(global: &GlobalOpts, topics: &mut [TopicSummary]) -> bool {
+async fn fill_message_counts(global: &GlobalOpts, topics: &mut [TopicSummary]) -> bool {
     // Reads watermarks only; no group is joined or created.
     let Ok(consumer) = KafkaConsumerClient::lookup(&global.to_kafka_config()) else {
         return false;
@@ -1079,7 +1079,7 @@ fn fill_message_counts(global: &GlobalOpts, topics: &mut [TopicSummary]) -> bool
                 .map(|p| (t.name.as_str(), p.partition_id))
         })
         .collect();
-    let watermarks = match consumer.fetch_watermarks_batch(&keys, None) {
+    let watermarks = match consumer.fetch_watermarks_batch_async(&keys, None).await {
         Ok(w) if w.len() == keys.len() => w,
         _ => return false,
     };

@@ -176,6 +176,11 @@ impl MetricsService {
     }
 
     /// Queries watermarks and committed offsets using a consumer client to compute real-time consumer group lag.
+    ///
+    /// Blocking: broker round trips per partition, and up to 3.5 s of thread
+    /// sleep per partition while its leader moves (see
+    /// [`KafkaConsumerClient::fetch_watermarks`]). Call it from a blocking
+    /// context, e.g. `tokio::task::spawn_blocking`.
     pub fn fetch_consumer_group_lag(
         consumer: &KafkaConsumerClient,
         group_id: &str,
