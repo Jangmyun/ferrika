@@ -268,6 +268,20 @@ The RabbitMQ entries below are planned for 0.2.0.
   with `EffectivePolicy::{environment, copy_down,
   copy_down_needs_broker_metadata}`. Code that builds `PolicyRules`
   without `..Default::default()` must add the new fields.
+- Library: `ferrika_ops::history::undo::prepare_request` makes the whole
+  undo decision in one place, so the CLI and other front ends cannot
+  decide differently: whether the "undone by" mark is believed
+  (`UndoneMark`, with the note to show and the edited undoing entry to
+  record as `history.tampered`), the audit digest, the scope check against
+  the cluster in use (`ScopeCheck`, naming both), the company policy,
+  `force` and whether a legacy entry needs its cluster confirmed. It
+  returns an `UndoRequest` with the `UndoPlan`, the refusal
+  (`UndoRefusal`) with and without `force` and `needs_legacy_confirmation`.
+  `undo_eligibility` makes the part of that decision a list can make
+  without contacting the cluster (the scope by cluster id when known), so
+  a list can mark an entry whose undo would be refused; `listed_on` is the
+  rule for which entries a cluster's history lists. `ferrika undo` and
+  `ferrika history` use them; their behaviour and output are unchanged.
 
 ### Security
 

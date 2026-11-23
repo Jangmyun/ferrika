@@ -1,7 +1,12 @@
 //! Preparing an undo, shared by `ferrika undo` and the GUI: find the
 //! operation, read the current state, compare, plan the steps and decide
-//! whether undo may run. The callers run the policy gate, ask, record and
-//! run [`execute`].
+//! whether undo may run. [`prepare_request`] makes the whole decision (the
+//! "undone by" mark, the audit digest, the scope, the company policy and
+//! the plan) and [`undo_eligibility`] the part a list can make without the
+//! cluster, so every caller decides alike. The callers run the policy
+//! gate, ask, record and run [`execute`].
+
+use std::collections::HashMap;
 
 use serde::Serialize;
 
@@ -126,6 +131,417 @@ pub fn undo_mark_trusted(undoer: &Operation, audited: Option<&str>, policy_activ
     }
 }
 
+/// The audit log's `op_digest`s by operation id, as
+/// `ferrika_governance::audit::op_digests` reads them.
+pub type AuditDigests = HashMap<String, String>;
+
+/// What the journal's "undone by" mark on an operation amounts to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "mark", rename_all = "snake_case")]
+pub enum UndoneMark {
+    /// The operation has no mark.
+    None,
+    /// The audit log vouches that `by` undid the operation (see
+    /// [`undo_mark_trusted`]): it is not undone again.
+    Trusted { by: String },
+    /// The audit log does not vouch for the mark, so it is ignored and
+    /// the current state decides.
+    Ignored {
+        by: String,
+        /// How the undoing operation compares with the audit log; `None`
+        /// when the journal has no such operation.
+        audit: Option<DigestCheck>,
+        /// The undoing operation's entry was edited (record it as
+        /// `history.tampered` with [`TAMPERED_UNDO_LINK`]).
+        tampered: bool,
+    },
+}
+
+impl UndoneMark {
+    /// Why the mark on operation `op` is ignored, or `None` when it is
+    /// not: "the history says … undid …, but the audit log does not vouch
+    /// for that (…); ignoring it, the current state decides".
+    pub fn ignored_note(&self, op: &str) -> Option<String> {
+        match self {
+            Self::Ignored { by, audit, .. } => Some(format!(
+                "the history says {by} undid {op}, but the audit log does not vouch for that \
+                 ({}); ignoring it, the current state decides",
+                audit.map_or("no such entry", DigestCheck::label)
+            )),
+            Self::None | Self::Trusted { .. } => None,
+        }
+    }
+
+    /// The undoing operation whose edited entry is to be recorded as
+    /// `history.tampered` (with [`TAMPERED_UNDO_LINK`]).
+    pub fn tampered_undoer(&self) -> Option<&str> {
+        match self {
+            Self::Ignored {
+                by, tampered: true, ..
+            } => Some(by),
+            _ => None,
+        }
+    }
+}
+
+/// The `history.tampered` outcome for an undoing operation whose entry
+/// does not match the audit log (its undo link is ignored).
+pub const TAMPERED_UNDO_LINK: &str =
+    "the history entry does not match the audit log's op_digest; its undo link is ignored";
+
+/// The `history.tampered` outcome for an operation whose undo is refused
+/// because its entry does not match the audit log.
+pub const TAMPERED_REFUSED: &str =
+    "the history entry does not match the audit log's op_digest; undo refused";
+
+/// Checks `op`'s "undone by" mark against the audit log (`audited`) with
+/// [`undo_mark_trusted`]; `all` is the whole journal.
+pub fn undone_mark(
+    op: &Operation,
+    all: &[Operation],
+    audited: &AuditDigests,
+    policy_active: bool,
+) -> UndoneMark {
+    let Some(by) = &op.undone_by else {
+        return UndoneMark::None;
+    };
+    let undoer = all.iter().find(|o| &o.id == by);
+    let audited_by = audited.get(by).map(String::as_str);
+    if undoer.is_some_and(|undoer| undo_mark_trusted(undoer, audited_by, policy_active)) {
+        return UndoneMark::Trusted { by: by.clone() };
+    }
+    let audit = undoer.map(|undoer| digest_check(undoer, audited_by));
+    UndoneMark::Ignored {
+        by: by.clone(),
+        audit,
+        tampered: audit == Some(DigestCheck::Mismatch),
+    }
+}
+
+/// Whether the history of the cluster `current` points at lists `op`
+/// ([`Scope::same_cluster`]). Looser than undo, which needs
+/// [`Scope::check_undo_target`]: [`undo_eligibility`] says when a listed
+/// operation would be refused.
+pub fn listed_on(op: &Operation, current: &Scope) -> bool {
+    op.begin.scope.same_cluster(current)
+}
+
+/// Whether the cluster in use is where an operation ran, as undo decides
+/// ([`Scope::check_undo_target`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum ScopeCheck {
+    Same,
+    /// Undo would change another cluster (or one whose id could not be
+    /// read to confirm it).
+    Mismatch {
+        /// Where the history says the operation ran.
+        recorded: String,
+        /// Where the caller is connected.
+        current: String,
+        /// The refusal, naming both.
+        reason: String,
+    },
+}
+
+impl ScopeCheck {
+    /// Compares the scope `op` was recorded with and `current`.
+    pub fn of(op: &Operation, current: &Scope) -> Self {
+        match op.begin.scope.check_undo_target(current) {
+            Ok(()) => Self::Same,
+            Err(reason) => Self::Mismatch {
+                recorded: op.begin.scope.describe(),
+                current: current.describe(),
+                reason,
+            },
+        }
+    }
+
+    pub fn is_same(&self) -> bool {
+        matches!(self, Self::Same)
+    }
+}
+
+/// The two places a legacy entry's undo asks the user to compare: its
+/// digest (Ferrika 0.1) does not cover the scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LegacyScopes {
+    /// Where the history says the operation ran (possibly edited).
+    pub recorded: String,
+    /// Where the caller is connected.
+    pub current: String,
+}
+
+/// Why an undo is refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "refusal", content = "reason", rename_all = "snake_case")]
+pub enum UndoRefusal {
+    /// The audit log vouches that `by` already undid the operation.
+    AlreadyUndone { by: String },
+    /// The operation failed: there is nothing to undo.
+    Failed,
+    /// Refused before the cluster is read ([`undo_eligibility`]): the
+    /// entry was edited, the company policy needs an audit entry, or the
+    /// cluster in use is another one.
+    Audit(String),
+    /// Refused by the plan ([`UndoPlan::refusal`]), which also checks the
+    /// audit digest and scope first.
+    Plan(String),
+}
+
+impl UndoRefusal {
+    /// The reason alone, without the operation id.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::AlreadyUndone { by } => format!("it was already undone by {by}"),
+            Self::Failed => "it failed, so there is nothing to undo".to_string(),
+            Self::Audit(reason) | Self::Plan(reason) => reason.clone(),
+        }
+    }
+
+    /// The error `ferrika undo` reports for operation `op`.
+    pub fn message(&self, op: &str) -> String {
+        match self {
+            Self::AlreadyUndone { by } => {
+                format!("Operation {op} was already undone by {by}; undo {by} to apply it again")
+            }
+            Self::Failed => format!("Operation {op} failed, so there is nothing to undo"),
+            Self::Audit(reason) | Self::Plan(reason) => format!("Cannot undo {op}: {reason}"),
+        }
+    }
+}
+
+/// Why undo stops for an entry with `digest` before anything else is
+/// checked, or `None`. [`UndoPlan::refusal`] and [`undo_eligibility`]
+/// both start here.
+fn digest_refusal(digest: DigestCheck, policy_active: bool) -> Option<String> {
+    match digest {
+        DigestCheck::Mismatch => Some(
+            "the history entry does not match the audit log (it was edited); refusing to undo"
+                .to_string(),
+        ),
+        DigestCheck::Missing if policy_active => Some(
+            "the audit log has no entry for this operation, which the company policy requires before undo"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// Whether undo is offered for an operation in a list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Eligibility {
+    /// Not offered: the operation failed, cannot be undone by its kind,
+    /// or was undone (and the audit log vouches for that).
+    NotUndoable,
+    /// Offered, but undo would be refused before the cluster is read.
+    Refused { refusal: UndoRefusal },
+    /// Undo can be planned (the plan may still refuse it, e.g. for
+    /// drift); a legacy entry needs the cluster confirmed.
+    Allowed { needs_legacy_confirmation: bool },
+}
+
+/// What a list knows about undoing one operation without contacting the
+/// cluster: the rules [`prepare_request`] starts with, in the same order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UndoEligibility {
+    pub mark: UndoneMark,
+    pub digest: DigestCheck,
+    pub scope: ScopeCheck,
+    pub status: Eligibility,
+}
+
+impl UndoEligibility {
+    /// Whether undo is offered at all (refused or not).
+    pub fn offered(&self) -> bool {
+        !matches!(self.status, Eligibility::NotUndoable)
+    }
+
+    /// Why undo would be refused, when it would be.
+    pub fn refusal(&self) -> Option<&UndoRefusal> {
+        match &self.status {
+            Eligibility::Refused { refusal } => Some(refusal),
+            _ => None,
+        }
+    }
+}
+
+/// [`UndoEligibility`] of `op` (one of `all`, the whole journal) for a
+/// caller connected to `current`, given the audit log's digests and
+/// whether a company policy is installed. Reads nothing from the cluster:
+/// the scope is compared by cluster id when `current` has one.
+pub fn undo_eligibility(
+    op: &Operation,
+    all: &[Operation],
+    current: &Scope,
+    audited: &AuditDigests,
+    policy_active: bool,
+) -> UndoEligibility {
+    let mark = undone_mark(op, all, audited, policy_active);
+    let digest = digest_check(op, audited.get(&op.id).map(String::as_str));
+    let scope = ScopeCheck::of(op, current);
+    let status = if matches!(mark, UndoneMark::Trusted { .. })
+        || op.ok() != Some(true)
+        || !op.begin.reversibility.undoable()
+    {
+        Eligibility::NotUndoable
+    } else if let Some(reason) = digest_refusal(digest, policy_active) {
+        Eligibility::Refused {
+            refusal: UndoRefusal::Audit(reason),
+        }
+    } else if let ScopeCheck::Mismatch { reason, .. } = &scope {
+        Eligibility::Refused {
+            refusal: UndoRefusal::Audit(reason.clone()),
+        }
+    } else {
+        Eligibility::Allowed {
+            needs_legacy_confirmation: digest == DigestCheck::Legacy,
+        }
+    };
+    UndoEligibility {
+        mark,
+        digest,
+        scope,
+        status,
+    }
+}
+
+/// What the caller asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UndoOptions {
+    /// Overwrite drift and later changes (`--force`).
+    pub force: bool,
+    /// The user confirmed the cluster of a legacy entry
+    /// (`--accept-legacy`).
+    pub accept_legacy: bool,
+}
+
+/// The decision on one undo request, made the same way for every caller
+/// (`ferrika undo`, the GUI): the "undone by" mark, the result, the audit
+/// digest, the scope, the company policy and the plan. The caller still
+/// runs the write gate per step, asks, records and runs [`execute_steps`].
+#[derive(Debug, Clone)]
+pub struct UndoRequest {
+    pub op: String,
+    pub mark: UndoneMark,
+    pub digest: DigestCheck,
+    pub scope: ScopeCheck,
+    /// The plan; `None` when the request was refused before the cluster
+    /// was read (already undone, or the operation failed).
+    pub plan: Option<UndoPlan>,
+    /// Why undo is refused with the options given.
+    pub refusal: Option<UndoRefusal>,
+    /// Why undo is refused even with `force` (`None`: forcing works).
+    pub forced_refusal: Option<UndoRefusal>,
+    /// Set for a legacy entry (Ferrika 0.1 digest): both places to compare.
+    pub legacy: Option<LegacyScopes>,
+    /// A legacy entry whose cluster the user has not confirmed: ask (or
+    /// refuse with [`UndoRequest::legacy_refusal`]) before running.
+    pub needs_legacy_confirmation: bool,
+    /// The undo overwrites changes made since the operation (`force` with
+    /// drift); the outcome says so.
+    pub forced: bool,
+}
+
+impl UndoRequest {
+    /// Whether undo was refused because the entry itself was edited:
+    /// record it as `history.tampered` with [`TAMPERED_REFUSED`].
+    pub fn op_tampered(&self) -> bool {
+        self.digest == DigestCheck::Mismatch && matches!(self.refusal, Some(UndoRefusal::Plan(_)))
+    }
+
+    /// The refusal of a legacy entry whose cluster was not confirmed,
+    /// ending with how to confirm it (`confirm`, e.g. "pass
+    /// --accept-legacy"); `None` when no confirmation is needed.
+    pub fn legacy_refusal(&self, confirm: &str) -> Option<String> {
+        let legacy = self
+            .legacy
+            .as_ref()
+            .filter(|_| self.needs_legacy_confirmation)?;
+        Some(format!(
+            "Cannot undo {}: its history entry has a legacy digest that does not cover the \
+             cluster; check that {} is the right cluster and {confirm}",
+            self.op, legacy.current
+        ))
+    }
+}
+
+/// Decides on undoing `op` (one of `all`, the whole journal) for a caller
+/// connected to `current`: checks the "undone by" mark and the result,
+/// then plans with [`prepare`] (reading the cluster) and applies
+/// [`UndoPlan::refusal`] with the company policy (`policy_active`) and
+/// `options`. `audited` holds the audit log's `op_digest`s by id.
+#[allow(clippy::too_many_arguments)]
+pub async fn prepare_request(
+    op: &Operation,
+    all: &[Operation],
+    current: &Scope,
+    audited: &AuditDigests,
+    policy_active: bool,
+    options: UndoOptions,
+    config: &KafkaClientConfig,
+    admin: &KafkaAdminClient,
+) -> KafkaResult<UndoRequest> {
+    let mut request = check_request(op, all, current, audited, policy_active);
+    if request.refusal.is_some() {
+        return Ok(request);
+    }
+    let plan = prepare(
+        op,
+        all,
+        current,
+        audited.get(&op.id).map(String::as_str),
+        config,
+        admin,
+    )
+    .await?;
+    decide(&mut request, plan, policy_active, options);
+    Ok(request)
+}
+
+/// The part of [`prepare_request`] before the cluster is read.
+fn check_request(
+    op: &Operation,
+    all: &[Operation],
+    current: &Scope,
+    audited: &AuditDigests,
+    policy_active: bool,
+) -> UndoRequest {
+    let eligibility = undo_eligibility(op, all, current, audited, policy_active);
+    let legacy = (eligibility.digest == DigestCheck::Legacy).then(|| LegacyScopes {
+        recorded: op.begin.scope.describe(),
+        current: current.describe(),
+    });
+    let early = match &eligibility.mark {
+        UndoneMark::Trusted { by } => Some(UndoRefusal::AlreadyUndone { by: by.clone() }),
+        _ => (op.ok() == Some(false)).then_some(UndoRefusal::Failed),
+    };
+    UndoRequest {
+        op: op.id.clone(),
+        mark: eligibility.mark,
+        digest: eligibility.digest,
+        scope: eligibility.scope,
+        plan: None,
+        refusal: early.clone(),
+        forced_refusal: early,
+        legacy,
+        needs_legacy_confirmation: false,
+        forced: false,
+    }
+}
+
+/// The part of [`prepare_request`] after the plan is made.
+fn decide(request: &mut UndoRequest, plan: UndoPlan, policy_active: bool, options: UndoOptions) {
+    request.refusal = plan
+        .refusal(options.force, policy_active)
+        .map(UndoRefusal::Plan);
+    request.forced_refusal = plan.refusal(true, policy_active).map(UndoRefusal::Plan);
+    request.needs_legacy_confirmation = request.legacy.is_some() && !options.accept_legacy;
+    request.forced = options.force && matches!(plan.verdict, Verdict::Drift { .. });
+    request.plan = Some(plan);
+}
+
 /// Everything known about undoing one operation, before anything runs.
 #[derive(Debug, Clone, Serialize)]
 pub struct UndoPlan {
@@ -174,20 +590,8 @@ impl UndoPlan {
     /// edited journal. With a company policy, an operation the audit log
     /// does not know is refused too.
     pub fn refusal(&self, force: bool, policy_active: bool) -> Option<String> {
-        match self.digest {
-            DigestCheck::Mismatch => {
-                return Some(
-                    "the history entry does not match the audit log (it was edited); refusing to undo"
-                        .to_string(),
-                )
-            }
-            DigestCheck::Missing if policy_active => {
-                return Some(
-                    "the audit log has no entry for this operation, which the company policy requires before undo"
-                        .to_string(),
-                )
-            }
-            _ => {}
+        if let Some(reason) = digest_refusal(self.digest, policy_active) {
+            return Some(reason);
         }
         // After the digest: an edited scope is reported as an edit.
         if !self.same_scope {
@@ -724,6 +1128,273 @@ mod tests {
         assert_eq!(last.applied.len(), 2);
         assert!(last.not_run.is_empty());
         assert!(!last.to_string().contains("Not run"));
+    }
+
+    fn digests(pairs: &[(&str, String)]) -> AuditDigests {
+        pairs
+            .iter()
+            .map(|(id, digest)| (id.to_string(), digest.clone()))
+            .collect()
+    }
+
+    fn here() -> Scope {
+        Scope {
+            bootstrap: "a:9092".into(),
+            ..Scope::default()
+        }
+    }
+
+    #[test]
+    fn the_undone_mark_is_trusted_only_when_the_audit_log_vouches_for_it() {
+        let mut target = op("A", "u", true);
+        target.undone_by = Some("U".into());
+        let undoer = op("U", "u", true);
+        let all = vec![target.clone(), undoer.clone()];
+        assert_eq!(
+            undone_mark(&op("B", "u", true), &all, &AuditDigests::new(), false),
+            UndoneMark::None
+        );
+        let vouched = digests(&[("U", undoer.digest())]);
+        assert_eq!(
+            undone_mark(&target, &all, &vouched, true),
+            UndoneMark::Trusted { by: "U".into() }
+        );
+        let edited = digests(&[("U", "v2:00".to_string())]);
+        let mark = undone_mark(&target, &all, &edited, false);
+        assert_eq!(mark.tampered_undoer(), Some("U"));
+        let note = mark.ignored_note("A").unwrap();
+        assert!(
+            note.starts_with("the history says U undid A, but the audit log does not vouch")
+                && note.contains(DigestCheck::Mismatch.label()),
+            "{note}"
+        );
+        // No undoer in the journal: ignored, nothing to record.
+        let alone = undone_mark(&target, std::slice::from_ref(&target), &vouched, false);
+        assert_eq!(alone.tampered_undoer(), None);
+        assert!(alone.ignored_note("A").unwrap().contains("(no such entry)"));
+        // Without an audit entry the mark stands unless a policy is installed.
+        assert!(matches!(
+            undone_mark(&target, &all, &AuditDigests::new(), false),
+            UndoneMark::Trusted { .. }
+        ));
+        assert!(matches!(
+            undone_mark(&target, &all, &AuditDigests::new(), true),
+            UndoneMark::Ignored {
+                tampered: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn eligibility_refuses_like_the_plan_without_reading_the_cluster() {
+        let a = op("A", "u", true);
+        let audited = digests(&[("A", a.digest())]);
+        let all = vec![a.clone()];
+        let ok = undo_eligibility(&a, &all, &here(), &audited, true);
+        assert_eq!(
+            ok.status,
+            Eligibility::Allowed {
+                needs_legacy_confirmation: false
+            }
+        );
+        assert!(ok.offered() && ok.refusal().is_none());
+        // Failed: not offered.
+        let failed = op("F", "u", false);
+        assert_eq!(
+            undo_eligibility(&failed, &all, &here(), &audited, false).status,
+            Eligibility::NotUndoable
+        );
+        // Edited: refused with the plan's wording.
+        let edited = digests(&[("A", "v2:00".to_string())]);
+        let refused = undo_eligibility(&a, &all, &here(), &edited, false);
+        let plan_refusal = UndoPlan {
+            digest: DigestCheck::Mismatch,
+            ..plan(Verdict::Clean)
+        }
+        .refusal(true, false);
+        assert_eq!(
+            refused.refusal().map(UndoRefusal::reason),
+            plan_refusal,
+            "{refused:?}"
+        );
+        // No audit entry: refused only under a company policy.
+        let none = AuditDigests::new();
+        assert!(undo_eligibility(&a, &all, &here(), &none, false)
+            .refusal()
+            .is_none());
+        assert!(undo_eligibility(&a, &all, &here(), &none, true)
+            .refusal()
+            .is_some());
+        // Legacy: allowed with the cluster to confirm.
+        let legacy = digests(&[("A", a.digest_v1())]);
+        assert_eq!(
+            undo_eligibility(&a, &all, &here(), &legacy, false).status,
+            Eligibility::Allowed {
+                needs_legacy_confirmation: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_listed_operation_whose_cluster_id_cannot_be_confirmed_would_be_refused() {
+        let mut a = op("A", "u", true);
+        a.begin.scope.cluster_id = "PROD".into();
+        let audited = digests(&[("A", a.digest())]);
+        // Same brokers, but the cluster id could not be read: listed, refused.
+        let unknown = here();
+        assert!(listed_on(&a, &unknown));
+        let eligibility = undo_eligibility(&a, std::slice::from_ref(&a), &unknown, &audited, false);
+        let ScopeCheck::Mismatch {
+            recorded,
+            current,
+            reason,
+        } = &eligibility.scope
+        else {
+            panic!("{eligibility:?}");
+        };
+        assert!(recorded.contains("PROD") && current.contains("a:9092"));
+        assert_eq!(
+            eligibility.refusal(),
+            Some(&UndoRefusal::Audit(reason.clone()))
+        );
+        assert_eq!(
+            Some(reason.clone()),
+            a.begin.scope.check_undo_target(&unknown).err()
+        );
+        // Another cluster with the same brokers: not listed, refused too.
+        let dev = Scope {
+            cluster_id: "DEV".into(),
+            ..here()
+        };
+        assert!(!listed_on(&a, &dev));
+        let refusal = undo_eligibility(&a, std::slice::from_ref(&a), &dev, &audited, false)
+            .refusal()
+            .map(UndoRefusal::reason)
+            .unwrap();
+        assert!(
+            refusal.contains("PROD") && refusal.contains("DEV"),
+            "{refusal}"
+        );
+        let prod = Scope {
+            cluster_id: "PROD".into(),
+            ..here()
+        };
+        assert!(
+            undo_eligibility(&a, std::slice::from_ref(&a), &prod, &audited, false)
+                .scope
+                .is_same()
+        );
+    }
+
+    #[test]
+    fn a_request_is_refused_early_when_already_undone_or_failed() {
+        let mut target = op("A", "u", true);
+        target.undone_by = Some("U".into());
+        let undoer = op("U", "u", true);
+        let all = vec![target.clone(), undoer.clone()];
+        let audited = digests(&[("U", undoer.digest())]);
+        let request = check_request(&target, &all, &here(), &audited, false);
+        assert_eq!(
+            request.refusal,
+            Some(UndoRefusal::AlreadyUndone { by: "U".into() })
+        );
+        assert_eq!(
+            request.refusal.unwrap().message("A"),
+            "Operation A was already undone by U; undo U to apply it again"
+        );
+        let failed = op("F", "u", false);
+        let request = check_request(&failed, &all, &here(), &audited, false);
+        assert_eq!(request.refusal, Some(UndoRefusal::Failed));
+        assert!(request.plan.is_none() && !request.op_tampered());
+        assert_eq!(
+            UndoRefusal::Failed.message("F"),
+            "Operation F failed, so there is nothing to undo"
+        );
+        // An ignored mark does not refuse.
+        let edited = digests(&[("U", "v2:00".to_string())]);
+        let request = check_request(&target, &all, &here(), &edited, false);
+        assert_eq!(request.refusal, None);
+        assert_eq!(request.mark.tampered_undoer(), Some("U"));
+    }
+
+    #[test]
+    fn the_request_applies_force_policy_and_the_legacy_confirmation() {
+        let a = op("A", "u", true);
+        let all = vec![a.clone()];
+        let decided = |audited: &AuditDigests, plan: UndoPlan, policy, options| {
+            let mut request = check_request(&a, &all, &here(), audited, policy);
+            decide(&mut request, plan, policy, options);
+            request
+        };
+        let force = UndoOptions {
+            force: true,
+            ..UndoOptions::default()
+        };
+        let audited = digests(&[("A", a.digest())]);
+        let drift = || plan(Verdict::Drift { rows: vec![] });
+        let plain = decided(&audited, drift(), false, UndoOptions::default());
+        assert!(matches!(plain.refusal, Some(UndoRefusal::Plan(_))));
+        assert_eq!(plain.forced_refusal, None);
+        assert!(!plain.forced && !plain.needs_legacy_confirmation);
+        assert_eq!(
+            plain.refusal.unwrap().message("A"),
+            format!("Cannot undo A: {}", drift().refusal(false, false).unwrap())
+        );
+        let forced = decided(&audited, drift(), false, force);
+        assert_eq!(forced.refusal, None);
+        assert!(forced.forced && forced.plan.is_some());
+        // An edited entry: refused even when forced, recorded as tampered.
+        let edited = digests(&[("A", "v2:00".to_string())]);
+        let edited_plan = UndoPlan {
+            digest: DigestCheck::Mismatch,
+            ..plan(Verdict::Clean)
+        };
+        let tampered = decided(&edited, edited_plan, false, force);
+        assert!(tampered.forced_refusal.is_some() && tampered.op_tampered());
+        // Legacy: confirmation needed until accepted; both places named.
+        let legacy = digests(&[("A", a.digest_v1())]);
+        let legacy_plan = || UndoPlan {
+            digest: DigestCheck::Legacy,
+            ..plan(Verdict::Clean)
+        };
+        let ask = decided(&legacy, legacy_plan(), false, UndoOptions::default());
+        assert_eq!(ask.refusal, None);
+        assert!(ask.needs_legacy_confirmation);
+        let scopes = ask.legacy.clone().unwrap();
+        assert_eq!(scopes.recorded, a.begin.scope.describe());
+        assert_eq!(scopes.current, here().describe());
+        assert_eq!(
+            ask.legacy_refusal("pass --accept-legacy").unwrap(),
+            format!(
+                "Cannot undo A: its history entry has a legacy digest that does not cover the \
+                 cluster; check that {} is the right cluster and pass --accept-legacy",
+                here().describe()
+            )
+        );
+        let accept = UndoOptions {
+            accept_legacy: true,
+            ..UndoOptions::default()
+        };
+        let accepted = decided(&legacy, legacy_plan(), false, accept);
+        assert!(!accepted.needs_legacy_confirmation);
+        assert_eq!(accepted.legacy_refusal("confirm it"), None);
+        // Under a policy, an operation the audit log does not know is refused.
+        let unaudited_plan = UndoPlan {
+            digest: DigestCheck::Missing,
+            ..plan(Verdict::Clean)
+        };
+        let unaudited = decided(
+            &AuditDigests::new(),
+            unaudited_plan,
+            true,
+            UndoOptions::default(),
+        );
+        assert!(unaudited
+            .refusal
+            .unwrap()
+            .reason()
+            .contains("company policy"));
     }
 
     #[test]
