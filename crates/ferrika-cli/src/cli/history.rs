@@ -15,7 +15,7 @@ use crate::model::format::redact_url;
 use crate::model::history::{Operation, Scope};
 use crate::ops::history::apply::Target;
 use crate::ops::history::conflict::{DriftRow, Verdict};
-use crate::ops::history::undo::{self, DigestCheck, UndoPlan};
+use crate::ops::history::undo::{self, DigestCheck, UndoOptions, UndoPlan, UndoRefusal};
 use crate::ops::history::Journal;
 
 #[derive(Args, Debug, Clone)]
@@ -77,11 +77,6 @@ fn current_scope(global: &GlobalOpts, admin: Option<&KafkaAdminClient>) -> Scope
         connect: redact_url(config.connect_url.as_deref().unwrap_or_default()),
         ..record::cluster_scope(global, admin)
     }
-}
-
-/// Whether an operation recorded in `recorded` ran where `current` points.
-fn in_scope(recorded: &Scope, current: &Scope) -> bool {
-    recorded.same_cluster(current)
 }
 
 /// `-n`: how many operations to list; at least 1, so a typo cannot report
@@ -192,7 +187,7 @@ fn select<'a>(
 ) -> Vec<&'a Operation> {
     ops.iter()
         .rev()
-        .filter(|op| scope.is_none_or(|scope| in_scope(&op.begin.scope, scope)))
+        .filter(|op| scope.is_none_or(|scope| undo::listed_on(op, scope)))
         .filter(|op| {
             args.resource.as_deref().is_none_or(|text| {
                 op.begin.target.contains(text)
@@ -305,98 +300,83 @@ pub async fn run_undo(args: UndoArgs, global: &GlobalOpts) -> KafkaResult<()> {
         )?,
     };
     let policy = crate::governance::policy::current();
-    if let Some(by) = &op.undone_by {
-        // The `undoes` link is the journal's word; only a version 2 digest
-        // in the audit log vouches for it.
-        let undoer = ops.iter().find(|o| &o.id == by);
-        let audited_by = crate::governance::audit::op_digest(by);
-        let trusted = undoer.is_some_and(|undoer| {
-            undo::undo_mark_trusted(undoer, audited_by.as_deref(), policy.is_active())
-        });
-        if trusted {
-            return Err(KafkaError::config(format!(
-                "Operation {} was already undone by {by}; undo {by} to apply it again",
-                op.id
-            )));
-        }
-        let check = undoer.map(|undoer| undo::digest_check(undoer, audited_by.as_deref()));
-        if let (Some(undoer), Some(DigestCheck::Mismatch)) = (undoer, check) {
-            record_tampered(
-                global,
-                undoer,
-                "the history entry does not match the audit log's op_digest; its undo link is ignored",
-            );
-        }
-        eprintln!(
-            "{} the history says {by} undid {}, but the audit log does not vouch for that ({}); \
-             ignoring it, the current state decides.",
-            "warning:".yellow().bold(),
-            op.id,
-            check.map_or("no such entry", DigestCheck::label)
+    let audited = crate::governance::audit::op_digests();
+    // The "undone by" mark is checked again by `prepare_request`; its
+    // warning is shown first, before the cluster is read.
+    let mark = undo::undone_mark(op, &ops, &audited, policy.is_active());
+    if let Some(undoer) = mark.tampered_undoer() {
+        record_tampered(global, undoer, undo::TAMPERED_UNDO_LINK);
+    }
+    if let Some(note) = mark.ignored_note(&op.id) {
+        eprintln!("{} {note}.", "warning:".yellow().bold());
+    }
+    let options = UndoOptions {
+        force: args.force,
+        accept_legacy: args.accept_legacy,
+    };
+    let request = undo::prepare_request(
+        op,
+        &ops,
+        &scope,
+        &audited,
+        policy.is_active(),
+        options,
+        &config,
+        &admin,
+    )
+    .await?;
+    let Some(plan) = &request.plan else {
+        // Already undone or failed: refused before the cluster was read.
+        let refusal = request.refusal.as_ref().map_or_else(
+            || format!("Cannot undo {}", op.id),
+            |refusal| refusal.message(&op.id),
         );
-    }
-    if op.ok() == Some(false) {
-        return Err(KafkaError::config(format!(
-            "Operation {} failed, so there is nothing to undo",
-            op.id
-        )));
-    }
-    let audited = crate::governance::audit::op_digest(&op.id);
-    let plan = undo::prepare(op, &ops, &scope, audited.as_deref(), &config, &admin).await?;
-    let refusal = plan.refusal(args.force, policy.is_active());
+        return Err(KafkaError::config(refusal));
+    };
 
     let json_out = global.format == OutputFormat::Json;
-    if json_out && (args.dry_run || refusal.is_some()) {
-        output::print_json(&plan_json(&plan, refusal.as_deref(), None))?;
+    let refused = request.refusal.as_ref().map(UndoRefusal::reason);
+    if json_out && (args.dry_run || refused.is_some()) {
+        output::print_json(&plan_json(plan, refused.as_deref(), None))?;
     }
     if json_out && args.dry_run {
         // A refused undo fails a dry run too, with the same exit code.
-        return match refusal {
-            Some(reason) => Err(KafkaError::config(format!(
-                "Cannot undo {}: {reason}",
-                op.id
-            ))),
+        return match &request.refusal {
+            Some(refusal) => Err(KafkaError::config(refusal.message(&op.id))),
             None => Ok(()),
         };
     }
     if !json_out {
-        describe_plan(op, &plan);
+        describe_plan(op, plan);
     }
 
-    if let Some(reason) = refusal {
-        if plan.digest == DigestCheck::Mismatch {
-            record_tampered(
-                global,
-                op,
-                "the history entry does not match the audit log's op_digest; undo refused",
-            );
+    if let Some(refusal) = &request.refusal {
+        if request.op_tampered() {
+            record_tampered(global, &op.id, undo::TAMPERED_REFUSED);
         }
         for line in &op.begin.info {
             eprintln!("{} {line}", "info:".bright_black());
         }
         // A dry run shows the plan above and fails like the real undo
         // would, with the same exit code.
-        return Err(KafkaError::config(format!(
-            "Cannot undo {}: {reason}",
-            op.id
-        )));
+        return Err(KafkaError::config(refusal.message(&op.id)));
     }
-    if plan.digest == DigestCheck::Missing {
+    if request.digest == DigestCheck::Missing {
         eprintln!(
             "{} the audit log has no entry for {}, so the history entry cannot be checked against it.",
             "warning:".yellow().bold(),
             op.id
         );
     }
-    if plan.digest == DigestCheck::Legacy {
+    if let Some(legacy) = &request.legacy {
         eprintln!(
             "{} {} has a legacy digest (scope not covered): it was recorded by Ferrika 0.1, \
              whose audit digest covers only the before- and after-state, not the cluster, \
              action or undo link. The history says it ran on {}; you are connected to {}.",
             "warning:".yellow().bold(),
             op.id,
-            op.begin.scope.describe(),
-            scope.describe()
+            legacy.recorded,
+            legacy.current
         );
     }
     if plan.runnable_steps().is_empty() {
@@ -419,14 +399,9 @@ pub async fn run_undo(args: UndoArgs, global: &GlobalOpts) -> KafkaResult<()> {
         return Ok(());
     }
 
-    if plan.digest == DigestCheck::Legacy && !args.accept_legacy {
+    if let Some(refusal) = request.legacy_refusal("pass --accept-legacy") {
         if args.yes {
-            return Err(KafkaError::config(format!(
-                "Cannot undo {}: its history entry has a legacy digest that does not cover the \
-                 cluster; check that {} is the right cluster and pass --accept-legacy",
-                op.id,
-                scope.describe()
-            )));
+            return Err(KafkaError::config(refusal));
         }
         confirm(
             &format!(
@@ -441,7 +416,7 @@ pub async fn run_undo(args: UndoArgs, global: &GlobalOpts) -> KafkaResult<()> {
     let target = format!("{} {} (op {})", op.begin.action, op.begin.target, op.id);
     // The undo's own operation id, named on its audit request entries.
     let undo_op = crate::model::history::new_op_id(crate::kafka::clock::now_ms());
-    authorize(global, &plan, &target, &undo_op)?;
+    authorize(global, plan, &target, &undo_op)?;
     if !args.yes {
         confirm(
             &format!(
@@ -459,7 +434,7 @@ pub async fn run_undo(args: UndoArgs, global: &GlobalOpts) -> KafkaResult<()> {
         target,
         op: Some(undo_op),
     });
-    let forced = args.force && matches!(plan.verdict, Verdict::Drift { .. });
+    let forced = request.forced;
     let change = Change {
         reversibility: plan.redo,
         limits: plan.redo_limits.clone(),
@@ -476,7 +451,7 @@ pub async fn run_undo(args: UndoArgs, global: &GlobalOpts) -> KafkaResult<()> {
     );
     // The failure as data; its text is what is shown and recorded.
     let result = undo::execute_steps(
-        &plan,
+        plan,
         &Target {
             config: &config,
             admin: &admin,
@@ -558,8 +533,8 @@ fn authorize(global: &GlobalOpts, plan: &UndoPlan, target: &str, op: &str) -> Ka
     Ok(())
 }
 
-/// Records an edited history entry found by undo as `history.tampered`.
-fn record_tampered(global: &GlobalOpts, op: &Operation, outcome: &str) {
+/// Records an edited history entry `op` found by undo as `history.tampered`.
+fn record_tampered(global: &GlobalOpts, op: &str, outcome: &str) {
     crate::governance::audit::record(&crate::governance::audit::AuditEntry {
         time_ms: crate::governance::audit::now_ms(),
         source: "cli".to_string(),
@@ -567,12 +542,12 @@ fn record_tampered(global: &GlobalOpts, op: &Operation, outcome: &str) {
             .resolved_profile_name()
             .unwrap_or_else(|| global.resolved_bootstrap_servers()),
         action: "history.tampered".to_string(),
-        target: format!("op {}", op.id),
+        target: format!("op {op}"),
         outcome: outcome.to_string(),
         ok: false,
         user: String::new(),
         actor: None,
-        op: op.id.clone(),
+        op: op.to_string(),
         op_digest: String::new(),
     });
 }
