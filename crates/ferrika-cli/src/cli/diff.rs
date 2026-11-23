@@ -259,8 +259,8 @@ async fn fetch_aligned_records(
     global: &GlobalOpts,
 ) -> KafkaResult<(Vec<DiffRecord>, Vec<DiffRecord>)> {
     let config = global.to_kafka_config();
-    let marks_a = topic_watermarks(&config, &args.topic_a, None)?;
-    let marks_b = topic_watermarks(&config, &args.topic_b, None)?;
+    let marks_a = topic_watermarks(&config, &args.topic_a, None).await?;
+    let marks_b = topic_watermarks(&config, &args.topic_b, None).await?;
     let (ranges_a, ranges_b) = plan_aligned_ranges(&marks_a, &marks_b, args.limit);
     let opts = BoundedReadOptions::default();
     let mut sides = Vec::with_capacity(2);

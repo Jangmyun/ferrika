@@ -160,7 +160,9 @@ pub async fn run_dump(args: DumpArgs, global: &GlobalOpts) -> KafkaResult<()> {
         if !args.from_beginning {
             break;
         }
-        let (low, high) = consumer.fetch_watermarks(&args.topic, p, None)?;
+        let (low, high) = consumer
+            .fetch_watermarks_async(&args.topic, p, None)
+            .await?;
         let first = match start {
             StartOffset::At(o) => o,
             StartOffset::End => high,

@@ -43,3 +43,7 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust", "ve
 # NASM is optional. Release builds enable this; the default build has no
 # OpenSSL dependency.
 ssl = ["rdkafka/ssl-vendored"]
+
+[dev-dependencies]
+# Paused virtual time for the async retry tests.
+tokio = { workspace = true, features = ["test-util"] }

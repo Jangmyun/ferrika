@@ -285,7 +285,9 @@ async fn handle_lag(
             }
 
             for p in &topic.partitions {
-                let (low, high) = consumer.fetch_watermarks(&topic.name, p.partition_id, None)?;
+                let (low, high) = consumer
+                    .fetch_watermarks_async(&topic.name, p.partition_id, None)
+                    .await?;
 
                 let current_offset = committed_tpl
                     .find_partition(&topic.name, p.partition_id)

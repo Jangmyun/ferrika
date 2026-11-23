@@ -207,7 +207,7 @@ pub fn select_partitions(
 }
 
 /// Fetches the watermarks of `topic`'s partitions (or of `only`).
-pub fn topic_watermarks(
+pub async fn topic_watermarks(
     config: &KafkaClientConfig,
     topic: &str,
     only: Option<i32>,
@@ -216,7 +216,7 @@ pub fn topic_watermarks(
     let all = client.topic_partitions(topic, None)?;
     let selected = select_partitions(topic, &all, only)?;
     let wanted: Vec<(&str, i32)> = selected.iter().map(|&p| (topic, p)).collect();
-    let fetched = client.fetch_watermarks_batch(&wanted, None)?;
+    let fetched = client.fetch_watermarks_batch_async(&wanted, None).await?;
     Ok(collect_marks(topic, &selected, &fetched))
 }
 
@@ -471,7 +471,7 @@ pub async fn read_topic<F>(
 where
     F: Fn(&ConsumedMessage) -> bool + Send + Sync + 'static,
 {
-    let marks = topic_watermarks(config, topic, only)?;
+    let marks = topic_watermarks(config, topic, only).await?;
     let ranges = plan_ranges(&marks, None);
     let mut read = read_ranges(config, &ranges, opts, keep).await?;
     read.unavailable = marks.unavailable;

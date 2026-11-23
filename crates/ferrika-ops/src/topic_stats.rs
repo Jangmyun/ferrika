@@ -123,7 +123,9 @@ pub async fn analyze_topic(
     let consumer = KafkaConsumerClient::scanner(config)?;
     let partitions = consumer.topic_partitions(topic, Some(Duration::from_secs(5)))?;
     let keys: Vec<(&str, i32)> = partitions.iter().map(|&p| (topic, p)).collect();
-    let marks = consumer.fetch_watermarks_batch(&keys, Some(Duration::from_secs(5)))?;
+    let marks = consumer
+        .fetch_watermarks_batch_async(&keys, Some(Duration::from_secs(5)))
+        .await?;
     let mut ends: HashMap<i32, i64> = partitions
         .iter()
         .filter_map(|&p| {

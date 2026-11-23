@@ -294,7 +294,8 @@ async fn fetch_cluster_snapshot(
         .flat_map(|t| t.partitions.iter().map(move |p| (t.name.as_str(), p.id)))
         .collect();
     let watermarks = probe
-        .fetch_watermarks_batch(&keys, Some(SNAPSHOT_TIMEOUT))
+        .fetch_watermarks_batch_async(&keys, Some(SNAPSHOT_TIMEOUT))
+        .await
         .unwrap_or_default();
 
     for t in &meta.topics {
