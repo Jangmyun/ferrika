@@ -7,9 +7,11 @@
 # (RabbitMQ history and undo) use it.
 # ferrika-mqtt (MQTT preview) depends on ferrika-core only; ferrika-cli uses
 # it behind its default feature `mqtt`.
+# ferrika-ksql (ksqlDB REST client, preview) depends on ferrika-core only;
+# ferrika-cli and ferrika-mcp use it.
 [workspace]
 resolver = "2"
-members = ["crates/ferrika-core", "crates/ferrika-governance", "crates/ferrika-ops", "crates/ferrika-mcp", "crates/ferrika-cli", "crates/ferrika-rabbitmq", "crates/ferrika-mqtt"]
+members = ["crates/ferrika-core", "crates/ferrika-governance", "crates/ferrika-ops", "crates/ferrika-mcp", "crates/ferrika-cli", "crates/ferrika-rabbitmq", "crates/ferrika-mqtt", "crates/ferrika-ksql"]
 
 [workspace.package]
 version = "0.2.0"
@@ -69,6 +71,7 @@ ferrika-cli = { path = "crates/ferrika-cli", version = "0.2.0" }
 # use the management API only; ferrika-cli turns `amqp` on for the redrive.
 ferrika-rabbitmq = { path = "crates/ferrika-rabbitmq", version = "0.2.0", default-features = false }
 ferrika-mqtt = { path = "crates/ferrika-mqtt", version = "0.2.0" }
+ferrika-ksql = { path = "crates/ferrika-ksql", version = "0.2.0" }
 
 # Debug builds (check, clippy, test) keep line tables for ferrika so panics
 # and backtraces still name files and lines, and no debug info for

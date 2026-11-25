@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""End-to-end smoke test of `ferrika ksql` against a real ksqlDB server.
+
+Checks what unit tests cannot: the ksqlDB REST API (/info, /ksql,
+/query-stream over HTTP/1.1, /close-query) as a live server answers it. The
+script runs the CLI for a profile with a ksqlDB server, listings, DESCRIBE,
+statements (CREATE, INSERT, CREATE TABLE AS SELECT, TERMINATE, DROP ...
+DELETE TOPIC), pull and push queries (row limit, time limit, masking), a
+read-only profile, a failing script, the audit log, and the MCP tools
+ksql_list, ksql_describe and ksql_query.
+
+Start a throw-away Kafka and ksqlDB first, e.g.:
+
+    docker run -d --name ferrika-kafka-test -p 9092:9092 apache/kafka:3.9.0
+    docker run -d --name ferrika-ksql-test --network host \\
+        -e KSQL_BOOTSTRAP_SERVERS=localhost:9092 -e KSQL_LISTENERS=http://0.0.0.0:8088 \\
+        confluentinc/ksqldb-server:0.29.0
+
+Run (needs only the Python 3 standard library):
+
+    cargo build -p ferrika-cli
+    python3 tools/e2e/ksql_smoke.py target/debug/ferrika --url http://localhost:8088 \\
+        --broker localhost:9092
+
+Isolation: every stream, table and topic is named <prefix><run id>_..., and
+the CLI runs with its own FERRIKA_CONFIG_DIR (HOME and USERPROFILE too), so
+the user's profiles and audit log are not touched. Everything the run created
+is dropped (with its topic) at the end, even after a failure. Exit code 0
+when every check passes, 1 when any fails.
+
+Use a test server only: the script creates and drops streams and topics.
+"""
+import argparse
+import json
+import os
+import queue
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+parser.add_argument("binary", nargs="?", default=str(ROOT / "target" / "release" / "ferrika"))
+parser.add_argument("--url", default="http://localhost:8088", help="ksqlDB server (default http://localhost:8088)")
+parser.add_argument("--broker", default="localhost:9092", help="the server's Kafka cluster (default localhost:9092)")
+parser.add_argument("--prefix", default="kq_", help="name prefix of everything the run creates (default kq_)")
+ARGS = parser.parse_args()
+
+F = ARGS.binary
+URL = ARGS.url.rstrip("/")
+RUN = f"{ARGS.prefix}{uuid.uuid4().hex[:6]}_"  # unique per run
+ORDERS, BIG, TOTALS, FAIL = f"{RUN}orders", f"{RUN}big", f"{RUN}totals", f"{RUN}fail"
+PROFILE, RO_PROFILE = f"{RUN}p", f"{RUN}ro"
+# Record values: must never show up in the audit log, nor unmasked when masked.
+EMAIL = f"jane.{uuid.uuid4().hex[:6]}@example.com"
+results = []
+
+tmp = Path(tempfile.mkdtemp(prefix="ferrika-ksql-smoke-"))
+HOME = tmp / "home"
+HOME.mkdir()
+CONFIG = HOME / ".ferrika"
+ENV = dict(os.environ)
+ENV.update({"HOME": str(HOME), "USERPROFILE": str(HOME), "FERRIKA_CONFIG_DIR": str(CONFIG),
+            "FERRIKA_SECRET_STORE": "file", "NO_COLOR": "1"})
+for key in ("FERRIKA_PROFILE", "FERRIKA_KSQL_URL", "FERRIKA_KSQL_USER", "FERRIKA_KSQL_PASSWORD",
+            "KAFKA_BOOTSTRAP_SERVERS"):
+    ENV.pop(key, None)
+
+
+def ferrika(args, stdin=None, timeout=60):
+    """Runs `ferrika ...`; returns (rc, stdout, stderr)."""
+    try:
+        p = subprocess.run([F] + args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout, env=ENV, input=stdin)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired as ex:
+        return "timeout", str(ex.stdout or ""), str(ex.stderr or "")
+
+
+def ksql(args, profile=PROFILE, json_out=True, **kw):
+    head = (["-f", "json"] if json_out else []) + (["-p", profile] if profile else [])
+    return ferrika(head + ["ksql"] + args, **kw)
+
+
+def check(name, ok, detail=""):
+    results.append(bool(ok))
+    print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"   [{detail}]" if detail and not ok else ""), flush=True)
+
+
+def tail(s, n=300):
+    return str(s)[-n:].replace("\n", " | ")
+
+
+def parse_json(text):
+    try:
+        return json.loads(text)
+    except ValueError:
+        return None
+
+
+def server(statement):
+    """Runs a statement on the server directly (set-up checks, clean-up)."""
+    body = json.dumps({"ksql": statement, "streamsProperties": {}}).encode()
+    req = urllib.request.Request(f"{URL}/ksql", data=body, method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Accept": "application/vnd.ksql.v1+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return {"error": e.read().decode(errors="replace")}
+
+
+def close_query(query_id):
+    """Asks the server to close `query_id`: (HTTP status, body)."""
+    body = json.dumps({"queryId": query_id}).encode()
+    req = urllib.request.Request(f"{URL}/close-query", data=body, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, r.read().decode(errors="replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace")
+
+
+def names(kind):
+    """Stream or table names the server has now."""
+    out = server(f"SHOW {kind.upper()};")
+    if not isinstance(out, list) or not out:
+        return []
+    return [s["name"] for s in out[0].get(kind, [])]
+
+
+def audit_entries():
+    path = CONFIG / "audit.log"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def wait_rows(sql, n, timeout=30):
+    """Pull-query rows, polled until there are `n` (the server materializes
+    asynchronously)."""
+    deadline = time.time() + timeout
+    rows = []
+    while time.time() < deadline:
+        rc, out, _ = ksql(["query", sql])
+        data = parse_json(out) if rc == 0 else None
+        rows = data["rows"] if data else []
+        if len(rows) >= n:
+            return rows
+        time.sleep(1)
+    return rows
+
+
+class Mcp:
+    """One `ferrika mcp` process spoken to over newline-delimited JSON-RPC."""
+
+    def __init__(self, profile):
+        self.proc = subprocess.Popen([F, "-p", profile, "mcp"], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV,
+                                     text=True, encoding="utf-8", errors="replace", bufsize=1)
+        self.lines = queue.Queue()
+        self.next_id = 0
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        for line in self.proc.stdout:
+            self.lines.put(line)
+
+    def request(self, method, params=None, timeout=60):
+        self.next_id += 1
+        rid = self.next_id
+        self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": rid, "method": method,
+                                          "params": params or {}}) + "\n")
+        self.proc.stdin.flush()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                msg = json.loads(self.lines.get(timeout=max(0.1, deadline - time.time())))
+            except (queue.Empty, ValueError):
+                continue
+            if msg.get("id") == rid:
+                return msg
+        raise TimeoutError(f"no answer to {method}")
+
+    def call(self, name, arguments):
+        msg = self.request("tools/call", {"name": name, "arguments": arguments})
+        result = msg.get("result", {})
+        text = "".join(c.get("text", "") for c in result.get("content", []))
+        return bool(result.get("isError")), result.get("structuredContent"), text
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            self.proc.kill()
+
+
+def scenarios():
+    # --- profiles ---------------------------------------------------------
+    rc, out, err = ferrika(["profile", "add", PROFILE, "-b", ARGS.broker, "--ksql-url", URL])
+    check("profile add --ksql-url", rc == 0, f"rc={rc} {tail(out + err)}")
+    rc, out, err = ferrika(["profile", "add", RO_PROFILE, "-b", ARGS.broker, "--ksql-url", URL, "--read-only"])
+    check("read-only profile add", rc == 0, tail(out + err))
+    rc, out, err = ferrika(["-f", "json", "profile", "show", PROFILE])
+    shown = parse_json(out) or {}
+    check("profile show names the ksqlDB URL", shown.get("ksql_url") == URL, tail(out + err))
+
+    # --- metadata ---------------------------------------------------------
+    rc, out, err = ksql(["info"])
+    info = parse_json(out) or {}
+    check("ksql info", rc == 0 and info.get("version") and info.get("server_status") == "RUNNING",
+          tail(out + err))
+    print(f"      ksqlDB {info.get('version')}")
+
+    # --- statements -------------------------------------------------------
+    script = (f"CREATE STREAM {ORDERS} (id INT KEY, email STRING, amount DOUBLE) "
+              f"WITH (KAFKA_TOPIC='{ORDERS}', PARTITIONS=1, VALUE_FORMAT='JSON');\n"
+              f"-- two orders; the comment's ; does not split\n"
+              f"INSERT INTO {ORDERS} (id, email, amount) VALUES (1, '{EMAIL}', 25.0);\n"
+              f"INSERT INTO {ORDERS} (id, email, amount) VALUES (2, 'bob@example.com', 3.5);\n")
+    rc, out, err = ksql(["exec", script, "--dry-run"])
+    plan = parse_json(out) or {}
+    cats = [s.get("categories") for s in plan.get("statements", [])]
+    check("exec --dry-run classifies each statement",
+          rc == 0 and cats == [["ksql.create", "topics.create"], ["ksql.insert", "produce"],
+                               ["ksql.insert", "produce"]], tail(out + err))
+    check("a dry run sends nothing", ORDERS.upper() not in names("streams"))
+
+    # A file, read from disk.
+    sql_file = tmp / "orders.sql"
+    sql_file.write_text(script, encoding="utf-8")
+    rc, out, err = ksql(["exec", "-f", str(sql_file), "--yes"])
+    done = parse_json(out) or {}
+    check("exec -f creates the stream and inserts", rc == 0 and done.get("ok") is True
+          and [s.get("status") for s in done.get("statements", [])] == ["SUCCESS"] * 3, tail(out + err))
+
+    rc, out, err = ksql(["streams"])
+    check("ksql streams lists it", rc == 0 and any(s["name"] == ORDERS.upper() for s in parse_json(out) or []),
+          tail(out + err))
+    rc, out, err = ksql(["describe", ORDERS])
+    d = parse_json(out) or {}
+    check("ksql describe shows columns and topic",
+          rc == 0 and [f["name"] for f in d.get("fields", [])] == ["ID", "EMAIL", "AMOUNT"]
+          and d.get("topic") == ORDERS, tail(out + err))
+
+    # --- queries ----------------------------------------------------------
+    rows = wait_rows(f"SELECT * FROM {ORDERS};", 2)
+    check("pull query returns the rows with columns", len(rows) == 2 and {r["ID"] for r in rows} == {1, 2},
+          f"rows={rows}")
+    rc, out, err = ksql(["query", f"SELECT id, email FROM {ORDERS} EMIT CHANGES;", "--from-beginning",
+                         "-n", "2", "--mask-pii"], timeout=90)
+    data = parse_json(out) or {}
+    check("push query stops at the row limit", rc == 0 and data.get("end") == "row_limit"
+          and len(data.get("rows", [])) == 2 and data.get("push") is True, tail(out + err))
+    check("push query rows are masked", data.get("masked") is True and EMAIL not in out
+          and "example.com" in out, tail(out))
+    code, body = close_query(data.get("query_id") or "none")
+    check("the push query was closed on the server", code == 400 and "No query with id" in body,
+          f"{code} {tail(body)}")
+    started = time.time()
+    rc, out, err = ksql(["query", f"SELECT * FROM {ORDERS} EMIT CHANGES;", "--timeout", "3"], timeout=60)
+    data = parse_json(out) or {}
+    check("push query stops at the time limit", rc == 0 and data.get("end") == "time_limit"
+          and time.time() - started < 30, tail(out + err))
+    rc, out, err = ksql(["query", f"SELECT * FROM {ORDERS} EMIT CHANGES LIMIT 1;", "--from-beginning"],
+                        timeout=60)
+    data = parse_json(out) or {}
+    check("a query's own LIMIT ends it on the server", rc == 0 and data.get("end") == "completed"
+          and len(data.get("rows", [])) == 1, tail(out + err))
+    rc, out, err = ksql(["query", f"SELECT * FROM {ORDERS};"], json_out=False)
+    check("table output", rc == 0 and "EMAIL" in out and "AMOUNT" in out, tail(out + err))
+    rc, out, err = ksql(["query", f"DROP STREAM {ORDERS};"])
+    check("query refuses a statement", rc != 0 and "ksql exec" in err and ORDERS.upper() in names("streams"),
+          tail(err))
+    rc, out, err = ksql(["exec", f"SELECT * FROM {ORDERS};", "--yes"])
+    check("exec refuses a query", rc != 0 and "ksql query" in err, tail(err))
+    rc, out, err = ksql(["query", "SELECT * FROM no_such_stream_xyz;"])
+    check("a server error is reported", rc != 0 and "NO_SUCH_STREAM_XYZ" in err.upper(), tail(err))
+
+    # --- persistent query, terminate, drop --------------------------------
+    rc, out, err = ksql(["exec", f"CREATE TABLE {TOTALS} AS SELECT id, SUM(amount) AS total "
+                                 f"FROM {ORDERS} GROUP BY id EMIT CHANGES;", "--yes"])
+    done = parse_json(out) or {}
+    query_id = (done.get("statements") or [{}])[0].get("query_id")
+    check("CREATE TABLE AS SELECT starts a query", rc == 0 and bool(query_id), tail(out + err))
+    rc, out, err = ksql(["queries"])
+    check("ksql queries lists it", rc == 0 and any(q["id"] == query_id for q in parse_json(out) or []),
+          tail(out + err))
+    rc, out, err = ksql(["exec", f"TERMINATE {query_id}; DROP TABLE {TOTALS} DELETE TOPIC;", "--yes"])
+    check("TERMINATE and DROP TABLE ... DELETE TOPIC", rc == 0 and TOTALS.upper() not in names("tables"),
+          tail(out + err))
+
+    # --- governance -------------------------------------------------------
+    rc, out, err = ksql(["exec", f"CREATE STREAM {BIG} AS SELECT * FROM {ORDERS} WHERE amount > 10;", "--yes"],
+                        profile=RO_PROFILE)
+    check("a read-only profile refuses writes and sends nothing",
+          rc != 0 and "read-only" in err and BIG.upper() not in names("streams"), tail(err))
+    rc, out, err = ksql(["streams"], profile=RO_PROFILE)
+    check("a read-only profile still reads", rc == 0, tail(err))
+    rc, out, err = ksql(["exec", f"CREATE STREAM {FAIL} (v STRING) WITH (KAFKA_TOPIC='{FAIL}', PARTITIONS=1, "
+                                 f"VALUE_FORMAT='JSON'); INSERT INTO no_such_stream_xyz (v) VALUES ('x'); "
+                                 f"DROP STREAM {FAIL} DELETE TOPIC;", "--yes"])
+    done = parse_json(out) or {}
+    statuses = [s.get("status") for s in done.get("statements", [])]
+    check("a failing statement stops the script", rc != 0 and statuses == ["SUCCESS", "ERROR", "NOT RUN"]
+          and FAIL.upper() in names("streams"), f"{statuses} {tail(err)}")
+    rc, out, err = ksql(["exec", "--yes", "-f", "-"], stdin=f"DROP STREAM {FAIL} DELETE TOPIC;\n")
+    check("exec -f - reads stdin", rc == 0 and FAIL.upper() not in names("streams"), tail(out + err))
+
+    entries = [e for e in audit_entries() if e.get("action") == "ksql exec"]
+    targets = [e["target"] for e in entries]
+    check("writes are audited before and after", any(t == f"CREATE TABLE {TOTALS.upper()} AS SELECT"
+                                                    for t in targets)
+          and any(e["outcome"].startswith("ok: SUCCESS, query ") for e in entries)
+          and any(e["outcome"] == "requested" for e in entries), f"{targets[:6]}")
+    check("a refused read-only write is audited", any(not e["ok"] and e["profile"] == RO_PROFILE for e in entries))
+    check("failures and skipped statements are audited",
+          any(e["outcome"].startswith("failed: ksqlDB error") for e in entries)
+          and any(e["outcome"].startswith("not run") for e in entries))
+    log = (CONFIG / "audit.log").read_text(encoding="utf-8") if (CONFIG / "audit.log").exists() else ""
+    check("the audit log holds no record values", EMAIL not in log and "bob@example.com" not in log)
+
+    # --- MCP --------------------------------------------------------------
+    mcp = Mcp(PROFILE)
+    try:
+        mcp.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                   "clientInfo": {"name": "ksql-smoke", "version": "1"}})
+        tools = [t["name"] for t in mcp.request("tools/list")["result"]["tools"]]
+        check("MCP lists the ksqlDB tools", {"ksql_list", "ksql_describe", "ksql_query"} <= set(tools), tools)
+        err_, data, text = mcp.call("ksql_list", {"kind": "streams", "filter": ORDERS.upper()})
+        check("MCP ksql_list", not err_ and data and data.get("count") == 1, tail(text))
+        err_, data, text = mcp.call("ksql_describe", {"name": ORDERS})
+        check("MCP ksql_describe", not err_ and data and data["description"]["topic"] == ORDERS, tail(text))
+        err_, data, text = mcp.call("ksql_query", {"sql": f"SELECT * FROM {ORDERS} EMIT CHANGES;",
+                                                   "from_beginning": True, "limit": 2, "timeout_secs": 20})
+        check("MCP ksql_query returns masked rows", not err_ and data and data.get("count") == 2
+              and data.get("masked") is True and EMAIL not in text, tail(text))
+        err_, data, text = mcp.call("ksql_query", {"sql": f"DROP STREAM {ORDERS};"})
+        check("MCP ksql_query refuses statements", err_ and ORDERS.upper() in names("streams"), tail(text))
+    finally:
+        mcp.close()
+
+
+def cleanup():
+    for name in (BIG, FAIL, ORDERS):
+        if name.upper() in names("streams"):
+            server(f"DROP STREAM IF EXISTS {name} DELETE TOPIC;")
+    if TOTALS.upper() in names("tables"):
+        server(f"DROP TABLE IF EXISTS {TOTALS} DELETE TOPIC;")
+    left = [n for n in names("streams") + names("tables") if n.startswith(RUN.upper())]
+    print(f"\ncleanup: left {left}")
+    return not left
+
+
+if not Path(F).exists():
+    sys.exit(f"binary not found: {F} (build with `cargo build -p ferrika-cli`)")
+print(f"ferrika ksql smoke: binary={F} url={URL} run={RUN}\n")
+try:
+    with urllib.request.urlopen(f"{URL}/info", timeout=10) as r:
+        r.read()
+except (urllib.error.URLError, OSError) as e:
+    sys.exit(f"cannot reach the ksqlDB server at {URL}: {e}")
+clean = False
+try:
+    scenarios()
+finally:
+    try:
+        clean = cleanup()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+check("cleanup leaves no streams or tables of this run", clean)
+print(f"{sum(results)}/{len(results)} passed")
+sys.exit(0 if all(results) else 1)

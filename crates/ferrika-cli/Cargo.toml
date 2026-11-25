@@ -28,6 +28,7 @@ ferrika-governance.workspace = true
 ferrika-ops.workspace = true
 ferrika-mcp = { workspace = true, features = ["amqp"] }
 ferrika-rabbitmq = { workspace = true, features = ["amqp"] }
+ferrika-ksql.workspace = true
 # `ferrika mqtt` (feature `mqtt`, on by default).
 ferrika-mqtt = { workspace = true, optional = true }
 clap = { version = "4.5", features = ["derive", "env"] }

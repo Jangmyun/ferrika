@@ -1407,6 +1407,7 @@ pub fn extra_category_refusal(
                 let why = match action {
                     PolicyAction::MessagesMove => "republishes messages",
                     PolicyAction::MessagesDelete => "publishes an empty retained message",
+                    PolicyAction::KsqlInsert => "writes records",
                     _ => "does the work of more than one category",
                 };
                 format!(

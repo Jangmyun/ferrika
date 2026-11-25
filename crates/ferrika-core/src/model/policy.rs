@@ -817,10 +817,23 @@ pub enum PolicyAction {
     ExchangesDelete,
     /// Adding or removing a RabbitMQ binding.
     BindingsChange,
+    /// Creating ksqlDB streams, tables and types (`CREATE STREAM`, `CREATE
+    /// TABLE ... AS SELECT`, `CREATE TYPE`), which start persistent queries.
+    KsqlCreate,
+    /// Dropping ksqlDB streams, tables and types (`DROP STREAM`, `DROP TABLE`).
+    KsqlDrop,
+    /// Writing rows into a ksqlDB stream or table (`INSERT INTO`, `INSERT
+    /// VALUES`); also needs `produce`.
+    KsqlInsert,
+    /// Stopping, pausing or resuming ksqlDB persistent queries (`TERMINATE`,
+    /// `PAUSE`, `RESUME`).
+    KsqlTerminate,
+    /// Changing a ksqlDB stream's or table's columns (`ALTER`).
+    KsqlAlter,
 }
 
 impl PolicyAction {
-    pub const ALL: [PolicyAction; 23] = [
+    pub const ALL: [PolicyAction; 28] = [
         Self::TopicsCreate,
         Self::TopicsDelete,
         Self::TopicsPurge,
@@ -844,6 +857,11 @@ impl PolicyAction {
         Self::ExchangesCreate,
         Self::ExchangesDelete,
         Self::BindingsChange,
+        Self::KsqlCreate,
+        Self::KsqlDrop,
+        Self::KsqlInsert,
+        Self::KsqlTerminate,
+        Self::KsqlAlter,
     ];
 
     /// The name used in a policy's `forbid` list.
@@ -872,6 +890,11 @@ impl PolicyAction {
             Self::ExchangesCreate => "exchanges.create",
             Self::ExchangesDelete => "exchanges.delete",
             Self::BindingsChange => "bindings.change",
+            Self::KsqlCreate => "ksql.create",
+            Self::KsqlDrop => "ksql.drop",
+            Self::KsqlInsert => "ksql.insert",
+            Self::KsqlTerminate => "ksql.terminate",
+            Self::KsqlAlter => "ksql.alter",
         }
     }
 
@@ -881,14 +904,15 @@ impl PolicyAction {
 
     /// Policy categories a change of this category also needs allowed: a
     /// RabbitMQ redrive moves messages (`messages.move`) by publishing them
-    /// again, and clearing an MQTT retained message (`messages.delete`)
-    /// publishes an empty one, so `forbid: ["produce"]` refuses both too. Every front end that
+    /// again, clearing an MQTT retained message (`messages.delete`) publishes
+    /// an empty one, and a ksqlDB `INSERT` (`ksql.insert`) writes records, so
+    /// `forbid: ["produce"]` refuses all three too. Every front end that
     /// authorises a change checks these besides the change's own category
     /// (see `ferrika_governance::policy::extra_category_refusal`).
     pub fn also_requires(self) -> &'static [PolicyAction] {
         // No wildcard arm: a new category must decide what it also needs.
         match self {
-            Self::MessagesMove | Self::MessagesDelete => &[Self::Produce],
+            Self::MessagesMove | Self::MessagesDelete | Self::KsqlInsert => &[Self::Produce],
             Self::TopicsCreate
             | Self::TopicsDelete
             | Self::TopicsPurge
@@ -909,7 +933,11 @@ impl PolicyAction {
             | Self::QueuesPurge
             | Self::ExchangesCreate
             | Self::ExchangesDelete
-            | Self::BindingsChange => &[],
+            | Self::BindingsChange
+            | Self::KsqlCreate
+            | Self::KsqlDrop
+            | Self::KsqlTerminate
+            | Self::KsqlAlter => &[],
         }
     }
 
@@ -966,12 +994,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_move_needs_another_category() {
+    fn only_a_move_and_a_ksql_insert_need_another_category() {
         for action in PolicyAction::ALL {
             let extra = action.also_requires();
             if matches!(
                 action,
-                PolicyAction::MessagesMove | PolicyAction::MessagesDelete
+                PolicyAction::MessagesMove
+                    | PolicyAction::MessagesDelete
+                    | PolicyAction::KsqlInsert
             ) {
                 assert_eq!(extra, &[PolicyAction::Produce]);
             } else {
@@ -998,6 +1028,15 @@ mod tests {
             PolicyAction::from_id("messages.delete"),
             Some(PolicyAction::MessagesDelete)
         );
+        for (id, action) in [
+            ("ksql.create", PolicyAction::KsqlCreate),
+            ("ksql.drop", PolicyAction::KsqlDrop),
+            ("ksql.insert", PolicyAction::KsqlInsert),
+            ("ksql.terminate", PolicyAction::KsqlTerminate),
+            ("ksql.alter", PolicyAction::KsqlAlter),
+        ] {
+            assert_eq!(PolicyAction::from_id(id), Some(action));
+        }
     }
 
     #[test]
