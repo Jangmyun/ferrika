@@ -111,7 +111,8 @@ still starting can answer.
 | Schemas and integrations | `schema`, `connect`, `acl`, `quota`, `user` |
 | Change safety | `audit`, `history`, `undo`, `policy` |
 | AI assistants | `mcp` |
-| RabbitMQ (preview) | `rabbit` (queues, exchanges, bindings, peek, publish, DLQ inspect and redrive; separate RabbitMQ profiles) |
+| RabbitMQ (preview) | `rabbit` (queues, exchanges, bindings, peek, publish, DLQ inspect and redrive; queue, exchange and binding changes with history and undo; separate RabbitMQ profiles) |
+| MQTT (preview) | `mqtt` (bounded subscribe, publish, list and clear retained messages; MQTT 3.1.1 and 5, TLS; separate MQTT profiles) |
 
 Examples for each are in the [command reference](docs/CLI.md).
 
@@ -212,6 +213,7 @@ the crate with `-p`:
 | `crates/ferrika-mcp` | The MCP server behind `ferrika mcp`. |
 | `crates/ferrika-cli` | The `ferrika` command line. |
 | `crates/ferrika-rabbitmq` | Preview: RabbitMQ management API client, RabbitMQ profiles and AMQP dead-letter redrive behind `ferrika rabbit`. |
+| `crates/ferrika-mqtt` | Preview: MQTT 3.1.1 and 5 sessions, bounded subscriptions, retained messages and MQTT profiles behind `ferrika mqtt` (cargo feature `mqtt`, on by default). |
 
 The crates are published on [crates.io](https://crates.io/crates/ferrika-core); until 1.0 their API can change.
 

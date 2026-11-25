@@ -32,8 +32,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq --all-targets -- -D warnings
-      - run: cargo test -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq
+      - run: cargo clippy -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq -p ferrika-mqtt --all-targets -- -D warnings
+      - run: cargo test -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq -p ferrika-mqtt
+      # The CLI without its default features (no MQTT, no TUI) must build.
+      - run: cargo check -p ferrika-cli --no-default-features --all-targets
 
   # API documentation must build without rustdoc warnings (broken intra-doc
   # links, links to private items, stray HTML tags). Public items only.
@@ -61,7 +63,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake build-essential pkg-config
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked --all-targets -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq
+      - run: cargo check --locked --all-targets -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq -p ferrika-mqtt
 
   # Windows and macOS minutes cost more, and this repository may be private,
   # so these run automatically only once the repository is public. Start them
@@ -87,8 +89,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq --all-targets -- -D warnings
-      - run: cargo test -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq
+      - run: cargo clippy -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq -p ferrika-mqtt --all-targets -- -D warnings
+      - run: cargo test -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq -p ferrika-mqtt
 
   # End-to-end smoke test of the CLI against a real broker (Linux only).
   # A second single-node Kafka (localhost:29092, its own cluster id) is the
@@ -222,6 +224,36 @@ jobs:
           FERRIKA_SECRET_STORE: file
         run: |
           python3 tools/e2e/mcp_smoke.py target/debug/ferrika --broker localhost:9092             --rabbit-url http://localhost:15672 --rabbit-user ferrika-e2e --rabbit-password ferrika-e2e-pw             --rabbit-amqp-url amqp://localhost:5672
+
+  # End-to-end smoke test of `ferrika mqtt` against Mosquitto 2 with a
+  # password file and a TLS listener (test CA from mosquitto-setup.sh). A
+  # service container cannot mount the generated configuration.
+  e2e-mqtt:
+    name: End-to-end smoke test (MQTT)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start Mosquitto
+        run: |
+          sh tools/e2e/mosquitto-setup.sh "$RUNNER_TEMP/mosquitto" ferrika-e2e ferrika-e2e-pw
+          docker run -d --name mosquitto -p 1883:1883 -p 8883:8883 -v "$RUNNER_TEMP/mosquitto:/mosquitto/config" eclipse-mosquitto:2
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake build-essential pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p ferrika-cli
+      - name: MQTT smoke test
+        # No OS credential store on the runner: keep the password in the
+        # profile file, which the test checks is private.
+        env:
+          FERRIKA_SECRET_STORE: file
+        run: >-
+          python3 tools/e2e/mqtt_smoke.py target/debug/ferrika --url mqtt://localhost:1883
+          --user ferrika-e2e --password ferrika-e2e-pw
+          --tls-url mqtts://localhost:8883 --ca-file "$RUNNER_TEMP/mosquitto/ca.pem"
+      - name: Mosquitto logs
+        if: failure()
+        run: docker logs --tail 100 mosquitto
 
   # The same smoke test against AutoMQ (one node on an S3-compatible store);
   # the stack is docs/e2e/automq-compose.yml and starts in under a minute.

@@ -160,3 +160,15 @@ node with broker and controller roles on an S3-compatible store
   self-balancing can also move partitions while a `reassign` runs.
 - Not checked: SASL or TLS listeners, AutoMQ's table topics and other
   AutoMQ-only features.
+
+## Other brokers (preview)
+
+Ferrika's RabbitMQ and MQTT commands are previews; their scope and
+decisions are in [plans/multi-broker.md](plans/multi-broker.md) and
+[plans/mqtt.md](plans/mqtt.md).
+
+| Broker | Status |
+| --- | --- |
+| RabbitMQ 4 (`rabbitmq:4-management`) | CI-tested: `tools/e2e/rabbit_smoke.py` (management API and AMQP 0-9-1) |
+| Eclipse Mosquitto 2.1 (`eclipse-mosquitto:2`) | CI-tested: `tools/e2e/mqtt_smoke.py`, MQTT 3.1.1 and 5, password file, TLS with a private CA (set up by `tools/e2e/mosquitto-setup.sh`) |
+| EMQX, HiveMQ, VerneMQ, MQTT bridges to Kafka | Not tested. `ferrika mqtt` speaks standard MQTT 3.1.1 and 5 only, so they are expected to work; EMQX's `$queue/` and every broker's `$share/` shared subscriptions are refused on purpose |
