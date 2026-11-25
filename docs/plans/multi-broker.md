@@ -115,7 +115,7 @@ pub struct GateTarget { pub kind: BrokerKind, pub profile: String, pub addresses
 and a `brokers_for` per kind. This is not needed for the CLI preview, nor
 for the phase 3 topology writes, which the CLI gates through
 `gate_profile` / `gate_brokers` like the other `rabbit` commands
-(decision 14).
+(decision 18).
 
 ### New policy categories
 
@@ -143,7 +143,7 @@ the strictest mode. The policy format number is not raised for this (a new
 `forbid` value is not a new field); the CHANGELOG and `docs/POLICY.md` say
 to roll such a policy out only once every client runs 0.2.0 or later.
 
-Added after 0.2.0, for RabbitMQ topology writes (phase 3, decision 12):
+Added after 0.2.0, for RabbitMQ topology writes (phase 3, decision 16):
 
 | Category | Covers |
 | --- | --- |
@@ -177,7 +177,7 @@ ferrika-cli ──> ferrika-mcp ──> ferrika-ops ──> ferrika-governance �
 - The Kafka path is untouched. The DLQ redrive lives in
   `ferrika-rabbitmq::amqp`, called by the CLI. Since phase 3 `ferrika-ops`
   depends on the crate (without `amqp`) for the RabbitMQ history and undo
-  (`history::rabbit`, decision 17). `ferrika-mcp` uses it without the `amqp` feature for its read-only
+  (`history::rabbit`, decision 21). `ferrika-mcp` uses it without the `amqp` feature for its read-only
   RabbitMQ listings.
 
 New third-party dependency: `lapin` 4.13 (MIT) with its AMQP crates
@@ -197,9 +197,9 @@ AMQP dependency.
 
 | Command | Request |
 | --- | --- |
-| `rabbit queues` | `GET /api/queues/{vhost}` |
-| `rabbit exchanges` | `GET /api/exchanges/{vhost}` |
-| `rabbit bindings` | `GET /api/bindings/{vhost}` |
+| `rabbit queues` | `GET /api/queues/{vhost}?page=N&page_size=S&columns=...[&name=P&use_regex=B]` until `--limit` |
+| `rabbit exchanges` | `GET /api/exchanges/{vhost}?page=N&page_size=S&columns=...[&name=P&use_regex=B]` until `--limit` |
+| `rabbit bindings` | `GET /api/bindings/{vhost}` (the API does not page bindings; filtered and cut locally) |
 | `rabbit peek Q -n N` | `POST /api/queues/{vhost}/{Q}/get` with `{"count": N, "ackmode": "ack_requeue_true", "encoding": "auto", "truncate": 50000}` |
 | `rabbit publish X -k K -m M` | `POST /api/exchanges/{vhost}/{X}/publish` with `{"properties": {...}, "routing_key": K, "payload": M, "payload_encoding": "string"}` |
 
@@ -213,9 +213,15 @@ with `ack_requeue_true` takes messages and requeues them:
   retry signal;
 - requeued messages go back to the head in classic queues, but ordering
   relative to messages published meanwhile is not guaranteed;
-- on quorum queues a requeue can count as a delivery attempt towards
-  `delivery-limit` (default 20 since RabbitMQ 4.0); repeated peeks can push a
-  message over the limit and dead-letter or drop it;
+- on quorum queues with a delivery limit, RabbitMQ before 4.0 counts the
+  requeue as a delivery attempt: repeated peeks push a message over the limit
+  and the broker dead-letters it (or drops it without a dead-letter
+  exchange). Checked on 3.13.7: `x-delivery-limit: 2`, the third peek
+  dead-lettered the message (`x-death` reason `delivery_limit`). RabbitMQ
+  4.0+ counts only failed deliveries; a peek's requeue is none (checked on
+  4.4.1: 28 peeks with `x-delivery-limit: 2` kept the message, only
+  `x-acquired-count` grew). See [Quorum queues and the delivery
+  limit](#quorum-queues-and-the-delivery-limit);
 - stream queues do not support `get`; reading them needs a stream consumer
   (later phase);
 - messages are held briefly while being fetched; a peek on a busy queue
@@ -229,9 +235,55 @@ effects a peek is a write under the policy (decision 1 below).
 Why not AMQP for everything: the management API covers listing, peeking
 and publishing with one HTTP client we already ship and audit; AMQP 0-9-1
 is used only where the management API cannot do the job safely, moving
-messages (`dlq redrive --execute`). Listing is
-also unpaginated for now: a vhost with tens of thousands of queues can hit
-the 64 MiB cap; `?page=&page_size=` support is phase 2.
+messages (`dlq redrive --execute`).
+
+### Paged listings
+
+`ferrika_rabbitmq::listing` (`ManagementClient::list_queues`,
+`list_exchanges`, `list_bindings` with a `ListQuery { name, regex, limit }`,
+returning `Listing { items, matched, total }`) is what the CLI and the MCP
+read tools use; the unbounded `queues` / `exchanges` / `bindings` stay for
+callers that want everything in one request.
+
+- Queues and exchanges: `page` / `page_size` (the page size is the limit,
+  at most 500, the API's maximum), `name` with `use_regex`, and `columns`
+  with only the fields Ferrika shows (the default queue object carries
+  message rates, garbage-collection and backing-queue details). Pages are
+  fetched one after another until the limit or the last page; a `400` on a
+  later page (entries deleted meanwhile) ends the listing. `disable_stats`
+  is not used: it drops `consumers`, which the table shows.
+- The broker's `name` filter is a case-insensitive substring, and
+  `use_regex=true` a case-insensitive regular expression (checked on
+  4.4.1). The pattern is checked locally first, so a bad one never reaches
+  the broker.
+- Bindings: `/api/bindings/{vhost}` ignores `page` (checked on 4.4.1), so
+  they are fetched whole (small objects without statistics) and filtered
+  (source or destination) and cut locally with the same matching rules.
+- Pages are not a snapshot: a queue created or deleted between two pages
+  can shift an entry across the page boundary.
+
+### TLS
+
+`https://` management URLs and `amqps://` were verified end to end against
+`rabbitmq:4-management` (4.4.1) with a private CA and listeners on 15671
+and 5671: without the CA the commands fail with `invalid peer certificate:
+UnknownIssuer` plus a hint naming `--rabbit-ca-cert`; with it `rabbit
+queues` and `rabbit dlq redrive` (preview and `--execute`) work; with
+`fail_if_no_peer_cert = true` the client certificate options are required
+(`CertificateRequired` without them, again with a hint) and work.
+
+- `--rabbit-ca-cert`, `--rabbit-client-cert`, `--rabbit-client-key` (and
+  `FERRIKA_RABBIT_CA_CERT` / `_CLIENT_CERT` / `_CLIENT_KEY`; profile fields
+  `ca_cert`, `client_cert`, `client_key`, stored as absolute paths that must
+  exist). The Kafka profile's `ssl_ca_location` works the same way for the
+  Kafka native requests; the Schema Registry and Connect clients have no CA
+  option yet.
+- The management API (Ferrika's HTTP client,
+  `ferrika_core::kafka::http::Endpoint::with_tls_files`) trusts only the
+  given CA, like Kafka's `ssl_ca_location`. AMQP (lapin's rustls connector)
+  adds the CA to the OS trust store; lapin offers no way to replace it.
+- No insecure mode: there is no option that skips certificate
+  verification (decision 14 below).
 
 ## Connection and profile configuration
 
@@ -420,7 +472,7 @@ Topology writes are undoable and fit the existing model (implemented on
   without the `rabbitmq` field, whose digest would not match (a false
   "edited"). So every RabbitMQ operation records at least one `rabbit_*`
   state, and a change whose before-state cannot be read is refused instead
-  of being recorded as not undoable (decision 16). The test
+  of being recorded as not undoable (decision 20). The test
   `a_0_2_reader_skips_rabbit_operations_whole_and_keeps_the_others`
   (`ferrika-ops`, `history.rs`) parses a journal with the 0.2 shapes.
 
@@ -432,7 +484,9 @@ Topology writes are undoable and fit the existing model (implemented on
 2. **Done (preview, this branch, for 0.2.0):** RabbitMQ profiles and
    secrets; `messages.peek` / `messages.move`; peek as a write;
    `rabbit dlq inspect`; `rabbit dlq redrive` with an AMQP client.
-   Still open in this phase: pagination; the neutral `GateTarget` type; e2e
+   Done since: paged listings, TLS with a private CA and client
+   certificates, the quorum-queue delivery-limit guard (2026-11-23).
+   Still open in this phase: the neutral `GateTarget` type; e2e
    checks against a throw-away `rabbitmq:4-management` container in
    `tools/e2e` (the AMQP move is unit-tested against a fake broker only).
    MCP read tools `rabbit_queues`, `rabbit_exchanges` and `rabbit_bindings`
@@ -514,9 +568,55 @@ Topology writes are undoable and fit the existing model (implemented on
     (`version.workspace = true`) and is labelled preview in its README and
     crate description.
 
+## Decisions (2026-11-23)
+
+12. **Listings are bounded by default.** `rabbit queues | exchanges |
+    bindings` show at most 1000 entries unless `--limit` says otherwise
+    (`--limit 0`: all, still fetched 500 per request). A production vhost
+    can hold tens of thousands of queues; a bounded default keeps the
+    command fast and the response small, and stderr says how many more
+    match, so nobody mistakes a cut list for the whole. Scripts that need
+    everything pass `--limit 0`. The MCP read tools keep their cap of 500.
+13. **`--name` is a substring by default, `--regex` opts in to regular
+    expressions.** A substring is what people type most and cannot fail to
+    parse; it matches the MCP tools' `filter` and the broker's own default.
+    Both are case-insensitive because the broker matches that way.
+14. **No insecure TLS mode.** A private CA is handled with
+    `--rabbit-ca-cert`; an option to skip verification would be one typo
+    away from sending the broker password to an impostor, and would need
+    its own policy rule. If one is ever needed it must be explicit per
+    command, refused under any company policy, and warn on every use.
+15. **Peeks that can dead-letter are refused unless opted in.** On RabbitMQ
+    before 4.0 (or of unknown version), `peek`, `dlq inspect` and the `dlq
+    redrive` preview of a quorum queue with a delivery limit are refused;
+    `--allow-delivery-count` reads anyway, warns, and shows per message how
+    many more peeks keep it. The MCP tools refuse such queues with no
+    opt-in: an agent should not take a step that can lose messages. On 4.0+
+    nothing is refused, since a peek does not count there. The check costs
+    one extra request per peek (two for a quorum queue with a limit).
+
+## Quorum queues and the delivery limit
+
+`ferrika_rabbitmq::delivery_limit`: `ManagementClient::peek_risk(vhost,
+queue)` reads the queue (`type`, `arguments`, `effective_policy_definition`,
+`delivery_limit`) and, for a quorum queue with a positive limit, the broker
+version from `/api/overview`. `PeekRisk::peeks_count()` is true for a
+quorum queue with a limit on a broker before 4.0 or of unknown version; the
+lowest of the argument, the policy and the broker-reported limit applies.
+`PeekRisk::fate(message)` turns a peeked message's `x-delivery-count` (as
+read, before this peek's requeue) into the number of further peeks that
+keep it, or `OverLimit` when this peek's requeue took it past the limit:
+with limit L and count c the message stays while c + 1 <= L. Checked on
+3.13.7 with a limit of 3: the CLI predicted 2, 1, 0 further peeks and then
+"over the limit", and the fourth peek dead-lettered the message.
+
+The AMQP redrive is not affected: it acks moved messages, and a message it
+fails to move is returned with `basic.nack` and requeue, which counts as
+one failed delivery on every version (one per failed redrive).
+
 ## Decisions (2026-11-23, phase 3)
 
-12. **Exchanges get their own categories**, `exchanges.create` and
+16. **Exchanges get their own categories**, `exchanges.create` and
     `exchanges.delete`, next to the proposed `queues.create`,
     `queues.delete`, `queues.purge` and `bindings.change`. Deleting an
     exchange silently drops what is published to it and removes its
@@ -524,7 +624,7 @@ Topology writes are undoable and fit the existing model (implemented on
     `bindings.change` or a broad `topology.change` would force operators
     to allow one to allow the other. All six arrive together, so it is one
     policy-format event.
-13. **CLI shape.** `rabbit queue declare|delete|purge NAME`, `rabbit
+17. **CLI shape.** `rabbit queue declare|delete|purge NAME`, `rabbit
     exchange declare|delete NAME`, `rabbit bind|unbind SOURCE DESTINATION
     [-k KEY] [--destination-type queue|exchange] [--arg K=V]`, like
     `topics create|delete|purge`: changes run directly, deletions and purges
@@ -535,12 +635,12 @@ Topology writes are undoable and fit the existing model (implemented on
     RabbitMQ connection options; `ferrika undo ID` on a RabbitMQ operation
     names `ferrika rabbit undo ID` instead of connecting to Kafka, and
     `ferrika history --all` lists both brokers' operations.
-14. **No neutral gate target yet.** The CLI gates the new writes through
+18. **No neutral gate target yet.** The CLI gates the new writes through
     `gate_profile` / `gate_brokers` like the other `rabbit` commands, and
     `rabbit undo` builds its `WriteRequest` from the RabbitMQ profile and
     addresses. `GateTarget` is left for the MCP tools and desktop views,
     which need it to share one write guard; no public gate API changes now.
-15. **Declaring something that exists is refused**, so undoing a
+19. **Declaring something that exists is refused**, so undoing a
     declaration never deletes a queue or exchange this command did not
     make. Undo of a queue declaration refuses a queue holding messages,
     with consumers or with bindings added since, and `--force` does not
@@ -550,12 +650,12 @@ Topology writes are undoable and fit the existing model (implemented on
     4 refuses both flags on quorum and stream queues, so for those the
     check reads the broker's statistics (refreshed every few seconds) just
     before deleting.
-16. **A RabbitMQ change whose current state cannot be read is refused**
+20. **A RabbitMQ change whose current state cannot be read is refused**
     (nothing is changed), unlike Kafka changes, which then run and are
     recorded as not undoable. The state read is the same management API the
     change uses, and an entry without a RabbitMQ state would be misread by
     0.2.0 (see the history section).
-17. **`ferrika-ops` depends on `ferrika-rabbitmq`** (without `amqp`), so the
+21. **`ferrika-ops` depends on `ferrika-rabbitmq`** (without `amqp`), so the
     RabbitMQ undo shares the Kafka undo's decision code (`check_request`,
     `decide`, `UndoPlan`, `Step`). The dependency stays one-way
     (ops → rabbitmq → core).

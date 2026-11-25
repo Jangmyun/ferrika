@@ -1,13 +1,18 @@
 //! A client for the RabbitMQ management HTTP API (the `rabbitmq_management`
 //! plugin), over the same small HTTP/1.1 client Ferrika uses for the Schema
 //! Registry and Kafka Connect: `http://` and `https://` (OS trust store),
-//! basic authentication, one request per connection.
+//! basic authentication, one request per connection. A CA file and a
+//! client certificate replace the OS trust store with
+//! [`ManagementClient::with_tls`]; there is no mode that skips verifying
+//! the server's certificate.
 
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 
 use ferrika_core::error::KafkaError;
+/// The CA file and client certificate for `https://` and `amqps://`.
+pub use ferrika_core::kafka::http::TlsFiles;
 use ferrika_core::kafka::http::{Endpoint, Response};
 
 use crate::error::{RabbitError, RabbitResult};
@@ -61,6 +66,17 @@ impl ManagementClient {
         let token = ferrika_core::codec::base64::encode(format!("{user}:{password}").as_bytes());
         self.authorization = Some(format!("Basic {token}"));
         self
+    }
+
+    /// Uses `files` for `https://`: the CA file is trusted instead of the
+    /// OS trust store, and the client certificate and key are presented
+    /// for mutual TLS. The files are read now.
+    pub fn with_tls(mut self, files: &TlsFiles) -> RabbitResult<Self> {
+        self.endpoint = self.endpoint.with_tls_files(files).map_err(|e| match e {
+            KafkaError::Config(message) => RabbitError::Config(message),
+            other => RabbitError::Config(other.to_string()),
+        })?;
+        Ok(self)
     }
 
     /// Sets the time allowed to connect and, separately, for each exchange.
@@ -287,7 +303,7 @@ impl ManagementClient {
         success_body(response).map(|_| ())
     }
 
-    async fn get_json<T: DeserializeOwned>(&self, path: &str) -> RabbitResult<T> {
+    pub(crate) async fn get_json<T: DeserializeOwned>(&self, path: &str) -> RabbitResult<T> {
         let response = self.send("GET", path, None).await?;
         parse_json(&success_body(response)?)
     }
@@ -312,10 +328,10 @@ impl ManagementClient {
             .await
             .map_err(|e| RabbitError::Unreachable {
                 target: self.address(),
-                reason: match e {
+                reason: with_tls_hint(match e {
                     KafkaError::Io(reason) | KafkaError::Config(reason) => reason,
                     other => other.to_string(),
-                },
+                }),
             })
     }
 }
@@ -355,6 +371,30 @@ fn conditions(flags: &[(&str, bool)]) -> String {
     }
 }
 
+/// `reason` with a hint when the server's TLS certificate was not trusted
+/// (rustls says `invalid peer certificate: UnknownIssuer`, `NotValidForName`
+/// ...), since that usually means a private CA.
+pub(crate) fn with_tls_hint(reason: String) -> String {
+    if reason.contains("CertificateRequired") {
+        return format!(
+            "{reason} (the server requires a client certificate: give --rabbit-client-cert and \
+             --rabbit-client-key, or the profile's client_cert and client_key)"
+        );
+    }
+    if !reason.contains("invalid peer certificate") {
+        return reason;
+    }
+    let hint = if reason.contains("NotValidForName") {
+        "the certificate does not name this host; connect with a host name it lists"
+    } else if reason.contains("Expired") || reason.contains("NotValidYet") {
+        "the certificate is outside its validity period"
+    } else {
+        "the server's certificate is not trusted; if it is signed by a private CA, give the CA \
+         file with --rabbit-ca-cert or the profile's ca_cert"
+    };
+    format!("{reason} ({hint})")
+}
+
 /// `/api/queues/{vhost}/{queue}/get`.
 fn peek_path(vhost: &str, queue: &str) -> String {
     format!("/api/queues/{}/{}/get", segment(vhost), segment(queue))
@@ -378,7 +418,7 @@ fn publish_path(vhost: &str, exchange: &str) -> String {
 /// Percent-encodes `text` as one path segment: the default vhost `/` becomes
 /// `%2F`, and a name holding `/`, `?`, `..` or CR/LF cannot change the
 /// request path or inject headers. A name of dots only is encoded too.
-fn segment(text: &str) -> String {
+pub(crate) fn segment(text: &str) -> String {
     if !text.is_empty() && text.bytes().all(|b| b == b'.') {
         return "%2E".repeat(text.len());
     }
@@ -552,6 +592,35 @@ mod tests {
         let plain = success_body(response(500, "")).unwrap_err().to_string();
         assert!(plain.contains("HTTP/1.1 500"), "{plain}");
         assert_eq!(success_body(response(200, "[]")).unwrap(), "[]");
+    }
+
+    #[test]
+    fn untrusted_certificates_get_a_hint() {
+        let unknown = with_tls_hint(
+            "TLS handshake with h:1 failed: invalid peer certificate: UnknownIssuer".to_string(),
+        );
+        assert!(unknown.contains("--rabbit-ca-cert"), "{unknown}");
+        let name = with_tls_hint(
+            "invalid peer certificate: certificate not valid for name NotValidForName".to_string(),
+        );
+        assert!(name.contains("does not name this host"), "{name}");
+        let required = with_tls_hint("received fatal alert: CertificateRequired".to_string());
+        assert!(required.contains("--rabbit-client-cert"), "{required}");
+        assert_eq!(with_tls_hint("refused".to_string()), "refused");
+    }
+
+    #[test]
+    fn tls_files_are_read_when_set() {
+        let client = ManagementClient::new("https://rabbit:15671").unwrap();
+        assert!(client.clone().with_tls(&TlsFiles::default()).is_ok());
+        let missing = TlsFiles {
+            ca_file: Some("/no/such/ca.pem".to_string()),
+            ..TlsFiles::default()
+        };
+        assert!(matches!(
+            client.with_tls(&missing),
+            Err(RabbitError::Config(_))
+        ));
     }
 
     #[test]

@@ -19,7 +19,8 @@ cargo fmt --all --check
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo test -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq
+cargo test -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq -p ferrika-mqtt
+cargo check -p ferrika-cli --no-default-features --all-targets   # without MQTT and the TUI
 ```
 
 The root manifest is virtual. Build the CLI with
@@ -45,11 +46,13 @@ python3 tools/e2e/smoke.py            # 35 checks against target/release/ferrika
 | `crates/ferrika-mcp` | The MCP server (`ferrika mcp`): read tools (Kafka, transform preview, RabbitMQ listings), policy-gated write tools |
 | `crates/ferrika-cli` | `src/cli` (command definitions, console I/O, the policy gate in `cli/app.rs`) and `src/main.rs` (the `ferrika` binary) |
 | `crates/ferrika-rabbitmq` | Preview: RabbitMQ management HTTP API client (`client`), typed responses and `x-death` (`model`), RabbitMQ profiles in `rabbit-profiles.json` (`profile`), AMQP dead-letter redrive with lapin (`amqp`, default feature `amqp`); no policy, audit or masking (the CLI applies them). See `docs/plans/multi-broker.md` |
+| `crates/ferrika-mqtt` | Preview: MQTT profiles in `mqtt-profiles.json` (`profile`), the connection and its overrides (`connection`), one clean MQTT 3.1.1/5 session on rumqttc's packet codec with TLS through tokio-rustls (`client`), the bounded loops (`collect`), topic rules (`topic`) and masked views (`view`); no policy or audit (the CLI applies them). Behind the `ferrika-cli` feature `mqtt` (default). See `docs/plans/mqtt.md` |
 
 Dependencies point one way: `ferrika-cli` → `ferrika-mcp` → `ferrika-ops` →
 `ferrika-governance` → `ferrika-core`; `ferrika-cli`, `ferrika-mcp` and
 `ferrika-ops` → `ferrika-rabbitmq` → `ferrika-core` (`ferrika-mcp` and
-`ferrika-ops` without the `amqp` feature). Inside `ferrika-core`, `model` and `codec` never use `kafka`. The CLI
+`ferrika-ops` without the `amqp` feature); `ferrika-cli` (feature `mqtt`) →
+`ferrika-mqtt` → `ferrika-core`. Inside `ferrika-core`, `model` and `codec` never use `kafka`. The CLI
 crate root re-exports `ferrika_core::{codec, error, files, kafka, model, notice}` and
 the other crates as `governance` and `ops`, so CLI code writes `crate::kafka::...`,
 `crate::governance::policy::...` and `crate::ops::mirror::...`.
@@ -87,7 +90,7 @@ in both functions and add a test for the decision.
 ## Releasing
 
 1. Bump `version` in the root `Cargo.toml` (the `[workspace.package]` value
-   and the five `ferrika-*` entries under `[workspace.dependencies]`) and run
+   and every `ferrika-*` entry under `[workspace.dependencies]`) and run
    `cargo check` so `Cargo.lock` follows; merge that.
 2. `cargo publish --workspace` from the merged commit (crates.io).
 3. Tag the same commit `v<version>` and push the tag. The release workflow

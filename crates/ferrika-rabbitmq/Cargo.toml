@@ -15,6 +15,9 @@ categories = ["api-bindings", "network-programming"]
 # credential store and the config directory come from ferrika-core.
 [dependencies]
 ferrika-core.workspace = true
+# `--name ... --regex` for bindings, which the management API filters only
+# for queues and exchanges (and to check a pattern before sending it).
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -37,4 +40,5 @@ amqp = ["dep:lapin", "dep:tokio"]
 test-util = ["dep:tokio"]
 
 [dev-dependencies]
+# A fake management API for the paging and delivery-limit tests.
 tokio.workspace = true

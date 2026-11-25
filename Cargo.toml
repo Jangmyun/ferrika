@@ -5,9 +5,11 @@
 # ferrika-governance -> ferrika-core. ferrika-rabbitmq (RabbitMQ preview)
 # depends on ferrika-core only; ferrika-cli, ferrika-mcp and ferrika-ops
 # (RabbitMQ history and undo) use it.
+# ferrika-mqtt (MQTT preview) depends on ferrika-core only; ferrika-cli uses
+# it behind its default feature `mqtt`.
 [workspace]
 resolver = "2"
-members = ["crates/ferrika-core", "crates/ferrika-governance", "crates/ferrika-ops", "crates/ferrika-mcp", "crates/ferrika-cli", "crates/ferrika-rabbitmq"]
+members = ["crates/ferrika-core", "crates/ferrika-governance", "crates/ferrika-ops", "crates/ferrika-mcp", "crates/ferrika-cli", "crates/ferrika-rabbitmq", "crates/ferrika-mqtt"]
 
 [workspace.package]
 version = "0.2.0"
@@ -66,6 +68,7 @@ ferrika-cli = { path = "crates/ferrika-cli", version = "0.2.0" }
 # Without default features (no AMQP client): ferrika-mcp and ferrika-ops
 # use the management API only; ferrika-cli turns `amqp` on for the redrive.
 ferrika-rabbitmq = { path = "crates/ferrika-rabbitmq", version = "0.2.0", default-features = false }
+ferrika-mqtt = { path = "crates/ferrika-mqtt", version = "0.2.0" }
 
 # Debug builds (check, clippy, test) keep line tables for ferrika so panics
 # and backtraces still name files and lines, and no debug info for

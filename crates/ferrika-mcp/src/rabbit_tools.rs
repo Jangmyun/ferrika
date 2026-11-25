@@ -17,13 +17,16 @@ use ferrika_core::error::{KafkaError, KafkaResult};
 use ferrika_rabbitmq::connection::{
     CredentialsError, RabbitOverrides, ResolveError, ResolvedRabbit,
 };
+use ferrika_rabbitmq::listing::{ListQuery, Listing};
 use ferrika_rabbitmq::model::{Binding, Exchange, Queue};
 use ferrika_rabbitmq::profile::RabbitProfileStore;
 
 /// The RabbitMQ read tools.
 pub(super) const RABBIT_TOOLS: [&str; 3] = ["rabbit_queues", "rabbit_exchanges", "rabbit_bindings"];
 
-/// Most entries one call returns.
+/// Most entries one call returns. The broker pages and filters the
+/// listing, so a vhost with thousands of queues is never fetched whole
+/// (bindings excepted: the management API does not page them).
 const LIST_MAX: usize = 500;
 /// How long one management API request may take.
 const RABBIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -36,7 +39,8 @@ pub(super) fn definitions() -> Vec<Value> {
         "properties": {
             "profile": { "type": "string", "description": "RabbitMQ profile name (ferrika rabbit profile list); default: the active RabbitMQ profile" },
             "vhost": { "type": "string", "description": "Virtual host (default: the profile's)" },
-            "filter": { "type": "string", "description": "Only entries whose name contains this text" }
+            "filter": { "type": "string", "description": "Only entries whose name contains this text (case-insensitive; for bindings the source or the destination)" },
+            "regex": { "type": "boolean", "description": "Treat filter as a regular expression (default false)" }
         }
     });
     vec![
@@ -112,14 +116,16 @@ pub(super) async fn call(name: &str, args: &Value) -> KafkaResult<Value> {
         .client(credentials.as_ref(), RABBIT_TIMEOUT)
         .map_err(KafkaError::config)?;
     let vhost = resolved.vhost.as_str();
-    let filter = text_arg(args, "filter");
+    let query = list_query(args);
     let rabbit = |e: ferrika_rabbitmq::error::RabbitError| KafkaError::config(e.to_string());
     let mut result = match name {
-        "rabbit_queues" => queues_json(&client.queues(vhost).await.map_err(rabbit)?, filter),
+        "rabbit_queues" => queues_json(&client.list_queues(vhost, &query).await.map_err(rabbit)?),
         "rabbit_exchanges" => {
-            exchanges_json(&client.exchanges(vhost).await.map_err(rabbit)?, filter)
+            exchanges_json(&client.list_exchanges(vhost, &query).await.map_err(rabbit)?)
         }
-        "rabbit_bindings" => bindings_json(&client.bindings(vhost).await.map_err(rabbit)?, filter),
+        "rabbit_bindings" => {
+            bindings_json(&client.list_bindings(vhost, &query).await.map_err(rabbit)?)
+        }
         other => return Err(KafkaError::config(format!("Unknown tool '{other}'"))),
     };
     result["profile"] = json!(resolved.profile);
@@ -127,85 +133,70 @@ pub(super) async fn call(name: &str, args: &Value) -> KafkaResult<Value> {
     Ok(result)
 }
 
-/// `items` kept by `keep`, at most [`LIST_MAX`], as `{count, truncated, key: [...]}`.
-fn listing<T>(
-    key: &str,
-    items: &[T],
-    keep: impl Fn(&T) -> bool,
-    show: impl Fn(&T) -> Value,
-) -> Value {
-    let kept: Vec<&T> = items.iter().filter(|i| keep(i)).collect();
-    let shown: Vec<Value> = kept.iter().take(LIST_MAX).map(|i| show(i)).collect();
+/// The listing `args` ask for: `filter` (and `regex`), at most
+/// [`LIST_MAX`] entries.
+fn list_query(args: &Value) -> ListQuery {
+    ListQuery {
+        name: text_arg(args, "filter").map(str::to_string),
+        regex: args.get("regex").and_then(Value::as_bool).unwrap_or(false),
+        limit: LIST_MAX,
+    }
+}
+
+/// `listing` as `{count, truncated, key: [...]}`; `count` is every
+/// matching entry, fetched or not.
+fn listing_json<T>(key: &str, listing: &Listing<T>, show: impl Fn(&T) -> Value) -> Value {
     let mut out = json!({
-        "count": kept.len(),
-        "truncated": kept.len() > LIST_MAX,
+        "count": listing.matched,
+        "truncated": listing.truncated(),
     });
-    out[key] = Value::Array(shown);
+    out[key] = Value::Array(listing.items.iter().map(show).collect());
     out
 }
 
-fn contains(text: &str, filter: Option<&str>) -> bool {
-    filter.is_none_or(|f| text.contains(f))
+pub(super) fn queues_json(queues: &Listing<Queue>) -> Value {
+    listing_json("queues", queues, |q| {
+        json!({
+            "name": q.name,
+            "type": q.kind,
+            "state": q.state,
+            "durable": q.durable,
+            "auto_delete": q.auto_delete,
+            "exclusive": q.exclusive,
+            "messages": q.messages,
+            "messages_ready": q.messages_ready,
+            "messages_unacknowledged": q.messages_unacknowledged,
+            "consumers": q.consumers,
+            "dead_letter_exchange": q.dead_letter_exchange(),
+            "policy": q.policy,
+            "arguments": q.arguments,
+        })
+    })
 }
 
-pub(super) fn queues_json(queues: &[Queue], filter: Option<&str>) -> Value {
-    listing(
-        "queues",
-        queues,
-        |q| contains(&q.name, filter),
-        |q| {
-            json!({
-                "name": q.name,
-                "type": q.kind,
-                "state": q.state,
-                "durable": q.durable,
-                "auto_delete": q.auto_delete,
-                "exclusive": q.exclusive,
-                "messages": q.messages,
-                "messages_ready": q.messages_ready,
-                "messages_unacknowledged": q.messages_unacknowledged,
-                "consumers": q.consumers,
-                "dead_letter_exchange": q.dead_letter_exchange(),
-                "policy": q.policy,
-                "arguments": q.arguments,
-            })
-        },
-    )
+pub(super) fn exchanges_json(exchanges: &Listing<Exchange>) -> Value {
+    listing_json("exchanges", exchanges, |e| {
+        json!({
+            "name": e.display_name(),
+            "type": e.kind,
+            "durable": e.durable,
+            "auto_delete": e.auto_delete,
+            "internal": e.internal,
+            "arguments": e.arguments,
+        })
+    })
 }
 
-pub(super) fn exchanges_json(exchanges: &[Exchange], filter: Option<&str>) -> Value {
-    listing(
-        "exchanges",
-        exchanges,
-        |e| contains(e.display_name(), filter),
-        |e| {
-            json!({
-                "name": e.display_name(),
-                "type": e.kind,
-                "durable": e.durable,
-                "auto_delete": e.auto_delete,
-                "internal": e.internal,
-                "arguments": e.arguments,
-            })
-        },
-    )
-}
-
-pub(super) fn bindings_json(bindings: &[Binding], filter: Option<&str>) -> Value {
-    listing(
-        "bindings",
-        bindings,
-        |b| contains(&b.source, filter) || contains(&b.destination, filter),
-        |b| {
-            json!({
-                "source": b.source,
-                "destination": b.destination,
-                "destination_type": b.destination_type,
-                "routing_key": b.routing_key,
-                "arguments": b.arguments,
-            })
-        },
-    )
+pub(super) fn bindings_json(bindings: &Listing<Binding>) -> Value {
+    listing_json("bindings", bindings, |b| {
+        json!({
+            "source": b.source,
+            "destination": b.destination,
+            "destination_type": b.destination_type,
+            "routing_key": b.routing_key,
+            "arguments": b.arguments,
+        })
+    })
 }
 
 #[cfg(test)]
@@ -258,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn listings_filter_and_cap() {
+    fn listings_report_the_matching_count_and_the_cut() {
         let queue = |name: &str| -> Queue {
             serde_json::from_value(json!({
                 "name": name,
@@ -269,36 +260,59 @@ mod tests {
             }))
             .unwrap()
         };
-        let queues: Vec<Queue> = (0..LIST_MAX + 5)
-            .map(|i| queue(&format!("orders-{i}")))
-            .chain([queue("payments")])
-            .collect();
-        let all = queues_json(&queues, None);
+        let cut = Listing {
+            items: (0..LIST_MAX)
+                .map(|i| queue(&format!("orders-{i}")))
+                .collect(),
+            matched: LIST_MAX as u64 + 6,
+            total: 2000,
+        };
+        let all = queues_json(&cut);
         assert_eq!(all["count"], LIST_MAX + 6);
         assert_eq!(all["truncated"], true);
         assert_eq!(all["queues"].as_array().unwrap().len(), LIST_MAX);
-        let one = queues_json(&queues, Some("pay"));
+        let one = queues_json(&Listing {
+            items: vec![queue("payments")],
+            matched: 1,
+            total: 2000,
+        });
         assert_eq!(one["count"], 1);
+        assert_eq!(one["truncated"], false);
         assert_eq!(one["queues"][0]["dead_letter_exchange"], "dlx");
         assert_eq!(one["queues"][0]["messages_ready"], 3);
 
         let exchanges: Vec<Exchange> = serde_json::from_value(json!([
             { "name": "", "vhost": "/", "type": "direct" },
-            { "name": "dlx", "vhost": "/", "type": "fanout" }
         ]))
         .unwrap();
-        let shown = exchanges_json(&exchanges, Some("dlx"));
-        assert_eq!(shown["count"], 1);
-        assert_eq!(shown["exchanges"][0]["type"], "fanout");
+        let shown = exchanges_json(&Listing {
+            items: exchanges,
+            matched: 1,
+            total: 8,
+        });
+        assert_eq!(shown["exchanges"][0]["name"], "amq.default");
 
         let bindings: Vec<Binding> = serde_json::from_value(json!([
             { "source": "dlx", "vhost": "/", "destination": "orders.dlq", "destination_type": "queue", "routing_key": "#" },
-            { "source": "events", "vhost": "/", "destination": "audit", "destination_type": "queue" }
         ]))
         .unwrap();
-        assert_eq!(bindings_json(&bindings, Some("dlq"))["count"], 1);
-        assert_eq!(bindings_json(&bindings, Some("events"))["count"], 1);
-        assert_eq!(bindings_json(&bindings, None)["count"], 2);
+        let shown = bindings_json(&Listing {
+            items: bindings,
+            matched: 1,
+            total: 1,
+        });
+        assert_eq!(shown["bindings"][0]["routing_key"], "#");
+    }
+
+    #[test]
+    fn the_filter_goes_to_the_broker_with_the_cap() {
+        let query = list_query(&json!({ "filter": " orders ", "regex": true }));
+        assert_eq!(query.name.as_deref(), Some("orders"));
+        assert!(query.regex);
+        assert_eq!(query.limit, LIST_MAX);
+        let none = list_query(&json!({ "filter": "  " }));
+        assert_eq!(none.name, None);
+        assert!(!none.regex);
     }
 
     #[test]

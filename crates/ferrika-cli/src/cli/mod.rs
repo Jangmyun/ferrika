@@ -18,6 +18,11 @@ pub(crate) mod lint;
 pub(crate) mod mcp;
 pub(crate) mod mirror;
 pub(crate) mod monitor;
+/// `ferrika mqtt` (feature `mqtt`): MQTT preview.
+#[cfg(feature = "mqtt")]
+pub mod mqtt;
+#[cfg(feature = "mqtt")]
+pub(crate) mod mqtt_profile;
 pub(crate) mod offset;
 mod output;
 pub(crate) mod policy;

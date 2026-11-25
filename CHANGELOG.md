@@ -9,7 +9,108 @@ versions, and 0.2.0 made it crate-internal.
 
 ## Unreleased
 
-### Added
+### RabbitMQ: paged listings, TLS with a private CA, quorum-queue peeks
+
+Command line:
+
+- `rabbit queues`, `rabbit exchanges` and `rabbit bindings` take
+  `--name TEXT` (case-insensitive substring, filtered by the broker),
+  `--regex` (treat `--name` as a regular expression) and `--limit N`
+  (default 1000, `0` for all). Queues and exchanges are fetched from the
+  management API in pages of up to 500 with only the shown columns, so a
+  vhost with thousands of queues no longer comes back as one response that
+  can pass the 64 MiB limit. **Changed:** the listings stop at 1000 entries
+  by default (stderr says how many more match); pass `--limit 0` for the
+  earlier "everything" behaviour.
+- TLS options for every `rabbit` command and `rabbit profile add`:
+  `--rabbit-ca-cert FILE` (a private CA for `https://` and `amqps://`),
+  `--rabbit-client-cert FILE` and `--rabbit-client-key FILE` (mutual TLS),
+  also as `FERRIKA_RABBIT_CA_CERT`, `FERRIKA_RABBIT_CLIENT_CERT`,
+  `FERRIKA_RABBIT_CLIENT_KEY` and as the profile fields `ca_cert`,
+  `client_cert`, `client_key` (absolute paths). An untrusted server
+  certificate fails with a hint to give the CA file; a server that requires
+  a client certificate fails with a hint to give one. There is no option to
+  skip certificate verification.
+- **Changed:** `rabbit peek`, `rabbit dlq inspect` and the `rabbit dlq
+  redrive` preview refuse a quorum queue with a delivery limit on RabbitMQ
+  before 4.0 (or when the broker version cannot be read), where every peek
+  counts as a delivery attempt and can dead-letter or drop messages.
+  `--allow-delivery-count` reads anyway and shows per message how many more
+  peeks keep it in the queue. RabbitMQ 4.0 and later do not count a peek,
+  so nothing changes there.
+
+MCP:
+
+- `rabbit_queues`, `rabbit_exchanges` and `rabbit_bindings` filter on the
+  broker and fetch in pages. **Changed:** `filter` is now case-insensitive;
+  a new `regex` argument treats it as a regular expression.
+- `rabbit_peek` and `rabbit_dlq_inspect` refuse a quorum queue whose
+  delivery limit a peek would count towards (RabbitMQ before 4.0), with no
+  opt-in over MCP; plans of other quorum queues say that a read does not
+  count.
+- RabbitMQ profiles with `ca_cert` / `client_cert` / `client_key` are used
+  with those files by every RabbitMQ tool.
+
+Library (`ferrika-rabbitmq`, `ferrika-core`):
+
+- New: `ferrika_rabbitmq::listing` (`ListQuery`, `Listing`,
+  `ManagementClient::list_queues`, `list_exchanges`, `list_bindings`);
+  `ferrika_rabbitmq::delivery_limit` (`PeekRisk`, `DeliveryFate`,
+  `delivery_count`, `ManagementClient::peek_risk`);
+  `ManagementClient::with_tls`; `ferrika_core::kafka::http::TlsFiles` and
+  `Endpoint::with_tls_files` (re-exported as
+  `ferrika_rabbitmq::client::TlsFiles`). The unbounded
+  `ManagementClient::queues`, `exchanges` and `bindings` are unchanged.
+- **Breaking** for code that builds these structs with every field listed
+  (use `..Default::default()` or `..RabbitProfile::new(url)`): new fields
+  `RabbitProfile::{ca_cert, client_cert, client_key}`,
+  `RabbitOverrides::{ca_cert, client_cert, client_key}`,
+  `ResolvedRabbit::tls` and `AmqpTarget::tls`. `rabbit-profiles.json`
+  files from 0.2.0 load unchanged.
+- `ResolvedRabbit::client` and `ResolvedRabbit::amqp_target` apply the TLS
+  files; `client` fails when a file cannot be read.
+
+### MQTT support (preview)
+
+Added:
+
+- MQTT support (preview): `ferrika mqtt` for MQTT 3.1.1 and 5 brokers
+  (Mosquitto, EMQX, HiveMQ, MQTT bridges), in the new crate `ferrika-mqtt`
+  behind the `ferrika-cli` cargo feature `mqtt` (on by default; a build
+  with `--no-default-features` leaves it out). `mqtt sub FILTER` shows
+  messages until `--count` (default 10) or `--duration` (default 30 s);
+  `mqtt pub TOPIC -m TEXT` publishes (QoS 1 by default, `--retain`
+  explicit; MQTT 5 user properties and content type); `mqtt retained
+  FILTER` lists retained messages; `mqtt retained clear TOPIC` deletes one
+  (asks first, `--yes` to skip; changes nothing when there is none). Table
+  and `-f json` output (`sub` writes JSON Lines). TLS with `mqtts://` and
+  the OS trust store or `--mqtt-ca-file`. Every session is clean with a
+  fresh client id and no last will; shared subscriptions (`$share/`,
+  `$queue/`) are refused. See `docs/plans/mqtt.md`.
+- MQTT profiles: `ferrika mqtt profile add|list|use|remove|show`, stored in
+  `mqtt-profiles.json` next to `profiles.json`, passwords in the OS
+  credential store (`<profile>/mqtt_password`). Broker URLs never carry
+  credentials.
+- Policy category `messages.delete` (`mqtt retained clear`), which also
+  needs `produce` allowed. `mqtt pub` is `produce`; `mqtt sub` and
+  `mqtt retained` pass the export gate and mask PII (payloads, topics, MQTT
+  5 user properties) under the policy. The policy's broker-address rules
+  match the MQTT broker's `host:port`; read-only MQTT profiles refuse `pub`
+  and `retained clear`.
+- `tools/e2e/mqtt_smoke.py` and `tools/e2e/mosquitto-setup.sh`, and a CI
+  job running them against `eclipse-mosquitto:2`.
+
+Compatibility:
+
+- A signed policy whose `forbid` names `messages.delete` is invalid for
+  builds up to 0.2.0, which then run in the strictest mode. Roll it out
+  only once every client runs a newer build.
+- `PolicyAction` has a new variant, `MessagesDelete`; code that matches it
+  exhaustively must add it.
+
+### RabbitMQ topology changes, history and undo
+
+Added:
 
 - RabbitMQ topology changes (preview): `ferrika rabbit queue
   declare|delete|purge`, `ferrika rabbit exchange declare|delete`,
@@ -28,7 +129,7 @@ versions, and 0.2.0 made it crate-internal.
 - `tools/e2e/rabbit_smoke.py` checks declare, delete, purge, bind, unbind,
   their undo and read-only refusals against a live broker.
 
-### Compatibility
+Compatibility:
 
 - A signed policy that names one of the six new categories is invalid for
   builds that do not know them (0.2.0 and older), which then run in the
@@ -39,10 +140,10 @@ versions, and 0.2.0 made it crate-internal.
   `undo` and `audit verify` do not see these operations (rather than
   report them as edited); its trimming keeps the lines byte for byte.
 
-### Library API
+Library API:
 
-- `ferrika-core`: `PolicyAction` has six more variants (`ALL` has 22
-  entries); `model::history::Scope` has a `rabbitmq` field; `State` has
+- `ferrika-core`: `PolicyAction` has six more variants (`ALL` has 23
+  entries with `MessagesDelete`); `model::history::Scope` has a `rabbitmq` field; `State` has
   `RabbitQueue`, `RabbitQueueMessages`, `RabbitExchange` and
   `RabbitBinding`, with the new types `RabbitQueueDeclaration`,
   `RabbitExchangeDeclaration` and `RabbitBindingKey`; `State::is_rabbitmq`.
