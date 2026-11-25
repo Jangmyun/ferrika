@@ -1,4 +1,4 @@
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use colored::Colorize;
 use comfy_table::{Cell, CellAlignment, Color};
 use serde_json::json;
@@ -9,6 +9,7 @@ use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::admin::KafkaAdminClient;
 use crate::kafka::offset_reset::{
     check_group_idle, commit_offset_reset, prepare_offset_reset, OffsetResetPlan, ResetStrategy,
+    UncommittedBase,
 };
 use crate::model::history::{PartitionOffset, Reversibility, State};
 use crate::ops::history::capture;
@@ -89,9 +90,24 @@ pub struct OffsetResetArgs {
     #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "shift_by", "to_timestamp"])]
     pub to_offset: Option<i64>,
 
-    /// Shift offsets by a relative delta (e.g. -100 to rewind, +50 to forward)
+    /// Shift offsets by a relative delta (e.g. -100 to rewind, +50 to forward).
+    /// Refused when the group has no committed offset on a partition it would
+    /// move, unless --shift-uncommitted-from says where those start
     #[arg(long, allow_hyphen_values = true, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "to_timestamp"])]
     pub shift_by: Option<i64>,
+
+    /// With --shift-by: shift partitions on which the group has no committed
+    /// offset from the earliest available offset or from the end (latest)
+    // The conflicts are spelled out: a strategy that conflicts with
+    // --shift-by would otherwise waive `requires`.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "FROM",
+        requires = "shift_by",
+        conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "to_timestamp"]
+    )]
+    pub shift_uncommitted_from: Option<ShiftBase>,
 
     /// Reset offsets to the position matching an epoch millisecond timestamp
     #[arg(long, conflicts_with_all = ["to_earliest", "to_latest", "to_offset", "shift_by"])]
@@ -104,6 +120,25 @@ pub struct OffsetResetArgs {
     /// Explicit flag to simulate changes without committing
     #[arg(long)]
     pub dry_run: bool,
+}
+
+/// `--shift-uncommitted-from`: where a shift starts on a partition without a
+/// committed offset.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftBase {
+    /// The earliest available offset (the low watermark)
+    Earliest,
+    /// The end of the partition (the high watermark)
+    Latest,
+}
+
+impl From<ShiftBase> for UncommittedBase {
+    fn from(base: ShiftBase) -> Self {
+        match base {
+            ShiftBase::Earliest => UncommittedBase::Earliest,
+            ShiftBase::Latest => UncommittedBase::Latest,
+        }
+    }
 }
 
 /// The smallest `--to-timestamp` taken (1973-03-03): any smaller value is
@@ -120,7 +155,10 @@ impl OffsetResetArgs {
         } else if let Some(off) = self.to_offset {
             Ok(ResetStrategy::Specific(off))
         } else if let Some(delta) = self.shift_by {
-            Ok(ResetStrategy::Shift(delta))
+            Ok(ResetStrategy::Shift {
+                delta,
+                uncommitted: self.shift_uncommitted_from.map(UncommittedBase::from),
+            })
         } else if let Some(ts) = self.to_timestamp {
             // Seconds (1700000000) read as milliseconds are January 1970, and
             // would rewind every partition to its oldest record.
@@ -297,6 +335,9 @@ async fn handle_offset_reset(args: OffsetResetArgs, global: &GlobalOpts) -> Kafk
     .await
     {
         Ok(p) => p,
+        // Refused before anything changed, the same with or without
+        // --execute: not a connection problem, so no connection hints.
+        Err(err @ KafkaError::UncommittedShift { .. }) => return Err(err),
         Err(err) => {
             print_connection_hint(&global.to_kafka_config(), &err);
             return Err(err);
@@ -531,6 +572,7 @@ mod tests {
             to_latest: false,
             to_offset: None,
             shift_by: None,
+            shift_uncommitted_from: None,
             to_timestamp: Some(ts),
             execute: false,
             dry_run: false,
@@ -626,10 +668,51 @@ mod tests {
                 assert_eq!(args.partition, Some(3));
                 assert_eq!(args.shift_by, Some(-500));
                 assert!(args.execute);
-                assert_eq!(args.strategy().unwrap(), ResetStrategy::Shift(-500));
+                assert_eq!(args.strategy().unwrap(), ResetStrategy::shift(-500));
             }
             other => panic!("expected reset, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shift_uncommitted_from_names_the_base_and_needs_shift_by() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            command: OffsetSubcommands,
+        }
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["test", "reset", "g", "-t", "orders"];
+            argv.extend_from_slice(extra);
+            TestCli::try_parse_from(argv)
+        };
+        let strategy = |extra: &[&str]| match parse(extra).unwrap().command {
+            OffsetSubcommands::Reset(args) => args.strategy().unwrap(),
+            other => panic!("expected reset, got {other:?}"),
+        };
+
+        assert_eq!(
+            strategy(&["--shift-by", "-5", "--shift-uncommitted-from", "earliest"]),
+            ResetStrategy::Shift {
+                delta: -5,
+                uncommitted: Some(UncommittedBase::Earliest)
+            }
+        );
+        assert_eq!(
+            strategy(&["--shift-by", "3", "--shift-uncommitted-from", "latest"]),
+            ResetStrategy::Shift {
+                delta: 3,
+                uncommitted: Some(UncommittedBase::Latest)
+            }
+        );
+        // Without the flag a shift refuses uncommitted partitions.
+        assert_eq!(strategy(&["--shift-by", "-5"]), ResetStrategy::shift(-5));
+        // Only with --shift-by, and only the two bases.
+        assert!(parse(&["--to-earliest", "--shift-uncommitted-from", "earliest"]).is_err());
+        assert!(parse(&["--shift-uncommitted-from", "latest"]).is_err());
+        assert!(parse(&["--shift-by", "1", "--shift-uncommitted-from", "zero"]).is_err());
     }
 
     #[test]

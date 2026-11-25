@@ -372,6 +372,7 @@ pub(super) mod fake {
 
     use super::*;
     use ferrika_core::kafka::admin::ConfigOrigin;
+    use ferrika_core::kafka::offset_reset::PartitionPosition;
 
     /// (key, value, set on the topic itself).
     pub type ConfigRow = (String, String, bool);
@@ -537,26 +538,23 @@ pub(super) mod fake {
             let Some(parts) = offsets.get(&(group.to_string(), topic.to_string())) else {
                 return ready(Err(KafkaError::TopicNotFound(topic.into())));
             };
-            let plans = parts
+            let positions: Vec<PartitionPosition> = parts
                 .iter()
                 .enumerate()
                 .filter(|(p, _)| partition.is_none_or(|only| only as usize == *p))
-                .map(|(p, &(current, high))| {
-                    let target = ferrika_core::kafka::offset_reset::calculate_target_offset(
-                        strategy, current, 0, high,
-                    );
-                    OffsetResetPlan {
-                        group_id: group.into(),
-                        topic: topic.into(),
-                        partition: p as i32,
-                        current_offset: current,
-                        low_watermark: 0,
-                        high_watermark: high,
-                        target_offset: target,
-                        delta: target - current.max(0),
-                    }
+                .map(|(p, &(current, high))| PartitionPosition {
+                    partition: p as i32,
+                    committed: current,
+                    low_watermark: 0,
+                    high_watermark: high,
                 })
                 .collect();
+            let plans = match ferrika_core::kafka::offset_reset::plan_offset_reset(
+                group, topic, strategy, &positions,
+            ) {
+                Ok(plans) => plans,
+                Err(e) => return ready(Err(e)),
+            };
             ready(Ok(plans))
         }
 

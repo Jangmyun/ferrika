@@ -287,12 +287,43 @@ def scenarios():
           rc == 0 and "past the end" in out and "Consumed 0" in out, f"rc={rc} {tail(out)}")
 
     # --- offset reset --shift-by with the largest value -----------------
-    rc, out = run(["offset", "reset", f"{t}-g", "-t", t, "--shift-by", "9223372036854775807"])
+    # The group committed nothing: a shift needs --shift-uncommitted-from.
+    rc, out = run(["offset", "reset", f"{t}-g", "-t", t, "--shift-by", "-1"])
+    check("offset reset --shift-by without a committed offset is refused (dry run)",
+          rc == 1 and "no committed offset on partition(s) 0" in out, f"rc={rc} {tail(out)}")
+    from_start = ["--shift-uncommitted-from", "earliest"]
+    rc, out = run(["offset", "reset", f"{t}-g", "-t", t, "--shift-by", "9223372036854775807", *from_start])
     check("offset reset --shift-by i64::MAX clamps to the end (dry run)",
           rc == 0 and not crashed(rc) and re.search(r"0 \.\. 2\s+┆\s+2\b", out) is not None, f"rc={rc} {tail(out)}")
-    rc, out = run(["offset", "reset", f"{t}-g", "-t", t, "--shift-by", "-9223372036854775808"])
+    rc, out = run(["offset", "reset", f"{t}-g", "-t", t, "--shift-by", "-9223372036854775808", *from_start])
     check("offset reset --shift-by i64::MIN clamps to the start (dry run)",
           rc == 0 and re.search(r"0 \.\. 2\s+┆\s+0\b", out) is not None, f"rc={rc} {tail(out)}")
+
+    # --- offset reset --shift-by with some partitions committed ---------
+    t = f"{RUN}shift3"
+    run(["topics", "create", t, "-p", "3"])
+    for p in range(3):
+        for i in range(5):
+            run(["produce", t, "-p", str(p), "-m", f"v{p}-{i}"])
+    g = f"{t}-g"
+    for p in ("0", "2"):
+        run(["offset", "reset", g, "-t", t, "-p", p, "--to-offset", "4", "--execute"])
+
+    def committed():
+        rc, out = run(["-f", "json", "offset", "reset", g, "-t", t, "--to-earliest"])
+        try:
+            return [p["current_offset"] for p in json.loads(out)["plans"]]
+        except (ValueError, KeyError, TypeError):
+            return f"rc={rc} {tail(out)}"
+
+    check("offset reset: partitions 0 and 2 committed, 1 not", committed() == [4, -1, 4], f"{committed()}")
+    rc, out = run(["offset", "reset", g, "-t", t, "--shift-by", "-2", "--execute"])
+    check("offset reset --shift-by refuses all partitions when one has no commit",
+          rc == 1 and "partition(s) 1 " in out and committed() == [4, -1, 4], f"rc={rc} {tail(out)} {committed()}")
+    rc, out = run(["offset", "reset", g, "-t", t, "--shift-by", "-2",
+                   "--shift-uncommitted-from", "latest", "--execute"])
+    check("offset reset --shift-uncommitted-from latest shifts uncommitted partitions from the end",
+          rc == 0 and committed() == [2, 3, 2], f"rc={rc} {tail(out)} {committed()}")
 
     # --- bad filters and dates ------------------------------------------
     rc, out = run(["consume", t, "--header-filter", "nocolon", "-t", "2000", "-g", f"{t}-g2"])

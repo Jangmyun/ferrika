@@ -16,20 +16,71 @@ pub enum ResetStrategy {
     Latest,
     /// Reset to an explicit offset number
     Specific(i64),
-    /// Shift offset relative to current committed offset (e.g. -100 or +50)
-    Shift(i64),
+    /// Shift offset relative to current committed offset (e.g. -100 or +50).
+    ///
+    /// A partition on which the group has no committed offset has nothing to
+    /// shift from: planning refuses the whole reset
+    /// ([`KafkaError::UncommittedShift`]) unless `uncommitted` names where
+    /// those partitions are shifted from.
+    Shift {
+        /// The number of records to move: negative rewinds, positive skips.
+        delta: i64,
+        /// The base for partitions without a committed offset; `None`
+        /// refuses them.
+        #[serde(default)]
+        uncommitted: Option<UncommittedBase>,
+    },
     /// Reset to offset matching an epoch millisecond timestamp
     Timestamp(i64),
 }
 
+impl ResetStrategy {
+    /// A shift by `delta` that refuses partitions without a committed offset.
+    pub fn shift(delta: i64) -> Self {
+        ResetStrategy::Shift {
+            delta,
+            uncommitted: None,
+        }
+    }
+}
+
+/// Where a shift starts on a partition on which the group has no committed
+/// offset (an explicit opt-in: without it such a shift is refused).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UncommittedBase {
+    /// From the low watermark (the first available record). Ferrika 0.2 and
+    /// earlier did this without being asked.
+    Earliest,
+    /// From the high watermark (the end of the partition).
+    Latest,
+}
+
+impl std::fmt::Display for UncommittedBase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            UncommittedBase::Earliest => "earliest",
+            UncommittedBase::Latest => "latest",
+        })
+    }
+}
+
 impl std::fmt::Display for ResetStrategy {
-    /// `earliest`, `latest`, `offset 150`, `shift -5`, `timestamp 1700000000000`.
+    /// `earliest`, `latest`, `offset 150`, `shift -5`,
+    /// `shift -5 (uncommitted from earliest)`, `timestamp 1700000000000`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ResetStrategy::Earliest => write!(f, "earliest"),
             ResetStrategy::Latest => write!(f, "latest"),
             ResetStrategy::Specific(offset) => write!(f, "offset {offset}"),
-            ResetStrategy::Shift(delta) => write!(f, "shift {delta:+}"),
+            ResetStrategy::Shift {
+                delta,
+                uncommitted: None,
+            } => write!(f, "shift {delta:+}"),
+            ResetStrategy::Shift {
+                delta,
+                uncommitted: Some(base),
+            } => write!(f, "shift {delta:+} (uncommitted from {base})"),
             ResetStrategy::Timestamp(ts) => write!(f, "timestamp {ts}"),
         }
     }
@@ -58,21 +109,115 @@ pub struct OffsetResetPlan {
 
 /// Calculates the target offset according to the reset strategy, safely clamped within watermarks.
 ///
+/// `current` is the group's committed offset, `-1` when it has none. A
+/// [`ResetStrategy::Shift`] on such a partition has nothing to shift from:
+/// the result is `None` unless the strategy names an [`UncommittedBase`].
+/// Every other strategy always has a target.
+///
 /// [`ResetStrategy::Timestamp`] needs a broker lookup, so callers resolve it to
 /// a [`ResetStrategy::Specific`] offset first (see [`prepare_offset_reset`]);
 /// left unresolved it means no record at or after the timestamp: the end.
-pub fn calculate_target_offset(strategy: &ResetStrategy, current: i64, low: i64, high: i64) -> i64 {
-    let effective_current = if current < 0 { low } else { current };
-
+pub fn calculate_target_offset(
+    strategy: &ResetStrategy,
+    current: i64,
+    low: i64,
+    high: i64,
+) -> Option<i64> {
     let raw = match strategy {
         ResetStrategy::Earliest => low,
         ResetStrategy::Latest => high,
         ResetStrategy::Specific(off) => *off,
-        ResetStrategy::Shift(delta) => effective_current.saturating_add(*delta),
+        ResetStrategy::Shift { delta, uncommitted } => {
+            let from = if current >= 0 {
+                current
+            } else {
+                match uncommitted {
+                    Some(UncommittedBase::Earliest) => low,
+                    Some(UncommittedBase::Latest) => high,
+                    None => return None,
+                }
+            };
+            from.saturating_add(*delta)
+        }
         ResetStrategy::Timestamp(_) => high,
     };
 
-    raw.clamp(low, high)
+    Some(raw.clamp(low, high))
+}
+
+/// What was read for one partition before planning its reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionPosition {
+    /// Partition number
+    pub partition: i32,
+    /// The group's committed offset, `-1` when it has none
+    pub committed: i64,
+    /// Earliest available offset in this partition
+    pub low_watermark: i64,
+    /// Latest offset (log end) in this partition
+    pub high_watermark: i64,
+}
+
+/// Plans a reset of `group_id` on `topic` from offsets already read, without
+/// touching the cluster. All partitions or none: when a shift finds
+/// partitions without a committed offset (and the strategy names no base for
+/// them), the whole plan is refused with [`KafkaError::UncommittedShift`]
+/// naming them, so a reset is never applied to only part of the topic.
+///
+/// [`ResetStrategy::Timestamp`] is not resolved here (see
+/// [`calculate_target_offset`]); [`prepare_offset_reset`] resolves it.
+pub fn plan_offset_reset(
+    group_id: &str,
+    topic: &str,
+    strategy: &ResetStrategy,
+    positions: &[PartitionPosition],
+) -> KafkaResult<Vec<OffsetResetPlan>> {
+    let resolved: Vec<(PartitionPosition, ResetStrategy)> = positions
+        .iter()
+        .map(|pos| (*pos, strategy.clone()))
+        .collect();
+    plan_resolved(group_id, topic, &resolved)
+}
+
+/// [`plan_offset_reset`] with a strategy per partition (a timestamp resolved
+/// to each partition's offset).
+fn plan_resolved(
+    group_id: &str,
+    topic: &str,
+    resolved: &[(PartitionPosition, ResetStrategy)],
+) -> KafkaResult<Vec<OffsetResetPlan>> {
+    let mut plans = Vec::with_capacity(resolved.len());
+    let mut uncommitted = Vec::new();
+    for (pos, strategy) in resolved {
+        let (current, low, high) = (pos.committed, pos.low_watermark, pos.high_watermark);
+        let Some(target) = calculate_target_offset(strategy, current, low, high) else {
+            uncommitted.push(pos.partition);
+            continue;
+        };
+        let delta = if current >= 0 {
+            target.saturating_sub(current)
+        } else {
+            target.saturating_sub(low)
+        };
+        plans.push(OffsetResetPlan {
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            partition: pos.partition,
+            current_offset: current,
+            low_watermark: low,
+            high_watermark: high,
+            target_offset: target,
+            delta,
+        });
+    }
+    if !uncommitted.is_empty() {
+        return Err(KafkaError::UncommittedShift {
+            group: group_id.to_string(),
+            topic: topic.to_string(),
+            partitions: uncommitted,
+        });
+    }
+    Ok(plans)
 }
 
 /// Prepares and simulates the offset reset plans across partitions without modifying cluster state.
@@ -93,7 +238,7 @@ pub async fn prepare_offset_reset(
     consumer_cfg = consumer_cfg.with_group_id(group_id.to_string());
     let consumer = KafkaConsumerClient::new(&consumer_cfg)?;
 
-    let mut plans = Vec::new();
+    let mut resolved: Vec<(PartitionPosition, ResetStrategy)> = Vec::new();
 
     let partitions_to_check: Vec<i32> = match target_partition {
         Some(p) => vec![p],
@@ -156,30 +301,24 @@ pub async fn prepare_offset_reset(
             }
         };
 
-        let target = calculate_target_offset(&strategy, current_committed, low, high);
-        let delta = if current_committed >= 0 {
-            target.saturating_sub(current_committed)
-        } else {
-            target - low
-        };
-
-        plans.push(OffsetResetPlan {
-            group_id: group_id.to_string(),
-            topic: topic.to_string(),
-            partition: p,
-            current_offset: current_committed,
-            low_watermark: low,
-            high_watermark: high,
-            target_offset: target,
-            delta,
-        });
+        resolved.push((
+            PartitionPosition {
+                partition: p,
+                committed: current_committed,
+                low_watermark: low,
+                high_watermark: high,
+            },
+            strategy,
+        ));
     }
 
     if !failures.is_empty() {
         return Err(plan_failures_error(group_id, topic, &failures));
     }
 
-    Ok(plans)
+    // A shift that finds partitions without a committed offset (and no base
+    // for them) refuses the whole plan.
+    plan_resolved(group_id, topic, &resolved)
 }
 
 /// The group's committed offset for `topic`/`partition` in a committed-offsets
@@ -314,63 +453,211 @@ mod tests {
         // Resolved timestamps arrive as Specific; an unresolved one means no
         // record at or after it, so the group must not be rewound.
         let target = calculate_target_offset(&ResetStrategy::Timestamp(1), 50, 10, 100);
-        assert_eq!(target, 100);
+        assert_eq!(target, Some(100));
     }
 
     #[test]
     fn test_calculate_target_offset_earliest() {
         let target = calculate_target_offset(&ResetStrategy::Earliest, 50, 10, 100);
-        assert_eq!(target, 10);
+        assert_eq!(target, Some(10));
     }
 
     #[test]
     fn test_calculate_target_offset_latest() {
         let target = calculate_target_offset(&ResetStrategy::Latest, 50, 10, 100);
-        assert_eq!(target, 100);
+        assert_eq!(target, Some(100));
     }
 
     #[test]
     fn test_calculate_target_offset_specific_clamped() {
         // Within bounds
         let target = calculate_target_offset(&ResetStrategy::Specific(45), 50, 10, 100);
-        assert_eq!(target, 45);
+        assert_eq!(target, Some(45));
 
         // Clamped to low
         let target = calculate_target_offset(&ResetStrategy::Specific(5), 50, 10, 100);
-        assert_eq!(target, 10);
+        assert_eq!(target, Some(10));
 
         // Clamped to high
         let target = calculate_target_offset(&ResetStrategy::Specific(150), 50, 10, 100);
-        assert_eq!(target, 100);
+        assert_eq!(target, Some(100));
     }
 
     #[test]
     fn test_calculate_target_offset_shift_forward_and_backward() {
         // Shift backward (rewind)
-        let target = calculate_target_offset(&ResetStrategy::Shift(-20), 50, 10, 100);
-        assert_eq!(target, 30);
+        let target = calculate_target_offset(&ResetStrategy::shift(-20), 50, 10, 100);
+        assert_eq!(target, Some(30));
 
         // Shift forward
-        let target = calculate_target_offset(&ResetStrategy::Shift(30), 50, 10, 100);
-        assert_eq!(target, 80);
+        let target = calculate_target_offset(&ResetStrategy::shift(30), 50, 10, 100);
+        assert_eq!(target, Some(80));
 
         // Shift beyond low clamp
-        let target = calculate_target_offset(&ResetStrategy::Shift(-100), 50, 10, 100);
-        assert_eq!(target, 10);
+        let target = calculate_target_offset(&ResetStrategy::shift(-100), 50, 10, 100);
+        assert_eq!(target, Some(10));
+    }
 
-        // Shift uncommitted (-1) treats as low
-        let target = calculate_target_offset(&ResetStrategy::Shift(15), -1, 10, 100);
-        assert_eq!(target, 25);
+    #[test]
+    fn a_shift_without_a_committed_offset_has_no_target_unless_given_a_base() {
+        let from = |base| ResetStrategy::Shift {
+            delta: 15,
+            uncommitted: base,
+        };
+        assert_eq!(calculate_target_offset(&from(None), -1, 10, 100), None);
+        assert_eq!(
+            calculate_target_offset(&from(Some(UncommittedBase::Earliest)), -1, 10, 100),
+            Some(25)
+        );
+        // From the end, a forward shift stays at the end; a rewind goes back.
+        assert_eq!(
+            calculate_target_offset(&from(Some(UncommittedBase::Latest)), -1, 10, 100),
+            Some(100)
+        );
+        let rewind = ResetStrategy::Shift {
+            delta: -30,
+            uncommitted: Some(UncommittedBase::Latest),
+        };
+        assert_eq!(calculate_target_offset(&rewind, -1, 10, 100), Some(70));
+        // The base does not apply where an offset is committed.
+        assert_eq!(
+            calculate_target_offset(&from(Some(UncommittedBase::Latest)), 50, 10, 100),
+            Some(65)
+        );
+        // The other strategies never need one.
+        for strategy in [
+            ResetStrategy::Earliest,
+            ResetStrategy::Latest,
+            ResetStrategy::Specific(40),
+        ] {
+            assert!(calculate_target_offset(&strategy, -1, 10, 100).is_some());
+        }
     }
 
     #[test]
     fn shift_by_extreme_values_clamps_instead_of_wrapping() {
-        let shift = |d, cur| calculate_target_offset(&ResetStrategy::Shift(d), cur, 10, 100);
-        assert_eq!(shift(i64::MAX, 50), 100);
-        assert_eq!(shift(i64::MAX, i64::MAX), 100);
-        assert_eq!(shift(i64::MAX, -1), 100);
-        assert_eq!(shift(i64::MIN, 50), 10);
-        assert_eq!(shift(i64::MIN, i64::MAX), 10);
+        let shift = |d, cur| {
+            let strategy = ResetStrategy::Shift {
+                delta: d,
+                uncommitted: Some(UncommittedBase::Earliest),
+            };
+            calculate_target_offset(&strategy, cur, 10, 100)
+        };
+        assert_eq!(shift(i64::MAX, 50), Some(100));
+        assert_eq!(shift(i64::MAX, i64::MAX), Some(100));
+        assert_eq!(shift(i64::MAX, -1), Some(100));
+        assert_eq!(shift(i64::MIN, 50), Some(10));
+        assert_eq!(shift(i64::MIN, i64::MAX), Some(10));
+        assert_eq!(shift(i64::MIN, -1), Some(10));
+    }
+
+    fn pos(partition: i32, committed: i64) -> PartitionPosition {
+        PartitionPosition {
+            partition,
+            committed,
+            low_watermark: 10,
+            high_watermark: 100,
+        }
+    }
+
+    #[test]
+    fn a_shift_on_uncommitted_partitions_is_refused() {
+        let err = plan_offset_reset("grp", "events", &ResetStrategy::shift(-5), &[pos(0, -1)])
+            .unwrap_err();
+        match &err {
+            KafkaError::UncommittedShift {
+                group,
+                topic,
+                partitions,
+            } => {
+                assert_eq!((group.as_str(), topic.as_str()), ("grp", "events"));
+                assert_eq!(partitions, &[0]);
+            }
+            other => panic!("expected UncommittedShift, got {other:?}"),
+        }
+        let text = err.to_string();
+        assert!(text.contains("partition(s) 0"), "{text}");
+        assert!(text.contains("--shift-uncommitted-from"), "{text}");
+        assert!(text.contains("No offsets were changed"), "{text}");
+    }
+
+    #[test]
+    fn a_shift_on_some_uncommitted_partitions_refuses_all_of_them() {
+        // Partitions 0 and 2 committed, 1 and 3 not: no plan at all (not a
+        // plan for 0 and 2), naming both uncommitted ones.
+        let positions = [pos(0, 50), pos(1, -1), pos(2, 60), pos(3, -1)];
+        let err =
+            plan_offset_reset("grp", "events", &ResetStrategy::shift(-5), &positions).unwrap_err();
+        assert!(
+            matches!(&err, KafkaError::UncommittedShift { partitions, .. } if partitions == &[1, 3]),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("partition(s) 1, 3"), "{err}");
+    }
+
+    #[test]
+    fn a_shift_with_a_base_plans_uncommitted_partitions_from_it() {
+        let positions = [pos(0, 50), pos(1, -1)];
+        let plan = |base| {
+            let strategy = ResetStrategy::Shift {
+                delta: -5,
+                uncommitted: Some(base),
+            };
+            plan_offset_reset("grp", "events", &strategy, &positions).unwrap()
+        };
+        let earliest = plan(UncommittedBase::Earliest);
+        assert_eq!(earliest[0].target_offset, 45);
+        assert_eq!(earliest[0].delta, -5);
+        // The 0.2 behaviour: from the low watermark (rewinding past it clamps).
+        assert_eq!(earliest[1].target_offset, 10);
+        assert_eq!(earliest[1].current_offset, -1);
+        let latest = plan(UncommittedBase::Latest);
+        assert_eq!(latest[0].target_offset, 45);
+        assert_eq!(latest[1].target_offset, 95);
+        assert_eq!(latest[1].delta, 85, "relative to the low watermark");
+    }
+
+    #[test]
+    fn a_shift_on_committed_partitions_is_unchanged() {
+        let positions = [pos(0, 50), pos(1, 20), pos(2, 100)];
+        let plans =
+            plan_offset_reset("grp", "events", &ResetStrategy::shift(-15), &positions).unwrap();
+        let targets: Vec<(i32, i64, i64)> = plans
+            .iter()
+            .map(|p| (p.partition, p.target_offset, p.delta))
+            .collect();
+        assert_eq!(targets, vec![(0, 35, -15), (1, 10, -10), (2, 85, -15)]);
+        // A base changes nothing where every partition is committed.
+        let with_base = ResetStrategy::Shift {
+            delta: -15,
+            uncommitted: Some(UncommittedBase::Latest),
+        };
+        assert_eq!(
+            plan_offset_reset("grp", "events", &with_base, &positions).unwrap(),
+            plans
+        );
+    }
+
+    #[test]
+    fn other_strategies_still_plan_uncommitted_partitions() {
+        let positions = [pos(0, 50), pos(1, -1)];
+        let plans =
+            plan_offset_reset("grp", "events", &ResetStrategy::Earliest, &positions).unwrap();
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[1].target_offset, 10);
+    }
+
+    #[test]
+    fn reset_strategy_display_names_the_base() {
+        assert_eq!(ResetStrategy::shift(-5).to_string(), "shift -5");
+        let with_base = ResetStrategy::Shift {
+            delta: 5,
+            uncommitted: Some(UncommittedBase::Earliest),
+        };
+        assert_eq!(
+            with_base.to_string(),
+            "shift +5 (uncommitted from earliest)"
+        );
     }
 
     #[test]

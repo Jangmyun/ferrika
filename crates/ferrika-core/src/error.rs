@@ -37,6 +37,20 @@ pub enum KafkaError {
     #[error("Offset manipulation error: {0}")]
     Offset(String),
 
+    /// An offset reset with a shift found partitions on which the group has
+    /// no committed offset to shift from, and the strategy named no base for
+    /// them. The whole reset is refused: no offsets were changed.
+    #[error(
+        "refusing to shift the offsets of group '{group}' on '{topic}': the group has no committed offset on partition(s) {} to shift from. Name where those partitions start (--shift-uncommitted-from earliest|latest in the CLI, \"uncommitted_from\" in the MCP tool), or reset them with another strategy first. No offsets were changed.",
+        .partitions.iter().map(i32::to_string).collect::<Vec<_>>().join(", ")
+    )]
+    UncommittedShift {
+        group: String,
+        topic: String,
+        /// The partitions without a committed offset, in plan order.
+        partitions: Vec<i32>,
+    },
+
     #[error("Consumer lag calculation error: {0}")]
     Lag(String),
 

@@ -5,7 +5,9 @@ Drives the MCP server over stdio JSON-RPC as an AI client would
 (initialize, notifications/initialized, tools/list, tools/call) with write
 tools on and limited to this run's topics: read tools, transform_preview
 (masked records), transform_execute (plan, confirmation token, execute), a
-destination outside --topics, and the audit entries the session leaves.
+destination outside --topics, reset_consumer_group_offsets with a shift over
+a partition the group never committed (refused, then allowed with
+uncommitted_from), and the audit entries the session leaves.
 
 Start a throw-away broker first (KRaft, single node, no auth):
 
@@ -68,6 +70,8 @@ BROKER = ARGS.broker
 HEX = uuid.uuid4().hex[:6]
 RUN = f"{ARGS.prefix}{HEX}-"  # unique per run
 SRC, DST = f"{RUN}src", f"{RUN}dst"
+RESET = f"{RUN}reset"  # 3 partitions; its group commits on 0 and 2 only
+RESET_GROUP = f"{RESET}-g"
 OUTSIDE = f"{ARGS.prefix}x{HEX}-outside"  # exists, but outside --topics
 N = 5
 EMAILS = [f"user{i}-{HEX}@example.com" for i in range(N)]
@@ -321,6 +325,12 @@ def scenarios():
         check(f"create topic {t}", rc == 0, f"rc={rc} {tail(out)}")
     for i, email in enumerate(EMAILS):
         run(["produce", SRC, "-k", f"k{i}", "-m", json.dumps({"id": i, "email": email, "amount": i * 10})])
+    run(["topics", "create", RESET, "-p", "3"])
+    for p in range(3):
+        for i in range(5):
+            run(["produce", RESET, "-p", str(p), "-m", f"v{p}-{i}"])
+    for p in ("0", "2"):
+        run(["offset", "reset", RESET_GROUP, "-t", RESET, "-p", p, "--to-offset", "4", "--execute"])
 
     if ARGS.rabbit_url:
         amqp = ["--amqp-url", ARGS.rabbit_amqp_url] if ARGS.rabbit_amqp_url else []
@@ -385,6 +395,20 @@ def scenarios():
                                                         "mode": "plan"})
         check("produce_messages to a topic outside --topics is refused", err and "outside" in text, tail(text))
 
+        reset = {"group": RESET_GROUP, "topic": RESET, "to": {"shift": -1}}
+        err, data, text = mcp.call("reset_consumer_group_offsets", {**reset, "mode": "plan"})
+        check("reset_consumer_group_offsets refuses a shift over a partition without a commit",
+              err and "uncommitted_partitions" in text and "partition(s) 1 " in text, tail(text))
+        reset["to"] = {"shift": -1, "uncommitted_from": "earliest"}
+        had_token, refused, err, data, text = confirmed(mcp, "reset_consumer_group_offsets", reset)
+        rc, out = run(["-f", "json", "offset", "reset", RESET_GROUP, "-t", RESET, "--to-earliest"])
+        try:
+            now = [p["current_offset"] for p in json.loads(out)["plans"]]
+        except (ValueError, KeyError, TypeError):
+            now = tail(out)
+        check("reset_consumer_group_offsets with uncommitted_from shifts every partition",
+              had_token and refused and not err and now == [3, 0, 3], f"now={now} {tail(text)}")
+
         if ARGS.rabbit_url:
             err, data, text = mcp.call("rabbit_queues", {})
             check("rabbit_queues answers with the active RabbitMQ profile", not err and "queues" in text, tail(text))
@@ -422,6 +446,7 @@ def topic_names():
 
 
 def cleanup():
+    run(["offset", "delete-group", "-y", RESET_GROUP], timeout=60)
     mine = lambda n: n.startswith(RUN) or n == OUTSIDE  # noqa: E731
     names = [n for n in topic_names() if mine(n)]
     for name in names:

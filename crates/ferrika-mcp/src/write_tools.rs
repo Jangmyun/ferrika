@@ -22,7 +22,9 @@ use super::transform_tools::{self, EXECUTE_MAX};
 use super::transport::{Peer, PeerError};
 use super::{ConfirmMode, WriteOptions};
 use ferrika_core::kafka::context::ResolvedContext;
-use ferrika_core::kafka::offset_reset::{check_group_idle, OffsetResetPlan, ResetStrategy};
+use ferrika_core::kafka::offset_reset::{
+    check_group_idle, OffsetResetPlan, ResetStrategy, UncommittedBase,
+};
 use ferrika_core::kafka::producer::OwnedProducerRecord;
 use ferrika_core::model::history::{Reversibility, Scope};
 use ferrika_core::model::policy::McpWriteRule;
@@ -1178,7 +1180,14 @@ impl WriteTools {
             .backend
             .plan_reset(group, topic, partition, strategy)
             .await
-            .map_err(ToolError::kafka)?;
+            .map_err(|e| match e {
+                // The agent can fix the request: name a base or another
+                // strategy. Refused at plan time, nothing changed.
+                ferrika_core::error::KafkaError::UncommittedShift { .. } => {
+                    ToolError::new("uncommitted_partitions", e.to_string())
+                }
+                other => ToolError::kafka(other),
+            })?;
         let state = self
             .backend
             .group_state(group)
@@ -1741,18 +1750,31 @@ pub(super) fn short_sha256(bytes: &[u8]) -> String {
     ferrika_governance::policy::to_hex(&d.as_ref()[..6])
 }
 
-/// `to`: `earliest`, `latest`, `{offset: N}`, `{shift: N}` or
-/// `{timestamp: "RFC 3339"}`.
+/// `to`: `earliest`, `latest`, `{offset: N}`, `{shift: N}` (optionally with
+/// `uncommitted_from: "earliest" | "latest"`) or `{timestamp: "RFC 3339"}`.
 fn reset_strategy(to: Option<&Value>) -> Result<ResetStrategy, ToolError> {
     let bad = || {
         ToolError::invalid(
-            "'to' must be \"earliest\", \"latest\", {\"offset\": N}, {\"shift\": N} or \
-             {\"timestamp\": \"RFC 3339\"}",
+            "'to' must be \"earliest\", \"latest\", {\"offset\": N}, {\"shift\": N} (with \
+             \"uncommitted_from\": \"earliest\" or \"latest\" to shift partitions without a \
+             committed offset) or {\"timestamp\": \"RFC 3339\"}",
         )
     };
     match to {
         Some(Value::String(s)) if s == "earliest" => Ok(ResetStrategy::Earliest),
         Some(Value::String(s)) if s == "latest" => Ok(ResetStrategy::Latest),
+        Some(Value::Object(map)) if map.len() == 2 && map.contains_key("uncommitted_from") => {
+            let delta = map.get("shift").and_then(Value::as_i64).ok_or_else(bad)?;
+            let base = match map.get("uncommitted_from").and_then(Value::as_str) {
+                Some("earliest") => UncommittedBase::Earliest,
+                Some("latest") => UncommittedBase::Latest,
+                _ => return Err(bad()),
+            };
+            Ok(ResetStrategy::Shift {
+                delta,
+                uncommitted: Some(base),
+            })
+        }
         Some(Value::Object(map)) if map.len() == 1 => {
             let (key, value) = map.iter().next().ok_or_else(bad)?;
             match key.as_str() {
@@ -1761,7 +1783,7 @@ fn reset_strategy(to: Option<&Value>) -> Result<ResetStrategy, ToolError> {
                     .filter(|n| *n >= 0)
                     .map(ResetStrategy::Specific)
                     .ok_or_else(bad),
-                "shift" => value.as_i64().map(ResetStrategy::Shift).ok_or_else(bad),
+                "shift" => value.as_i64().map(ResetStrategy::shift).ok_or_else(bad),
                 "timestamp" => value
                     .as_str()
                     .and_then(|t| t.parse::<jiff::Timestamp>().ok())
@@ -2134,7 +2156,7 @@ fn kafka_definitions() -> Vec<Value> {
         json!({
             "name": "reset_consumer_group_offsets",
             "title": "Reset consumer group offsets",
-            "description": "Moves a consumer group's committed offsets on a topic. The plan shows each partition's current and new offset and how many records are re-read or skipped. The group must have no active members.",
+            "description": "Moves a consumer group's committed offsets on a topic. The plan shows each partition's current and new offset and how many records are re-read or skipped. The group must have no active members. A shift is refused when the group has no committed offset on a partition it would move, unless 'uncommitted_from' says where those partitions start.",
             "inputSchema": {
                 "type": "object",
                 "additionalProperties": false,
@@ -2143,11 +2165,11 @@ fn kafka_definitions() -> Vec<Value> {
                     "topic": { "type": "string", "minLength": 1 },
                     "partition": { "type": "integer", "minimum": 0, "description": "Only this partition (default: all)" },
                     "to": {
-                        "description": "earliest | latest | {offset:N} | {shift:N} | {timestamp:\"RFC 3339\"}",
+                        "description": "earliest | latest | {offset:N} | {shift:N, uncommitted_from?: earliest|latest} | {timestamp:\"RFC 3339\"}",
                         "oneOf": [
                             { "enum": ["earliest", "latest"] },
                             { "type": "object", "properties": { "offset": { "type": "integer", "minimum": 0 } }, "required": ["offset"], "additionalProperties": false },
-                            { "type": "object", "properties": { "shift": { "type": "integer" } }, "required": ["shift"], "additionalProperties": false },
+                            { "type": "object", "properties": { "shift": { "type": "integer" }, "uncommitted_from": { "enum": ["earliest", "latest"], "description": "Where to shift partitions without a committed offset from; without it such a shift is refused" } }, "required": ["shift"], "additionalProperties": false },
                             { "type": "object", "properties": { "timestamp": { "type": "string", "format": "date-time" } }, "required": ["timestamp"], "additionalProperties": false }
                         ]
                     }
@@ -2720,7 +2742,11 @@ pub(super) mod tests {
         let (mut tools, cluster, log, _) = tools_with(c, config());
         let journal = temp_journal("active");
         tools.history = Some(journal.clone());
-        let args = json!({ "group": "billing", "topic": "orders", "to": { "shift": -10 } });
+        let args = json!({
+            "group": "billing",
+            "topic": "orders",
+            "to": { "shift": -10, "uncommitted_from": "earliest" }
+        });
         let plan = tools
             .call_token("reset_consumer_group_offsets", &args)
             .await;
@@ -2788,6 +2814,67 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
+    async fn a_shift_over_uncommitted_partitions_is_refused_unless_given_a_base() {
+        // Partition 2 of the fixture has no committed offset.
+        let c = reset_cluster();
+        c.group_states
+            .borrow_mut()
+            .insert("billing".into(), ("Empty".into(), 0));
+        let (mut tools, cluster, _, _) = tools_with(c, config());
+        let refused = json!({ "group": "billing", "topic": "orders", "to": { "shift": -10 } });
+        let plan = tools
+            .call_token("reset_consumer_group_offsets", &refused)
+            .await;
+        assert_eq!(code(&plan), "uncommitted_partitions", "{plan}");
+        let text = plan.to_string();
+        assert!(text.contains("partition(s) 2"), "{text}");
+        assert!(text.contains("uncommitted_from"), "{text}");
+        // Refused at plan time: no token, so it cannot be executed either.
+        let result = tools
+            .call_token(
+                "reset_consumer_group_offsets",
+                &execute(&refused, "not-a-token"),
+            )
+            .await;
+        assert_eq!(code(&result), "uncommitted_partitions", "{result}");
+        assert!(cluster.changes.borrow().is_empty());
+
+        // Only the committed partitions: allowed, as before.
+        let committed_only = json!({
+            "group": "billing", "topic": "orders", "partition": 0, "to": { "shift": -10 }
+        });
+        let plan = tools
+            .call_token("reset_consumer_group_offsets", &committed_only)
+            .await;
+        assert_eq!(
+            plan["structuredContent"]["plan"]["partitions"][0]["new"], 90,
+            "{plan}"
+        );
+
+        // With a base, every partition is planned and committed.
+        let allowed = json!({
+            "group": "billing",
+            "topic": "orders",
+            "to": { "shift": -10, "uncommitted_from": "latest" }
+        });
+        let plan = tools
+            .call_token("reset_consumer_group_offsets", &allowed)
+            .await;
+        let p = &plan["structuredContent"]["plan"];
+        assert_eq!(p["to"], "shift -10 (uncommitted from latest)", "{plan}");
+        assert_eq!(p["partitions"][2]["current"], Value::Null);
+        assert_eq!(p["partitions"][2]["new"], 20);
+        let done = tools
+            .call_token(
+                "reset_consumer_group_offsets",
+                &execute(&allowed, &token(&plan)),
+            )
+            .await;
+        assert_eq!(done["structuredContent"]["executed"], true, "{done}");
+        assert_eq!(cluster.changes.borrow().len(), 3);
+    }
+
+    #[tokio::test]
     async fn a_large_reset_needs_a_person() {
         let small_limit = GuardConfig {
             limits: Limits {
@@ -2823,7 +2910,14 @@ pub(super) mod tests {
         );
         assert_eq!(
             reset_strategy(Some(&json!({ "shift": -5 }))),
-            Ok(ResetStrategy::Shift(-5))
+            Ok(ResetStrategy::shift(-5))
+        );
+        assert_eq!(
+            reset_strategy(Some(&json!({ "shift": -5, "uncommitted_from": "latest" }))),
+            Ok(ResetStrategy::Shift {
+                delta: -5,
+                uncommitted: Some(UncommittedBase::Latest)
+            })
         );
         assert_eq!(
             reset_strategy(Some(&json!({ "timestamp": "2026-11-03T00:00:00Z" }))),
@@ -2833,6 +2927,10 @@ pub(super) mod tests {
             json!("beginning"),
             json!({ "offset": -1 }),
             json!({ "offset": 1, "shift": 2 }),
+            json!({ "uncommitted_from": "earliest" }),
+            json!({ "shift": 1, "uncommitted_from": "zero" }),
+            json!({ "offset": 1, "uncommitted_from": "earliest" }),
+            json!({ "shift": 1, "uncommitted_from": "earliest", "offset": 2 }),
             json!({ "timestamp": "yesterday" }),
             json!(5),
         ] {
