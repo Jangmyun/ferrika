@@ -841,7 +841,7 @@ Filter expressions (`-W`/`--where`, expressions that start with
 | `$.a.b`, `$.items[0]`, `$["odd key"]`, `$` | A field of the JSON value; `$` alone is the whole value |
 | `key`, `partition`, `offset`, `timestamp`, `headers.<name>` | Record fields (timestamp in epoch ms) |
 | `== != > >= < <=` | Compare; a number and a numeric string compare as numbers |
-| `=~ "regex"`, `contains "text"` | Case-insensitive match (`=~` too: `key =~ "^EU-"` matches `eu-1`); `contains` also checks array elements |
+| `=~ "regex"`, `contains "text"` | Case-insensitive match (`=~` too: `key =~ "^EU-"` matches `eu-1`); `contains` also checks array elements. Start a `=~` pattern with `(?-i)` for a case-sensitive match: `$.status =~ "(?-i)ERROR"` matches `ERROR` but not `error` |
 | `exists`, `&&`/`and`, `\|\|`/`or`, `!`/`not`, `( )` | Presence and logic; a bare field is true unless missing, null, false, 0 or "" |
 
 With `-g`, the group's offsets are committed for the records the command
@@ -975,6 +975,10 @@ ferrika mirror orders-v1 orders-v1 --src-profile prod --dst-profile staging -g o
 ferrika mirror orders-v1 orders-v1 --src-profile prod --dst-profile dev -b --mask
 ```
 
+Records are copied with their headers in order, including repeated keys and
+headers with a null value (written as null, not as an empty value; `--mask`
+leaves them null).
+
 ### Stream transform (`ferrika transform`)
 
 Copies records from a topic (on the cluster the global options select) to
@@ -982,7 +986,7 @@ another topic, through steps applied in the order they are given:
 
 | Step | Effect |
 | --- | --- |
-| `--filter EXPR` | Keep records the expression matches (the `consume --where` syntax: `$.user.country == "KR"`, `$.amount > 100`, `key =~ "^order-"`, `headers.source == "web"`, `&&`, `\|\|`, `!`) |
+| `--filter EXPR` | Keep records the expression matches (the `consume --where` syntax: `$.user.country == "KR"`, `$.amount > 100`, `key =~ "^order-"`, `headers.source == "web"`, `&&`, `\|\|`, `!`; `=~` ignores case unless the pattern starts with `(?-i)`) |
 | `--drop FIELD` | Remove a value field (`user.email`, `items.0`) |
 | `--rename OLD=NEW` | Move a value field to another name or path |
 | `--set FIELD=JSON` | Set a value field to a JSON value (`env='"staging"'`, `retries=0`) |
@@ -995,6 +999,10 @@ binary, JSON scalars and arrays) pass through them unchanged and are counted
 as "not JSON"; a `$.` filter on them is false. A value no step changed is
 written byte for byte; a changed one is written as compact JSON. Source
 timestamps and headers are kept; the partition follows the (new) key.
+Headers with a null value are written as null in their original positions:
+`--mask` leaves them null, and `--filter` reads them as missing
+(`headers.trace exists` is false for a null `trace`). The dry run shows
+their value as `null`.
 
 Without `--execute` the command is a dry run: it prints up to 10 transformed
 records (or `-n`) as JSON lines on stdout and writes nothing; the summary
@@ -1069,10 +1077,16 @@ ferrika restore orders-v1 -i ./orders_backup.jsonl --preserve-partitions
 ```
 
 A dump line has `headers` (text) and `headers_base64` objects. Only a record
-that those objects cannot hold exactly (a repeated header key, or a binary
-header before a text one) also gets `header_list`, every header in record
-order, and `restore` prefers it. Records without repeated keys are written as
-before, and files from older versions restore as they always did. `restore`
+that those objects cannot hold exactly (a repeated header key, a binary
+header before a text one, or a header with a null value) also gets
+`header_list`, every header in record order, and `restore` prefers it. A
+null-valued header is a `header_list` entry with only a `key`
+(`{"key":"trace"}`) and is restored as null, not as an empty value.
+
+Each line also has `"format_version": 2`. Lines without it (dumps from
+Ferrika 0.2.0 and earlier, which left null-valued headers out) restore as
+they always did. Ferrika 0.2.0 and earlier read a version 2 dump too: they
+ignore the field and restore null-valued headers as empty values. `restore`
 creates a missing topic only if the broker auto-creates topics.
 
 ### 12. Kafka ACL & Cluster Security Manager (`ferrika acl`)

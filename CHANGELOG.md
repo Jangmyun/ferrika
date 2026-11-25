@@ -169,6 +169,34 @@ Library API:
   `docs/plans/multi-broker.md` is still not added: the CLI gates RabbitMQ
   writes with its RabbitMQ profile and addresses as before.
 
+### Null-valued Kafka headers kept in dump/restore, mirror and transform
+
+Changed:
+
+- `dump` keeps headers with a null value (it left them out) and `restore`
+  writes them back as null. Dump lines now carry `"format_version": 2`; a
+  null-valued header is a `header_list` entry with only a `key`. Dumps
+  without the field restore exactly as before. Ferrika 0.2.0 and earlier
+  ignore the field and restore a version 2 dump with null-valued headers as
+  empty values. `consume --save` is unchanged (it still leaves them out).
+- `mirror` and `transform` copy headers with a null value as null, in their
+  original positions (they left them out). `transform --mask` leaves them
+  null, `--filter` reads them as missing, and the dry run shows them with a
+  `null` value; the MCP transform preview lists their names.
+- Library API (breaking): `ConsumedMessage` and `OwnedProducerRecord` have a
+  new `null_headers` field (position and key of each null-valued header;
+  `headers` still holds only the others). New: `ConsumedMessage::all_headers`,
+  `OwnedProducerRecord::with_null_header`, `kafka::consumer::merge_headers`,
+  `DumpRecord::format_version`, `DumpRecord::extract_all_headers`,
+  `HeaderFields::from_all_headers` and `backup::DUMP_FORMAT_VERSION`.
+
+Documentation:
+
+- The filter expression operator `=~` is case-insensitive; the CLI help, the
+  MCP `peek_messages` description and docs/CLI.md now say so and that a
+  pattern starting with `(?-i)` matches case (`$.status =~ "(?-i)ERROR"`
+  matches `ERROR` but not `error`).
+
 ## 0.2.0
 
 New: connection presets for Kafka-compatible services, `ferrika transform`,

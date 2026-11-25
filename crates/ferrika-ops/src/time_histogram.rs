@@ -1771,6 +1771,7 @@ mod tests {
             payload: Some(b"secret".to_vec()),
             timestamp_ms: Some(5),
             headers: Vec::new(),
+            null_headers: Vec::new(),
         };
         assert!(!keep(&record));
         assert_eq!(bins.lock().unwrap().counts, vec![vec![1]]);
