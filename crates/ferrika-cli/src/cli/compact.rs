@@ -688,6 +688,7 @@ mod tests {
             payload,
             timestamp_ms: Some(1),
             headers: Vec::new(),
+            null_headers: Vec::new(),
         };
         // The phone number sits past the 60-character cut, which must not
         // leave part of it visible either.

@@ -322,6 +322,7 @@ pub fn mirror_record(msg: &ConsumedMessage, dst_topic: &str) -> OwnedProducerRec
         partition: None,
         timestamp: msg.timestamp_ms,
         headers: msg.headers.clone(),
+        null_headers: Vec::new(),
     }
 }
 
@@ -983,6 +984,7 @@ mod tests {
             payload: None,
             timestamp_ms: Some(1_726_900_000_000),
             headers,
+            null_headers: Vec::new(),
         }
     }
 

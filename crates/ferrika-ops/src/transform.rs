@@ -520,6 +520,7 @@ impl Working {
             partition: None,
             timestamp: msg.timestamp_ms,
             headers: self.headers,
+            null_headers: Vec::new(),
         }
     }
 }
@@ -778,6 +779,7 @@ mod tests {
             payload: value.map(<[u8]>::to_vec),
             timestamp_ms: Some(1_700_000_000_000),
             headers: vec![("source".to_string(), b"web".to_vec())],
+            null_headers: Vec::new(),
         }
     }
 

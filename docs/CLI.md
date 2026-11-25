@@ -914,10 +914,16 @@ ferrika restore orders-v1 -i ./orders_backup.jsonl --preserve-partitions
 ```
 
 A dump line has `headers` (text) and `headers_base64` objects. Only a record
-that those objects cannot hold exactly (a repeated header key, or a binary
-header before a text one) also gets `header_list`, every header in record
-order, and `restore` prefers it. Records without repeated keys are written as
-before, and files from older versions restore as they always did. `restore`
+that those objects cannot hold exactly (a repeated header key, a binary
+header before a text one, or a header with a null value) also gets
+`header_list`, every header in record order, and `restore` prefers it. A
+null-valued header is a `header_list` entry with only a `key`
+(`{"key":"trace"}`) and is restored as null, not as an empty value.
+
+Each line also has `"format_version": 2`. Lines without it (dumps from
+Ferrika 0.2.0 and earlier, which left null-valued headers out) restore as
+they always did. Ferrika 0.2.0 and earlier read a version 2 dump too: they
+ignore the field and restore null-valued headers as empty values. `restore`
 creates a missing topic only if the broker auto-creates topics.
 
 ### 12. Kafka ACL & Cluster Security Manager (`ferrika acl`)

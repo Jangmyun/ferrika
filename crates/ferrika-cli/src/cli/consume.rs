@@ -1373,6 +1373,7 @@ mod tests {
             payload: Some(vec![0, 0, 0, 0, 7, 0x0a, 0xff]),
             timestamp_ms: None,
             headers: Vec::new(),
+            null_headers: Vec::new(),
         };
         let decoded = DecodedPayload {
             text: r#"{"name":"alice"}"#.into(),
@@ -1495,6 +1496,7 @@ mod tests {
                 ("trace".to_string(), b"ok".to_vec()),
                 ("bin".to_string(), vec![0xff, 0xfe]),
             ]),
+            null_headers: Vec::new(),
         };
         let masked = msg.masked();
         let payload = String::from_utf8(masked.payload.clone().unwrap()).unwrap();
@@ -1519,6 +1521,7 @@ mod tests {
                 ("customer_name".to_string(), "김민준".as_bytes().to_vec()),
                 ("x-api-key".to_string(), b"abc".to_vec()),
             ]),
+            null_headers: Vec::new(),
         };
         let masked = msg.masked();
         assert_eq!(
@@ -1538,6 +1541,7 @@ mod tests {
             payload: Some(br#"{"rrn":"900101-1234567","note":"kim@example.com"}"#.to_vec()),
             timestamp_ms: None,
             headers: Vec::from([("x-api-key".to_string(), b"abc123".to_vec())]),
+            null_headers: Vec::new(),
         };
         let masked = msg.masked();
         let checks = [
@@ -1579,6 +1583,7 @@ mod tests {
             payload: Some(b"hello world".to_vec()),
             timestamp_ms: Some(1726900000000),
             headers: Vec::new(),
+            null_headers: Vec::new(),
         };
 
         let formatted = format_message_display(&msg, false, false);
@@ -1597,6 +1602,7 @@ mod tests {
             payload: Some(b"{\"name\":\"Alice\",\"age\":30}".to_vec()),
             timestamp_ms: None,
             headers: Vec::new(),
+            null_headers: Vec::new(),
         };
 
         let formatted = format_message_display(&msg, true, false);
@@ -1618,6 +1624,7 @@ mod tests {
                 ("x".to_string(), b"2".to_vec()),
                 ("y".to_string(), b"z".to_vec()),
             ],
+            null_headers: Vec::new(),
         };
         let formatted = format_message_display(&msg, false, true);
         assert!(formatted.contains("x=1, x=2, y=z"), "{formatted}");
@@ -1636,6 +1643,7 @@ mod tests {
                 ("a".to_string(), b"1".to_vec()),
                 ("b".to_string(), vec![0xff]),
             ],
+            null_headers: Vec::new(),
         };
         let plain = jsonl_record(&msg);
         assert!(plain.get("header_list").is_none());
@@ -1663,6 +1671,7 @@ mod tests {
             payload: Some(b"data".to_vec()),
             timestamp_ms: None,
             headers,
+            null_headers: Vec::new(),
         };
 
         let formatted = format_message_display(&msg, false, true);
@@ -1750,6 +1759,7 @@ mod tests {
             payload: Some(wire_payload),
             timestamp_ms: None,
             headers: Vec::new(),
+            null_headers: Vec::new(),
         };
 
         // Without decode_wire_format
@@ -1773,6 +1783,7 @@ mod tests {
             payload: Some(vec![0x00, 0x01, 0x02, 0xfe, 0xff]),
             timestamp_ms: None,
             headers: Vec::new(),
+            null_headers: Vec::new(),
         };
 
         let dump = format_message_display_ext(&msg, false, false, false, true);

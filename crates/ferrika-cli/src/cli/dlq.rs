@@ -1044,6 +1044,7 @@ mod tests {
                 "x-exception-message".to_string(),
                 format!("bad contact {PII}").into_bytes(),
             )]),
+            null_headers: Vec::new(),
         };
         let messages = vec![DlqMessage::from_consumed_message(&msg, "orders-dlq")];
         let as_json = |m: &[DlqMessage]| serde_json::to_string(m).unwrap();
@@ -1074,6 +1075,7 @@ mod tests {
                 "exception-message".to_string(),
                 exception.as_bytes().to_vec(),
             )],
+            null_headers: Vec::new(),
         };
         DlqMessage::from_consumed_message(&consumed, "t-dlq")
     }
@@ -1087,6 +1089,7 @@ mod tests {
             key: None,
             payload: payload.map(<[u8]>::to_vec),
             headers: Vec::new(),
+            null_headers: Vec::new(),
         };
         DlqMessage::from_consumed_message(&consumed, "t-dlq")
     }

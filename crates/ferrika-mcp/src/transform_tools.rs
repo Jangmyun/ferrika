@@ -618,6 +618,7 @@ mod tests {
             payload: Some(value.as_bytes().to_vec()),
             timestamp_ms: Some(1_700_000_000_000),
             headers: vec![("auth_token".to_string(), b"abc123".to_vec())],
+            null_headers: Vec::new(),
         }
     }
 

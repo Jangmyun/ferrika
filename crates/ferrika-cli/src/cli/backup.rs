@@ -732,8 +732,11 @@ fn build_restore_record(
             out_record = out_record.with_timestamp(ts);
         }
     }
-    for (k, v) in record.extract_headers()? {
-        out_record = out_record.with_header(k, v);
+    for (k, v) in record.extract_all_headers()? {
+        out_record = match v {
+            Some(v) => out_record.with_header(k, v),
+            None => out_record.with_null_header(k),
+        };
     }
     Ok(out_record)
 }
