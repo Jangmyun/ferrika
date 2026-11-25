@@ -68,6 +68,13 @@ struct ProfileView {
     read_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    /// TLS file paths (not secret: the key file's path, never its content).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ca_cert: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_cert: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_key: Option<String>,
 }
 
 impl ProfileView {
@@ -84,6 +91,9 @@ impl ProfileView {
                 .unwrap_or_else(|e| format!("(invalid: {e})")),
             read_only: profile.read_only,
             description: profile.description.clone(),
+            ca_cert: profile.ca_cert.clone(),
+            client_cert: profile.client_cert.clone(),
+            client_key: profile.client_key.clone(),
         }
     }
 }
@@ -232,6 +242,12 @@ pub fn run(
                 println!("  AMQP URL:       {}", v.amqp_url);
                 println!("  read-only:      {}", v.read_only);
                 println!("  active:         {}", v.active);
+                if let Some(ca) = &v.ca_cert {
+                    println!("  CA file:        {ca}");
+                }
+                if let (Some(cert), Some(key)) = (&v.client_cert, &v.client_key) {
+                    println!("  client cert:    {cert} (key {key})");
+                }
                 if let Some(d) = &v.description {
                     println!("  description:    {d}");
                 }
@@ -293,7 +309,24 @@ fn profile_from(
             .map(str::to_string),
         read_only: add.read_only,
         description: add.description.clone(),
+        ca_cert: tls_file(connection.ca_cert.as_deref(), "--rabbit-ca-cert")?,
+        client_cert: tls_file(connection.client_cert.as_deref(), "--rabbit-client-cert")?,
+        client_key: tls_file(connection.client_key.as_deref(), "--rabbit-client-key")?,
     })
+}
+
+/// A TLS file for a profile: it must exist, and is stored as an absolute
+/// path so the profile works from any directory.
+fn tls_file(path: Option<&str>, option: &str) -> anyhow::Result<Option<String>> {
+    let Some(path) = path.map(str::trim).filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    let absolute =
+        std::path::absolute(path).map_err(|e| anyhow::anyhow!("{option} '{path}': {e}"))?;
+    if !absolute.is_file() {
+        anyhow::bail!("{option}: no such file '{}'", absolute.display());
+    }
+    Ok(Some(absolute.display().to_string()))
 }
 
 /// `rabbit profile use|remove -f json`: the profile and what was done
@@ -333,7 +366,32 @@ mod tests {
             password: None,
             password_stdin: false,
             amqp_url: Some(" amqps://amqp.prod ".to_string()),
+            ca_cert: None,
+            client_cert: None,
+            client_key: None,
         }
+    }
+
+    #[test]
+    fn add_stores_tls_files_as_absolute_paths_and_checks_they_exist() {
+        let dir = std::env::temp_dir().join(format!("ferrika-rabbit-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = dir.join("ca.pem");
+        std::fs::write(&ca, "pem").unwrap();
+        let mut with_ca = connection(Some("https://rabbit.prod"), None);
+        with_ca.ca_cert = Some(ca.display().to_string());
+        let profile =
+            profile_from(&add("prod"), &with_ca, None, &RabbitProfileStore::default()).unwrap();
+        let stored = profile.ca_cert.unwrap();
+        assert!(std::path::Path::new(&stored).is_absolute(), "{stored}");
+        assert!(stored.ends_with("ca.pem"), "{stored}");
+
+        with_ca.ca_cert = Some(dir.join("missing.pem").display().to_string());
+        let err = profile_from(&add("prod"), &with_ca, None, &RabbitProfileStore::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--rabbit-ca-cert: no such file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

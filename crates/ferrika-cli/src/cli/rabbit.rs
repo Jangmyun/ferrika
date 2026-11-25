@@ -21,6 +21,8 @@ use crate::cli::{output, GlobalOpts, OutputFormat};
 use crate::rabbitmq::amqp::RedriveRequest;
 pub use crate::rabbitmq::connection::ResolvedRabbit;
 use crate::rabbitmq::connection::{CredentialsError, RabbitOverrides, ResolveError};
+use crate::rabbitmq::delivery_limit::{DeliveryFate, PeekRisk};
+use crate::rabbitmq::listing::{ListQuery, Listing};
 use crate::rabbitmq::model::{exchange_name, OutgoingMessage, MAX_PEEK};
 use crate::rabbitmq::profile::RabbitProfileStore;
 use crate::rabbitmq::view::{
@@ -53,7 +55,7 @@ pub struct RabbitArgs {
     /// The connection the options and the RabbitMQ profile name, filled in
     /// by `main` before the policy gates run (see [`resolve`]).
     #[arg(skip)]
-    pub resolved: Option<ResolvedRabbit>,
+    pub resolved: Option<Box<ResolvedRabbit>>,
 }
 
 /// Which RabbitMQ to talk to: a profile, overridden by the options.
@@ -106,6 +108,32 @@ pub struct RabbitConnection {
         value_name = "URL"
     )]
     pub amqp_url: Option<String>,
+    /// CA file (PEM) for https:// and amqps:// when the broker's certificate
+    /// is signed by a private CA (default: the profile's, else the OS trust
+    /// store). The server's certificate is always verified
+    #[arg(
+        long = "rabbit-ca-cert",
+        env = "FERRIKA_RABBIT_CA_CERT",
+        global = true,
+        value_name = "FILE"
+    )]
+    pub ca_cert: Option<String>,
+    /// Client certificate (PEM) for mutual TLS, with --rabbit-client-key
+    #[arg(
+        long = "rabbit-client-cert",
+        env = "FERRIKA_RABBIT_CLIENT_CERT",
+        global = true,
+        value_name = "FILE"
+    )]
+    pub client_cert: Option<String>,
+    /// The client certificate's key (PEM, not encrypted)
+    #[arg(
+        long = "rabbit-client-key",
+        env = "FERRIKA_RABBIT_CLIENT_KEY",
+        global = true,
+        value_name = "FILE"
+    )]
+    pub client_key: Option<String>,
 }
 
 // Manual so the password never reaches debug output.
@@ -128,6 +156,9 @@ impl std::fmt::Debug for RabbitConnection {
                     .as_deref()
                     .map(crate::model::format::redact_url),
             )
+            .field("ca_cert", &self.ca_cert)
+            .field("client_cert", &self.client_cert)
+            .field("client_key", &self.client_key)
             .finish()
     }
 }
@@ -150,6 +181,9 @@ impl RabbitConnection {
             vhost: self.vhost.as_deref(),
             user: self.user.as_deref(),
             amqp_url: self.amqp_url.as_deref(),
+            ca_cert: self.ca_cert.as_deref(),
+            client_cert: self.client_cert.as_deref(),
+            client_key: self.client_key.as_deref(),
         }
     }
 }
@@ -183,7 +217,7 @@ pub fn resolve(args: &mut RabbitArgs) -> Result<(), String> {
     let resolved = resolve_with(&args.connection, || {
         RabbitProfileStore::load().map_err(|e| e.to_string())
     })?;
-    args.resolved = Some(resolved);
+    args.resolved = Some(Box::new(resolved));
     Ok(())
 }
 
@@ -191,9 +225,9 @@ pub fn resolve(args: &mut RabbitArgs) -> Result<(), String> {
 fn needs_connection(command: &RabbitSubcommands) -> bool {
     match command {
         RabbitSubcommands::Profile(_) => false,
-        RabbitSubcommands::Queues
-        | RabbitSubcommands::Exchanges
-        | RabbitSubcommands::Bindings
+        RabbitSubcommands::Queues(_)
+        | RabbitSubcommands::Exchanges(_)
+        | RabbitSubcommands::Bindings(_)
         | RabbitSubcommands::Peek { .. }
         | RabbitSubcommands::Publish { .. }
         | RabbitSubcommands::Dlq(_) => true,
@@ -240,7 +274,7 @@ pub fn gate_profile(args: &RabbitArgs) -> String {
 
 /// Refuses `action` on a RabbitMQ profile marked read-only.
 pub fn ensure_writable(args: &RabbitArgs, action: &str) -> Result<(), String> {
-    match &args.resolved {
+    match args.resolved.as_deref() {
         Some(ResolvedRabbit {
             read_only: true,
             profile: Some(name),
@@ -255,12 +289,14 @@ pub fn ensure_writable(args: &RabbitArgs, action: &str) -> Result<(), String> {
 
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum RabbitSubcommands {
-    /// List the queues of the vhost with message counts and dead-letter exchange
-    Queues,
-    /// List the exchanges of the vhost
-    Exchanges,
-    /// List the bindings of the vhost
-    Bindings,
+    /// List the queues of the vhost with message counts and dead-letter
+    /// exchange (fetched in pages, up to --limit)
+    Queues(RabbitListArgs),
+    /// List the exchanges of the vhost (fetched in pages, up to --limit)
+    Exchanges(RabbitListArgs),
+    /// List the bindings of the vhost (--name matches the source or the
+    /// destination)
+    Bindings(RabbitListArgs),
     /// Show messages at the head of a queue. They are taken and requeued,
     /// so the broker marks them redelivered: a write under the company
     /// policy (category messages.peek)
@@ -273,6 +309,11 @@ pub enum RabbitSubcommands {
         /// enforces masking)
         #[arg(long = "mask-pii")]
         mask_pii: bool,
+        /// Peek a quorum queue even when the broker counts each peek
+        /// towards its delivery limit (RabbitMQ before 4.0), which can
+        /// dead-letter or drop messages; shows each message's remaining peeks
+        #[arg(long)]
+        allow_delivery_count: bool,
     },
     /// Publish one message to an exchange (amq.default is the default exchange)
     Publish {
@@ -300,6 +341,32 @@ pub enum RabbitSubcommands {
     Profile(crate::cli::rabbit_profile::RabbitProfileArgs),
 }
 
+/// Which entries `rabbit queues | exchanges | bindings` list.
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct RabbitListArgs {
+    /// Only names containing this text (case-insensitive), filtered by the
+    /// broker; with --regex a regular expression
+    #[arg(long, value_name = "PATTERN")]
+    pub name: Option<String>,
+    /// Treat --name as a regular expression
+    #[arg(long, requires = "name")]
+    pub regex: bool,
+    /// The most entries to list, fetched in pages of up to 500; 0 lists
+    /// all. Stderr says when more match
+    #[arg(long, default_value_t = crate::rabbitmq::listing::DEFAULT_LIST_LIMIT)]
+    pub limit: usize,
+}
+
+impl RabbitListArgs {
+    fn query(&self) -> ListQuery {
+        ListQuery {
+            name: self.name.clone(),
+            regex: self.regex,
+            limit: self.limit,
+        }
+    }
+}
+
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
 pub struct RabbitDlqArgs {
     #[command(subcommand)]
@@ -319,6 +386,10 @@ pub enum RabbitDlqSubcommands {
         /// enforces masking)
         #[arg(long = "mask-pii")]
         mask_pii: bool,
+        /// Read a quorum queue even when each read counts towards its
+        /// delivery limit (RabbitMQ before 4.0); see `rabbit peek --help`
+        #[arg(long)]
+        allow_delivery_count: bool,
     },
     /// Move dead-lettered messages back to their original exchange and
     /// routing key (from x-death). A preview unless --execute. Redriven
@@ -343,6 +414,10 @@ pub enum RabbitDlqSubcommands {
         /// Do not ask for confirmation
         #[arg(short = 'y', long, requires = "execute")]
         yes: bool,
+        /// Preview a quorum queue even when each read counts towards its
+        /// delivery limit (RabbitMQ before 4.0); see `rabbit peek --help`
+        #[arg(long)]
+        allow_delivery_count: bool,
     },
 }
 
@@ -361,9 +436,9 @@ pub fn write_action(args: &RabbitArgs) -> Option<&'static str> {
             }
             RabbitDlqSubcommands::Redrive { execute: false, .. } => Some("rabbit dlq redrive"),
         },
-        RabbitSubcommands::Queues | RabbitSubcommands::Exchanges | RabbitSubcommands::Bindings => {
-            None
-        }
+        RabbitSubcommands::Queues(_)
+        | RabbitSubcommands::Exchanges(_)
+        | RabbitSubcommands::Bindings(_) => None,
         // Local configuration only.
         RabbitSubcommands::Profile(profile) => match &profile.command {
             P::Add(_) | P::List | P::Use { .. } | P::Remove { .. } | P::Show { .. } => None,
@@ -414,9 +489,9 @@ pub fn write_target(args: &RabbitArgs) -> String {
                 redrive_target(to_exchange.as_deref(), routing_key.as_deref())
             ),
         },
-        RabbitSubcommands::Queues | RabbitSubcommands::Exchanges | RabbitSubcommands::Bindings => {
-            String::new()
-        }
+        RabbitSubcommands::Queues(_)
+        | RabbitSubcommands::Exchanges(_)
+        | RabbitSubcommands::Bindings(_) => String::new(),
         RabbitSubcommands::Profile(profile) => match &profile.command {
             P::Add(_) | P::List | P::Use { .. } | P::Remove { .. } | P::Show { .. } => {
                 String::new()
@@ -455,9 +530,9 @@ pub(crate) fn export(args: &RabbitArgs) -> Option<(&'static str, String)> {
             // Origins and destinations only, no bodies.
             RabbitDlqSubcommands::Redrive { .. } => None,
         },
-        RabbitSubcommands::Queues
-        | RabbitSubcommands::Exchanges
-        | RabbitSubcommands::Bindings
+        RabbitSubcommands::Queues(_)
+        | RabbitSubcommands::Exchanges(_)
+        | RabbitSubcommands::Bindings(_)
         | RabbitSubcommands::Publish { .. } => None,
         RabbitSubcommands::Profile(profile) => match &profile.command {
             P::Add(_) | P::List | P::Use { .. } | P::Remove { .. } | P::Show { .. } => None,
@@ -487,9 +562,10 @@ pub(crate) async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result
         .map_err(anyhow::Error::msg)?;
     let vhost = resolved.vhost.as_str();
     match &args.command {
-        RabbitSubcommands::Queues => {
-            let queues = client.queues(vhost).await?;
-            output::emit(json, &queues, |queues| {
+        RabbitSubcommands::Queues(list) => {
+            let listing = client.list_queues(vhost, &list.query()).await?;
+            note_truncated(&listing, "queue", list);
+            output::emit(json, &listing.items, |queues| {
                 let mut table = output::table(vec![
                     "NAME",
                     "TYPE",
@@ -518,9 +594,10 @@ pub(crate) async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result
                 println!("{table}");
             })?;
         }
-        RabbitSubcommands::Exchanges => {
-            let exchanges = client.exchanges(vhost).await?;
-            output::emit(json, &exchanges, |exchanges| {
+        RabbitSubcommands::Exchanges(list) => {
+            let listing = client.list_exchanges(vhost, &list.query()).await?;
+            note_truncated(&listing, "exchange", list);
+            output::emit(json, &listing.items, |exchanges| {
                 let mut table =
                     output::table(vec!["NAME", "TYPE", "DURABLE", "AUTO-DELETE", "INTERNAL"]);
                 for e in exchanges {
@@ -535,9 +612,10 @@ pub(crate) async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result
                 println!("{table}");
             })?;
         }
-        RabbitSubcommands::Bindings => {
-            let bindings = client.bindings(vhost).await?;
-            output::emit(json, &bindings, |bindings| {
+        RabbitSubcommands::Bindings(list) => {
+            let listing = client.list_bindings(vhost, &list.query()).await?;
+            note_truncated(&listing, "binding", list);
+            output::emit(json, &listing.items, |bindings| {
                 let mut table = output::table(vec!["SOURCE", "DESTINATION", "TYPE", "ROUTING KEY"]);
                 for b in bindings {
                     table.add_row(vec![
@@ -554,11 +632,14 @@ pub(crate) async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result
             queue,
             count,
             mask_pii,
+            allow_delivery_count,
         } => {
             let policy = crate::governance::policy::current();
             let mask = *mask_pii || policy.masking_enforced();
             crate::cli::note_masking(policy);
+            let risk = check_delivery_limit(&client, vhost, queue, *allow_delivery_count).await?;
             let messages = client.peek(vhost, queue, *count).await?;
+            note_delivery_fates(&risk, &messages);
             let shown: Vec<ShownMessage> = messages
                 .iter()
                 .map(|m| ShownMessage::new(m, mask))
@@ -583,7 +664,7 @@ pub(crate) async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result
                 }
                 println!("{table}");
             })?;
-            note_requeued(shown.len(), queue);
+            note_requeued(shown.len(), queue, &risk);
         }
         RabbitSubcommands::Publish {
             exchange,
@@ -629,15 +710,19 @@ pub(crate) async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result
                 queue,
                 count,
                 mask_pii,
+                allow_delivery_count,
             } => {
                 let policy = crate::governance::policy::current();
                 let mask = *mask_pii || policy.masking_enforced();
                 crate::cli::note_masking(policy);
+                let risk =
+                    check_delivery_limit(&client, vhost, queue, *allow_delivery_count).await?;
                 let messages = client.peek(vhost, queue, *count).await?;
+                note_delivery_fates(&risk, &messages);
                 let inspection = Inspection::new(&messages, mask);
                 crate::cli::export_finished(inspection.messages.len() as u64);
                 output::emit(json, &inspection, print_inspection)?;
-                note_requeued(inspection.messages.len(), queue);
+                note_requeued(inspection.messages.len(), queue, &risk);
             }
             RabbitDlqSubcommands::Redrive {
                 queue,
@@ -645,10 +730,14 @@ pub(crate) async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result
                 routing_key,
                 count,
                 execute: false,
+                allow_delivery_count,
                 ..
             } => {
                 let preview_count = u32::try_from(*count).unwrap_or(MAX_PEEK).min(MAX_PEEK);
+                let risk =
+                    check_delivery_limit(&client, vhost, queue, *allow_delivery_count).await?;
                 let messages = client.peek(vhost, queue, preview_count.max(1)).await?;
+                note_delivery_fates(&risk, &messages);
                 let preview = RedrivePreview::new(
                     queue,
                     vhost,
@@ -658,7 +747,7 @@ pub(crate) async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result
                 )
                 .with_unmovable_problem("no x-death header; pass --to-exchange");
                 output::emit(json, &preview, print_preview)?;
-                note_requeued(messages.len(), queue);
+                note_requeued(messages.len(), queue, &risk);
                 if !json {
                     println!(
                         "{}",
@@ -684,6 +773,7 @@ pub(crate) async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result
                 count,
                 execute: true,
                 yes,
+                ..
             } => {
                 let target = resolved
                     .amqp_target(credentials.as_ref(), timeout)
@@ -729,18 +819,114 @@ pub(crate) async fn run(args: RabbitArgs, global: &GlobalOpts) -> anyhow::Result
     Ok(())
 }
 
-/// Says on stderr that peeked messages went back marked redelivered.
-fn note_requeued(count: usize, queue: &str) {
-    if count > 0 {
-        eprintln!(
-            "{}",
-            format!(
-                "Read {count} message(s) from '{queue}'; they were requeued and are now marked \
-                 redelivered (on a quorum queue this can count towards its delivery limit)."
-            )
-            .bright_black()
-        );
+/// Says on stderr that peeked messages went back marked redelivered, and
+/// whether that counted towards a quorum queue's delivery limit.
+fn note_requeued(count: usize, queue: &str, risk: &PeekRisk) {
+    if count == 0 {
+        return;
     }
+    let quorum = if risk.peeks_count() {
+        "; each read counted towards the queue's delivery limit"
+    } else if risk.queue_type == "quorum" {
+        " (on this quorum queue a peek does not count towards a delivery limit: it has none, or \
+         the broker is RabbitMQ 4.0 or later)"
+    } else {
+        ""
+    };
+    eprintln!(
+        "{}",
+        format!(
+            "Read {count} message(s) from '{queue}'; they were requeued and are now marked \
+             redelivered{quorum}."
+        )
+        .bright_black()
+    );
+}
+
+/// Says on stderr when more entries match than were listed.
+fn note_truncated<T>(listing: &Listing<T>, what: &str, list: &RabbitListArgs) {
+    if let Some(note) = truncation_note(listing, what, list) {
+        eprintln!("{}", note.yellow());
+    }
+}
+
+fn truncation_note<T>(listing: &Listing<T>, what: &str, list: &RabbitListArgs) -> Option<String> {
+    if !listing.truncated() {
+        return None;
+    }
+    let narrow = if list.name.is_some() {
+        "narrow --name"
+    } else {
+        "filter with --name"
+    };
+    Some(format!(
+        "Showing {} of {} matching {what}(s) ({} in the vhost); raise --limit (0 for all) or \
+         {narrow}.",
+        listing.items.len(),
+        listing.matched,
+        listing.total
+    ))
+}
+
+/// Checks whether peeking `queue` can push messages over a quorum queue's
+/// delivery limit: refuses unless `allowed`, else warns.
+async fn check_delivery_limit(
+    client: &crate::rabbitmq::client::ManagementClient,
+    vhost: &str,
+    queue: &str,
+    allowed: bool,
+) -> anyhow::Result<PeekRisk> {
+    let risk = client.peek_risk(vhost, queue).await?;
+    delivery_limit_gate(&risk, allowed)?;
+    Ok(risk)
+}
+
+/// The refusal or warning for `risk` (see [`check_delivery_limit`]).
+fn delivery_limit_gate(risk: &PeekRisk, allowed: bool) -> anyhow::Result<()> {
+    if !allowed {
+        if let Some(refusal) = risk.refusal("--allow-delivery-count") {
+            anyhow::bail!(refusal);
+        }
+    } else if let Some(warning) = risk.warning() {
+        eprintln!("{}", format!("Warning: {warning}").yellow());
+    }
+    Ok(())
+}
+
+/// Says on stderr, per message, how many more peeks it survives, or that
+/// this peek took it over the delivery limit. Only when peeks count.
+fn note_delivery_fates(risk: &PeekRisk, messages: &[crate::rabbitmq::model::PeekedMessage]) {
+    for line in delivery_fate_lines(risk, messages) {
+        eprintln!("{}", line.yellow());
+    }
+}
+
+fn delivery_fate_lines(
+    risk: &PeekRisk,
+    messages: &[crate::rabbitmq::model::PeekedMessage],
+) -> Vec<String> {
+    let over_limit = if risk.dead_letter_exchange {
+        "went over the delivery limit with this peek and was dead-lettered"
+    } else {
+        "went over the delivery limit with this peek and was dropped"
+    };
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, message)| {
+            Some(match risk.fate(message)? {
+                DeliveryFate::OverLimit => format!("  message #{}: {over_limit}", i + 1),
+                DeliveryFate::Kept(0) => format!(
+                    "  message #{}: the next peek takes it over the delivery limit",
+                    i + 1
+                ),
+                DeliveryFate::Kept(left) => format!(
+                    "  message #{}: {left} more peek(s) leave it in the queue",
+                    i + 1
+                ),
+            })
+        })
+        .collect()
 }
 
 fn print_redrive(
@@ -881,6 +1067,9 @@ mod tests {
             password: None,
             password_stdin: false,
             amqp_url: None,
+            ca_cert: None,
+            client_cert: None,
+            client_key: None,
         }
     }
 
@@ -1114,7 +1303,7 @@ mod tests {
     #[test]
     fn a_read_only_profile_refuses_writes() {
         let mut args = parse(&["publish", "x", "-m", "y"]);
-        args.resolved = Some(
+        args.resolved = Some(Box::new(
             resolve_with(
                 &RabbitConnection {
                     profile: Some("prod".to_string()),
@@ -1123,7 +1312,7 @@ mod tests {
                 || Ok(store()),
             )
             .unwrap(),
-        );
+        ));
         assert_eq!(gate_profile(&args), "prod");
         assert_eq!(
             gate_address(&args).unwrap(),
@@ -1131,7 +1320,7 @@ mod tests {
         );
         let err = ensure_writable(&args, "rabbit publish").unwrap_err();
         assert!(err.contains("read-only"), "{err}");
-        args.resolved = Some(
+        args.resolved = Some(Box::new(
             resolve_with(
                 &RabbitConnection {
                     profile: Some("dev".to_string()),
@@ -1140,7 +1329,7 @@ mod tests {
                 || Ok(store()),
             )
             .unwrap(),
-        );
+        ));
         assert!(ensure_writable(&args, "rabbit publish").is_ok());
         args.resolved = None;
         assert!(gate_address(&args).is_err());
@@ -1211,5 +1400,125 @@ mod tests {
         .unwrap();
         let debug = format!("{resolved:?}");
         assert!(!debug.contains("stored-pw"), "{debug}");
+    }
+
+    #[test]
+    fn listings_take_a_name_filter_and_a_limit() {
+        let plain = parse(&["queues"]);
+        let RabbitSubcommands::Queues(list) = &plain.command else {
+            panic!("{plain:?}");
+        };
+        assert_eq!(list.query(), ListQuery::default());
+
+        let filtered = parse(&["exchanges", "--name", "^orders", "--regex", "--limit", "0"]);
+        let RabbitSubcommands::Exchanges(list) = &filtered.command else {
+            panic!("{filtered:?}");
+        };
+        assert_eq!(
+            list.query(),
+            ListQuery {
+                name: Some("^orders".to_string()),
+                regex: true,
+                limit: 0,
+            }
+        );
+        let bindings = parse(&["bindings", "--name", "dlq"]);
+        assert!(matches!(bindings.command, RabbitSubcommands::Bindings(_)));
+        // --regex without --name is refused.
+        assert!(Wrapper::try_parse_from(["rabbit", "queues", "--regex"]).is_err());
+    }
+
+    #[test]
+    fn a_cut_listing_says_so() {
+        let list = RabbitListArgs {
+            name: None,
+            regex: false,
+            limit: 2,
+        };
+        let cut = Listing {
+            items: vec![1, 2],
+            matched: 1200,
+            total: 1300,
+        };
+        let note = truncation_note(&cut, "queue", &list).unwrap();
+        assert_eq!(
+            note,
+            "Showing 2 of 1200 matching queue(s) (1300 in the vhost); raise --limit (0 for all) \
+             or filter with --name."
+        );
+        let whole = Listing {
+            items: vec![1, 2],
+            matched: 2,
+            total: 1300,
+        };
+        assert_eq!(truncation_note(&whole, "queue", &list), None);
+    }
+
+    fn quorum_risk(version: &str) -> PeekRisk {
+        PeekRisk::from_queue(
+            &serde_json::json!({
+                "name": "orders", "vhost": "/", "type": "quorum",
+                "arguments": { "x-delivery-limit": 2, "x-dead-letter-exchange": "dlx" },
+            }),
+            Some(version.to_string()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn peeks_that_count_towards_the_delivery_limit_need_the_flag() {
+        let old = quorum_risk("3.13.7");
+        let refused = delivery_limit_gate(&old, false).unwrap_err().to_string();
+        assert!(refused.contains("--allow-delivery-count"), "{refused}");
+        assert!(refused.contains("dead-lettered"), "{refused}");
+        assert!(delivery_limit_gate(&old, true).is_ok());
+        assert!(delivery_limit_gate(&quorum_risk("4.4.1"), false).is_ok());
+
+        let peeked = |count: Option<u64>| -> crate::rabbitmq::model::PeekedMessage {
+            let properties = match count {
+                Some(n) => serde_json::json!({ "headers": { "x-delivery-count": n } }),
+                None => serde_json::json!([]),
+            };
+            serde_json::from_value(serde_json::json!({ "payload": "m", "properties": properties }))
+                .unwrap()
+        };
+        let lines = delivery_fate_lines(&old, &[peeked(None), peeked(Some(2)), peeked(Some(1))]);
+        assert_eq!(
+            lines,
+            vec![
+                "  message #1: 1 more peek(s) leave it in the queue".to_string(),
+                "  message #2: went over the delivery limit with this peek and was dead-lettered"
+                    .to_string(),
+                "  message #3: the next peek takes it over the delivery limit".to_string(),
+            ]
+        );
+        assert!(delivery_fate_lines(&quorum_risk("4.4.1"), &[peeked(Some(5))]).is_empty());
+        let parsed = parse(&["peek", "orders", "--allow-delivery-count"]);
+        assert!(matches!(
+            parsed.command,
+            RabbitSubcommands::Peek {
+                allow_delivery_count: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tls_options_reach_the_connection() {
+        let parsed = parse(&[
+            "--rabbit-url",
+            "https://rabbit:15671",
+            "--rabbit-ca-cert",
+            "ca.pem",
+            "--rabbit-client-cert",
+            "me.pem",
+            "--rabbit-client-key",
+            "me.key",
+            "queues",
+        ]);
+        let resolved = resolve_with(&parsed.connection, || unreachable!()).unwrap();
+        assert_eq!(resolved.tls.ca_file.as_deref(), Some("ca.pem"));
+        assert_eq!(resolved.tls.client_cert.as_deref(), Some("me.pem"));
+        assert_eq!(resolved.tls.client_key.as_deref(), Some("me.key"));
     }
 }
