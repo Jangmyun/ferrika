@@ -375,18 +375,16 @@ pub fn broker_tls_config(
     build_tls_config(config.ssl_ca_location.as_deref(), client)
 }
 
-/// TLS for a REST client (the ksqlDB client, for one): the CA certificates
-/// in `ca_file` (PEM) or, without one, the OS trust store; and with `client`
-/// (certificate and unencrypted key, both PEM paths) a client certificate
-/// for mutual TLS. Without either it is the shared OS-trust-store config.
-pub fn rest_tls_config(
-    ca_file: Option<&str>,
-    client: Option<(&str, &str)>,
-) -> KafkaResult<Arc<rustls::ClientConfig>> {
-    match (ca_file, client) {
-        (None, None) => tls_config(),
-        _ => build_tls_config(ca_file, client),
+/// TLS for a REST client with its own transport (the ksqlDB client, for
+/// one), from the same [`TlsFiles`] as [`Endpoint::with_tls_files`]: the CA
+/// file (PEM) or, without one, the OS trust store, and the client
+/// certificate and unencrypted key for mutual TLS. Empty `files` give the
+/// shared OS-trust-store config.
+pub fn rest_tls_config(files: &TlsFiles) -> KafkaResult<Arc<rustls::ClientConfig>> {
+    if files.is_empty() {
+        return tls_config();
     }
+    build_tls_config(files.ca_file.as_deref(), files.client_pair()?)
 }
 
 fn build_tls_config(
@@ -596,11 +594,26 @@ mod tests {
 
     #[test]
     fn rest_tls_config_reports_missing_files() {
-        let err = rest_tls_config(Some("/no/such/ca.pem"), None).unwrap_err();
+        let ca = TlsFiles {
+            ca_file: Some("/no/such/ca.pem".into()),
+            ..TlsFiles::default()
+        };
+        let err = rest_tls_config(&ca).unwrap_err();
         assert!(err.to_string().contains("cannot read CA file"), "{err}");
         // The PEM files are checked when given, even with the OS trust store.
-        let err = rest_tls_config(None, Some(("/no/such/c.pem", "/no/such/k.pem"))).unwrap_err();
+        let client = TlsFiles {
+            client_cert: Some("/no/such/c.pem".into()),
+            client_key: Some("/no/such/k.pem".into()),
+            ..TlsFiles::default()
+        };
+        let err = rest_tls_config(&client).unwrap_err();
         assert!(err.to_string().contains("cannot read certificate"), "{err}");
+        // Half a client certificate is refused before any file is read.
+        let half = TlsFiles {
+            client_cert: Some("/no/such/c.pem".into()),
+            ..TlsFiles::default()
+        };
+        assert!(rest_tls_config(&half).is_err());
     }
 
     #[test]

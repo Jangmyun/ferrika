@@ -66,9 +66,10 @@ impl Transport {
     pub(crate) fn new(config: &KsqlConfig) -> KsqlResult<Self> {
         let endpoint = config.endpoint()?;
         let tls = if endpoint.tls {
-            let client = config.client_certificate()?;
+            // Checked here for the ksqlDB wording of a half-set pair.
+            config.client_certificate()?;
             Some(
-                ferrika_core::kafka::http::rest_tls_config(config.ca_location.as_deref(), client)
+                ferrika_core::kafka::http::rest_tls_config(&config.tls_files())
                     .map_err(|e| KsqlError::config(e.to_string()))?,
             )
         } else {

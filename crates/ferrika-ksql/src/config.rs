@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use ferrika_core::kafka::http::Endpoint;
+use ferrika_core::kafka::http::{Endpoint, TlsFiles};
 use ferrika_core::kafka::profile::{split_url_credentials, ClusterProfile};
 
 use crate::error::{KsqlError, KsqlResult};
@@ -130,6 +130,16 @@ impl KsqlConfig {
         }
     }
 
+    /// The CA, client certificate and key paths as Ferrika's shared TLS
+    /// settings for HTTP clients.
+    pub fn tls_files(&self) -> TlsFiles {
+        TlsFiles {
+            ca_file: self.ca_location.clone(),
+            client_cert: self.certificate_location.clone(),
+            client_key: self.key_location.clone(),
+        }
+    }
+
     /// The client certificate and key paths, when mutual TLS is configured.
     pub(crate) fn client_certificate(&self) -> KsqlResult<Option<(&str, &str)>> {
         match (&self.certificate_location, &self.key_location) {
@@ -177,6 +187,18 @@ mod tests {
         assert!(c.client_certificate().is_err());
         c.key_location = Some("k.pem".into());
         assert_eq!(c.client_certificate().unwrap(), Some(("c.pem", "k.pem")));
+    }
+
+    #[test]
+    fn tls_files_carry_the_three_paths() {
+        let mut c = KsqlConfig::new("https://k:8088");
+        assert!(c.tls_files().is_empty());
+        c.ca_location = Some("ca.pem".into());
+        c.certificate_location = Some("c.pem".into());
+        c.key_location = Some("k.pem".into());
+        let files = c.tls_files();
+        assert_eq!(files.ca_file.as_deref(), Some("ca.pem"));
+        assert_eq!(files.client_pair().unwrap(), Some(("c.pem", "k.pem")));
     }
 
     #[test]
