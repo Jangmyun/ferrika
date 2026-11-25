@@ -8,6 +8,7 @@ use tokio::task::{JoinError, JoinSet};
 
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::config::KafkaClientConfig;
+use crate::kafka::consumer::merge_headers;
 use crate::kafka::detached::DetachedDrop;
 
 /// Record to be sent to a Kafka topic.
@@ -20,6 +21,10 @@ pub struct OwnedProducerRecord {
     pub timestamp: Option<i64>,
     /// Headers in send order; a key may repeat.
     pub headers: Vec<(String, Vec<u8>)>,
+    /// Null-valued headers: each one's position in the full header list and
+    /// its key, positions ascending (as in
+    /// [`ConsumedMessage::null_headers`](crate::kafka::consumer::ConsumedMessage::null_headers)).
+    pub null_headers: Vec<(usize, String)>,
 }
 
 impl OwnedProducerRecord {
@@ -32,6 +37,7 @@ impl OwnedProducerRecord {
             partition: None,
             timestamp: None,
             headers: Vec::new(),
+            null_headers: Vec::new(),
         }
     }
 
@@ -62,6 +68,13 @@ impl OwnedProducerRecord {
     /// Appends a header; an earlier header of the same key stays.
     pub fn with_header(mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
         self.headers.push((key.into(), value.into()));
+        self
+    }
+
+    /// Appends a header with a null value (not an empty one).
+    pub fn with_null_header(mut self, key: impl Into<String>) -> Self {
+        let position = self.headers.len() + self.null_headers.len();
+        self.null_headers.push((position, key.into()));
         self
     }
 }
@@ -95,12 +108,9 @@ fn build_future_record(record: &OwnedProducerRecord) -> FutureRecord<'_, [u8], [
     }
 
     let mut owned_headers = OwnedHeaders::new();
-    if !record.headers.is_empty() {
-        for (k, v) in &record.headers {
-            owned_headers = owned_headers.insert(Header {
-                key: k.as_str(),
-                value: Some(v.as_slice()),
-            });
+    if !record.headers.is_empty() || !record.null_headers.is_empty() {
+        for (key, value) in merge_headers(&record.headers, &record.null_headers) {
+            owned_headers = owned_headers.insert(Header { key, value });
         }
         future_record = future_record.headers(owned_headers);
     }
@@ -296,6 +306,26 @@ impl std::future::Future for PendingDelivery {
     }
 }
 
+/// The librdkafka config of a producer: the shared client settings plus the
+/// producer-only ones. A key in `extra_properties` wins over both.
+fn producer_rdkafka_config(config: &KafkaClientConfig) -> KafkaResult<rdkafka::ClientConfig> {
+    let mut rd_config = config.to_rdkafka_config()?;
+    let explicit = |key: &str| config.extra_properties.contains_key(key);
+    // Writing to a topic that does not exist yet follows the broker's
+    // `auto.create.topics.enable`, as a Kafka producer normally does;
+    // read and admin clients never create topics.
+    if !explicit("allow.auto.create.topics") {
+        rd_config.set("allow.auto.create.topics", "true");
+    }
+    // Unset, librdkafka uses `consistent_random`.
+    if let Some(partitioner) = config.partitioner {
+        if !explicit("partitioner") {
+            rd_config.set("partitioner", partitioner.as_str());
+        }
+    }
+    Ok(rd_config)
+}
+
 /// High-performance asynchronous Kafka producer client.
 pub struct KafkaProducerClient {
     // Declared before `producer` so it stops before the client is destroyed.
@@ -307,16 +337,7 @@ pub struct KafkaProducerClient {
 impl KafkaProducerClient {
     /// Creates a new `KafkaProducerClient` from the configuration.
     pub fn new(config: &KafkaClientConfig) -> KafkaResult<Self> {
-        let mut rd_config = config.to_rdkafka_config()?;
-        // Writing to a topic that does not exist yet follows the broker's
-        // `auto.create.topics.enable`, as a Kafka producer normally does;
-        // read and admin clients never create topics.
-        if !config
-            .extra_properties
-            .contains_key("allow.auto.create.topics")
-        {
-            rd_config.set("allow.auto.create.topics", "true");
-        }
+        let rd_config = producer_rdkafka_config(config)?;
         let (oauth, producer) = crate::kafka::oauth_refresh::with_oauth(
             config,
             || Ok(rd_config.create::<FutureProducer<DefaultClientContext>>()?),
@@ -483,11 +504,65 @@ mod tests {
     }
 
     #[test]
+    fn null_headers_are_sent_as_null_in_place() {
+        let record = OwnedProducerRecord::new("t")
+            .with_null_header("n0")
+            .with_header("a", "1")
+            .with_null_header("n2")
+            .with_header("b", "");
+        use rdkafka::message::Headers;
+        let built = build_future_record(&record);
+        let headers = built.headers.expect("headers");
+        let got: Vec<(String, Option<Vec<u8>>)> = (0..headers.count())
+            .map(|i| {
+                let h = headers.get(i);
+                (h.key.to_string(), h.value.map(<[u8]>::to_vec))
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("n0".to_string(), None),
+                ("a".to_string(), Some(b"1".to_vec())),
+                ("n2".to_string(), None),
+                ("b".to_string(), Some(Vec::new())),
+            ]
+        );
+    }
+
+    #[test]
     fn test_producer_client_creation() {
         let config = KafkaClientConfig::new("localhost:9092").with_client_id("producer-test");
         let client = KafkaProducerClient::new(&config);
         assert!(client.is_ok());
         let client = client.unwrap();
         assert_eq!(client.config().client_id.as_deref(), Some("producer-test"));
+    }
+
+    #[test]
+    fn partitioner_is_left_to_librdkafka_unless_set() {
+        use crate::kafka::config::Partitioner;
+        let plain = KafkaClientConfig::new("localhost:9092");
+        assert_eq!(
+            producer_rdkafka_config(&plain).unwrap().get("partitioner"),
+            None
+        );
+        // Shared clients never get it, even when set.
+        let set = plain.clone().with_partitioner(Partitioner::Murmur2Random);
+        assert_eq!(set.to_rdkafka_config().unwrap().get("partitioner"), None);
+        assert_eq!(
+            producer_rdkafka_config(&set).unwrap().get("partitioner"),
+            Some("murmur2_random")
+        );
+        // A raw librdkafka property wins.
+        let raw = set.with_property("partitioner", "fnv1a");
+        assert_eq!(
+            producer_rdkafka_config(&raw).unwrap().get("partitioner"),
+            Some("fnv1a")
+        );
+        for p in Partitioner::ALL {
+            let config = KafkaClientConfig::new("localhost:9092").with_partitioner(p);
+            assert!(KafkaProducerClient::new(&config).is_ok(), "{p}");
+        }
     }
 }

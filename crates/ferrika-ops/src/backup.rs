@@ -6,9 +6,23 @@ use ferrika_core::codec::base64;
 use ferrika_core::error::KafkaResult;
 use ferrika_core::kafka::consumer::ConsumedMessage;
 
+/// The dump format version [`DumpRecord::from_message`] writes in
+/// `format_version`. A record without the field is version 1.
+///
+/// - 1: headers with a null value are left out; a [`DumpHeader`] with neither
+///   `value` nor `value_base64` (never written) reads as an empty value.
+/// - 2: headers with a null value are kept, as a [`DumpHeader`] with neither
+///   `value` nor `value_base64` in `header_list`, and restore as null. Older
+///   versions ignore the field and restore them as empty values.
+pub const DUMP_FORMAT_VERSION: u32 = 2;
+
 /// Represents a single backed-up Kafka record in portable JSON Lines format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DumpRecord {
+    /// Format version of this record ([`DUMP_FORMAT_VERSION`]); `None`
+    /// (absent) is version 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_version: Option<u32>,
     /// Topic where this record originated
     pub topic: String,
     /// Partition index
@@ -46,16 +60,17 @@ pub struct DumpRecord {
     )]
     pub headers_base64: Vec<(String, String)>,
     /// Every header in record order, written only when `headers` and
-    /// `headers_base64` cannot carry them exactly (a repeated key, or a
-    /// binary header before a text one). When present it wins on read; the
-    /// two objects beside it are the last-value-per-key view that older
-    /// versions read.
+    /// `headers_base64` cannot carry them exactly (a repeated key, a binary
+    /// header before a text one, or a null value). When present it wins on
+    /// read; the two objects beside it are the last-value-per-key view of the
+    /// non-null headers that older versions read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header_list: Option<Vec<DumpHeader>>,
 }
 
 /// One entry of [`DumpRecord::header_list`]: `value` for UTF-8 text,
-/// `value_base64` for anything else.
+/// `value_base64` for anything else, neither for a null value (format
+/// version 2; see [`DUMP_FORMAT_VERSION`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DumpHeader {
     pub key: String,
@@ -80,22 +95,40 @@ impl HeaderFields {
     /// serialize exactly as in the object-only format.
     /// `sorted_objects` is for writers whose JSON objects reorder their keys.
     pub fn from_headers(headers: &[(String, Vec<u8>)], sorted_objects: bool) -> Self {
+        let all: Vec<(&str, Option<&[u8]>)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), Some(v.as_slice())))
+            .collect();
+        Self::from_all_headers(&all, sorted_objects)
+    }
+
+    /// Like [`HeaderFields::from_headers`], for headers that may have a null
+    /// value (`None`). A null value is kept only in the ordered list, as an
+    /// entry with neither `value` nor `value_base64`, so the record needs
+    /// [`DUMP_FORMAT_VERSION`] 2 to be read back as null.
+    pub fn from_all_headers(headers: &[(&str, Option<&[u8]>)], sorted_objects: bool) -> Self {
         let mut fields = Self::default();
         let mut seen_binary = false;
         let mut lossy = false;
         let mut keys = std::collections::HashSet::new();
-        for (k, v) in headers {
-            if !keys.insert(k.as_str()) {
+        for &(k, v) in headers {
+            if !keys.insert(k) {
                 lossy = true;
             }
+            let Some(v) = v else {
+                lossy = true;
+                continue;
+            };
             match std::str::from_utf8(v) {
                 Ok(text) => {
                     lossy |= seen_binary;
-                    fields.headers.push((k.clone(), text.to_string()));
+                    fields.headers.push((k.to_string(), text.to_string()));
                 }
                 Err(_) => {
                     seen_binary = true;
-                    fields.headers_base64.push((k.clone(), base64::encode(v)));
+                    fields
+                        .headers_base64
+                        .push((k.to_string(), base64::encode(v)));
                 }
             }
         }
@@ -107,17 +140,25 @@ impl HeaderFields {
             fields.header_list = Some(
                 headers
                     .iter()
-                    .map(|(k, v)| match std::str::from_utf8(v) {
-                        Ok(text) => DumpHeader {
-                            key: k.clone(),
-                            value: Some(text.to_string()),
-                            value_base64: None,
-                        },
-                        Err(_) => DumpHeader {
-                            key: k.clone(),
-                            value: None,
-                            value_base64: Some(base64::encode(v)),
-                        },
+                    .map(|&(k, v)| {
+                        let key = k.to_string();
+                        match v.map(|v| (v, std::str::from_utf8(v))) {
+                            None => DumpHeader {
+                                key,
+                                value: None,
+                                value_base64: None,
+                            },
+                            Some((_, Ok(text))) => DumpHeader {
+                                key,
+                                value: Some(text.to_string()),
+                                value_base64: None,
+                            },
+                            Some((v, Err(_))) => DumpHeader {
+                                key,
+                                value: None,
+                                value_base64: Some(base64::encode(v)),
+                            },
+                        }
                     })
                     .collect(),
             );
@@ -200,9 +241,10 @@ impl DumpRecord {
             headers,
             headers_base64,
             header_list,
-        } = HeaderFields::from_headers(&msg.headers, false);
+        } = HeaderFields::from_all_headers(&msg.all_headers(), false);
 
         Self {
+            format_version: Some(DUMP_FORMAT_VERSION),
             topic: msg.topic.clone(),
             partition: msg.partition,
             offset: msg.offset,
@@ -229,31 +271,45 @@ impl DumpRecord {
     }
 
     /// Extracts all headers in record order, decoding Base64-encoded binary
-    /// values. Files without `header_list` list the text headers, then the
-    /// binary ones.
-    pub fn extract_headers(&self) -> KafkaResult<Vec<(String, Vec<u8>)>> {
+    /// values; `None` is a null value. Files without `header_list` list the
+    /// text headers, then the binary ones. A `header_list` entry with neither
+    /// value is null from format version 2 on and empty before it (as older
+    /// versions read it).
+    pub fn extract_all_headers(&self) -> KafkaResult<Vec<(String, Option<Vec<u8>>)>> {
         if let Some(list) = &self.header_list {
+            let keeps_nulls = self.format_version.unwrap_or(1) >= 2;
             return list
                 .iter()
                 .map(|h| {
                     let value = match (&h.value, &h.value_base64) {
-                        (Some(text), _) => text.as_bytes().to_vec(),
-                        (None, Some(b64)) => base64::decode(b64)?,
-                        (None, None) => Vec::new(),
+                        (Some(text), _) => Some(text.as_bytes().to_vec()),
+                        (None, Some(b64)) => Some(base64::decode(b64)?),
+                        (None, None) if keeps_nulls => None,
+                        (None, None) => Some(Vec::new()),
                     };
                     Ok((h.key.clone(), value))
                 })
                 .collect();
         }
-        let mut headers: Vec<(String, Vec<u8>)> = self
+        let mut headers: Vec<(String, Option<Vec<u8>>)> = self
             .headers
             .iter()
-            .map(|(k, v)| (k.clone(), v.as_bytes().to_vec()))
+            .map(|(k, v)| (k.clone(), Some(v.as_bytes().to_vec())))
             .collect();
         for (k, v) in &self.headers_base64 {
-            headers.push((k.clone(), base64::decode(v)?));
+            headers.push((k.clone(), Some(base64::decode(v)?)));
         }
         Ok(headers)
+    }
+
+    /// [`DumpRecord::extract_all_headers`] with null values read as empty
+    /// ones, as versions before format version 2 restore them.
+    pub fn extract_headers(&self) -> KafkaResult<Vec<(String, Vec<u8>)>> {
+        Ok(self
+            .extract_all_headers()?
+            .into_iter()
+            .map(|(k, v)| (k, v.unwrap_or_default()))
+            .collect())
     }
 }
 
@@ -437,6 +493,7 @@ mod tests {
             payload: Some(b"{\"item\":\"book\",\"price\":29.99}".to_vec()),
             timestamp_ms: Some(1726900000000),
             headers: Vec::new(),
+            null_headers: Vec::new(),
         };
 
         let dump = DumpRecord::from_message(&msg);
@@ -471,6 +528,7 @@ mod tests {
             payload: Some(binary_payload.clone()),
             timestamp_ms: None,
             headers: Vec::new(),
+            null_headers: Vec::new(),
         };
 
         let dump = DumpRecord::from_message(&msg);
@@ -495,6 +553,7 @@ mod tests {
             payload: None,
             timestamp_ms: Some(1000),
             headers: headers.clone(),
+            null_headers: Vec::new(),
         };
 
         let dump = DumpRecord::from_message(&msg);
@@ -514,6 +573,7 @@ mod tests {
             payload: Some(b"v".to_vec()),
             timestamp_ms: Some(9),
             headers,
+            null_headers: Vec::new(),
         }
     }
 
@@ -555,7 +615,7 @@ mod tests {
         let (line, back) = roundtrip(vec![h("trace", b"abc"), h("empty", b""), h("bin", &[0xff])]);
         assert_eq!(
             line,
-            r#"{"topic":"t","partition":1,"offset":5,"timestamp_ms":9,"key_text":"k","payload_text":"v","headers":{"trace":"abc","empty":""},"headers_base64":{"bin":"/w=="}}"#
+            r#"{"format_version":2,"topic":"t","partition":1,"offset":5,"timestamp_ms":9,"key_text":"k","payload_text":"v","headers":{"trace":"abc","empty":""},"headers_base64":{"bin":"/w=="}}"#
         );
         assert_eq!(
             back,
@@ -596,9 +656,118 @@ mod tests {
             .is_some());
     }
 
+    fn msg_with_nulls() -> ConsumedMessage {
+        let mut msg = msg_with(vec![h("a", b"1"), h("bin", &[0xff]), h("e", b"")]);
+        msg.null_headers = vec![(0, "n0".to_string()), (2, "n2".to_string())];
+        msg
+    }
+
+    fn all(headers: &[(&str, Option<&[u8]>)]) -> Vec<(String, Option<Vec<u8>>)> {
+        headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.map(<[u8]>::to_vec)))
+            .collect()
+    }
+
+    #[test]
+    fn dump_keeps_null_headers_and_restores_them_as_null() {
+        let msg = msg_with_nulls();
+        let line = serde_json::to_string(&DumpRecord::from_message(&msg)).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(json["format_version"], 2, "{line}");
+        assert_eq!(json["header_list"][0], serde_json::json!({"key": "n0"}));
+        // The objects older versions read without `header_list` leave nulls out.
+        assert_eq!(json["headers"], serde_json::json!({"a": "1", "e": ""}));
+        assert_eq!(json["headers_base64"], serde_json::json!({"bin": "/w=="}));
+
+        let back: DumpRecord = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.extract_all_headers().unwrap(), all(&msg.all_headers()));
+        assert_eq!(
+            back.extract_all_headers().unwrap(),
+            vec![
+                ("n0".to_string(), None),
+                ("a".to_string(), Some(b"1".to_vec())),
+                ("n2".to_string(), None),
+                ("bin".to_string(), Some(vec![0xff])),
+                ("e".to_string(), Some(Vec::new())),
+            ]
+        );
+        // The byte view reads a null as empty, as older versions restore it.
+        assert_eq!(
+            back.extract_headers().unwrap(),
+            vec![
+                h("n0", b""),
+                h("a", b"1"),
+                h("n2", b""),
+                h("bin", &[0xff]),
+                h("e", b"")
+            ]
+        );
+    }
+
+    #[test]
+    fn dump_without_null_headers_round_trips_in_format_2() {
+        let msg = msg_with(vec![h("x", b"1"), h("x", &[0xfe]), h("y", b"")]);
+        let dump = DumpRecord::from_message(&msg);
+        assert_eq!(dump.format_version, Some(DUMP_FORMAT_VERSION));
+        let back: DumpRecord =
+            serde_json::from_str(&serde_json::to_string(&dump).unwrap()).unwrap();
+        assert_eq!(back, dump);
+        assert_eq!(back.extract_all_headers().unwrap(), all(&msg.all_headers()));
+    }
+
+    #[test]
+    fn restore_reads_a_valueless_list_entry_of_an_old_dump_as_empty() {
+        // A dump without `format_version` (version 1) restores exactly as
+        // before: an entry with neither value is an empty value, not null.
+        let line = r#"{"topic":"t","partition":0,"offset":1,"payload_text":"v","headers":{"a":"2"},"header_list":[{"key":"a","value":"1"},{"key":"n"},{"key":"a","value":"2"}]}"#;
+        let record: DumpRecord = serde_json::from_str(line).unwrap();
+        assert_eq!(record.format_version, None);
+        assert_eq!(
+            record.extract_all_headers().unwrap(),
+            vec![
+                ("a".to_string(), Some(b"1".to_vec())),
+                ("n".to_string(), Some(Vec::new())),
+                ("a".to_string(), Some(b"2".to_vec())),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_format_2_line_reads_like_an_old_dump_without_the_version() {
+        // What an older version does with a new dump: it ignores
+        // `format_version` (and any other unknown field) and restores the
+        // null headers as empty values, keeping every other header.
+        let line = serde_json::to_string(&DumpRecord::from_message(&msg_with_nulls())).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let obj = json.as_object_mut().unwrap();
+        obj.remove("format_version");
+        obj.insert("some_future_field".into(), 1.into());
+        let old: DumpRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            old.extract_all_headers().unwrap(),
+            vec![
+                ("n0".to_string(), Some(Vec::new())),
+                ("a".to_string(), Some(b"1".to_vec())),
+                ("n2".to_string(), Some(Vec::new())),
+                ("bin".to_string(), Some(vec![0xff])),
+                ("e".to_string(), Some(Vec::new())),
+            ]
+        );
+    }
+
+    #[test]
+    fn consume_save_lines_still_leave_null_headers_out() {
+        let json = jsonl_record(&msg_with_nulls());
+        assert!(json.get("format_version").is_none());
+        assert!(!json.to_string().contains("n0"), "{json}");
+        assert_eq!(json["headers"], serde_json::json!({"a": "1", "e": ""}));
+    }
+
     #[test]
     fn test_dump_record_invalid_base64_is_error() {
         let record = DumpRecord {
+            format_version: None,
             topic: "t".into(),
             partition: 0,
             offset: 0,
@@ -617,6 +786,7 @@ mod tests {
     #[test]
     fn test_dump_record_json_serialization() {
         let record = DumpRecord {
+            format_version: None,
             topic: "events".into(),
             partition: 2,
             offset: 10,

@@ -329,6 +329,7 @@ mod tests {
             key: key.map(|k| k.as_bytes().to_vec()),
             payload: payload.map(|p| p.as_bytes().to_vec()),
             headers: header_map,
+            null_headers: Vec::new(),
         }
     }
 

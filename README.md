@@ -91,8 +91,16 @@ ferrika consume orders -b -n 10 --pretty-json
 
 Global options go before the subcommand: `-p/--profile <name>` picks a saved
 profile, `-b/--bootstrap-servers` overrides it, `-f json` switches the output
-to JSON, `--timeout <s>` sets the request timeout. `ferrika <command> --help`
-lists every option.
+to JSON, `--timeout <s>` sets the request timeout, `--partitioner <name>`
+picks the producers' partitioner. `ferrika <command> --help` lists every
+option.
+
+Keyed records go to the partition librdkafka's default partitioner picks
+(CRC32 of the key), which is not the one the Java client picks (murmur2). If
+Java applications write to the same topics, set `--partitioner
+murmur2_random` (or `ferrika profile partitioner <name> murmur2_random`) so
+records of one key stay on one partition and in order; see
+[Partitioner](docs/CLI.md#partitioner).
 
 At a terminal, a command that needs the cluster stops within seconds when
 nothing listens at the bootstrap servers (connection refused). In scripts
@@ -111,7 +119,8 @@ still starting can answer.
 | Schemas and integrations | `schema`, `connect`, `acl`, `quota`, `user` |
 | Change safety | `audit`, `history`, `undo`, `policy` |
 | AI assistants | `mcp` |
-| RabbitMQ (preview) | `rabbit` (queues, exchanges, bindings, peek, publish, DLQ inspect and redrive; separate RabbitMQ profiles) |
+| RabbitMQ (preview) | `rabbit` (queues, exchanges, bindings, peek, publish, DLQ inspect and redrive; queue, exchange and binding changes with history and undo; separate RabbitMQ profiles) |
+| MQTT (preview) | `mqtt` (bounded subscribe, publish, list and clear retained messages; MQTT 3.1.1 and 5, TLS; separate MQTT profiles) |
 | ksqlDB (preview) | `ksql` (info, streams, tables, queries, describe, pull and push queries, statements gated per statement; the server is attached to a Kafka profile) |
 
 Examples for each are in the [command reference](docs/CLI.md).
@@ -213,6 +222,7 @@ the crate with `-p`:
 | `crates/ferrika-mcp` | The MCP server behind `ferrika mcp`. |
 | `crates/ferrika-cli` | The `ferrika` command line. |
 | `crates/ferrika-rabbitmq` | Preview: RabbitMQ management API client, RabbitMQ profiles and AMQP dead-letter redrive behind `ferrika rabbit`. |
+| `crates/ferrika-mqtt` | Preview: MQTT 3.1.1 and 5 sessions, bounded subscriptions, retained messages and MQTT profiles behind `ferrika mqtt` (cargo feature `mqtt`, on by default). |
 | `crates/ferrika-ksql` | Preview: ksqlDB REST API client (an existing server; ksqlDB is not shipped), statement classification for the policy and masked query rows behind `ferrika ksql`. |
 
 The crates are published on [crates.io](https://crates.io/crates/ferrika-core); until 1.0 their API can change.

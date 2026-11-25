@@ -450,6 +450,14 @@ pub async fn recapture(
         State::SubjectVersions { subject, .. } => {
             subject_versions(&registry(config)?, subject, false).await
         }
+        State::RabbitQueue { .. }
+        | State::RabbitQueueMessages { .. }
+        | State::RabbitExchange { .. }
+        | State::RabbitBinding { .. } => Err(KafkaError::config(format!(
+            "{} is a RabbitMQ resource; it is read through the management API \
+             (ferrika_ops::history::rabbit), not a Kafka client",
+            state.subject()
+        ))),
         State::Connector { name, .. } => {
             let mut state = connector(&connect(config)?, name).await?;
             // Secret values stay out of comparisons and memory alike.

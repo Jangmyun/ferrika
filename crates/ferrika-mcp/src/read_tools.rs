@@ -158,7 +158,7 @@ pub(super) fn tool_definitions(with_peek: bool) -> Value {
                     "partition": { "type": "integer", "description": "Only this partition" },
                     "from": { "type": "string", "description": "\"latest\" (default: the newest records), \"earliest\", or an offset number (needs partition)" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": PEEK_MAX, "default": 10 },
-                    "where": { "type": "string", "description": "Keep only records matching an expression, e.g. $.amount > 100 && $.status == \"PAID\". Fields: $.path (JSON value), key, partition, offset, timestamp, headers.<name>; operators == != > >= < <= =~ contains exists && || !" },
+                    "where": { "type": "string", "description": "Keep only records matching an expression, e.g. $.amount > 100 && $.status == \"PAID\". Fields: $.path (JSON value), key, partition, offset, timestamp, headers.<name>; operators == != > >= < <= =~ contains exists && || !. =~ (regex) and contains ignore case; a =~ pattern that starts with (?-i) matches case, e.g. $.status =~ \"(?-i)ERROR\"" },
                     "scan_limit": { "type": "integer", "minimum": 1, "maximum": SCAN_MAX, "default": SCAN_DEFAULT, "description": "With where: most records to examine" },
                     "mask_pii": { "type": "boolean", "default": true, "description": "Mask emails, card numbers, SSNs and tokens" }
                 },
@@ -1193,6 +1193,7 @@ mod tests {
             payload: Some(br#"{"rrn":"900101-1234567"}"#.to_vec()),
             timestamp_ms: None,
             headers: Vec::from([("auth_token".to_string(), b"abc123".to_vec())]),
+            null_headers: Vec::new(),
         };
         let rrn = ferrika_core::model::expr::Expr::parse(r#"$.rrn =~ "^900101-1234""#).unwrap();
         let header =

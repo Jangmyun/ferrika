@@ -5,8 +5,9 @@
 //! - `$.a.b`, `$.items[0]`, `$["odd key"]`: a field of the JSON value (`$`
 //!   alone is the whole value, as JSON when it parses, else as text)
 //! - `key`, `partition`, `offset`, `timestamp` (ms), `headers.<name>`
-//! - `== != > >= < <=`, `=~` (regex, case-insensitive), `contains`
-//!   (text or array element, case-insensitive), `exists`, `&&`/`and`, `||`/`or`, `!`/`not`
+//! - `== != > >= < <=`, `=~` (regex, case-insensitive; a pattern that
+//!   starts with `(?-i)` matches case), `contains` (text or array element,
+//!   case-insensitive), `exists`, `&&`/`and`, `||`/`or`, `!`/`not`
 //! - strings in `"…"` or `'…'`, numbers, `true`, `false`, `null`
 //!
 //! A bare operand is true when it exists and is not `null`, `false`, `0` or
@@ -792,6 +793,17 @@ mod tests {
         assert!(check(r#"$.id =~ "^O\d""#, ORDER));
         assert!(check("!($.amount < 100)", ORDER));
         assert!(check("not $.missing", ORDER));
+    }
+
+    #[test]
+    fn regex_ignores_case_unless_the_pattern_turns_it_off() {
+        let upper = r#"{"status":"ERROR"}"#;
+        let lower = r#"{"status":"error"}"#;
+        assert!(check(r#"$.status =~ "ERROR""#, upper));
+        assert!(check(r#"$.status =~ "ERROR""#, lower));
+        assert!(check(r#"$.status =~ "(?-i)ERROR""#, upper));
+        assert!(!check(r#"$.status =~ "(?-i)ERROR""#, lower));
+        assert!(check(r#"$.status =~ "(?-i)^error$""#, lower));
     }
 
     #[test]

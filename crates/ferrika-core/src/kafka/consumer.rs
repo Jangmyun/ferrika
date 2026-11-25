@@ -72,8 +72,36 @@ pub struct ConsumedMessage {
     pub payload: Option<Vec<u8>>,
     pub timestamp_ms: Option<i64>,
     /// Record headers in wire order. Kafka allows repeated keys, and order is
-    /// meaningful, so this is a list, not a map. Null-valued headers are skipped.
+    /// meaningful, so this is a list, not a map. Null-valued headers are not
+    /// in it; they are in `null_headers`.
     pub headers: Vec<(String, Vec<u8>)>,
+    /// Null-valued headers: each one's position in the record's full header
+    /// list and its key, positions ascending. [`ConsumedMessage::all_headers`]
+    /// merges them with `headers`.
+    pub null_headers: Vec<(usize, String)>,
+}
+
+/// Merges `headers` and the null-valued `null_headers` (positions in the full
+/// list, ascending, and keys) into one list in wire order. A position past
+/// the end puts that header last.
+pub fn merge_headers<'a>(
+    headers: &'a [(String, Vec<u8>)],
+    null_headers: &'a [(usize, String)],
+) -> Vec<(&'a str, Option<&'a [u8]>)> {
+    let mut out = Vec::with_capacity(headers.len() + null_headers.len());
+    let mut values = headers.iter();
+    let mut nulls = null_headers.iter().peekable();
+    loop {
+        if let Some((_, key)) = nulls.next_if(|(pos, _)| *pos <= out.len()) {
+            out.push((key.as_str(), None));
+        } else if let Some((key, value)) = values.next() {
+            out.push((key.as_str(), Some(value.as_slice())));
+        } else if let Some((_, key)) = nulls.next() {
+            out.push((key.as_str(), None));
+        } else {
+            return out;
+        }
+    }
 }
 
 /// Timestamps of the records at the given `(topic, partition, offset)`
@@ -263,6 +291,11 @@ impl ConsumedMessage {
         }
     }
 
+    /// Every header in wire order, `None` for a null value.
+    pub fn all_headers(&self) -> Vec<(&str, Option<&[u8]>)> {
+        merge_headers(&self.headers, &self.null_headers)
+    }
+
     /// Returns the message key as a UTF-8 string if valid.
     pub fn key_str(&self) -> Option<&str> {
         self.key
@@ -313,6 +346,7 @@ fn owned_message<M: Message>(msg: &M) -> ConsumedMessage {
         payload: None,
         timestamp_ms: None,
         headers: Vec::new(),
+        null_headers: Vec::new(),
     };
     copy_message(msg, &mut owned);
     owned
@@ -338,11 +372,13 @@ fn copy_message<M: Message>(msg: &M, out: &mut ConsumedMessage) {
     copy_bytes(&mut out.payload, msg.payload());
     out.timestamp_ms = msg.timestamp().to_millis();
     out.headers.clear();
+    out.null_headers.clear();
     if let Some(msg_headers) = msg.headers() {
         for idx in 0..msg_headers.count() {
             let header = msg_headers.get(idx);
-            if let Some(val) = header.value {
-                out.headers.push((header.key.to_string(), val.to_vec()));
+            match header.value {
+                Some(val) => out.headers.push((header.key.to_string(), val.to_vec())),
+                None => out.null_headers.push((idx, header.key.to_string())),
             }
         }
     }
@@ -1255,6 +1291,70 @@ mod tests {
     }
 
     #[test]
+    fn copied_messages_keep_null_headers_in_place() {
+        use rdkafka::message::{Header, OwnedHeaders, OwnedMessage, Timestamp};
+        let headers = OwnedHeaders::new()
+            .insert(Header {
+                key: "n0",
+                value: None::<&[u8]>,
+            })
+            .insert(Header {
+                key: "a",
+                value: Some(b"1".as_slice()),
+            })
+            .insert(Header {
+                key: "n2",
+                value: None::<&[u8]>,
+            })
+            .insert(Header {
+                key: "e",
+                value: Some(b"".as_slice()),
+            });
+        let msg = OwnedMessage::new(
+            None,
+            None,
+            "t".to_string(),
+            Timestamp::NotAvailable,
+            0,
+            1,
+            Some(headers),
+        );
+        let copied = owned_message(&msg);
+        assert_eq!(
+            copied.headers,
+            [
+                ("a".to_string(), b"1".to_vec()),
+                ("e".to_string(), Vec::new())
+            ]
+        );
+        assert_eq!(
+            copied.null_headers,
+            [(0, "n0".to_string()), (2, "n2".to_string())]
+        );
+        assert_eq!(
+            copied.all_headers(),
+            [
+                ("n0", None),
+                ("a", Some(b"1".as_slice())),
+                ("n2", None),
+                ("e", Some(b"".as_slice())),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_headers_puts_nulls_at_their_positions() {
+        let headers = vec![("a".to_string(), b"1".to_vec())];
+        assert_eq!(merge_headers(&headers, &[]), [("a", Some(b"1".as_slice()))]);
+        let nulls = vec![(1, "n".to_string()), (9, "late".to_string())];
+        assert_eq!(
+            merge_headers(&headers, &nulls),
+            [("a", Some(b"1".as_slice())), ("n", None), ("late", None)]
+        );
+        assert_eq!(merge_headers(&[], &nulls), [("n", None), ("late", None)]);
+    }
+
+    #[test]
     fn start_offsets_map_to_driver_offsets() {
         assert_eq!(StartOffset::Beginning.to_driver(), Offset::Beginning);
         assert_eq!(StartOffset::End.to_driver(), Offset::End);
@@ -1410,6 +1510,7 @@ mod tests {
             payload: Some(b"{\"id\": 100, \"amount\": 250}".to_vec()),
             timestamp_ms: Some(1726900000000),
             headers: Vec::new(),
+            null_headers: Vec::new(),
         };
 
         assert_eq!(msg.key_str(), Some("order_100"));
@@ -1441,6 +1542,7 @@ mod tests {
             payload: Some(b"not a valid json".to_vec()),
             timestamp_ms: None,
             headers: Vec::new(),
+            null_headers: Vec::new(),
         };
 
         let result: Result<serde_json::Value, _> = msg.payload_json();

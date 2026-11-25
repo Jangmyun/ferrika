@@ -107,7 +107,7 @@ pub fn start_for(
 ) -> Option<Pending> {
     let write = global.write.as_ref()?;
     let id = write.op.clone().filter(|_| nth == 0);
-    start_as(write, id, scope, change, Some(target), None)
+    start_as(write, id, scope, change, Some(target), None, None)
 }
 
 /// [`start`] with a target of its own and, for an undo, the operation it
@@ -120,7 +120,29 @@ pub fn start_with(
     undoes: Option<String>,
 ) -> Option<Pending> {
     let write = global.write.as_ref()?;
-    start_as(write, write.op.clone(), scope, change, target, undoes)
+    start_as(write, write.op.clone(), scope, change, target, undoes, None)
+}
+
+/// [`start_with`] for a RabbitMQ change: the result entry names
+/// `audit_profile`, as the request entry did (the RabbitMQ profile, else
+/// the broker addresses the gate matched).
+pub fn start_rabbit(
+    global: &GlobalOpts,
+    scope: Scope,
+    change: Change,
+    audit_profile: String,
+    undoes: Option<String>,
+) -> Option<Pending> {
+    let write = global.write.as_ref()?;
+    start_as(
+        write,
+        write.op.clone(),
+        scope,
+        change,
+        None,
+        undoes,
+        Some(audit_profile),
+    )
 }
 
 /// Starts the record under `id`, or a new id when the request entry named
@@ -132,13 +154,16 @@ fn start_as(
     change: Change,
     target: Option<String>,
     undoes: Option<String>,
+    audit_profile: Option<String>,
 ) -> Option<Pending> {
     let target = target.unwrap_or_else(|| write.target.clone());
-    let profile = if scope.profile.is_empty() {
-        scope.bootstrap.clone()
-    } else {
-        scope.profile.clone()
-    };
+    let profile = audit_profile.unwrap_or_else(|| {
+        if scope.profile.is_empty() {
+            scope.bootstrap.clone()
+        } else {
+            scope.profile.clone()
+        }
+    });
     let begin = change.into_begin("cli", scope, write.label.clone(), target.clone(), undoes);
     let recorder = match id {
         Some(id) => Recorder::start_with_id(Journal::default(), id, begin),

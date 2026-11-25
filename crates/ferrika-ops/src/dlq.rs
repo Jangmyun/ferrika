@@ -621,6 +621,7 @@ mod tests {
                     key: Some(key.as_bytes().to_vec()),
                     payload: Some(b"{}".to_vec()),
                     headers: headers.into_iter().collect(),
+                    null_headers: Vec::new(),
                 },
                 "t-dlq",
             )
@@ -659,6 +660,7 @@ mod tests {
             key: None,
             payload: Some(b"{}".to_vec()),
             headers: headers.into_iter().collect(),
+            null_headers: Vec::new(),
         };
         let masked = DlqMessage::from_consumed_message(&consumed, "t-dlq").masked();
         let dump = format!("{:?}", masked.headers);
@@ -690,6 +692,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.as_bytes().to_vec()))
                 .collect(),
+            null_headers: Vec::new(),
         };
         let spring = msg(&[
             ("kafka_dlt-original-topic", "orders-v2"),
@@ -795,6 +798,7 @@ mod tests {
             key: Some(b"order-99".to_vec()),
             payload: Some(b"{\"order_id\": 99}".to_vec()),
             headers: headers.into_iter().collect(),
+            null_headers: Vec::new(),
         };
 
         let dlq_msg = DlqMessage::from_consumed_message(&consumed, "orders-v1-dlq");
@@ -1007,6 +1011,7 @@ mod tests {
             key: Some(vec![0xff, 0xfe, 0x00]),
             payload: Some(vec![0x00, 0x9f]),
             headers,
+            null_headers: Vec::new(),
         }
     }
 

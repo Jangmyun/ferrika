@@ -25,10 +25,15 @@ use std::time::Duration;
 use lapin::options::{
     BasicAckOptions, BasicGetOptions, BasicNackOptions, BasicPublishOptions, ConfirmSelectOptions,
 };
+use lapin::tcp::{OwnedIdentity, OwnedTLSConfig};
 use lapin::types::{AMQPValue, FieldTable, LongString, ShortString};
-use lapin::{BasicProperties, Channel, Confirmation, Connection, ConnectionProperties};
+use lapin::{
+    BasicProperties, Channel, Confirmation, Connection, ConnectionProperties,
+    DefaultConnectionBuilder,
+};
 use serde::Serialize;
 
+use crate::client::TlsFiles;
 use crate::error::{RabbitError, RabbitResult};
 use crate::model::{DeathRecord, RedriveDestination};
 
@@ -45,6 +50,9 @@ pub struct AmqpTarget {
     pub password: Option<String>,
     /// Time allowed to connect and for each broker answer.
     pub timeout: Duration,
+    /// For `amqps://`: a CA file trusted besides the OS trust store, and a
+    /// client certificate and key (PEM) for mutual TLS.
+    pub tls: TlsFiles,
 }
 
 // Manual so the password never reaches debug output.
@@ -56,6 +64,7 @@ impl std::fmt::Debug for AmqpTarget {
             .field("user", &self.user)
             .field("password", &self.password.as_ref().map(|_| "<redacted>"))
             .field("timeout", &self.timeout)
+            .field("tls", &self.tls)
             .finish()
     }
 }
@@ -83,6 +92,57 @@ impl AmqpTarget {
         }
         Ok(uri)
     }
+
+    /// The TLS settings lapin connects with: the CA file's certificates as
+    /// extra roots and the client certificate and key, read from their
+    /// files. The OS trust store stays in use; the server's certificate is
+    /// always verified.
+    fn tls_config(&self) -> RabbitResult<OwnedTLSConfig> {
+        let read = |path: &str, what: &str| {
+            std::fs::read(path)
+                .map_err(|e| RabbitError::config(format!("Cannot read the {what} '{path}': {e}")))
+        };
+        let cert_chain = match &self.tls.ca_file {
+            Some(path) => Some(String::from_utf8(read(path, "CA file")?).map_err(|_| {
+                RabbitError::config(format!("The CA file '{path}' is not PEM text"))
+            })?),
+            None => None,
+        };
+        let identity = match self
+            .tls
+            .client_pair()
+            .map_err(|e| RabbitError::config(e.to_string()))?
+        {
+            Some((cert, key)) => Some(OwnedIdentity::PKCS8 {
+                pem: read(cert, "client certificate")?,
+                key: read(key, "client key")?,
+            }),
+            None => None,
+        };
+        Ok(OwnedTLSConfig {
+            identity,
+            cert_chain,
+        })
+    }
+}
+
+/// Opens the AMQP connection, with [`AmqpTarget::tls_config`] when TLS
+/// files are set.
+async fn connect(
+    target: &AmqpTarget,
+    uri: lapin::uri::AMQPUri,
+    properties: ConnectionProperties,
+) -> Result<Connection, String> {
+    if target.tls.is_empty() {
+        return within(target.timeout, Connection::connect_uri(uri, properties)).await;
+    }
+    let tls = target.tls_config().map_err(|e| e.to_string())?;
+    let builder = DefaultConnectionBuilder::new()
+        .map_err(|e| e.to_string())?
+        .with_uri(uri)
+        .with_properties(properties)
+        .with_tls_config(tls);
+    within(target.timeout, builder.connect()).await
 }
 
 /// What to move.
@@ -198,9 +258,9 @@ pub async fn redrive(
         .map_err(|_| connect_failed("the queue name is longer than 255 bytes".to_string()))?;
     let address = target.address().unwrap_or_default();
     let properties = ConnectionProperties::default().with_connection_name("ferrika".into());
-    let connection = within(target.timeout, Connection::connect_uri(uri, properties))
+    let connection = connect(target, uri, properties)
         .await
-        .map_err(|e| connect_failed(format!("{address}: {e}")))?;
+        .map_err(|e| connect_failed(crate::client::with_tls_hint(format!("{address}: {e}"))))?;
     let channel = match open_confirm_channel(&connection, target.timeout).await {
         Ok(channel) => channel,
         Err(e) => {
@@ -841,6 +901,7 @@ mod tests {
             user: Some("ops".to_string()),
             password: Some("pw-secret".to_string()),
             timeout: Duration::from_secs(5),
+            tls: TlsFiles::default(),
         };
         let uri = target.uri().unwrap();
         assert_eq!(uri.vhost, "/");
@@ -855,5 +916,63 @@ mod tests {
             ..target
         };
         assert!(bad.uri().is_err());
+    }
+
+    #[test]
+    fn tls_files_are_read_into_lapins_config() {
+        let dir = std::env::temp_dir().join(format!("ferrika-amqp-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            path.display().to_string()
+        };
+        let ca = file(
+            "ca.pem",
+            "-----BEGIN CERTIFICATE-----
+AA==
+-----END CERTIFICATE-----
+",
+        );
+        let cert = file("client.pem", "client-cert");
+        let key = file("client.key", "client-key");
+        let target = |tls: TlsFiles| AmqpTarget {
+            url: "amqps://rabbit".to_string(),
+            vhost: "/".to_string(),
+            user: None,
+            password: None,
+            timeout: Duration::from_secs(5),
+            tls,
+        };
+        let none = target(TlsFiles::default()).tls_config().unwrap();
+        assert_eq!(none, OwnedTLSConfig::default());
+        let full = target(TlsFiles {
+            ca_file: Some(ca.clone()),
+            client_cert: Some(cert),
+            client_key: Some(key),
+        })
+        .tls_config()
+        .unwrap();
+        assert!(full.cert_chain.unwrap().contains("BEGIN CERTIFICATE"));
+        assert_eq!(
+            full.identity,
+            Some(OwnedIdentity::PKCS8 {
+                pem: b"client-cert".to_vec(),
+                key: b"client-key".to_vec(),
+            })
+        );
+        let half = target(TlsFiles {
+            ca_file: Some(ca),
+            client_cert: Some("x.pem".to_string()),
+            client_key: None,
+        });
+        assert!(half.tls_config().is_err());
+        let missing = target(TlsFiles {
+            ca_file: Some(dir.join("nope.pem").display().to_string()),
+            ..TlsFiles::default()
+        });
+        let err = missing.tls_config().unwrap_err().to_string();
+        assert!(err.contains("Cannot read the CA file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

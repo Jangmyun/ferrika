@@ -4,9 +4,11 @@ use comfy_table::{Cell, CellAlignment, Color};
 use serde_json::json;
 
 use crate::cli::preset::{self, Preset};
-use crate::cli::{output, GlobalOpts, OutputFormat};
+use crate::cli::{output, partitioner_parser, GlobalOpts, OutputFormat};
 use crate::governance::policy::EffectivePolicy;
-use crate::kafka::config::{OAuthClientAuth, OAuthMethod, SaslMechanism, SecurityProtocol};
+use crate::kafka::config::{
+    OAuthClientAuth, OAuthMethod, Partitioner, SaslMechanism, SecurityProtocol,
+};
 use crate::kafka::profile::{ClusterProfile, ProfileStore};
 
 /// Command line arguments for cluster profile management.
@@ -35,6 +37,22 @@ pub enum ProfileSubcommands {
     },
     /// Move passwords still stored in profiles.json into the OS credential store
     Secure,
+    /// Set the producer partitioner of a profile (murmur2_random places keys
+    /// like the Java client), or go back to librdkafka's default with --unset
+    Partitioner {
+        /// Profile name
+        name: String,
+        /// Partitioner name
+        #[arg(
+            value_parser = partitioner_parser(),
+            required_unless_present = "unset",
+            conflicts_with = "unset"
+        )]
+        partitioner: Option<Partitioner>,
+        /// Remove the setting (librdkafka's default, consistent_random)
+        #[arg(long)]
+        unset: bool,
+    },
     /// Mark a profile read-only (refuse changes to its cluster), or undo it with --off
     ReadOnly {
         /// Profile name
@@ -133,6 +151,11 @@ pub struct ProfileAddArgs {
     /// Kafka Connect REST URL for `ferrika connect` and the GUI
     #[arg(long, value_name = "URL")]
     pub connect: Option<String>,
+    /// Producer partitioner for records without an explicit partition:
+    /// murmur2_random places keys like the Java client (default:
+    /// librdkafka's consistent_random)
+    #[arg(long, value_name = "NAME", value_parser = partitioner_parser())]
+    pub partitioner: Option<Partitioner>,
     #[command(flatten)]
     pub ksql: KsqlProfileArgs,
     #[command(flatten)]
@@ -278,6 +301,7 @@ impl std::fmt::Debug for ProfileAddArgs {
             )
             .field("connect", &redacted_url(&self.connect))
             .field("ksql", &self.ksql)
+            .field("partitioner", &self.partitioner)
             .field("oauth", &self.oauth)
             .finish()
     }
@@ -379,6 +403,7 @@ pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
                 schema_registry,
                 add_args.connect,
                 ksql,
+                add_args.partitioner,
                 add_args.oauth,
             )?;
             if json {
@@ -501,6 +526,37 @@ pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
             }
             if !left.is_empty() {
                 anyhow::bail!("{} profile(s) still keep passwords in the file", left.len());
+            }
+            Ok(())
+        }
+        ProfileSubcommands::Partitioner {
+            name,
+            partitioner,
+            unset,
+        } => {
+            let partitioner = if unset { None } else { partitioner };
+            set_partitioner(&mut store, &name, partitioner)?;
+            store.save()?;
+            if json {
+                let mut value = change_json(&name, "updated");
+                value["partitioner"] = partitioner.map(|p| p.as_str()).into();
+                value["effective_partitioner"] = effective_partitioner(partitioner).into();
+                output::print_json(&value)?;
+                return Ok(());
+            }
+            match partitioner {
+                Some(p) => println!(
+                    "{} Profile '{}' produces with the {} partitioner.",
+                    "✔".green().bold(),
+                    name.cyan(),
+                    p.as_str().cyan()
+                ),
+                None => println!(
+                    "{} Profile '{}' uses librdkafka's default partitioner ({}).",
+                    "✔".green().bold(),
+                    name.cyan(),
+                    Partitioner::LIBRDKAFKA_DEFAULT.as_str()
+                ),
             }
             Ok(())
         }
@@ -748,6 +804,12 @@ fn handle_show(
             if has_secret {
                 obj.insert("secret_store".to_string(), json!(secret_store));
             }
+            obj.insert(
+                "effective_partitioner".to_string(),
+                json!(effective_partitioner(
+                    global.partitioner.or(profile.partitioner)
+                )),
+            );
         }
         output::print_json(&val)?;
         return Ok(());
@@ -895,6 +957,16 @@ fn handle_show(
             ]);
         }
     }
+    table.add_row(vec![
+        Cell::new("Partitioner").fg(Color::White),
+        Cell::new(partitioner_row(global.partitioner, profile.partitioner)).fg(
+            if global.partitioner.or(profile.partitioner).is_some() {
+                Color::Yellow
+            } else {
+                Color::DarkGrey
+            },
+        ),
+    ]);
 
     if let Some(ref desc) = profile.description {
         table.add_row(vec![
@@ -1001,6 +1073,37 @@ fn apply_oauth(
     Ok(())
 }
 
+/// Sets (or with `None` removes) the partitioner of profile `name`.
+fn set_partitioner(
+    store: &mut ProfileStore,
+    name: &str,
+    partitioner: Option<Partitioner>,
+) -> anyhow::Result<()> {
+    let profile = store
+        .profiles
+        .get_mut(name)
+        .ok_or_else(|| anyhow::anyhow!("Profile '{name}' not found"))?;
+    profile.partitioner = partitioner;
+    Ok(())
+}
+
+/// The partitioner producers use with `configured`: it, else librdkafka's default.
+fn effective_partitioner(configured: Option<Partitioner>) -> &'static str {
+    configured
+        .unwrap_or(Partitioner::LIBRDKAFKA_DEFAULT)
+        .as_str()
+}
+
+/// The partitioner row of `profile show`: `--partitioner` wins over the
+/// profile, which wins over librdkafka's default.
+fn partitioner_row(flag: Option<Partitioner>, profile: Option<Partitioner>) -> String {
+    match (flag, profile) {
+        (Some(p), _) => format!("{p} (--partitioner)"),
+        (None, Some(p)) => p.to_string(),
+        (None, None) => format!("{} (librdkafka default)", Partitioner::LIBRDKAFKA_DEFAULT),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_add(
     store: &mut ProfileStore,
@@ -1019,6 +1122,7 @@ fn handle_add(
     schema_registry: Option<String>,
     connect: Option<String>,
     ksql: KsqlSettings,
+    partitioner: Option<Partitioner>,
     oauth: OAuthArgs,
 ) -> anyhow::Result<bool> {
     let protocol = parse_security_protocol(sec_proto)?;
@@ -1046,6 +1150,7 @@ fn handle_add(
     profile.ksql_ca_location = ksql.ca_location;
     profile.ksql_certificate_location = ksql.certificate_location;
     profile.ksql_key_location = ksql.key_location;
+    profile.partitioner = partitioner;
     apply_oauth(&mut profile, oauth_method, oauth)?;
 
     let is_new = !store.profiles.contains_key(&name);
@@ -1115,7 +1220,7 @@ fn carry_over(existing: &ClusterProfile, new: &mut ClusterProfile) -> Replaced {
     {
         new.ssl_key_password = existing.ssl_key_password.clone();
     }
-    let settings: [(&'static str, bool, bool); 7] = [
+    let settings: [(&'static str, bool, bool); 8] = [
         (
             "SASL password",
             existing.sasl_password.is_some(),
@@ -1150,6 +1255,11 @@ fn carry_over(existing: &ClusterProfile, new: &mut ClusterProfile) -> Replaced {
             "description",
             existing.description.is_some(),
             new.description.is_some(),
+        ),
+        (
+            "partitioner",
+            existing.partitioner.is_some(),
+            new.partitioner.is_some(),
         ),
     ];
     replaced.dropped = settings
@@ -1553,5 +1663,102 @@ mod tests {
             }
             _ => panic!("Expected ProfileSubcommands::Add"),
         }
+    }
+
+    #[test]
+    fn partitioner_options_parse_and_unknown_names_are_refused() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        struct Wrapper {
+            #[command(subcommand)]
+            cmd: ProfileSubcommands,
+        }
+
+        let parsed = Wrapper::parse_from([
+            "profile",
+            "add",
+            "java",
+            "-b",
+            "j:9092",
+            "--partitioner",
+            "murmur2_random",
+        ]);
+        match parsed.cmd {
+            ProfileSubcommands::Add(add_args) => {
+                assert_eq!(add_args.partitioner, Some(Partitioner::Murmur2Random));
+            }
+            _ => panic!("Expected ProfileSubcommands::Add"),
+        }
+        let parsed = Wrapper::parse_from(["profile", "add", "plain", "-b", "p:9092"]);
+        match parsed.cmd {
+            ProfileSubcommands::Add(add_args) => assert_eq!(add_args.partitioner, None),
+            _ => panic!("Expected ProfileSubcommands::Add"),
+        }
+
+        assert_eq!(
+            Wrapper::parse_from(["profile", "partitioner", "java", "murmur2"]).cmd,
+            ProfileSubcommands::Partitioner {
+                name: "java".into(),
+                partitioner: Some(Partitioner::Murmur2),
+                unset: false,
+            }
+        );
+        assert_eq!(
+            Wrapper::parse_from(["profile", "partitioner", "java", "--unset"]).cmd,
+            ProfileSubcommands::Partitioner {
+                name: "java".into(),
+                partitioner: None,
+                unset: true,
+            }
+        );
+        for bad in [
+            vec!["profile", "partitioner", "java"],
+            vec!["profile", "partitioner", "java", "murmur2", "--unset"],
+            vec!["profile", "partitioner", "java", "java_murmur"],
+            vec![
+                "profile",
+                "add",
+                "x",
+                "-b",
+                "x:9092",
+                "--partitioner",
+                "crc",
+            ],
+        ] {
+            assert!(Wrapper::try_parse_from(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn partitioner_is_set_shown_and_named_when_an_update_drops_it() {
+        let mut store = ProfileStore::default();
+        store.add(ClusterProfile::new("java", "j:9092"), true);
+        set_partitioner(&mut store, "java", Some(Partitioner::Murmur2Random)).unwrap();
+        assert_eq!(
+            store.get("java").unwrap().partitioner,
+            Some(Partitioner::Murmur2Random)
+        );
+        assert!(set_partitioner(&mut store, "nope", None).is_err());
+
+        assert_eq!(
+            partitioner_row(None, None),
+            "consistent_random (librdkafka default)"
+        );
+        assert_eq!(
+            partitioner_row(None, Some(Partitioner::Murmur2Random)),
+            "murmur2_random"
+        );
+        assert_eq!(
+            partitioner_row(Some(Partitioner::Fnv1a), Some(Partitioner::Murmur2Random)),
+            "fnv1a (--partitioner)"
+        );
+        assert_eq!(effective_partitioner(None), "consistent_random");
+
+        let old = store.get("java").unwrap().clone();
+        let mut new = ClusterProfile::new("java", "j:9092");
+        assert_eq!(carry_over(&old, &mut new).dropped, vec!["partitioner"]);
+        set_partitioner(&mut store, "java", None).unwrap();
+        assert_eq!(store.get("java").unwrap().partitioner, None);
     }
 }

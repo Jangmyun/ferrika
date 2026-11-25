@@ -69,7 +69,8 @@ be placed leaves the value unchanged.
 - operands: `$.a.b`, `$.items[0]`, `$["odd key"]` (value fields), `$` (the
   whole value), `key`, `partition`, `offset`, `timestamp`, `headers.<name>`;
 - literals: `"text"`, `'text'`, numbers, `true`, `false`, `null`;
-- operators: `== != > >= < <=`, `=~` (regex, case-insensitive), `contains`,
+- operators: `== != > >= < <=`, `=~` (regex, case-insensitive; `(?-i)` at
+  the start of the pattern makes it case-sensitive), `contains`,
   `exists`, `&&`/`and`, `||`/`or`, `!`/`not`, parentheses.
 
 Examples: `$.user.country == "KR"`, `$.amount > 100`, `key =~ "^order-"`,

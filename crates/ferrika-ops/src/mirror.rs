@@ -322,6 +322,7 @@ pub fn mirror_record(msg: &ConsumedMessage, dst_topic: &str) -> OwnedProducerRec
         partition: None,
         timestamp: msg.timestamp_ms,
         headers: msg.headers.clone(),
+        null_headers: msg.null_headers.clone(),
     }
 }
 
@@ -983,6 +984,7 @@ mod tests {
             payload: None,
             timestamp_ms: Some(1_726_900_000_000),
             headers,
+            null_headers: Vec::new(),
         }
     }
 
@@ -1003,6 +1005,18 @@ mod tests {
             ]
         );
         assert_eq!(record.partition, None);
+    }
+
+    #[test]
+    fn mirror_record_keeps_null_headers_in_place() {
+        let mut msg = source_message();
+        msg.null_headers = vec![(0, "n0".to_string()), (2, "n2".to_string())];
+        let record = mirror_record(&msg, "dst");
+        assert_eq!(
+            ferrika_core::kafka::consumer::merge_headers(&record.headers, &record.null_headers),
+            msg.all_headers()
+        );
+        assert_eq!(record.null_headers, msg.null_headers);
     }
 
     #[test]

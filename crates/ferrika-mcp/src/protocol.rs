@@ -259,6 +259,7 @@ pub(super) mod tests {
             profile: None,
             bootstrap_servers: Some("127.0.0.1:1".to_string()),
             timeout: std::time::Duration::from_secs(30),
+            partitioner: None,
         };
         ResolvedContext::from_store(
             &selection,

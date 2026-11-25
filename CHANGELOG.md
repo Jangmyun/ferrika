@@ -9,6 +9,227 @@ versions, and 0.2.0 made it crate-internal.
 
 ## Unreleased
 
+### RabbitMQ: paged listings, TLS with a private CA, quorum-queue peeks
+
+Command line:
+
+- `rabbit queues`, `rabbit exchanges` and `rabbit bindings` take
+  `--name TEXT` (case-insensitive substring, filtered by the broker),
+  `--regex` (treat `--name` as a regular expression) and `--limit N`
+  (default 1000, `0` for all). Queues and exchanges are fetched from the
+  management API in pages of up to 500 with only the shown columns, so a
+  vhost with thousands of queues no longer comes back as one response that
+  can pass the 64 MiB limit. **Changed:** the listings stop at 1000 entries
+  by default (stderr says how many more match); pass `--limit 0` for the
+  earlier "everything" behaviour.
+- TLS options for every `rabbit` command and `rabbit profile add`:
+  `--rabbit-ca-cert FILE` (a private CA for `https://` and `amqps://`),
+  `--rabbit-client-cert FILE` and `--rabbit-client-key FILE` (mutual TLS),
+  also as `FERRIKA_RABBIT_CA_CERT`, `FERRIKA_RABBIT_CLIENT_CERT`,
+  `FERRIKA_RABBIT_CLIENT_KEY` and as the profile fields `ca_cert`,
+  `client_cert`, `client_key` (absolute paths). An untrusted server
+  certificate fails with a hint to give the CA file; a server that requires
+  a client certificate fails with a hint to give one. There is no option to
+  skip certificate verification.
+- **Changed:** `rabbit peek`, `rabbit dlq inspect` and the `rabbit dlq
+  redrive` preview refuse a quorum queue with a delivery limit on RabbitMQ
+  before 4.0 (or when the broker version cannot be read), where every peek
+  counts as a delivery attempt and can dead-letter or drop messages.
+  `--allow-delivery-count` reads anyway and shows per message how many more
+  peeks keep it in the queue. RabbitMQ 4.0 and later do not count a peek,
+  so nothing changes there.
+
+MCP:
+
+- `rabbit_queues`, `rabbit_exchanges` and `rabbit_bindings` filter on the
+  broker and fetch in pages. **Changed:** `filter` is now case-insensitive;
+  a new `regex` argument treats it as a regular expression.
+- `rabbit_peek` and `rabbit_dlq_inspect` refuse a quorum queue whose
+  delivery limit a peek would count towards (RabbitMQ before 4.0), with no
+  opt-in over MCP; plans of other quorum queues say that a read does not
+  count.
+- RabbitMQ profiles with `ca_cert` / `client_cert` / `client_key` are used
+  with those files by every RabbitMQ tool.
+
+Library (`ferrika-rabbitmq`, `ferrika-core`):
+
+- New: `ferrika_rabbitmq::listing` (`ListQuery`, `Listing`,
+  `ManagementClient::list_queues`, `list_exchanges`, `list_bindings`);
+  `ferrika_rabbitmq::delivery_limit` (`PeekRisk`, `DeliveryFate`,
+  `delivery_count`, `ManagementClient::peek_risk`);
+  `ManagementClient::with_tls`; `ferrika_core::kafka::http::TlsFiles` and
+  `Endpoint::with_tls_files` (re-exported as
+  `ferrika_rabbitmq::client::TlsFiles`). The unbounded
+  `ManagementClient::queues`, `exchanges` and `bindings` are unchanged.
+- **Breaking** for code that builds these structs with every field listed
+  (use `..Default::default()` or `..RabbitProfile::new(url)`): new fields
+  `RabbitProfile::{ca_cert, client_cert, client_key}`,
+  `RabbitOverrides::{ca_cert, client_cert, client_key}`,
+  `ResolvedRabbit::tls` and `AmqpTarget::tls`. `rabbit-profiles.json`
+  files from 0.2.0 load unchanged.
+- `ResolvedRabbit::client` and `ResolvedRabbit::amqp_target` apply the TLS
+  files; `client` fails when a file cannot be read.
+
+### MQTT support (preview)
+
+Added:
+
+- MQTT support (preview): `ferrika mqtt` for MQTT 3.1.1 and 5 brokers
+  (Mosquitto, EMQX, HiveMQ, MQTT bridges), in the new crate `ferrika-mqtt`
+  behind the `ferrika-cli` cargo feature `mqtt` (on by default; a build
+  with `--no-default-features` leaves it out). `mqtt sub FILTER` shows
+  messages until `--count` (default 10) or `--duration` (default 30 s);
+  `mqtt pub TOPIC -m TEXT` publishes (QoS 1 by default, `--retain`
+  explicit; MQTT 5 user properties and content type); `mqtt retained
+  FILTER` lists retained messages; `mqtt retained clear TOPIC` deletes one
+  (asks first, `--yes` to skip; changes nothing when there is none). Table
+  and `-f json` output (`sub` writes JSON Lines). TLS with `mqtts://` and
+  the OS trust store or `--mqtt-ca-file`. Every session is clean with a
+  fresh client id and no last will; shared subscriptions (`$share/`,
+  `$queue/`) are refused. See `docs/plans/mqtt.md`.
+- MQTT profiles: `ferrika mqtt profile add|list|use|remove|show`, stored in
+  `mqtt-profiles.json` next to `profiles.json`, passwords in the OS
+  credential store (`<profile>/mqtt_password`). Broker URLs never carry
+  credentials.
+- Policy category `messages.delete` (`mqtt retained clear`), which also
+  needs `produce` allowed. `mqtt pub` is `produce`; `mqtt sub` and
+  `mqtt retained` pass the export gate and mask PII (payloads, topics, MQTT
+  5 user properties) under the policy. The policy's broker-address rules
+  match the MQTT broker's `host:port`; read-only MQTT profiles refuse `pub`
+  and `retained clear`.
+- `tools/e2e/mqtt_smoke.py` and `tools/e2e/mosquitto-setup.sh`, and a CI
+  job running them against `eclipse-mosquitto:2`.
+
+Compatibility:
+
+- A signed policy whose `forbid` names `messages.delete` is invalid for
+  builds up to 0.2.0, which then run in the strictest mode. Roll it out
+  only once every client runs a newer build.
+- `PolicyAction` has a new variant, `MessagesDelete`; code that matches it
+  exhaustively must add it.
+
+### RabbitMQ topology changes, history and undo
+
+Added:
+
+- RabbitMQ topology changes (preview): `ferrika rabbit queue
+  declare|delete|purge`, `ferrika rabbit exchange declare|delete`,
+  `ferrika rabbit bind` and `ferrika rabbit unbind`, with `-f json`
+  output. Deletions and purges ask first (`-y` to skip); declaring a queue
+  or exchange that exists is refused. Every change passes the company
+  policy and the read-only checks and is audited.
+- New policy categories `queues.create`, `queues.delete`, `queues.purge`,
+  `exchanges.create`, `exchanges.delete` and `bindings.change`.
+- RabbitMQ changes are recorded in the operation history:
+  `ferrika rabbit history` and `ferrika rabbit undo` (a declared queue or
+  exchange is deleted while empty and unbound; a deleted one is declared
+  again with its bindings, its messages lost; bindings are restored or
+  removed; purges cannot be undone). `ferrika history --all` lists them;
+  `ferrika undo` points them to `ferrika rabbit undo`.
+- `tools/e2e/rabbit_smoke.py` checks declare, delete, purge, bind, unbind,
+  their undo and read-only refusals against a live broker.
+
+Compatibility:
+
+- A signed policy that names one of the six new categories is invalid for
+  builds that do not know them (0.2.0 and older), which then run in the
+  strictest mode. Roll such a policy out only once every client runs a
+  build with these categories.
+- History entries of RabbitMQ changes hold `rabbit_*` state kinds. Ferrika
+  0.2.0 cannot parse those journal lines and skips them, so its `history`,
+  `undo` and `audit verify` do not see these operations (rather than
+  report them as edited); its trimming keeps the lines byte for byte.
+
+Library API:
+
+- `ferrika-core`: `PolicyAction` has six more variants (`ALL` has 23
+  entries with `MessagesDelete`); `model::history::Scope` has a `rabbitmq` field; `State` has
+  `RabbitQueue`, `RabbitQueueMessages`, `RabbitExchange` and
+  `RabbitBinding`, with the new types `RabbitQueueDeclaration`,
+  `RabbitExchangeDeclaration` and `RabbitBindingKey`; `State::is_rabbitmq`.
+- `ferrika-ops` depends on `ferrika-rabbitmq` (without its `amqp`
+  feature). `history::inverse::Step` has `DeclareQueue`, `DeleteQueue`,
+  `DeclareExchange`, `DeleteExchange`, `Bind` and `Unbind`, and
+  `Step::is_rabbitmq`; the new module `history::rabbit` reads RabbitMQ
+  states, plans and runs their undo (`prepare_request`, `execute_steps`)
+  with the same rules as `history::undo`. The Kafka `undo::prepare` refuses
+  a RabbitMQ operation (another scope).
+- `ferrika-rabbitmq`: `ManagementClient::{queue, exchange,
+  queue_bindings, exchange_bindings, bindings_between, declare_queue,
+  delete_queue, purge_queue, declare_exchange, delete_exchange, bind,
+  unbind}`; `model::{QueueDeclaration, ExchangeDeclaration,
+  BindingDeclaration, DestinationType, validate_name, MAX_NAME_BYTES}`;
+  `Binding` has a `properties_key` field; bodiless `DELETE` requests send
+  `Accept: */*` (the purge resource answers 406 to JSON-only). Feature
+  `test-util` adds `fake`, an in-memory management API for tests.
+- `ferrika-cli`: `cli::rabbit::RabbitSubcommands` has `Queue`, `Exchange`,
+  `Bind`, `Unbind`, `History` and `Undo` (front ends that match it
+  exhaustively must classify them).
+- The neutral gate target (`GateTarget`) proposed in
+  `docs/plans/multi-broker.md` is still not added: the CLI gates RabbitMQ
+  writes with its RabbitMQ profile and addresses as before.
+
+### Null-valued Kafka headers kept in dump/restore, mirror and transform
+
+Changed:
+
+- `dump` keeps headers with a null value (it left them out) and `restore`
+  writes them back as null. Dump lines now carry `"format_version": 2`; a
+  null-valued header is a `header_list` entry with only a `key`. Dumps
+  without the field restore exactly as before. Ferrika 0.2.0 and earlier
+  ignore the field and restore a version 2 dump with null-valued headers as
+  empty values. `consume --save` is unchanged (it still leaves them out).
+- `mirror` and `transform` copy headers with a null value as null, in their
+  original positions (they left them out). `transform --mask` leaves them
+  null, `--filter` reads them as missing, and the dry run shows them with a
+  `null` value; the MCP transform preview lists their names.
+- Library API (breaking): `ConsumedMessage` and `OwnedProducerRecord` have a
+  new `null_headers` field (position and key of each null-valued header;
+  `headers` still holds only the others). New: `ConsumedMessage::all_headers`,
+  `OwnedProducerRecord::with_null_header`, `kafka::consumer::merge_headers`,
+  `DumpRecord::format_version`, `DumpRecord::extract_all_headers`,
+  `HeaderFields::from_all_headers` and `backup::DUMP_FORMAT_VERSION`.
+
+Documentation:
+
+- The filter expression operator `=~` is case-insensitive; the CLI help, the
+  MCP `peek_messages` description and docs/CLI.md now say so and that a
+  pattern starting with `(?-i)` matches case (`$.status =~ "(?-i)ERROR"`
+  matches `ERROR` but not `error`).
+
+### Producer partitioner setting
+
+Added:
+
+- Producer partitioner setting. librdkafka hashes record keys with CRC32
+  (`consistent_random`) by default, while the Java client uses murmur2, so a
+  key Ferrika produced could land on a different partition than the same key
+  from a Java producer, splitting the key's records and their order. Set
+  `murmur2_random` for Java-compatible placement: per profile with
+  `ferrika profile add --partitioner <name>` or the new
+  `ferrika profile partitioner <profile> <name>` (`--unset` removes it), or per
+  run with the global `--partitioner <name>`, which wins over the profile.
+  Accepted values are librdkafka's: `consistent_random`, `murmur2_random`,
+  `murmur2`, `consistent`, `fnv1a`, `fnv1a_random`, `random`; others are
+  refused. It applies to every producer: `produce`, `restore`, `mirror`,
+  `transform`, `dlq redrive`, `generate`, `bench produce`, `probe` and the MCP
+  write tools. `profile show` prints the partitioner in use (`-f json`:
+  `partitioner` and `effective_partitioner`). The default is unchanged
+  (librdkafka's `consistent_random`); 0.3 is planned to switch it to
+  `murmur2_random`.
+- Library: `ferrika_core::kafka::config::Partitioner`,
+  `KafkaClientConfig::with_partitioner`.
+
+Changed:
+
+- Library (breaking for code that builds these structs with a struct
+  literal): new public fields `KafkaClientConfig::partitioner`,
+  `ClusterProfile::partitioner` and `ClusterSelection::partitioner`
+  (`Option<Partitioner>`; `None` keeps librdkafka's default). Code that uses
+  `KafkaClientConfig::new`/`Default`, `ClusterProfile::new` or `..` in the
+  literal is unaffected. `profiles.json` stays compatible both ways: the
+  `partitioner` key is written only when set, and older versions ignore it.
+
 ### ksqlDB client (preview)
 
 - New crate `ferrika-ksql` and command `ferrika ksql`: a client for an
@@ -40,10 +261,12 @@ Compatibility:
   every client knows them.
 - Library API: `ClusterProfile` gains the public fields `ksql_url`,
   `ksql_ca_location`, `ksql_certificate_location` and `ksql_key_location`,
-  and `PolicyAction` five variants (`ALL` has 21 entries); code that builds
+  and `PolicyAction` five variants (`ALL` has 28 entries with the
+  MQTT and RabbitMQ topology categories above); code that builds
   `ClusterProfile` with a struct literal or matches `PolicyAction`
   exhaustively must add them. `ferrika_core::kafka::http::rest_tls_config`
-  is new.
+  (a rustls client configuration from `TlsFiles`, for clients with their
+  own HTTP transport) is new.
 
 ## 0.2.0
 
