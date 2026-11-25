@@ -686,7 +686,7 @@ Filter expressions (`-W`/`--where`, expressions that start with
 | `$.a.b`, `$.items[0]`, `$["odd key"]`, `$` | A field of the JSON value; `$` alone is the whole value |
 | `key`, `partition`, `offset`, `timestamp`, `headers.<name>` | Record fields (timestamp in epoch ms) |
 | `== != > >= < <=` | Compare; a number and a numeric string compare as numbers |
-| `=~ "regex"`, `contains "text"` | Case-insensitive match (`=~` too: `key =~ "^EU-"` matches `eu-1`); `contains` also checks array elements |
+| `=~ "regex"`, `contains "text"` | Case-insensitive match (`=~` too: `key =~ "^EU-"` matches `eu-1`); `contains` also checks array elements. Start a `=~` pattern with `(?-i)` for a case-sensitive match: `$.status =~ "(?-i)ERROR"` matches `ERROR` but not `error` |
 | `exists`, `&&`/`and`, `\|\|`/`or`, `!`/`not`, `( )` | Presence and logic; a bare field is true unless missing, null, false, 0 or "" |
 
 With `-g`, the group's offsets are committed for the records the command
@@ -827,7 +827,7 @@ another topic, through steps applied in the order they are given:
 
 | Step | Effect |
 | --- | --- |
-| `--filter EXPR` | Keep records the expression matches (the `consume --where` syntax: `$.user.country == "KR"`, `$.amount > 100`, `key =~ "^order-"`, `headers.source == "web"`, `&&`, `\|\|`, `!`) |
+| `--filter EXPR` | Keep records the expression matches (the `consume --where` syntax: `$.user.country == "KR"`, `$.amount > 100`, `key =~ "^order-"`, `headers.source == "web"`, `&&`, `\|\|`, `!`; `=~` ignores case unless the pattern starts with `(?-i)`) |
 | `--drop FIELD` | Remove a value field (`user.email`, `items.0`) |
 | `--rename OLD=NEW` | Move a value field to another name or path |
 | `--set FIELD=JSON` | Set a value field to a JSON value (`env='"staging"'`, `retries=0`) |

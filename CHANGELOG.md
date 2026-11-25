@@ -24,6 +24,13 @@ versions, and 0.2.0 made it crate-internal.
   `DumpRecord::format_version`, `DumpRecord::extract_all_headers`,
   `HeaderFields::from_all_headers` and `backup::DUMP_FORMAT_VERSION`.
 
+### Documentation
+
+- The filter expression operator `=~` is case-insensitive; the CLI help, the
+  MCP `peek_messages` description and docs/CLI.md now say so and that a
+  pattern starting with `(?-i)` matches case (`$.status =~ "(?-i)ERROR"`
+  matches `ERROR` but not `error`).
+
 ## 0.2.0
 
 New: connection presets for Kafka-compatible services, `ferrika transform`,

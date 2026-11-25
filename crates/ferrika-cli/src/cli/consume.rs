@@ -67,7 +67,8 @@ pub struct ConsumeArgs {
     /// Keep records matching an expression, e.g. '$.amount > 100 && $.status == "PAID"'.
     /// Fields: $.path (JSON value, decoded first with -D), key, partition,
     /// offset, timestamp, headers.<name>; operators == != > >= < <= =~
-    /// contains exists && || !
+    /// contains exists && || !. =~ (regex) and contains ignore case; start a
+    /// =~ pattern with (?-i) to match case, e.g. '$.status =~ "(?-i)ERROR"'
     #[arg(short = 'W', long = "where", value_name = "EXPR")]
     pub where_expr: Option<String>,
 

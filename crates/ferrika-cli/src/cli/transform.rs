@@ -123,7 +123,8 @@ impl StepArgs {
                 "EXPR",
                 "Keep records matching an expression, e.g. '$.amount > 100', \
                  '$.user.country == \"KR\"', 'key =~ \"^order-\"', 'headers.source == \"web\"' \
-                 (the syntax of consume --where)",
+                 (the syntax of consume --where; =~ ignores case unless the pattern starts \
+                 with (?-i))",
             ),
             StepKind::Drop => (
                 "FIELD",
