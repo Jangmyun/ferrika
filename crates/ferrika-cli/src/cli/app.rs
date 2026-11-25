@@ -1168,6 +1168,7 @@ mod tests {
         "profile add",
         "profile import",
         "profile list",
+        "profile partitioner",
         "profile read-only",
         "profile remove",
         "profile secure",

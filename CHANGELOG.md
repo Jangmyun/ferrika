@@ -7,6 +7,39 @@ module is the command line's own code (argument structs, the command enum),
 not a library API; options added to commands changed it in 0.1 patch
 versions, and 0.2.0 made it crate-internal.
 
+## Unreleased
+
+### Added
+
+- Producer partitioner setting. librdkafka hashes record keys with CRC32
+  (`consistent_random`) by default, while the Java client uses murmur2, so a
+  key Ferrika produced could land on a different partition than the same key
+  from a Java producer, splitting the key's records and their order. Set
+  `murmur2_random` for Java-compatible placement: per profile with
+  `ferrika profile add --partitioner <name>` or the new
+  `ferrika profile partitioner <profile> <name>` (`--unset` removes it), or per
+  run with the global `--partitioner <name>`, which wins over the profile.
+  Accepted values are librdkafka's: `consistent_random`, `murmur2_random`,
+  `murmur2`, `consistent`, `fnv1a`, `fnv1a_random`, `random`; others are
+  refused. It applies to every producer: `produce`, `restore`, `mirror`,
+  `transform`, `dlq redrive`, `generate`, `bench produce`, `probe` and the MCP
+  write tools. `profile show` prints the partitioner in use (`-f json`:
+  `partitioner` and `effective_partitioner`). The default is unchanged
+  (librdkafka's `consistent_random`); 0.3 is planned to switch it to
+  `murmur2_random`.
+- Library: `ferrika_core::kafka::config::Partitioner`,
+  `KafkaClientConfig::with_partitioner`.
+
+### Changed
+
+- Library (breaking for code that builds these structs with a struct
+  literal): new public fields `KafkaClientConfig::partitioner`,
+  `ClusterProfile::partitioner` and `ClusterSelection::partitioner`
+  (`Option<Partitioner>`; `None` keeps librdkafka's default). Code that uses
+  `KafkaClientConfig::new`/`Default`, `ClusterProfile::new` or `..` in the
+  literal is unaffected. `profiles.json` stays compatible both ways: the
+  `partitioner` key is written only when set, and older versions ignore it.
+
 ## 0.2.0
 
 New: connection presets for Kafka-compatible services, `ferrika transform`,

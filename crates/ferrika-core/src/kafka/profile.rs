@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{KafkaError, KafkaResult};
 use crate::files::write_private_file;
 use crate::kafka::config::{
-    KafkaClientConfig, OAuthClientAuth, OAuthConfig, OAuthMethod, SaslMechanism, SecurityProtocol,
+    KafkaClientConfig, OAuthClientAuth, OAuthConfig, OAuthMethod, Partitioner, SaslMechanism,
+    SecurityProtocol,
 };
 use crate::kafka::secrets;
 
@@ -87,6 +88,10 @@ pub struct ClusterProfile {
     /// AWS shared-config profile for MSK IAM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aws_profile: Option<String>,
+    /// Producer partitioner; `None` leaves librdkafka's default
+    /// (`consistent_random`). `murmur2_random` matches the Java client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitioner: Option<Partitioner>,
 }
 
 impl ClusterProfile {
@@ -117,6 +122,7 @@ impl ClusterProfile {
             oauth_extensions: BTreeMap::new(),
             aws_region: None,
             aws_profile: None,
+            partitioner: None,
         }
     }
 
@@ -169,6 +175,7 @@ impl ClusterProfile {
             aws_region: self.aws_region.clone(),
             aws_profile: self.aws_profile.clone(),
         };
+        config.partitioner = self.partitioner;
 
         if let Some(ms) = self.request_timeout_ms {
             config.request_timeout = Duration::from_millis(ms);
@@ -204,6 +211,7 @@ impl ClusterProfile {
             oauth_extensions: config.oauth.extensions.clone(),
             aws_region: config.oauth.aws_region.clone(),
             aws_profile: config.oauth.aws_profile.clone(),
+            partitioner: config.partitioner,
         }
     }
 
@@ -868,6 +876,7 @@ impl std::fmt::Debug for ClusterProfile {
             .field("oauth_extensions", &self.oauth_extensions)
             .field("aws_region", &self.aws_region)
             .field("aws_profile", &self.aws_profile)
+            .field("partitioner", &self.partitioner)
             .finish()
     }
 }
@@ -1052,6 +1061,29 @@ impl ClusterProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partitioner_is_stored_only_when_set_and_reaches_the_client_config() {
+        let mut profile = ClusterProfile::new("prod", "b:9092");
+        let json = serde_json::to_value(&profile).unwrap();
+        assert!(json.get("partitioner").is_none());
+        assert_eq!(profile.to_kafka_config().partitioner, None);
+
+        profile.partitioner = Some(Partitioner::Murmur2Random);
+        let json = serde_json::to_value(&profile).unwrap();
+        assert_eq!(json["partitioner"], "murmur2_random");
+        let back: ClusterProfile = serde_json::from_value(json).unwrap();
+        assert_eq!(back, profile);
+        let config = profile.to_kafka_config();
+        assert_eq!(config.partitioner, Some(Partitioner::Murmur2Random));
+        assert_eq!(
+            ClusterProfile::from_kafka_config("prod", &config).partitioner,
+            Some(Partitioner::Murmur2Random)
+        );
+
+        let bad = r#"{"name":"x","bootstrap_servers":"b:9092","partitioner":"java"}"#;
+        assert!(serde_json::from_str::<ClusterProfile>(bad).is_err());
+    }
 
     #[test]
     fn file_mode_never_removes_secrets_it_could_not_read() {

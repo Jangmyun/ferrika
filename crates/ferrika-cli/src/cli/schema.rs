@@ -1365,6 +1365,7 @@ mod tests {
             bootstrap_servers: None,
             format: super::OutputFormat::Json,
             timeout: Some(5),
+            partitioner: None,
             resolved: None,
             write: None,
         };
@@ -1509,6 +1510,7 @@ mod tests {
             bootstrap_servers: None,
             format: super::OutputFormat::Json,
             timeout: Some(5),
+            partitioner: None,
             resolved: None,
             write: None,
         };
@@ -1769,6 +1771,7 @@ mod tests {
             profile: None,
             format: OutputFormat::Table,
             timeout: Some(30),
+            partitioner: None,
             resolved: None,
             write: None,
         };

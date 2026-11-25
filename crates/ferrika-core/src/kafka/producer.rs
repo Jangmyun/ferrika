@@ -296,6 +296,26 @@ impl std::future::Future for PendingDelivery {
     }
 }
 
+/// The librdkafka config of a producer: the shared client settings plus the
+/// producer-only ones. A key in `extra_properties` wins over both.
+fn producer_rdkafka_config(config: &KafkaClientConfig) -> KafkaResult<rdkafka::ClientConfig> {
+    let mut rd_config = config.to_rdkafka_config()?;
+    let explicit = |key: &str| config.extra_properties.contains_key(key);
+    // Writing to a topic that does not exist yet follows the broker's
+    // `auto.create.topics.enable`, as a Kafka producer normally does;
+    // read and admin clients never create topics.
+    if !explicit("allow.auto.create.topics") {
+        rd_config.set("allow.auto.create.topics", "true");
+    }
+    // Unset, librdkafka uses `consistent_random`.
+    if let Some(partitioner) = config.partitioner {
+        if !explicit("partitioner") {
+            rd_config.set("partitioner", partitioner.as_str());
+        }
+    }
+    Ok(rd_config)
+}
+
 /// High-performance asynchronous Kafka producer client.
 pub struct KafkaProducerClient {
     // Declared before `producer` so it stops before the client is destroyed.
@@ -307,16 +327,7 @@ pub struct KafkaProducerClient {
 impl KafkaProducerClient {
     /// Creates a new `KafkaProducerClient` from the configuration.
     pub fn new(config: &KafkaClientConfig) -> KafkaResult<Self> {
-        let mut rd_config = config.to_rdkafka_config()?;
-        // Writing to a topic that does not exist yet follows the broker's
-        // `auto.create.topics.enable`, as a Kafka producer normally does;
-        // read and admin clients never create topics.
-        if !config
-            .extra_properties
-            .contains_key("allow.auto.create.topics")
-        {
-            rd_config.set("allow.auto.create.topics", "true");
-        }
+        let rd_config = producer_rdkafka_config(config)?;
         let (oauth, producer) = crate::kafka::oauth_refresh::with_oauth(
             config,
             || Ok(rd_config.create::<FutureProducer<DefaultClientContext>>()?),
@@ -489,5 +500,32 @@ mod tests {
         assert!(client.is_ok());
         let client = client.unwrap();
         assert_eq!(client.config().client_id.as_deref(), Some("producer-test"));
+    }
+
+    #[test]
+    fn partitioner_is_left_to_librdkafka_unless_set() {
+        use crate::kafka::config::Partitioner;
+        let plain = KafkaClientConfig::new("localhost:9092");
+        assert_eq!(
+            producer_rdkafka_config(&plain).unwrap().get("partitioner"),
+            None
+        );
+        // Shared clients never get it, even when set.
+        let set = plain.clone().with_partitioner(Partitioner::Murmur2Random);
+        assert_eq!(set.to_rdkafka_config().unwrap().get("partitioner"), None);
+        assert_eq!(
+            producer_rdkafka_config(&set).unwrap().get("partitioner"),
+            Some("murmur2_random")
+        );
+        // A raw librdkafka property wins.
+        let raw = set.with_property("partitioner", "fnv1a");
+        assert_eq!(
+            producer_rdkafka_config(&raw).unwrap().get("partitioner"),
+            Some("fnv1a")
+        );
+        for p in Partitioner::ALL {
+            let config = KafkaClientConfig::new("localhost:9092").with_partitioner(p);
+            assert!(KafkaProducerClient::new(&config).is_ok(), "{p}");
+        }
     }
 }

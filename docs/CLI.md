@@ -2,8 +2,8 @@
 
 Examples for the `ferrika` command line, grouped by task. Run
 `ferrika <command> --help` for the full list of options of any command. The
-global options `-p/--profile`, `-b/--bootstrap-servers`, `-f/--format` and
-`--timeout` go before the subcommand; some subcommands reuse `-b` or `-p` for
+global options `-p/--profile`, `-b/--bootstrap-servers`, `-f/--format`,
+`--timeout` and `--partitioner` go before the subcommand; some subcommands reuse `-b` or `-p` for
 their own flags (`consume -b` reads from the beginning, `consume -p` picks a
 partition).
 
@@ -83,7 +83,38 @@ ferrika profile add msk -b "b-1.demo.abc123.c2.kafka.us-east-1.amazonaws.com:909
 # (create/delete/purge topics, produce, offset resets, ACL changes, ...) are refused
 ferrika profile read-only prod
 ferrika profile read-only prod --off
+
+# Place keyed records on the partitions a Java producer picks (murmur2)
+ferrika profile add prod -b kafka.prod:9092 --partitioner murmur2_random
+ferrika profile partitioner prod murmur2_random
+ferrika profile partitioner prod --unset
+ferrika --partitioner murmur2_random produce orders -k order-17 -m '{"id":17}'
 ```
+
+#### Partitioner
+
+A record with a key and no explicit partition goes to a partition chosen by
+hashing the key. librdkafka, which Ferrika's producers use, hashes with CRC32
+by default (`consistent_random`); the Java client hashes with murmur2. So the
+same key can land on a different partition when Ferrika writes it than when a
+Java application does. When Ferrika and Java producers write to one topic
+(`produce`, `restore`, `mirror`, `transform`, `dlq redrive`, `generate`,
+`bench produce`, `probe` and the MCP write tools), records of one key are then
+split across two partitions and lose their per-key order, and consumers that
+rely on key placement (Kafka Streams, compacted topics keyed by entity) see
+them on the wrong partition.
+
+`--partitioner murmur2_random` makes Ferrika hash keys like the Java client;
+records without a key still go to a random partition. Set it per profile with
+`profile add --partitioner` or `profile partitioner <name> <partitioner>`,
+or per run with the global `--partitioner` option, which wins over the
+profile (for `mirror` and `transform` it applies to both clusters' profiles).
+Without either, librdkafka's default applies, as in earlier versions.
+`profile show` prints the partitioner a profile's producers use. The values
+are librdkafka's: `consistent_random` (default), `murmur2_random`, `murmur2`,
+`consistent`, `fnv1a`, `fnv1a_random` and `random`. A record with an explicit
+partition (`produce -p`) is not affected. The default is planned to become
+`murmur2_random` in 0.3.
 
 OAUTHBEARER tokens are fetched by Ferrika and shared by every client in the
 process: OIDC tokens with the client credentials grant (`client_secret_basic`,

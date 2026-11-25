@@ -113,6 +113,36 @@ def consume(t, n=1, extra=(), timeout_ms=8000):
     return run(["consume", t, "-b", "-n", str(n), "-t", str(timeout_ms), "-g", f"{t}-g", *extra], timeout=40)
 
 
+def java_partition(key, partitions):
+    """The partition the Java client picks for `key`: Kafka's
+    Utils.toPositive(Utils.murmur2(key)) % partitions."""
+    data = key.encode("utf-8")
+    m, h = 0x5BD1E995, (0x9747B28C ^ len(data)) & 0xFFFFFFFF
+    for i in range(0, len(data) - len(data) % 4, 4):
+        k = int.from_bytes(data[i:i + 4], "little")
+        k = (k * m) & 0xFFFFFFFF
+        k ^= k >> 24
+        h = ((h * m) & 0xFFFFFFFF) ^ ((k * m) & 0xFFFFFFFF)
+    rest = data[len(data) - len(data) % 4:]
+    if len(rest) == 3:
+        h ^= rest[2] << 16
+    if len(rest) >= 2:
+        h ^= rest[1] << 8
+    if rest:
+        h = ((h ^ rest[0]) * m) & 0xFFFFFFFF
+    h ^= h >> 13
+    h = (h * m) & 0xFFFFFFFF
+    h ^= h >> 15
+    return (h & 0x7FFFFFFF) % partitions
+
+
+def produced_partition(out):
+    try:
+        return json.loads(out[out.index("{"):])["partition"]
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
 # --- fake Schema Registry returning hostile schemas ---------------------
 def avro_bomb():
     # R0 = {a: R1, b: R1}, ... 40 levels: 2^40 decode nodes from zero bytes.
@@ -354,6 +384,18 @@ def scenarios():
     z = f"{RUN}zstd"
     rc, out = run(["bench", "produce", z, "-c", "zstd", "-n", "5000"], timeout=60)
     check("bench produce -c zstd works", rc == 0 and "libzstd" not in out, f"rc={rc} {tail(out)}")
+
+    # --- partitioner ----------------------------------------------------
+    pt = f"{RUN}partitioner"
+    run(["topics", "create", pt, "-p", "6"])
+    keys = ["order-1", "order-2", "user-42", "beta", "gamma", "k", "0", "주문-7"]
+    placed = {k: produced_partition(run(["-f", "json", "--partitioner", "murmur2_random",
+                                         "produce", pt, "-k", k, "-m", "v"])[1]) for k in keys}
+    expected = {k: java_partition(k, 6) for k in keys}
+    check("--partitioner murmur2_random places keys like the Java client", placed == expected,
+          f"got={placed} java={expected}")
+    rc, out = run(["--partitioner", "java", "topics", "list"])
+    check("unknown --partitioner is a usage error (2)", rc == 2 and "murmur2_random" in out, f"rc={rc} {tail(out)}")
 
     # --- closed stdout/stderr pipes -------------------------------------
     po, wo = os.pipe()
