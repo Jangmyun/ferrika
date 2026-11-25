@@ -19,6 +19,52 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// memory.
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// TLS files for an endpoint other than the defaults: a CA file (PEM)
+/// trusted instead of the OS trust store, and a client certificate and key
+/// (PEM, unencrypted key) for mutual TLS. Paths, not contents.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TlsFiles {
+    pub ca_file: Option<String>,
+    pub client_cert: Option<String>,
+    pub client_key: Option<String>,
+}
+
+impl TlsFiles {
+    /// Whether nothing is set (the OS trust store, no client certificate).
+    pub fn is_empty(&self) -> bool {
+        self.ca_file.is_none() && self.client_cert.is_none() && self.client_key.is_none()
+    }
+
+    /// The client certificate and key, which go together.
+    pub fn client_pair(&self) -> KafkaResult<Option<(&str, &str)>> {
+        match (&self.client_cert, &self.client_key) {
+            (Some(cert), Some(key)) => Ok(Some((cert.as_str(), key.as_str()))),
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(KafkaError::config(
+                "A TLS client certificate needs its key file too",
+            )),
+            (None, Some(_)) => Err(KafkaError::config(
+                "A TLS client key needs its certificate file too",
+            )),
+        }
+    }
+}
+
+/// A TLS configuration built from [`TlsFiles`]; compared by its files.
+#[derive(Clone)]
+struct CustomTls {
+    files: TlsFiles,
+    config: Arc<rustls::ClientConfig>,
+}
+
+impl PartialEq for CustomTls {
+    fn eq(&self, other: &Self) -> bool {
+        self.files == other.files
+    }
+}
+
+impl Eq for CustomTls {}
+
 /// Where requests go: scheme, host, port, path prefix and credentials.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Endpoint {
@@ -31,6 +77,8 @@ pub struct Endpoint {
     authorization: Option<String>,
     /// Limit for connecting, the TLS handshake and the exchange, each.
     timeout: Duration,
+    /// TLS from [`Endpoint::with_tls_files`], else the OS trust store.
+    custom_tls: Option<CustomTls>,
 }
 
 /// A response's status code and body (chunked encoding already removed).
@@ -73,6 +121,7 @@ impl std::fmt::Debug for Endpoint {
                 "authorization",
                 &self.authorization.as_ref().map(|_| "<redacted>"),
             )
+            .field("tls_files", &self.custom_tls.as_ref().map(|c| &c.files))
             .finish()
     }
 }
@@ -130,7 +179,25 @@ impl Endpoint {
             base_path,
             authorization,
             timeout: HTTP_TIMEOUT,
+            custom_tls: None,
         })
+    }
+
+    /// Uses `files` for `https://`: the CA file instead of the OS trust
+    /// store, and the client certificate and key for mutual TLS. The files
+    /// are read now, so a missing or bad file fails here. Empty `files`
+    /// keep the defaults; a plain `http://` endpoint ignores them.
+    pub fn with_tls_files(mut self, files: &TlsFiles) -> KafkaResult<Self> {
+        if files.is_empty() {
+            self.custom_tls = None;
+            return Ok(self);
+        }
+        let config = build_tls_config(files.ca_file.as_deref(), files.client_pair()?)?;
+        self.custom_tls = Some(CustomTls {
+            files: files.clone(),
+            config,
+        });
+        Ok(self)
     }
 
     /// Sets the time allowed to connect, for the TLS handshake and for the
@@ -183,7 +250,11 @@ impl Endpoint {
             let name = rustls::pki_types::ServerName::try_from(self.host.clone()).map_err(|e| {
                 KafkaError::config(format!("Invalid TLS host '{}': {e}", self.host))
             })?;
-            let handshake = tokio_rustls::TlsConnector::from(tls_config()?).connect(name, tcp);
+            let config = match &self.custom_tls {
+                Some(custom) => custom.config.clone(),
+                None => tls_config()?,
+            };
+            let handshake = tokio_rustls::TlsConnector::from(config).connect(name, tcp);
             let stream = tokio::time::timeout(self.timeout, handshake)
                 .await
                 .map_err(|_| timed_out())?
@@ -625,5 +696,55 @@ mod tests {
             String::from_utf8(decode_chunked_body(&split)).unwrap(),
             "한"
         );
+    }
+
+    #[test]
+    fn tls_files_are_checked_when_set() {
+        let plain = Endpoint::parse("https://rabbit:15671", 1).unwrap();
+        let same = plain.clone().with_tls_files(&TlsFiles::default()).unwrap();
+        assert_eq!(same, plain);
+
+        let missing = TlsFiles {
+            ca_file: Some("/no/such/ferrika-ca.pem".into()),
+            ..TlsFiles::default()
+        };
+        let err = plain
+            .clone()
+            .with_tls_files(&missing)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot read CA file"), "{err}");
+        assert!(err.contains("ferrika-ca.pem"), "{err}");
+
+        let half = TlsFiles {
+            client_cert: Some("client.pem".into()),
+            ..TlsFiles::default()
+        };
+        assert!(half.client_pair().is_err());
+        let err = plain.clone().with_tls_files(&half).unwrap_err().to_string();
+        assert!(err.contains("key file"), "{err}");
+        let key_only = TlsFiles {
+            client_key: Some("client.key".into()),
+            ..TlsFiles::default()
+        };
+        assert!(key_only.client_pair().is_err());
+
+        // A CA file without any certificate in it trusts nothing: refused.
+        let dir = std::env::temp_dir().join(format!("ferrika-http-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty-ca.pem");
+        std::fs::write(
+            &empty,
+            "not a certificate
+",
+        )
+        .unwrap();
+        let none = TlsFiles {
+            ca_file: Some(empty.display().to_string()),
+            ..TlsFiles::default()
+        };
+        let err = plain.with_tls_files(&none).unwrap_err().to_string();
+        assert!(err.contains("no trusted root certificates"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

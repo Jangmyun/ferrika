@@ -7,7 +7,12 @@ change in any release until it leaves preview.
 - `client`: a typed client for the RabbitMQ management HTTP API (plugin
   `rabbitmq_management`): queues, exchanges and bindings of a vhost, peeking
   at messages (taken and requeued: they are marked redelivered) and
-  publishing to an exchange
+  publishing to an exchange; `https://` with the OS trust store or a
+  private CA, and client certificates
+- `listing`: bounded listings for brokers with many queues: pages, a name
+  filter applied by the broker, a limit
+- `delivery_limit`: whether a peek counts towards a quorum queue's
+  delivery limit (RabbitMQ before 4.0), so a front end can refuse it
 - `model`: the API's responses and request bodies, and the `x-death`
   history of dead-lettered messages
 - `profile`: named connections in `rabbit-profiles.json` next to Ferrika's
