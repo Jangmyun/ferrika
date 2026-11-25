@@ -23,7 +23,7 @@
 
 use std::time::Duration;
 
-use crate::client::ManagementClient;
+use crate::client::{ManagementClient, TlsFiles};
 use crate::profile::{url_credentials, RabbitProfile, RabbitProfileStore};
 
 #[cfg(feature = "amqp")]
@@ -42,6 +42,12 @@ pub struct RabbitOverrides<'a> {
     pub user: Option<&'a str>,
     /// The AMQP URL for moving messages.
     pub amqp_url: Option<&'a str>,
+    /// A CA file (PEM) for `https://` and `amqps://`.
+    pub ca_cert: Option<&'a str>,
+    /// A client certificate (PEM) for mutual TLS; with `client_key`. Either
+    /// one given replaces both of the profile's.
+    pub client_cert: Option<&'a str>,
+    pub client_key: Option<&'a str>,
 }
 
 /// Why [`ResolvedRabbit::resolve`] found no connection.
@@ -101,6 +107,8 @@ pub struct ResolvedRabbit {
     /// the user is the profile's own; a password given by the user wins.
     profile_password: Option<String>,
     pub amqp_url: Option<String>,
+    /// The CA file and client certificate for TLS (paths).
+    pub tls: TlsFiles,
 }
 
 // Manual so the password never reaches debug output.
@@ -120,6 +128,7 @@ impl std::fmt::Debug for ResolvedRabbit {
                 &self.profile_password.as_ref().map(|_| "<redacted>"),
             )
             .field("amqp_url", &self.amqp_url)
+            .field("tls", &self.tls)
             .finish()
     }
 }
@@ -170,6 +179,22 @@ impl ResolvedRabbit {
         let profile_password = profile
             .filter(|p| overrides.user.is_none() || overrides.user == p.user.as_deref())
             .and_then(|p| p.password.clone());
+        let path = |text: Option<&str>| given(text).map(str::to_string);
+        let client_given =
+            given(overrides.client_cert).is_some() || given(overrides.client_key).is_some();
+        let tls = TlsFiles {
+            ca_file: path(overrides.ca_cert).or_else(|| profile.and_then(|p| p.ca_cert.clone())),
+            client_cert: if client_given {
+                path(overrides.client_cert)
+            } else {
+                profile.and_then(|p| p.client_cert.clone())
+            },
+            client_key: if client_given {
+                path(overrides.client_key)
+            } else {
+                profile.and_then(|p| p.client_key.clone())
+            },
+        };
         Ok(Self {
             profile: chosen.as_ref().map(|(name, _)| name.clone()),
             read_only: profile.is_some_and(|p| p.read_only),
@@ -184,6 +209,7 @@ impl ResolvedRabbit {
             amqp_url: given(overrides.amqp_url)
                 .map(str::to_string)
                 .or_else(|| profile.and_then(|p| p.amqp_url.clone())),
+            tls,
         })
     }
 
@@ -197,6 +223,7 @@ impl ResolvedRabbit {
             user: profile.user.clone(),
             profile_password: profile.password.clone(),
             amqp_url: profile.amqp_url.clone(),
+            tls: profile.tls(),
         }
     }
 
@@ -264,6 +291,7 @@ impl ResolvedRabbit {
         timeout: Duration,
     ) -> Result<ManagementClient, String> {
         let client = ManagementClient::new(&self.management_url)
+            .and_then(|client| client.with_tls(&self.tls))
             .map_err(|e| e.to_string())?
             .with_timeout(timeout);
         Ok(match credentials {
@@ -290,6 +318,7 @@ impl ResolvedRabbit {
             user: login.as_ref().map(|(user, _)| user.clone()),
             password: login.map(|(_, password)| password),
             timeout,
+            tls: self.tls.clone(),
         })
     }
 }
@@ -409,6 +438,55 @@ mod tests {
         let given = Some(("ops".to_string(), "x".to_string()));
         let target = resolved.amqp_target(given.as_ref(), TIMEOUT).unwrap();
         assert_eq!(target.user.as_deref(), Some("ops"));
+    }
+
+    #[test]
+    fn tls_files_come_from_the_profile_or_the_options() {
+        let mut store = store();
+        let prod = store.profiles.get_mut("prod").unwrap();
+        prod.ca_cert = Some("/etc/prod-ca.pem".to_string());
+        prod.client_cert = Some("/etc/prod.pem".to_string());
+        prod.client_key = Some("/etc/prod.key".to_string());
+        let named = RabbitOverrides {
+            profile: Some("prod"),
+            ..RabbitOverrides::default()
+        };
+        let resolved = ResolvedRabbit::resolve(&named, || Ok(store.clone())).unwrap();
+        assert_eq!(resolved.tls, store.get("prod").unwrap().tls());
+
+        // An option replaces the profile's CA; a client option replaces
+        // both client files, so a profile's key never pairs with another
+        // certificate.
+        let overridden = RabbitOverrides {
+            ca_cert: Some("/tmp/other-ca.pem"),
+            client_cert: Some("/tmp/me.pem"),
+            ..named
+        };
+        let resolved = ResolvedRabbit::resolve(&overridden, || Ok(store.clone())).unwrap();
+        assert_eq!(resolved.tls.ca_file.as_deref(), Some("/tmp/other-ca.pem"));
+        assert_eq!(resolved.tls.client_cert.as_deref(), Some("/tmp/me.pem"));
+        assert_eq!(resolved.tls.client_key, None);
+        let err = resolved.client(None, TIMEOUT).unwrap_err();
+        assert!(err.contains("key file"), "{err}");
+
+        // A missing CA file fails when the client is built.
+        let url_only = RabbitOverrides {
+            url: Some("https://rabbit.dev"),
+            ca_cert: Some("/no/such/ca.pem"),
+            ..RabbitOverrides::default()
+        };
+        let resolved = ResolvedRabbit::resolve(&url_only, || unreachable!()).unwrap();
+        assert!(resolved.client(None, TIMEOUT).is_err());
+        #[cfg(feature = "amqp")]
+        assert_eq!(
+            resolved
+                .amqp_target(None, TIMEOUT)
+                .unwrap()
+                .tls
+                .ca_file
+                .as_deref(),
+            Some("/no/such/ca.pem")
+        );
     }
 
     #[test]

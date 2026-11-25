@@ -11,6 +11,11 @@
 //! Filters use the record expression syntax of `consume --where`
 //! ([`ferrika_core::model::expr`]): `$.user.country == "KR"`,
 //! `$.amount > 100`, `key =~ "^order-"`, `headers.source == "web"`.
+//!
+//! Headers with a null value are written as null in their original
+//! positions. No step changes them: `mask` leaves them null (there is
+//! nothing to mask) and a filter reads them as missing, as `consume --where`
+//! does (`headers.<name> exists` is false for them).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -441,6 +446,8 @@ struct Working {
     key: Option<Vec<u8>>,
     body: Body,
     headers: Vec<(String, Vec<u8>)>,
+    /// Null-valued headers (position, key), copied as they are.
+    null_headers: Vec<(usize, String)>,
     /// Whether the value must be written from `body` rather than copied.
     value_changed: bool,
 }
@@ -456,6 +463,7 @@ impl Working {
             key: msg.key.clone(),
             body,
             headers: msg.headers.clone(),
+            null_headers: msg.null_headers.clone(),
             value_changed,
         }
     }
@@ -520,6 +528,7 @@ impl Working {
             partition: None,
             timestamp: msg.timestamp_ms,
             headers: self.headers,
+            null_headers: self.null_headers,
         }
     }
 }
@@ -778,6 +787,7 @@ mod tests {
             payload: value.map(<[u8]>::to_vec),
             timestamp_ms: Some(1_700_000_000_000),
             headers: vec![("source".to_string(), b"web".to_vec())],
+            null_headers: Vec::new(),
         }
     }
 
@@ -1023,6 +1033,43 @@ mod tests {
             .collect();
         assert_eq!(kept, [0, 3, 6, 9]);
         assert_eq!(counters.sampled_out, 6);
+    }
+
+    #[test]
+    fn null_headers_are_kept_in_place_through_every_step() {
+        let mut m = msg(0, Some("k"), Some(br#"{"user":{"email":"a@b.c","n":1}}"#));
+        m.headers = vec![
+            ("authorization".to_string(), b"Bearer abc.def".to_vec()),
+            ("source".to_string(), b"web".to_vec()),
+        ];
+        m.null_headers = vec![(0, "trace".to_string()), (2, "authorization".to_string())];
+        let p = pipeline(&[
+            (
+                StepKind::Filter,
+                r#"!headers.trace exists && headers.source == "web""#,
+            ),
+            (StepKind::Drop, "user.email"),
+            (StepKind::Rename, "user.n=user.count"),
+            (StepKind::Mask, "redact"),
+        ]);
+        let out = run(&p, &m).0.expect("kept");
+        assert_eq!(out.null_headers, m.null_headers);
+        let all = ferrika_core::kafka::consumer::merge_headers(&out.headers, &out.null_headers);
+        let names: Vec<(&str, bool)> = all.iter().map(|(k, v)| (*k, v.is_none())).collect();
+        assert_eq!(
+            names,
+            [
+                ("trace", true),
+                ("authorization", false),
+                ("authorization", true),
+                ("source", false)
+            ]
+        );
+        // The non-null header of the same name is masked, the null one stays null.
+        assert_ne!(out.headers[0].1, b"Bearer abc.def".to_vec());
+        // A null header reads as missing in a filter.
+        let p = pipeline(&[(StepKind::Filter, "headers.trace exists")]);
+        assert!(run(&p, &m).0.is_none());
     }
 
     #[test]

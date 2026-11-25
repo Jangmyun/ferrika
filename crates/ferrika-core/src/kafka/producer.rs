@@ -8,6 +8,7 @@ use tokio::task::{JoinError, JoinSet};
 
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::config::KafkaClientConfig;
+use crate::kafka::consumer::merge_headers;
 use crate::kafka::detached::DetachedDrop;
 
 /// Record to be sent to a Kafka topic.
@@ -20,6 +21,10 @@ pub struct OwnedProducerRecord {
     pub timestamp: Option<i64>,
     /// Headers in send order; a key may repeat.
     pub headers: Vec<(String, Vec<u8>)>,
+    /// Null-valued headers: each one's position in the full header list and
+    /// its key, positions ascending (as in
+    /// [`ConsumedMessage::null_headers`](crate::kafka::consumer::ConsumedMessage::null_headers)).
+    pub null_headers: Vec<(usize, String)>,
 }
 
 impl OwnedProducerRecord {
@@ -32,6 +37,7 @@ impl OwnedProducerRecord {
             partition: None,
             timestamp: None,
             headers: Vec::new(),
+            null_headers: Vec::new(),
         }
     }
 
@@ -62,6 +68,13 @@ impl OwnedProducerRecord {
     /// Appends a header; an earlier header of the same key stays.
     pub fn with_header(mut self, key: impl Into<String>, value: impl Into<Vec<u8>>) -> Self {
         self.headers.push((key.into(), value.into()));
+        self
+    }
+
+    /// Appends a header with a null value (not an empty one).
+    pub fn with_null_header(mut self, key: impl Into<String>) -> Self {
+        let position = self.headers.len() + self.null_headers.len();
+        self.null_headers.push((position, key.into()));
         self
     }
 }
@@ -95,12 +108,9 @@ fn build_future_record(record: &OwnedProducerRecord) -> FutureRecord<'_, [u8], [
     }
 
     let mut owned_headers = OwnedHeaders::new();
-    if !record.headers.is_empty() {
-        for (k, v) in &record.headers {
-            owned_headers = owned_headers.insert(Header {
-                key: k.as_str(),
-                value: Some(v.as_slice()),
-            });
+    if !record.headers.is_empty() || !record.null_headers.is_empty() {
+        for (key, value) in merge_headers(&record.headers, &record.null_headers) {
+            owned_headers = owned_headers.insert(Header { key, value });
         }
         future_record = future_record.headers(owned_headers);
     }
@@ -489,6 +499,33 @@ mod tests {
                 ("a".to_string(), b"1".to_vec()),
                 ("a".to_string(), b"2".to_vec()),
                 ("b".to_string(), b"3".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn null_headers_are_sent_as_null_in_place() {
+        let record = OwnedProducerRecord::new("t")
+            .with_null_header("n0")
+            .with_header("a", "1")
+            .with_null_header("n2")
+            .with_header("b", "");
+        use rdkafka::message::Headers;
+        let built = build_future_record(&record);
+        let headers = built.headers.expect("headers");
+        let got: Vec<(String, Option<Vec<u8>>)> = (0..headers.count())
+            .map(|i| {
+                let h = headers.get(i);
+                (h.key.to_string(), h.value.map(<[u8]>::to_vec))
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("n0".to_string(), None),
+                ("a".to_string(), Some(b"1".to_vec())),
+                ("n2".to_string(), None),
+                ("b".to_string(), Some(Vec::new())),
             ]
         );
     }

@@ -802,10 +802,25 @@ pub enum PolicyAction {
     /// Moving messages between queues, e.g. redriving dead-lettered
     /// RabbitMQ messages to their original exchange.
     MessagesMove,
+    /// Deleting messages a broker keeps, e.g. clearing an MQTT retained
+    /// message (which publishes an empty retained message).
+    MessagesDelete,
+    /// Declaring a RabbitMQ queue.
+    QueuesCreate,
+    /// Deleting a RabbitMQ queue (its messages are lost).
+    QueuesDelete,
+    /// Deleting every message of a RabbitMQ queue, keeping the queue.
+    QueuesPurge,
+    /// Declaring a RabbitMQ exchange.
+    ExchangesCreate,
+    /// Deleting a RabbitMQ exchange (its bindings go with it).
+    ExchangesDelete,
+    /// Adding or removing a RabbitMQ binding.
+    BindingsChange,
 }
 
 impl PolicyAction {
-    pub const ALL: [PolicyAction; 16] = [
+    pub const ALL: [PolicyAction; 23] = [
         Self::TopicsCreate,
         Self::TopicsDelete,
         Self::TopicsPurge,
@@ -822,6 +837,13 @@ impl PolicyAction {
         Self::ConnectChange,
         Self::MessagesPeek,
         Self::MessagesMove,
+        Self::MessagesDelete,
+        Self::QueuesCreate,
+        Self::QueuesDelete,
+        Self::QueuesPurge,
+        Self::ExchangesCreate,
+        Self::ExchangesDelete,
+        Self::BindingsChange,
     ];
 
     /// The name used in a policy's `forbid` list.
@@ -843,6 +865,13 @@ impl PolicyAction {
             Self::ConnectChange => "connect.change",
             Self::MessagesPeek => "messages.peek",
             Self::MessagesMove => "messages.move",
+            Self::MessagesDelete => "messages.delete",
+            Self::QueuesCreate => "queues.create",
+            Self::QueuesDelete => "queues.delete",
+            Self::QueuesPurge => "queues.purge",
+            Self::ExchangesCreate => "exchanges.create",
+            Self::ExchangesDelete => "exchanges.delete",
+            Self::BindingsChange => "bindings.change",
         }
     }
 
@@ -852,13 +881,14 @@ impl PolicyAction {
 
     /// Policy categories a change of this category also needs allowed: a
     /// RabbitMQ redrive moves messages (`messages.move`) by publishing them
-    /// again, so `forbid: ["produce"]` refuses it too. Every front end that
+    /// again, and clearing an MQTT retained message (`messages.delete`)
+    /// publishes an empty one, so `forbid: ["produce"]` refuses both too. Every front end that
     /// authorises a change checks these besides the change's own category
     /// (see `ferrika_governance::policy::extra_category_refusal`).
     pub fn also_requires(self) -> &'static [PolicyAction] {
         // No wildcard arm: a new category must decide what it also needs.
         match self {
-            Self::MessagesMove => &[Self::Produce],
+            Self::MessagesMove | Self::MessagesDelete => &[Self::Produce],
             Self::TopicsCreate
             | Self::TopicsDelete
             | Self::TopicsPurge
@@ -873,7 +903,13 @@ impl PolicyAction {
             | Self::QuotaChange
             | Self::SchemaChange
             | Self::ConnectChange
-            | Self::MessagesPeek => &[],
+            | Self::MessagesPeek
+            | Self::QueuesCreate
+            | Self::QueuesDelete
+            | Self::QueuesPurge
+            | Self::ExchangesCreate
+            | Self::ExchangesDelete
+            | Self::BindingsChange => &[],
         }
     }
 
@@ -895,6 +931,18 @@ impl PolicyAction {
             // the same way.
             "rabbit peek" | "rabbit dlq inspect" | "rabbit dlq redrive" => Self::MessagesPeek,
             "rabbit dlq redrive --execute" => Self::MessagesMove,
+            // RabbitMQ topology.
+            "rabbit queue declare" => Self::QueuesCreate,
+            "rabbit queue delete" => Self::QueuesDelete,
+            "rabbit queue purge" => Self::QueuesPurge,
+            "rabbit exchange declare" => Self::ExchangesCreate,
+            "rabbit exchange delete" => Self::ExchangesDelete,
+            "rabbit bind" | "rabbit unbind" => Self::BindingsChange,
+            // Publishing to an MQTT topic writes messages like `produce`.
+            "mqtt pub" => Self::Produce,
+            // Clearing a retained message deletes what the broker keeps
+            // for new subscribers (a device's last state or configuration).
+            "mqtt retained clear" => Self::MessagesDelete,
             _ => match head {
                 "topics" | "reassign" => Self::TopicsAlter,
                 "produce" | "generate" | "mirror" | "transform" | "restore" | "probe" | "bench"
@@ -921,7 +969,10 @@ mod tests {
     fn only_a_move_needs_another_category() {
         for action in PolicyAction::ALL {
             let extra = action.also_requires();
-            if action == PolicyAction::MessagesMove {
+            if matches!(
+                action,
+                PolicyAction::MessagesMove | PolicyAction::MessagesDelete
+            ) {
                 assert_eq!(extra, &[PolicyAction::Produce]);
             } else {
                 assert!(extra.is_empty(), "{action:?}");
@@ -942,6 +993,10 @@ mod tests {
         assert_eq!(
             PolicyAction::from_id("messages.move"),
             Some(PolicyAction::MessagesMove)
+        );
+        assert_eq!(
+            PolicyAction::from_id("messages.delete"),
+            Some(PolicyAction::MessagesDelete)
         );
     }
 
@@ -979,6 +1034,22 @@ mod tests {
             PolicyAction::from_cli("rabbit dlq redrive --execute"),
             PolicyAction::MessagesMove
         );
+        assert_eq!(PolicyAction::from_cli("mqtt pub"), PolicyAction::Produce);
+        assert_eq!(
+            PolicyAction::from_cli("mqtt retained clear"),
+            PolicyAction::MessagesDelete
+        );
+        for (action, category) in [
+            ("rabbit queue declare", "queues.create"),
+            ("rabbit queue delete", "queues.delete"),
+            ("rabbit queue purge", "queues.purge"),
+            ("rabbit exchange declare", "exchanges.create"),
+            ("rabbit exchange delete", "exchanges.delete"),
+            ("rabbit bind", "bindings.change"),
+            ("rabbit unbind", "bindings.change"),
+        ] {
+            assert_eq!(PolicyAction::from_cli(action).id(), category, "{action}");
+        }
         // Kafka's redrive stays a produce.
         assert_eq!(
             PolicyAction::from_cli("dlq redrive --execute"),

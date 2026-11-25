@@ -7,7 +7,8 @@ use serde::Serialize;
 
 use ferrika_core::model::acl::AclBinding;
 use ferrika_core::model::history::{
-    acl_label, Operation, PartitionReplicas, Reversibility, SchemaVersion, State,
+    acl_label, Operation, PartitionReplicas, RabbitBindingKey, RabbitExchangeDeclaration,
+    RabbitQueueDeclaration, Reversibility, SchemaVersion, State,
 };
 use ferrika_core::model::policy::PolicyAction;
 
@@ -86,6 +87,35 @@ pub enum Step {
     ResumeConnector {
         name: String,
     },
+    /// Declares a RabbitMQ queue again (its messages are not restored).
+    DeclareQueue {
+        vhost: String,
+        name: String,
+        declaration: RabbitQueueDeclaration,
+    },
+    /// Deletes a RabbitMQ queue, only while it is empty and unused.
+    DeleteQueue {
+        vhost: String,
+        name: String,
+    },
+    DeclareExchange {
+        vhost: String,
+        name: String,
+        declaration: RabbitExchangeDeclaration,
+    },
+    /// Deletes a RabbitMQ exchange, only while no binding has it as source.
+    DeleteExchange {
+        vhost: String,
+        name: String,
+    },
+    Bind {
+        vhost: String,
+        binding: RabbitBindingKey,
+    },
+    Unbind {
+        vhost: String,
+        binding: RabbitBindingKey,
+    },
 }
 
 impl Step {
@@ -108,6 +138,48 @@ impl Step {
             | Self::DeleteConnector { .. }
             | Self::PauseConnector { .. }
             | Self::ResumeConnector { .. } => PolicyAction::ConnectChange,
+            Self::DeclareQueue { .. } => PolicyAction::QueuesCreate,
+            Self::DeleteQueue { .. } => PolicyAction::QueuesDelete,
+            Self::DeclareExchange { .. } => PolicyAction::ExchangesCreate,
+            Self::DeleteExchange { .. } => PolicyAction::ExchangesDelete,
+            Self::Bind { .. } | Self::Unbind { .. } => PolicyAction::BindingsChange,
+        }
+    }
+
+    /// Whether the step changes a RabbitMQ broker (run through its
+    /// management API, see [`super::rabbit`]).
+    pub fn is_rabbitmq(&self) -> bool {
+        self.rabbit_phase().is_some()
+    }
+
+    /// The order RabbitMQ steps run in, whatever the order of the recorded
+    /// states: bindings are removed first, then queues and exchanges
+    /// deleted, then declared, then bindings added (a binding needs both
+    /// ends). `None` for other steps.
+    fn rabbit_phase(&self) -> Option<u8> {
+        match self {
+            Self::Unbind { .. } => Some(0),
+            Self::DeleteQueue { .. } | Self::DeleteExchange { .. } => Some(1),
+            Self::DeclareExchange { .. } | Self::DeclareQueue { .. } => Some(2),
+            Self::Bind { .. } => Some(3),
+            Self::TopicConfig { .. }
+            | Self::BrokerConfig { .. }
+            | Self::DeleteTopic { .. }
+            | Self::Reassign { .. }
+            | Self::CommitOffsets { .. }
+            | Self::DeleteOffsets { .. }
+            | Self::CreateAcls { .. }
+            | Self::DeleteAcls { .. }
+            | Self::SetQuota { .. }
+            | Self::DeleteScram { .. }
+            | Self::SetCompatibility { .. }
+            | Self::DeleteCompatibility { .. }
+            | Self::DeleteSchemaVersions { .. }
+            | Self::RegisterSchemas { .. }
+            | Self::PutConnector { .. }
+            | Self::DeleteConnector { .. }
+            | Self::PauseConnector { .. }
+            | Self::ResumeConnector { .. } => None,
         }
     }
 
@@ -196,6 +268,34 @@ impl Step {
             Self::DeleteConnector { name } => format!("delete connector {name}"),
             Self::PauseConnector { name } => format!("pause connector {name}"),
             Self::ResumeConnector { name } => format!("resume connector {name}"),
+            Self::DeclareQueue {
+                vhost,
+                name,
+                declaration,
+            } => format!(
+                "declare {} queue {name} on vhost {vhost} again (empty)",
+                declaration.kind
+            ),
+            Self::DeleteQueue { vhost, name } => {
+                format!("delete queue {name} on vhost {vhost} (only while empty and unused)")
+            }
+            Self::DeclareExchange {
+                vhost,
+                name,
+                declaration,
+            } => format!(
+                "declare {} exchange {name} on vhost {vhost} again",
+                declaration.kind
+            ),
+            Self::DeleteExchange { vhost, name } => {
+                format!("delete exchange {name} on vhost {vhost}")
+            }
+            Self::Bind { vhost, binding } => {
+                format!("bind {} on vhost {vhost}", binding.label())
+            }
+            Self::Unbind { vhost, binding } => {
+                format!("unbind {} on vhost {vhost}", binding.label())
+            }
         }
     }
 }
@@ -249,6 +349,11 @@ pub fn plan(op: &Operation, current: &[State]) -> Result<Vec<Step>, NotReversibl
     let mut steps = Vec::new();
     for (before, now) in op.begin.before.iter().zip(current) {
         steps.extend(restore_steps(before, now)?);
+    }
+    // Stable: other steps keep their order (they never share a plan with
+    // RabbitMQ ones).
+    if steps.iter().any(Step::is_rabbitmq) {
+        steps.sort_by_key(|step| step.rabbit_phase().unwrap_or(0));
     }
     Ok(steps)
 }
@@ -523,6 +628,94 @@ pub fn restore_steps(before: &State, current: &State) -> Result<Vec<Step>, NotRe
                 }
                 steps
             }
+        },
+        (
+            State::RabbitQueue {
+                vhost,
+                name,
+                declaration,
+            },
+            State::RabbitQueue {
+                declaration: now, ..
+            },
+        ) => match (declaration, now) {
+            (None, Some(_)) => vec![Step::DeleteQueue {
+                vhost: vhost.clone(),
+                name: name.clone(),
+            }],
+            (Some(declaration), None) => vec![Step::DeclareQueue {
+                vhost: vhost.clone(),
+                name: name.clone(),
+                declaration: declaration.clone(),
+            }],
+            (Some(was), Some(now)) if was != now => {
+                return Err(NotReversible(format!(
+                    "queue {name} on vhost {vhost} was declared again with other settings; \
+                     RabbitMQ cannot change a queue's settings in place"
+                )))
+            }
+            _ => vec![],
+        },
+        (
+            State::RabbitQueueMessages {
+                vhost,
+                name,
+                messages,
+            },
+            State::RabbitQueueMessages { messages: now, .. },
+        ) => {
+            if messages == now {
+                vec![]
+            } else {
+                return Err(NotReversible(format!(
+                    "the messages of queue {name} on vhost {vhost} cannot be restored"
+                )));
+            }
+        }
+        (
+            State::RabbitExchange {
+                vhost,
+                name,
+                declaration,
+            },
+            State::RabbitExchange {
+                declaration: now, ..
+            },
+        ) => match (declaration, now) {
+            (None, Some(_)) => vec![Step::DeleteExchange {
+                vhost: vhost.clone(),
+                name: name.clone(),
+            }],
+            (Some(declaration), None) => vec![Step::DeclareExchange {
+                vhost: vhost.clone(),
+                name: name.clone(),
+                declaration: declaration.clone(),
+            }],
+            (Some(was), Some(now)) if was != now => {
+                return Err(NotReversible(format!(
+                    "exchange {name} on vhost {vhost} was declared again with other settings; \
+                     RabbitMQ cannot change an exchange's settings in place"
+                )))
+            }
+            _ => vec![],
+        },
+        (
+            State::RabbitBinding {
+                vhost,
+                binding,
+                present,
+            },
+            State::RabbitBinding { present: now, .. },
+        ) => match (present, now) {
+            (true, false) => vec![Step::Bind {
+                vhost: vhost.clone(),
+                binding: binding.clone(),
+            }],
+            (false, true) => vec![Step::Unbind {
+                vhost: vhost.clone(),
+                binding: binding.clone(),
+            }],
+            _ => vec![],
         },
         _ => return Err(mismatch()),
     })

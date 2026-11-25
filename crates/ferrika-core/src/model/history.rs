@@ -69,6 +69,10 @@ pub struct Scope {
     /// Kafka Connect URL without credentials, for connector operations.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub connect: String,
+    /// The RabbitMQ management API's `host:port` (never credentials), for
+    /// RabbitMQ operations; `bootstrap` is empty for them.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rabbitmq: String,
 }
 
 impl Scope {
@@ -77,6 +81,9 @@ impl Scope {
     /// same set of bootstrap servers (order and spacing ignored). Registry
     /// and Connect operations compare those URLs instead.
     pub fn same_cluster(&self, current: &Scope) -> bool {
+        if !self.rabbitmq.is_empty() {
+            return same_address(&self.rabbitmq, &current.rabbitmq);
+        }
         if !self.registry.is_empty() {
             return self.registry == current.registry;
         }
@@ -101,6 +108,15 @@ impl Scope {
                 self.describe()
             ))
         };
+        if !self.rabbitmq.is_empty() {
+            if !same_address(&self.rabbitmq, &current.rabbitmq) {
+                return refuse(format!(
+                    "but the RabbitMQ in use is {}",
+                    or_none(&current.rabbitmq)
+                ));
+            }
+            return Ok(());
+        }
         if !self.registry.is_empty() {
             if self.registry != current.registry {
                 return refuse(format!(
@@ -142,7 +158,9 @@ impl Scope {
 
     /// "cluster 4L62… (profile prod-a)" for messages.
     pub fn describe(&self) -> String {
-        let place = if !self.registry.is_empty() {
+        let place = if !self.rabbitmq.is_empty() {
+            format!("RabbitMQ {}", self.rabbitmq)
+        } else if !self.registry.is_empty() {
             format!("Schema Registry {}", self.registry)
         } else if !self.connect.is_empty() {
             format!("Kafka Connect {}", self.connect)
@@ -157,6 +175,11 @@ impl Scope {
             format!("{place} (profile {})", self.profile)
         }
     }
+}
+
+/// Two `host:port` addresses, case ignored (an empty one matches nothing).
+fn same_address(a: &str, b: &str) -> bool {
+    !a.trim().is_empty() && a.trim().eq_ignore_ascii_case(b.trim())
 }
 
 fn or_none(text: &str) -> &str {
@@ -227,6 +250,66 @@ pub struct SchemaVersion {
     pub references: Vec<SchemaReference>,
 }
 
+/// How a RabbitMQ queue was declared: what re-declaring it needs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RabbitQueueDeclaration {
+    /// `classic`, `quorum` or `stream`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub durable: bool,
+    #[serde(default)]
+    pub auto_delete: bool,
+    /// The `x-*` arguments it was declared with.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub arguments: BTreeMap<String, serde_json::Value>,
+}
+
+/// How a RabbitMQ exchange was declared.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RabbitExchangeDeclaration {
+    /// `direct`, `fanout`, `topic`, `headers` or a plugin's type.
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub durable: bool,
+    #[serde(default)]
+    pub auto_delete: bool,
+    #[serde(default)]
+    pub internal: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub arguments: BTreeMap<String, serde_json::Value>,
+}
+
+/// One RabbitMQ binding, by what the broker tells bindings apart by.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RabbitBindingKey {
+    /// The exchange messages come from.
+    pub source: String,
+    pub destination: String,
+    /// `queue` or `exchange`.
+    pub destination_type: String,
+    #[serde(default)]
+    pub routing_key: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub arguments: BTreeMap<String, serde_json::Value>,
+}
+
+impl RabbitBindingKey {
+    /// "exchange orders -> queue billing, routing key 'order.*'".
+    pub fn label(&self) -> String {
+        let mut text = format!(
+            "exchange {} -> {} {}, routing key '{}'",
+            self.source, self.destination_type, self.destination, self.routing_key
+        );
+        if !self.arguments.is_empty() {
+            text.push_str(&format!(
+                ", arguments {}",
+                serde_json::to_string(&self.arguments).unwrap_or_default()
+            ));
+        }
+        text
+    }
+}
+
 /// The state of one resource an operation touched, limited to what the
 /// operation changes (the keys it sets, the partitions it moves, ...).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -284,6 +367,34 @@ pub enum State {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         secret_keys: Vec<String>,
     },
+    /// A RabbitMQ queue's declaration; `None` when there is no such queue.
+    /// Ferrika 0.2 does not know the `rabbit_*` kinds and skips the journal
+    /// lines holding them, so every RabbitMQ operation records at least one.
+    RabbitQueue {
+        vhost: String,
+        name: String,
+        declaration: Option<RabbitQueueDeclaration>,
+    },
+    /// How many messages a RabbitMQ queue holds (for a purge); `None` when
+    /// the broker did not say.
+    RabbitQueueMessages {
+        vhost: String,
+        name: String,
+        messages: Option<u64>,
+    },
+    /// A RabbitMQ exchange's declaration; `None` when there is no such
+    /// exchange.
+    RabbitExchange {
+        vhost: String,
+        name: String,
+        declaration: Option<RabbitExchangeDeclaration>,
+    },
+    /// Whether one RabbitMQ binding exists.
+    RabbitBinding {
+        vhost: String,
+        binding: RabbitBindingKey,
+        present: bool,
+    },
 }
 
 /// The value [`State::entries`] gives an item that is absent.
@@ -310,6 +421,36 @@ impl State {
                 format!("subject {subject}")
             }
             Self::Connector { name, .. } => format!("connector {name}"),
+            Self::RabbitQueue { vhost, name, .. }
+            | Self::RabbitQueueMessages { vhost, name, .. } => {
+                format!("queue {name} on vhost {vhost}")
+            }
+            Self::RabbitExchange { vhost, name, .. } => {
+                format!("exchange {name} on vhost {vhost}")
+            }
+            Self::RabbitBinding { vhost, .. } => format!("bindings on vhost {vhost}"),
+        }
+    }
+
+    /// Whether the state is about a RabbitMQ resource (read and restored
+    /// through the management API, not a Kafka client).
+    pub fn is_rabbitmq(&self) -> bool {
+        match self {
+            Self::RabbitQueue { .. }
+            | Self::RabbitQueueMessages { .. }
+            | Self::RabbitExchange { .. }
+            | Self::RabbitBinding { .. } => true,
+            Self::TopicConfig { .. }
+            | Self::BrokerConfig { .. }
+            | Self::Topic { .. }
+            | Self::Replicas { .. }
+            | Self::GroupOffsets { .. }
+            | Self::Acls { .. }
+            | Self::Quota { .. }
+            | Self::Scram { .. }
+            | Self::SubjectCompat { .. }
+            | Self::SubjectVersions { .. }
+            | Self::Connector { .. } => false,
         }
     }
 
@@ -394,6 +535,35 @@ impl State {
                     }
                 }
             }
+            Self::RabbitQueue { declaration, .. } => {
+                out.insert("exists".into(), yes_no(declaration.is_some()));
+                if let Some(d) = declaration {
+                    out.insert("type".into(), d.kind.clone());
+                    out.insert("durable".into(), yes_no(d.durable));
+                    out.insert("auto_delete".into(), yes_no(d.auto_delete));
+                    arguments_entries(&mut out, &d.arguments);
+                }
+            }
+            Self::RabbitQueueMessages { messages, .. } => {
+                if let Some(messages) = messages {
+                    out.insert("messages".into(), messages.to_string());
+                }
+            }
+            Self::RabbitExchange { declaration, .. } => {
+                out.insert("exists".into(), yes_no(declaration.is_some()));
+                if let Some(d) = declaration {
+                    out.insert("type".into(), d.kind.clone());
+                    out.insert("durable".into(), yes_no(d.durable));
+                    out.insert("auto_delete".into(), yes_no(d.auto_delete));
+                    out.insert("internal".into(), yes_no(d.internal));
+                    arguments_entries(&mut out, &d.arguments);
+                }
+            }
+            Self::RabbitBinding {
+                binding, present, ..
+            } => {
+                out.insert(binding.label(), present_absent(*present));
+            }
         }
         out
     }
@@ -452,7 +622,32 @@ impl State {
             Self::SubjectCompat { subject, .. } => vec![format!("subject:{subject}/compat")],
             Self::SubjectVersions { subject, .. } => vec![format!("subject:{subject}/versions")],
             Self::Connector { name, .. } => vec![format!("connector:{name}")],
+            Self::RabbitQueue { vhost, name, .. } => vec![format!("rabbit-queue:{name}@{vhost}")],
+            Self::RabbitQueueMessages { vhost, name, .. } => {
+                vec![format!("rabbit-queue-messages:{name}@{vhost}")]
+            }
+            Self::RabbitExchange { vhost, name, .. } => {
+                vec![format!("rabbit-exchange:{name}@{vhost}")]
+            }
+            Self::RabbitBinding { vhost, binding, .. } => {
+                vec![format!("rabbit-binding:{}@{vhost}", binding.label())]
+            }
         }
+    }
+}
+
+/// One `argument NAME` entry per declaration argument (text as is, other
+/// values as JSON).
+fn arguments_entries(
+    out: &mut BTreeMap<String, String>,
+    arguments: &BTreeMap<String, serde_json::Value>,
+) {
+    for (key, value) in arguments {
+        let text = match value {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        out.insert(format!("argument {key}"), text);
     }
 }
 
@@ -1137,5 +1332,110 @@ mod tests {
         assert_eq!(a.len(), 12);
         assert!(a < b, "{a} < {b}");
         assert!(a.chars().all(|c| BASE32.contains(&(c as u8))));
+    }
+
+    fn rabbit_queue(declared: bool) -> State {
+        State::RabbitQueue {
+            vhost: "/".into(),
+            name: "orders".into(),
+            declaration: declared.then(|| RabbitQueueDeclaration {
+                kind: "quorum".into(),
+                durable: true,
+                auto_delete: false,
+                arguments: BTreeMap::from([("x-delivery-limit".to_string(), serde_json::json!(5))]),
+            }),
+        }
+    }
+
+    #[test]
+    fn rabbit_states_compare_show_and_name_their_resources() {
+        let json = serde_json::to_value(rabbit_queue(true)).unwrap();
+        assert_eq!(json["kind"], "rabbit_queue");
+        assert_eq!(json["declaration"]["type"], "quorum");
+        let back: State = serde_json::from_value(json).unwrap();
+        assert_eq!(back, rabbit_queue(true));
+        let entries = rabbit_queue(true).entries();
+        assert_eq!(entries["exists"], "yes");
+        assert_eq!(entries["type"], "quorum");
+        assert_eq!(entries["argument x-delivery-limit"], "5");
+        assert_eq!(rabbit_queue(false).entries().len(), 1);
+        assert!(!rabbit_queue(true).same_as(&rabbit_queue(false)));
+        assert_eq!(
+            rabbit_queue(true).resource_keys(),
+            vec!["rabbit-queue:orders@/".to_string()]
+        );
+        assert_eq!(rabbit_queue(true).subject(), "queue orders on vhost /");
+        assert!(rabbit_queue(true).is_rabbitmq());
+        assert!(!config("t", "k", None).is_rabbitmq());
+
+        let binding = |present| State::RabbitBinding {
+            vhost: "/".into(),
+            binding: RabbitBindingKey {
+                source: "shop".into(),
+                destination: "orders".into(),
+                destination_type: "queue".into(),
+                routing_key: "order.*".into(),
+                arguments: BTreeMap::new(),
+            },
+            present,
+        };
+        let label = "exchange shop -> queue orders, routing key 'order.*'";
+        assert_eq!(binding(true).entries()[label], "present");
+        assert_eq!(binding(false).entries()[label], "absent");
+        assert_eq!(
+            binding(true).resource_keys(),
+            vec![format!("rabbit-binding:{label}@/")]
+        );
+        // A purge's message count is its own resource: it never overlaps
+        // the queue's declaration.
+        let messages = State::RabbitQueueMessages {
+            vhost: "/".into(),
+            name: "orders".into(),
+            messages: Some(3),
+        };
+        assert_eq!(messages.entries()["messages"], "3");
+        assert_ne!(messages.resource_keys(), rabbit_queue(true).resource_keys());
+    }
+
+    #[test]
+    fn rabbit_scopes_match_by_management_address_and_are_digested() {
+        let rabbit = |address: &str| Scope {
+            profile: "dev".into(),
+            rabbitmq: address.into(),
+            ..Scope::default()
+        };
+        assert!(rabbit("rabbit:15672").same_cluster(&rabbit("RABBIT:15672")));
+        assert!(!rabbit("rabbit:15672").same_cluster(&rabbit("other:15672")));
+        // A Kafka cluster without brokers named is not that RabbitMQ.
+        assert!(!rabbit("rabbit:15672").same_cluster(&Scope::default()));
+        let refused = rabbit("rabbit:15672")
+            .check_undo_target(&Scope {
+                bootstrap: "localhost:9092".into(),
+                ..Scope::default()
+            })
+            .unwrap_err();
+        assert!(refused.contains("RabbitMQ rabbit:15672"), "{refused}");
+        assert!(refused.contains("in use is none"), "{refused}");
+        assert_eq!(
+            rabbit("rabbit:15672").describe(),
+            "RabbitMQ rabbit:15672 (profile dev)"
+        );
+        // Kafka scopes serialise as before (no empty `rabbitmq` key).
+        let kafka = serde_json::to_value(Scope::default()).unwrap();
+        assert!(kafka.get("rabbitmq").is_none());
+
+        let mut recorded = begin(None);
+        recorded.scope = rabbit("rabbit:15672");
+        recorded.before = vec![rabbit_queue(true)];
+        recorded.after = vec![rabbit_queue(false)];
+        let op = finished(recorded);
+        let audited = op.digest();
+        let mut moved = op.clone();
+        moved.begin.scope.rabbitmq = "other:15672".into();
+        assert_eq!(moved.verify_digest(Some(&audited)), DigestStatus::Mismatch);
+        let mut edited = op.clone();
+        edited.begin.before = vec![rabbit_queue(false)];
+        assert_eq!(edited.verify_digest(Some(&audited)), DigestStatus::Mismatch);
+        assert_eq!(op.verify_digest(Some(&audited)), DigestStatus::Verified);
     }
 }

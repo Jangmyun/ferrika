@@ -276,7 +276,10 @@ RabbitMQ (preview): `rabbit_queues`, `rabbit_exchanges` and
 `rabbit_bindings` list a virtual host through the management API, for the
 RabbitMQ profile named by `profile` (default: the active one, see
 [RabbitMQ](#rabbitmq-ferrika-rabbit-preview)), with optional `vhost` and
-`filter` (at most 500 entries). They read no message bodies and take no
+`filter` (a case-insensitive name substring, or a regular expression with
+`regex: true`; the broker filters and pages queues and exchanges, at most
+500 entries come back, `count` is every match and `truncated` says when
+there are more). They read no message bodies and take no
 URL, so a profile's stored password only goes to that profile's broker.
 Peeking at a queue and DLQ inspect/redrive are write tools (below): a
 RabbitMQ peek takes messages and requeues them.
@@ -302,7 +305,7 @@ profile (`profile`, `vhost` arguments as for the listings):
 
 | Tool | What it does | Policy category |
 |---|---|---|
-| `rabbit_peek` | Reads up to 20 messages (`count`, default 5) at the head of `queue` and returns them; they are requeued and marked redelivered (on a quorum queue each read counts towards its delivery-limit). | `messages.peek`, export gate |
+| `rabbit_peek` | Reads up to 20 messages (`count`, default 5) at the head of `queue` and returns them; they are requeued and marked redelivered (a quorum queue with a delivery limit on RabbitMQ before 4.0 would count each read towards it; such queues are refused, the CLI's `--allow-delivery-count` is the opt-in). | `messages.peek`, export gate |
 | `rabbit_dlq_inspect` | Reads up to 50 messages (default 20) of a dead-letter queue, groups them by `x-death` (source queue, reason, exchange, routing key) and returns a sample of 10; requeued like a peek. | `messages.peek`, export gate |
 | `rabbit_publish` | Publishes one UTF-8 `body` to an existing `exchange` (`""` or `amq.default`: the default exchange, where `routing_key` names the queue) with optional `headers`, `content_type`, `persistent` (default true). A message no binding routes is an error (`unroutable`). | `produce` |
 | `rabbit_dlq_redrive` | Moves up to `max` (at most 1,000) messages of a dead-letter queue to their original exchange and routing key from `x-death`, or to `to_exchange` / `routing_key`, over AMQP (publish with publisher confirms, then ack), stopping at the first failure. | `messages.move` + `produce` |
@@ -432,14 +435,38 @@ Connections are RabbitMQ profiles in `rabbit-profiles.json` next to
 `profiles.json` (separate from the Kafka profiles), passwords in the OS
 credential store. A command uses `--rabbit-profile NAME`, else the active
 RabbitMQ profile; `--rabbit-url`, `--vhost`, `--rabbit-user`, the password
-options and `--amqp-url` override the profile's values. `--rabbit-url`
-without `--rabbit-profile` uses no profile (a profile's password is never
-sent to a URL typed by hand).
+options, `--amqp-url` and the TLS options override the profile's values.
+`--rabbit-url` without `--rabbit-profile` uses no profile (a profile's
+password is never sent to a URL typed by hand).
+
+TLS: `https://` management URLs and `amqps://` are verified against the OS
+trust store. For a broker certificate signed by a private CA, give the CA
+file (PEM) with `--rabbit-ca-cert FILE` (`FERRIKA_RABBIT_CA_CERT`, or the
+profile's `ca_cert`): the management API then trusts only that CA, AMQP
+trusts it in addition to the OS store. Mutual TLS takes
+`--rabbit-client-cert FILE --rabbit-client-key FILE` (PEM, unencrypted
+key; `FERRIKA_RABBIT_CLIENT_CERT` / `FERRIKA_RABBIT_CLIENT_KEY`, or the
+profile's `client_cert` / `client_key`); giving either replaces both of the
+profile's. `rabbit profile add` stores these as absolute paths and checks
+that the files exist. There is no option to skip certificate verification:
+an untrusted certificate fails with `invalid peer certificate:
+UnknownIssuer` and a hint to give the CA file.
+
+Listing: `queues`, `exchanges` and `bindings` return at most `--limit`
+entries (default 1000; `--limit 0` for all). Queues and exchanges are
+fetched from the management API in pages of up to 500 with only the
+columns shown, so a vhost with thousands of queues never comes back as one
+huge response; `--name TEXT` keeps names containing `TEXT`
+(case-insensitive, filtered by the broker), `--name PATTERN --regex` a
+case-insensitive regular expression. The API does not page bindings: they
+are fetched whole and filtered (`--name` matches the source or the
+destination) and cut locally. When more entries match than are shown, stderr
+says so (`Showing 1000 of 1203 matching queue(s) ...`); stdout holds only the
+entries, also with `-f json`.
 
 Under the company policy: `publish` is the category `produce`, like Kafka's
 `produce`. The management API has no browse, so `peek` and `dlq inspect`
-take the messages and requeue them (they are marked redelivered, and on a
-quorum queue this can count towards its delivery limit): they are writes in
+take the messages and requeue them (they are marked redelivered): they are writes in
 the category `messages.peek` (refused on read-only profiles and brokers,
 audited), and their output is a record export like `consume`, masked when
 the policy enforces masking. The `dlq redrive` preview reads the same way
@@ -457,16 +484,40 @@ ferrika rabbit profile add dev --rabbit-url http://localhost:15672 --read-only
 ferrika rabbit profile list                      # also: use, show, remove
 ferrika rabbit queues                            # the active profile
 ferrika rabbit --rabbit-profile dev exchanges --vhost other
-ferrika -f json rabbit bindings
+ferrika rabbit queues --name orders --limit 50    # broker-side filter, paged
+ferrika rabbit queues --name '^orders\.(eu|us)$' --regex
+ferrika -f json rabbit queues --limit 0           # every queue, 500 per request
+ferrika -f json rabbit bindings --name orders.dlq
 ferrika rabbit peek orders.dlq -n 5              # requeues: messages get "redelivered"
 ferrika rabbit publish orders -k order.created -m '{"id":1}' --content-type application/json
 ferrika rabbit publish amq.default -k my-queue -m hello   # the default exchange
+
+# A broker with a private CA, and mutual TLS:
+ferrika rabbit profile add prod --rabbit-url https://rabbit.prod:15671 \
+  --amqp-url amqps://rabbit.prod:5671 --rabbit-ca-cert /etc/ferrika/rabbit-ca.pem \
+  --rabbit-client-cert /etc/ferrika/ops.pem --rabbit-client-key /etc/ferrika/ops.key \
+  --rabbit-user ops --rabbit-password-stdin --use
 
 # Without a profile:
 export FERRIKA_RABBIT_URL=http://rabbit:15672 FERRIKA_RABBIT_USER=ops
 export FERRIKA_RABBIT_PASSWORD=...               # or --rabbit-password-stdin
 ferrika rabbit queues
 ```
+
+Quorum queues and the delivery limit: on RabbitMQ before 4.0 a quorum
+queue counts every requeue as a delivery attempt, so each peek raises a
+message's `x-delivery-count`; past the queue's delivery limit
+(`x-delivery-limit` or a policy's `delivery-limit`) the broker dead-letters
+the message, or drops it without a dead-letter exchange (seen on 3.13.7:
+with a limit of 3 the fourth peek dead-lettered the message). RabbitMQ 4.0
+and later count only failed deliveries, and a peek is none (seen on 4.4.1:
+28 peeks with a limit of 2 kept the message). Before `peek`, `dlq inspect`
+and the `dlq redrive` preview read a quorum queue that has a limit, Ferrika
+asks the broker for its version; on 3.x (or when the version cannot be
+read) the read is refused unless `--allow-delivery-count` is given, which
+warns and then says per message how many more peeks leave it in the queue,
+or that this peek took it over the limit. The MCP `rabbit_peek` and
+`rabbit_dlq_inspect` tools refuse such queues without an opt-in.
 
 Dead-lettered messages:
 
@@ -486,6 +537,110 @@ confirm. It stops at the first failure and returns that message to the
 queue. Redriven messages keep their headers, `x-death` included, and
 get `x-ferrika-redriven-from: <queue>`. The audit log records the counts, the
 source queue and the destinations, never message bodies.
+
+Queues, exchanges and bindings (recorded in the operation history, so
+`rabbit undo` can reverse them):
+
+```bash
+ferrika rabbit queue declare orders --type quorum --arg x-delivery-limit=5
+ferrika rabbit exchange declare shop --type topic
+ferrika rabbit bind shop orders -k 'order.*'          # exchange -> queue
+ferrika rabbit bind shop audit --destination-type exchange
+ferrika rabbit unbind shop orders -k 'order.*'
+ferrika rabbit queue purge orders                    # asks first; cannot be undone
+ferrika rabbit queue delete orders                   # asks first; --if-empty, --if-unused, -y
+ferrika rabbit exchange delete shop -y               # removes its bindings too
+ferrika rabbit history                               # this broker's changes, newest first
+ferrika rabbit history show 01K9ABCDEF12
+ferrika rabbit undo --dry-run                        # your latest undoable change here
+ferrika rabbit undo 01K9AB                           # asks first; -y to skip
+```
+
+Policy categories: `queues.create`, `queues.delete`, `queues.purge`,
+`exchanges.create`, `exchanges.delete` and `bindings.change`; a read-only
+RabbitMQ profile or broker refuses them all. Declaring a queue or exchange
+that exists already is refused, so undoing a declaration never deletes
+something the command did not make. `--arg KEY=VALUE` sends whole numbers
+and `true`/`false` as numbers and booleans, JSON in quotes as JSON.
+
+What undo does:
+
+- a declared queue is deleted again, only while it holds no messages and
+  has no consumers or bindings added since (`--force` does not override
+  this; purge it first if the messages are not needed). Classic queues are
+  deleted with the broker's `if-empty` and `if-unused` checks; quorum and
+  stream queues support neither, so for them the check relies on the
+  broker's statistics, which lag a few seconds;
+- a deleted queue is declared again with its type, arguments and bindings,
+  empty: its messages are lost (the history marks it `partial`);
+- a declared exchange is deleted again while it has no bindings added
+  since; a deleted exchange is declared again with every binding from and
+  to it (where the other end still exists);
+- a binding is added back or removed;
+- a purge cannot be undone; it is recorded with the message count the
+  broker's statistics reported.
+
+`ferrika history --all` lists these operations too; `ferrika undo` points a
+RabbitMQ operation to `ferrika rabbit undo`, which needs that broker's
+connection (`--rabbit-profile` or `--rabbit-url`): it refuses another
+broker than the one recorded.
+
+### MQTT (`ferrika mqtt`, preview)
+
+For MQTT 3.1.1 and 5 brokers (Mosquitto, EMQX, HiveMQ, MQTT-to-Kafka
+bridges). Built in with the `ferrika-cli` cargo feature `mqtt` (on by
+default).
+
+Connections are MQTT profiles in `mqtt-profiles.json` next to
+`profiles.json` (separate from the Kafka and RabbitMQ profiles), passwords
+in the OS credential store. A command uses `--mqtt-profile NAME`, else the
+active MQTT profile; `--mqtt-url`, `--mqtt-user`, the password
+(`FERRIKA_MQTT_PASSWORD` or `--mqtt-password-stdin`), `--mqtt-version`
+(`3.1.1`, the default, or `5`) and `--mqtt-ca-file` override the profile's
+values. `--mqtt-url` without `--mqtt-profile` uses no profile. URLs are
+`mqtt://host[:1883]` or `mqtts://host[:8883]` and never carry a user or
+password.
+
+```bash
+ferrika mqtt profile add plant-a --mqtt-url mqtts://broker.plant-a:8883   --mqtt-ca-file ./plant-a-ca.pem --mqtt-user ops --mqtt-password-stdin --use
+ferrika mqtt profile add lab --mqtt-url mqtt://localhost --mqtt-version 5 --read-only
+ferrika mqtt profile list                        # also: use, show, remove
+
+ferrika mqtt sub 'sensors/+/temperature'         # 10 messages or 30 s, whichever first
+ferrika mqtt sub 'devices/#' -n 100 --duration 300 --qos 1
+ferrika -f json mqtt sub 'devices/#' > out.jsonl # JSON Lines, an export under the policy
+ferrika mqtt pub devices/42/cmd -m '{"reboot":true}'               # QoS 1, not retained
+ferrika mqtt pub devices/42/config -m '{"interval":60}' --retain --qos 2
+ferrika mqtt --mqtt-version 5 pub orders/new -m '{}' --content-type application/json -H trace:abc
+
+ferrika mqtt retained 'devices/+/config'         # list retained messages (table or -f json)
+ferrika mqtt retained clear devices/42/config    # asks first; --yes to skip
+```
+
+Every session is clean, with a fresh client id (`ferrika` and 12 random hex
+digits), and sets no last will: it never takes over another client's
+session and leaves nothing on the broker. Shared subscriptions
+(`$share/GROUP/...`, `$queue/...`) are refused, since they would take
+messages from the group's consumers. `sub` stops at `--count` (default 10)
+or `--duration` seconds (default 30); `retained` stops once retained
+messages stop coming for a second, after `--wait` seconds (default 5) or at
+`--count` (default 500), and says when there may be more. `--timeout`
+limits each step (connect, acknowledgement; default 10 s).
+
+Under the company policy: `pub` is the category `produce` (like Kafka's
+`produce` and `rabbit publish`). `retained clear` publishes an empty
+retained message, which deletes the topic's retained message: category
+`messages.delete`, which also needs `produce` allowed. It first looks for
+the retained message; without one it changes nothing. `pub --retain` with an
+empty message is refused (use `retained clear`). `sub` and `retained` are
+reads, but they show message data: their output is a record export like
+`consume`, masked when the policy enforces masking (or with `--mask-pii`:
+payloads, topics and MQTT 5 user properties). Read-only MQTT profiles and
+the policy's broker-address rules (matched on the broker's `host:port`)
+refuse `pub` and `retained clear`. The audit log records topics, QoS, the
+retain flag and cleared sizes, never payloads. On MQTT 3.1.1 a broker that
+drops a message its ACL forbids still acknowledges it; with
+`--mqtt-version 5` the broker's refusal is reported as an error.
 
 ### Client quotas (`ferrika quota`)
 
@@ -717,7 +872,7 @@ Filter expressions (`-W`/`--where`, expressions that start with
 | `$.a.b`, `$.items[0]`, `$["odd key"]`, `$` | A field of the JSON value; `$` alone is the whole value |
 | `key`, `partition`, `offset`, `timestamp`, `headers.<name>` | Record fields (timestamp in epoch ms) |
 | `== != > >= < <=` | Compare; a number and a numeric string compare as numbers |
-| `=~ "regex"`, `contains "text"` | Case-insensitive match (`=~` too: `key =~ "^EU-"` matches `eu-1`); `contains` also checks array elements |
+| `=~ "regex"`, `contains "text"` | Case-insensitive match (`=~` too: `key =~ "^EU-"` matches `eu-1`); `contains` also checks array elements. Start a `=~` pattern with `(?-i)` for a case-sensitive match: `$.status =~ "(?-i)ERROR"` matches `ERROR` but not `error` |
 | `exists`, `&&`/`and`, `\|\|`/`or`, `!`/`not`, `( )` | Presence and logic; a bare field is true unless missing, null, false, 0 or "" |
 
 With `-g`, the group's offsets are committed for the records the command
@@ -851,6 +1006,10 @@ ferrika mirror orders-v1 orders-v1 --src-profile prod --dst-profile staging -g o
 ferrika mirror orders-v1 orders-v1 --src-profile prod --dst-profile dev -b --mask
 ```
 
+Records are copied with their headers in order, including repeated keys and
+headers with a null value (written as null, not as an empty value; `--mask`
+leaves them null).
+
 ### Stream transform (`ferrika transform`)
 
 Copies records from a topic (on the cluster the global options select) to
@@ -858,7 +1017,7 @@ another topic, through steps applied in the order they are given:
 
 | Step | Effect |
 | --- | --- |
-| `--filter EXPR` | Keep records the expression matches (the `consume --where` syntax: `$.user.country == "KR"`, `$.amount > 100`, `key =~ "^order-"`, `headers.source == "web"`, `&&`, `\|\|`, `!`) |
+| `--filter EXPR` | Keep records the expression matches (the `consume --where` syntax: `$.user.country == "KR"`, `$.amount > 100`, `key =~ "^order-"`, `headers.source == "web"`, `&&`, `\|\|`, `!`; `=~` ignores case unless the pattern starts with `(?-i)`) |
 | `--drop FIELD` | Remove a value field (`user.email`, `items.0`) |
 | `--rename OLD=NEW` | Move a value field to another name or path |
 | `--set FIELD=JSON` | Set a value field to a JSON value (`env='"staging"'`, `retries=0`) |
@@ -871,6 +1030,10 @@ binary, JSON scalars and arrays) pass through them unchanged and are counted
 as "not JSON"; a `$.` filter on them is false. A value no step changed is
 written byte for byte; a changed one is written as compact JSON. Source
 timestamps and headers are kept; the partition follows the (new) key.
+Headers with a null value are written as null in their original positions:
+`--mask` leaves them null, and `--filter` reads them as missing
+(`headers.trace exists` is false for a null `trace`). The dry run shows
+their value as `null`.
 
 Without `--execute` the command is a dry run: it prints up to 10 transformed
 records (or `-n`) as JSON lines on stdout and writes nothing; the summary
@@ -945,10 +1108,16 @@ ferrika restore orders-v1 -i ./orders_backup.jsonl --preserve-partitions
 ```
 
 A dump line has `headers` (text) and `headers_base64` objects. Only a record
-that those objects cannot hold exactly (a repeated header key, or a binary
-header before a text one) also gets `header_list`, every header in record
-order, and `restore` prefers it. Records without repeated keys are written as
-before, and files from older versions restore as they always did. `restore`
+that those objects cannot hold exactly (a repeated header key, a binary
+header before a text one, or a header with a null value) also gets
+`header_list`, every header in record order, and `restore` prefers it. A
+null-valued header is a `header_list` entry with only a `key`
+(`{"key":"trace"}`) and is restored as null, not as an empty value.
+
+Each line also has `"format_version": 2`. Lines without it (dumps from
+Ferrika 0.2.0 and earlier, which left null-valued headers out) restore as
+they always did. Ferrika 0.2.0 and earlier read a version 2 dump too: they
+ignore the field and restore null-valued headers as empty values. `restore`
 creates a missing topic only if the broker auto-creates topics.
 
 ### 12. Kafka ACL & Cluster Security Manager (`ferrika acl`)

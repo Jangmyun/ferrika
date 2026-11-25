@@ -86,6 +86,9 @@ pub(crate) enum Commands {
     Mcp(cli::mcp::McpArgs),
     /// RabbitMQ (preview): queues, exchanges, bindings, peek, publish, DLQ inspect/redrive, profiles
     Rabbit(cli::rabbit::RabbitArgs),
+    /// MQTT (preview): bounded subscribe, publish, list and clear retained messages, profiles
+    #[cfg(feature = "mqtt")]
+    Mqtt(cli::mqtt::MqttArgs),
     /// Show the local audit log of cluster changes (GUI, CLI and MCP)
     Audit {
         /// Number of entries to show
@@ -303,6 +306,13 @@ pub fn run(mut cli: Cli) {
             cli::exit_with_error(&err);
         }
     }
+    // `mqtt` the same, with an MQTT profile and the broker's address.
+    #[cfg(feature = "mqtt")]
+    if let Some(Commands::Mqtt(args)) = &mut cli.command {
+        if let Err(err) = cli::mqtt::resolve(args) {
+            cli::exit_with_error(&err);
+        }
+    }
     // Record data leaving the app: refused under `export: forbidden` (before
     // the masking refusal of `dump` below, so that is the reason shown),
     // recorded under `export: audited`.
@@ -427,6 +437,8 @@ pub fn run(mut cli: Cli) {
                 // broker, which has its own profiles.
                 match cli.command.as_ref() {
                     Some(Commands::Rabbit(args)) => cli::rabbit::ensure_writable(args, action),
+                    #[cfg(feature = "mqtt")]
+                    Some(Commands::Mqtt(args)) => cli::mqtt::ensure_writable(args, action),
                     _ => cli
                         .global_opts
                         .ensure_writable(action)
@@ -537,6 +549,8 @@ pub fn run(mut cli: Cli) {
         Some(Commands::Undo(args)) => run_async(cli::history::run_undo(args, global)),
         Some(Commands::Mcp(args)) => run_async(cli::mcp::run(args, global)),
         Some(Commands::Rabbit(args)) => run_async(cli::rabbit::run(args, global)),
+        #[cfg(feature = "mqtt")]
+        Some(Commands::Mqtt(args)) => run_async(cli::mqtt::run(args, global)),
         None => print!("{}", no_command_help()),
     }
     // The handler returned without an error (an interrupted batch too).
@@ -617,7 +631,21 @@ fn needs_profiles(command: Option<&Commands>) -> bool {
                 | Commands::Completions { .. }
                 | Commands::Rabbit(_)
         )
-    )
+    ) && !is_mqtt(command)
+}
+
+/// Whether `command` is `mqtt`, which uses its own profiles (false
+/// without the `mqtt` feature).
+fn is_mqtt(command: Option<&Commands>) -> bool {
+    #[cfg(feature = "mqtt")]
+    {
+        matches!(command, Some(Commands::Mqtt(_)))
+    }
+    #[cfg(not(feature = "mqtt"))]
+    {
+        let _ = command;
+        false
+    }
 }
 
 /// The profile name the policy and audit gates use for `command`: the
@@ -627,6 +655,8 @@ fn needs_profiles(command: Option<&Commands>) -> bool {
 fn gate_profile(command: Option<&Commands>, global: &cli::GlobalOpts) -> String {
     match command {
         Some(Commands::Rabbit(args)) => cli::rabbit::gate_profile(args),
+        #[cfg(feature = "mqtt")]
+        Some(Commands::Mqtt(args)) => cli::mqtt::gate_profile(args),
         _ => global.resolved_profile_name().unwrap_or_default(),
     }
 }
@@ -642,6 +672,8 @@ fn gate_brokers(
 ) -> Result<String, String> {
     match command {
         Some(Commands::Rabbit(args)) => cli::rabbit::gate_address(args),
+        #[cfg(feature = "mqtt")]
+        Some(Commands::Mqtt(args)) => cli::mqtt::gate_address(args),
         _ => crate::governance::policy::brokers_for(&global.to_kafka_config(), needed),
     }
 }
@@ -805,6 +837,8 @@ fn write_action(command: &Commands) -> Option<&'static str> {
         // Each MCP write tool call passes the gate itself.
         Commands::Mcp(_) => None,
         Commands::Rabbit(args) => cli::rabbit::write_action(args),
+        #[cfg(feature = "mqtt")]
+        Commands::Mqtt(args) => cli::mqtt::write_action(args),
         Commands::Completions { .. } => None,
         Commands::Connect(args) => match &args.command {
             cli::connect::ConnectSubcommands::Pause { .. } => Some("connect pause"),
@@ -842,7 +876,7 @@ fn write_action(command: &Commands) -> Option<&'static str> {
 /// nothing to undo and are not recorded; neither is `reassign rollback`,
 /// which only saves a plan.
 fn records_history(label: &str) -> bool {
-    const RECORDED: [&str; 8] = [
+    const RECORDED: [&str; 12] = [
         "topics ",
         "offset ",
         "user ",
@@ -851,6 +885,11 @@ fn records_history(label: &str) -> bool {
         "schema ",
         "connect ",
         "reassign execute",
+        // RabbitMQ topology, undone with `rabbit undo`.
+        "rabbit queue ",
+        "rabbit exchange ",
+        "rabbit bind",
+        "rabbit unbind",
     ];
     RECORDED.iter().any(|prefix| label.starts_with(prefix))
 }
@@ -919,6 +958,10 @@ fn export_gate(command: &Commands) -> Option<ExportGate> {
         Commands::Transform(a) if !a.execute => gate(Stdout, "transform --dry-run", &a.src_topic),
         Commands::Rabbit(args) => {
             cli::rabbit::export(args).and_then(|(label, target)| gate(Stdout, label, &target))
+        }
+        #[cfg(feature = "mqtt")]
+        Commands::Mqtt(args) => {
+            cli::mqtt::export(args).and_then(|(label, target)| gate(Stdout, label, &target))
         }
         // Metadata or counts only, records read in, or checked elsewhere.
         Commands::Mirror(_)
@@ -1102,6 +1145,8 @@ fn write_target(command: &Commands) -> String {
             _ => String::new(),
         },
         Commands::Rabbit(args) => cli::rabbit::write_target(args),
+        #[cfg(feature = "mqtt")]
+        Commands::Mqtt(args) => cli::mqtt::write_target(args),
         Commands::Undo(a) => match &a.id {
             Some(id) => format!("op {id}"),
             None => "the latest undoable operation".to_string(),
@@ -1155,6 +1200,14 @@ mod tests {
         "mirror",
         "monitor brokers",
         "monitor lag",
+        "mqtt profile add",
+        "mqtt profile list",
+        "mqtt profile remove",
+        "mqtt profile show",
+        "mqtt profile use",
+        "mqtt pub",
+        "mqtt retained",
+        "mqtt retained clear",
         "offset delete",
         "offset delete-group",
         "offset reset",
@@ -1177,10 +1230,15 @@ mod tests {
         "quota list",
         "quota remove",
         "quota set",
+        "rabbit bind",
         "rabbit bindings",
         "rabbit dlq inspect",
         "rabbit dlq redrive",
+        "rabbit exchange declare",
+        "rabbit exchange delete",
         "rabbit exchanges",
+        "rabbit history",
+        "rabbit history show",
         "rabbit peek",
         "rabbit profile add",
         "rabbit profile list",
@@ -1188,7 +1246,12 @@ mod tests {
         "rabbit profile show",
         "rabbit profile use",
         "rabbit publish",
+        "rabbit queue declare",
+        "rabbit queue delete",
+        "rabbit queue purge",
         "rabbit queues",
+        "rabbit unbind",
+        "rabbit undo",
         "reassign execute",
         "reassign plan",
         "reassign rollback",
@@ -1241,6 +1304,10 @@ mod tests {
         ),
         ("mcp", "an MCP server: stdout carries the protocol"),
         (
+            "mqtt sub",
+            "streams messages: -f json writes JSON Lines, one object per message",
+        ),
+        (
             "monitor export",
             "a Prometheus exporter: -f json prints its URLs as JSON once, then serves",
         ),
@@ -1284,6 +1351,10 @@ mod tests {
             );
         }
         for listed in JSON_OUTPUT.iter().chain(&exempt) {
+            // `mqtt` is a cargo feature (on by default).
+            if cfg!(not(feature = "mqtt")) && listed.starts_with("mqtt ") {
+                continue;
+            }
             assert!(
                 commands.iter().any(|c| c == listed),
                 "'{listed}' is listed but is no command"
@@ -1378,6 +1449,8 @@ mod tests {
             | Commands::Lint(_)
             | Commands::Rabbit(_)
             | Commands::Undo(_) => true,
+            #[cfg(feature = "mqtt")]
+            Commands::Mqtt(_) => true,
             Commands::History(_)
             | Commands::Monitor(_)
             | Commands::Profile(_)
@@ -1524,6 +1597,13 @@ mod tests {
             "schema compat --set",
             "connect apply",
             "reassign execute",
+            "rabbit queue declare",
+            "rabbit queue delete",
+            "rabbit queue purge",
+            "rabbit exchange declare",
+            "rabbit exchange delete",
+            "rabbit bind",
+            "rabbit unbind",
         ] {
             assert!(records_history(label), "{label}");
         }
@@ -1537,6 +1617,9 @@ mod tests {
             "dlq redrive --execute",
             "bench produce",
             "reassign rollback",
+            "rabbit publish",
+            "rabbit peek",
+            "rabbit dlq redrive --execute",
         ] {
             assert!(!records_history(label), "{label}");
         }
@@ -1617,6 +1700,8 @@ mod tests {
             | Commands::Transform(_)
             | Commands::Rabbit(_)
             | Commands::Mcp(_) => true,
+            #[cfg(feature = "mqtt")]
+            Commands::Mqtt(_) => true,
             // Counts, sizes and offsets only; or records read in.
             Commands::Topics(_)
             | Commands::Produce(_)
@@ -1869,6 +1954,111 @@ mod tests {
             "rabbit.prod.corp:443,rabbit.prod.corp:5671"
         );
         assert!(!super::fails_fast_without_broker(&publish));
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[test]
+    fn mqtt_pub_and_clear_are_writes_and_sub_and_retained_are_exports() {
+        use governance::policy::ExportChannel::Stdout;
+        use model::policy::PolicyAction;
+        let url = "--mqtt-url=mqtt://broker.prod:1883";
+        let publish = command(&["mqtt", url, "pub", "devices/1/cmd", "-m", "body"]);
+        assert!(may_write(&publish));
+        assert_eq!(write_action(&publish), Some("mqtt pub"));
+        assert_eq!(super::main_gate_action(&publish), Some("mqtt pub"));
+        assert_eq!(PolicyAction::from_cli("mqtt pub"), PolicyAction::Produce);
+        assert_eq!(write_target(&publish), "topic devices/1/cmd (QoS 1)");
+        assert!(!records_history("mqtt pub"));
+        assert_eq!(export_gate(&publish), None);
+
+        let clear = command(&["mqtt", url, "retained", "clear", "devices/1/config"]);
+        assert_eq!(write_action(&clear), Some("mqtt retained clear"));
+        assert_eq!(
+            PolicyAction::from_cli("mqtt retained clear"),
+            PolicyAction::MessagesDelete
+        );
+        assert_eq!(
+            PolicyAction::MessagesDelete.also_requires(),
+            &[PolicyAction::Produce]
+        );
+        assert!(!records_history("mqtt retained clear"));
+        assert_eq!(export_gate(&clear), None);
+
+        // A clean-session subscription changes nothing: a read, and an
+        // export of message data.
+        let sub = command(&["mqtt", url, "sub", "devices/#", "-n", "5"]);
+        assert!(reads_records(&sub));
+        assert_eq!(write_action(&sub), None);
+        let gate = export_gate(&sub).expect("sub shows message data");
+        assert_eq!(
+            (gate.channel, gate.label, gate.target.as_str()),
+            (Stdout, "mqtt sub", "topic filter devices/#")
+        );
+        let listing = command(&["mqtt", url, "retained", "devices/+/config"]);
+        assert_eq!(write_action(&listing), None);
+        let gate = export_gate(&listing).expect("retained shows message data");
+        assert_eq!(gate.label, "mqtt retained");
+
+        for args in [
+            &["mqtt", "profile", "list"][..],
+            &["mqtt", "profile", "use", "prod"][..],
+        ] {
+            let cmd = command(args);
+            assert_eq!(write_action(&cmd), None, "{args:?}");
+            assert_eq!(export_gate(&cmd), None, "{args:?}");
+        }
+    }
+
+    #[cfg(feature = "mqtt")]
+    #[test]
+    fn mqtt_gates_match_the_broker_address_not_a_kafka_profile() {
+        use super::{gate_brokers, gate_profile};
+        use model::policy::PolicyAction;
+        let mut publish = command(&[
+            "-p",
+            "prod-kafka",
+            "mqtt",
+            "--mqtt-url",
+            "mqtts://broker.prod.corp",
+            "pub",
+            "t",
+            "-m",
+            "x",
+        ]);
+        let global = Cli::try_parse_from(["ferrika", "-p", "prod-kafka", "topics", "list"])
+            .unwrap()
+            .global_opts;
+        assert!(!needs_profiles(Some(&publish)));
+        let Commands::Mqtt(args) = &mut publish else {
+            panic!("an mqtt command")
+        };
+        args.connection.profile = None;
+        cli::mqtt::resolve(args).unwrap();
+        assert_eq!(gate_profile(Some(&publish), &global), "");
+        let address = gate_brokers(Some(&publish), &global, true).unwrap();
+        assert_eq!(address, "broker.prod.corp:8883");
+        assert!(!super::fails_fast_without_broker(&publish));
+
+        // A read-only rule on the broker covers both writes; `forbid:
+        // ["produce"]` covers a clear too, which publishes.
+        let mut policy = crate::governance::test_policy::masking();
+        policy.rules.read_only_brokers = vec!["*.prod.corp:*".to_string()];
+        assert!(policy.check(PolicyAction::Produce, "", &address).is_err());
+        assert!(policy
+            .check(PolicyAction::MessagesDelete, "", &address)
+            .is_err());
+        let mut policy = crate::governance::test_policy::masking();
+        policy.rules.forbid = vec!["produce".to_string()];
+        let refusal = governance::policy::extra_category_refusal(
+            &policy,
+            PolicyAction::MessagesDelete,
+            "mqtt retained clear",
+            "",
+            &address,
+        )
+        .expect("refused");
+        assert!(refusal.contains("messages.delete"), "{refusal}");
+        assert!(refusal.contains("empty retained message"), "{refusal}");
     }
 
     #[test]

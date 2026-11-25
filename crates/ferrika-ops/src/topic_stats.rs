@@ -180,6 +180,7 @@ mod tests {
             payload: value.map(|n| vec![b'x'; n]),
             timestamp_ms: Some(ts),
             headers: Vec::new(),
+            null_headers: Vec::new(),
         }
     }
 

@@ -123,7 +123,8 @@ impl StepArgs {
                 "EXPR",
                 "Keep records matching an expression, e.g. '$.amount > 100', \
                  '$.user.country == \"KR\"', 'key =~ \"^order-\"', 'headers.source == \"web\"' \
-                 (the syntax of consume --where)",
+                 (the syntax of consume --where; =~ ignores case unless the pattern starts \
+                 with (?-i))",
             ),
             StepKind::Drop => (
                 "FIELD",
@@ -344,17 +345,18 @@ fn summary_table(summary: &TransformSummary) -> comfy_table::Table {
 }
 
 /// One transformed record of a dry run, as a JSON line: the key and header
-/// values as text, the value as JSON when it is JSON.
+/// values as text (`null` for a null header value), the value as JSON when
+/// it is JSON.
 fn preview_line(record: &OwnedProducerRecord) -> Value {
     let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
     let value = record.payload.as_deref().map(|payload| {
         serde_json::from_slice::<Value>(payload).unwrap_or_else(|_| Value::String(text(payload)))
     });
-    let headers: Vec<Value> = record
-        .headers
-        .iter()
-        .map(|(name, value)| json!([name, text(value)]))
-        .collect();
+    let headers: Vec<Value> =
+        crate::kafka::consumer::merge_headers(&record.headers, &record.null_headers)
+            .into_iter()
+            .map(|(name, value)| json!([name, value.map(text)]))
+            .collect();
     json!({
         "key": record.key.as_deref().map(text),
         "value": value,
@@ -693,6 +695,13 @@ mod tests {
         assert_eq!(
             preview_line(&text),
             json!({"key": null, "value": "plain", "headers": []})
+        );
+        let nulls = OwnedProducerRecord::new("dst")
+            .with_null_header("n")
+            .with_header("a", b"1".to_vec());
+        assert_eq!(
+            preview_line(&nulls)["headers"],
+            json!([["n", null], ["a", "1"]])
         );
         let tombstone = OwnedProducerRecord::new("dst").with_key("k");
         assert_eq!(preview_line(&tombstone)["value"], Value::Null);

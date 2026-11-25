@@ -302,6 +302,16 @@ pub async fn run(step: &Step, target: &Target<'_>) -> KafkaResult<()> {
                 .act(name, ferrika_core::kafka::connect::ConnectorAction::Resume)
                 .await
         }
+        Step::DeclareQueue { .. }
+        | Step::DeleteQueue { .. }
+        | Step::DeclareExchange { .. }
+        | Step::DeleteExchange { .. }
+        | Step::Bind { .. }
+        | Step::Unbind { .. } => Err(KafkaError::config(format!(
+            "'{}' changes RabbitMQ; it runs through the management API \
+             (ferrika_ops::history::rabbit), not a Kafka client",
+            step.describe()
+        ))),
     }
 }
 

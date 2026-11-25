@@ -15,6 +15,9 @@ categories = ["api-bindings", "network-programming"]
 # credential store and the config directory come from ferrika-core.
 [dependencies]
 ferrika-core.workspace = true
+# `--name ... --regex` for bindings, which the management API filters only
+# for queues and exchanges (and to check a pattern before sending it).
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -32,3 +35,10 @@ default = ["amqp"]
 # The AMQP client (`amqp` module). Without it the crate has the management
 # API client and the profiles only.
 amqp = ["dep:lapin", "dep:tokio"]
+# `fake`: an in-memory management API over HTTP for tests of code that uses
+# the client. For tests only; never enable it in a shipped binary.
+test-util = ["dep:tokio"]
+
+[dev-dependencies]
+# A fake management API for the paging and delivery-limit tests.
+tokio.workspace = true
