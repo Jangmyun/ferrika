@@ -10,14 +10,14 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::error::{KafkaError, KafkaResult};
-use crate::kafka::config::KafkaClientConfig;
+use crate::kafka::config::{KafkaClientConfig, Partitioner};
 use crate::kafka::profile::{ClusterProfile, ProfileStore};
 
 /// Brokers used when no profile exists at all.
 pub const FALLBACK_BOOTSTRAP: &str = "localhost:9092";
 
 /// What the caller asked for: a profile name, a broker list replacing the
-/// profile's, and the request timeout.
+/// profile's, the request timeout and a partitioner replacing the profile's.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterSelection {
     /// The profile to use; `None` means the store's active one.
@@ -26,6 +26,9 @@ pub struct ClusterSelection {
     pub bootstrap_servers: Option<String>,
     /// Request timeout of the clients built from the config.
     pub timeout: Duration,
+    /// Producer partitioner replacing the profile's; `None` keeps the
+    /// profile's (or librdkafka's default when the profile sets none).
+    pub partitioner: Option<Partitioner>,
 }
 
 /// The profile and brokers one run uses.
@@ -113,6 +116,9 @@ impl ResolvedContext {
             config.bootstrap_servers = bs.clone();
         }
         config.request_timeout = selection.timeout;
+        if let Some(partitioner) = selection.partitioner {
+            config.partitioner = Some(partitioner);
+        }
         Self {
             profile_name: profile.as_ref().map(|p| p.name.clone()),
             bootstrap_servers: config.bootstrap_servers.clone(),
@@ -132,6 +138,7 @@ mod tests {
             profile: profile.map(str::to_string),
             bootstrap_servers: bootstrap.map(str::to_string),
             timeout: Duration::from_secs(7),
+            partitioner: None,
         }
     }
 
@@ -163,5 +170,27 @@ mod tests {
                 .unwrap();
         assert_eq!(ctx.profile_name.as_deref(), Some("prod-eu"));
         assert_eq!(ctx.config.bootstrap_servers, "other:9092");
+    }
+
+    #[test]
+    fn partitioner_comes_from_the_selection_then_the_profile() {
+        let mut store = store();
+        let ctx = ResolvedContext::from_store(&selection(None, None), store.clone()).unwrap();
+        assert_eq!(ctx.config.partitioner, None);
+
+        let mut murmur = ClusterProfile::new("java", "kafka.prod:9092");
+        murmur.partitioner = Some(Partitioner::Murmur2Random);
+        store.add(murmur, false);
+        let ctx =
+            ResolvedContext::from_store(&selection(Some("java"), None), store.clone()).unwrap();
+        assert_eq!(ctx.config.partitioner, Some(Partitioner::Murmur2Random));
+
+        let mut flag = selection(Some("java"), None);
+        flag.partitioner = Some(Partitioner::Consistent);
+        let ctx = ResolvedContext::from_store(&flag, store.clone()).unwrap();
+        assert_eq!(ctx.config.partitioner, Some(Partitioner::Consistent));
+        flag.profile = Some("prod-eu".into());
+        let ctx = ResolvedContext::from_store(&flag, store).unwrap();
+        assert_eq!(ctx.config.partitioner, Some(Partitioner::Consistent));
     }
 }

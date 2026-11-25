@@ -91,8 +91,16 @@ ferrika consume orders -b -n 10 --pretty-json
 
 Global options go before the subcommand: `-p/--profile <name>` picks a saved
 profile, `-b/--bootstrap-servers` overrides it, `-f json` switches the output
-to JSON, `--timeout <s>` sets the request timeout. `ferrika <command> --help`
-lists every option.
+to JSON, `--timeout <s>` sets the request timeout, `--partitioner <name>`
+picks the producers' partitioner. `ferrika <command> --help` lists every
+option.
+
+Keyed records go to the partition librdkafka's default partitioner picks
+(CRC32 of the key), which is not the one the Java client picks (murmur2). If
+Java applications write to the same topics, set `--partitioner
+murmur2_random` (or `ferrika profile partitioner <name> murmur2_random`) so
+records of one key stay on one partition and in order; see
+[Partitioner](docs/CLI.md#partitioner).
 
 At a terminal, a command that needs the cluster stops within seconds when
 nothing listens at the bootstrap servers (connection refused). In scripts

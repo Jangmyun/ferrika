@@ -60,7 +60,7 @@ use clap::{Args, ValueEnum};
 use colored::Colorize;
 
 use crate::error::{KafkaError, KafkaResult};
-use crate::kafka::config::KafkaClientConfig;
+use crate::kafka::config::{KafkaClientConfig, Partitioner};
 use crate::kafka::profile::ProfileStore;
 
 pub use crate::kafka::context::ResolvedContext;
@@ -88,6 +88,13 @@ fn effective_timeout(
     }
 }
 
+/// Parses a librdkafka partitioner name; the help lists the names.
+pub fn partitioner_parser() -> impl clap::builder::TypedValueParser<Value = Partitioner> {
+    use clap::builder::TypedValueParser;
+    clap::builder::PossibleValuesParser::new(Partitioner::ALL.map(|p| p.as_str()))
+        .try_map(|name| name.parse::<Partitioner>())
+}
+
 /// Global CLI options shared across subcommands. Public: GUI front ends
 /// parse them for their own start-up.
 #[derive(Args, Debug, Clone)]
@@ -107,6 +114,12 @@ pub struct GlobalOpts {
     /// Request timeout in seconds (default: the profile's, else 30)
     #[arg(long)]
     pub timeout: Option<u64>,
+
+    /// Producer partitioner for records without an explicit partition,
+    /// replacing the profile's. murmur2_random places keys like the Java
+    /// client; default: the profile's, else librdkafka's consistent_random
+    #[arg(long, value_name = "NAME", value_parser = partitioner_parser())]
+    pub partitioner: Option<Partitioner>,
 
     /// The profile and brokers `main` resolved for this run. Set for every
     /// command that talks to a cluster; `None` elsewhere (GUI, tests).
@@ -192,6 +205,7 @@ impl GlobalOpts {
             profile: self.profile.clone(),
             bootstrap_servers: self.bootstrap_servers.clone(),
             timeout: self.request_timeout(),
+            partitioner: self.partitioner,
         }
     }
 

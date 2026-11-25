@@ -128,4 +128,40 @@ mod tests {
         assert_eq!(ctx.profile_name.as_deref(), Some("prod-eu"));
         assert_eq!(ctx.bootstrap_servers, "other:9092");
     }
+
+    #[test]
+    fn partitioner_flag_beats_the_profile_and_is_validated() {
+        use crate::kafka::config::Partitioner;
+        let mut store = ProfileStore::default();
+        let mut java = ClusterProfile::new("java", "kafka.prod:9092");
+        java.partitioner = Some(Partitioner::Murmur2Random);
+        store.add(java, true);
+        store.add(ClusterProfile::new("plain", "kafka.prod:9092"), false);
+        let path = temp_store(
+            "partitioner",
+            &serde_json::to_string(&store).expect("serialize store"),
+        );
+
+        let ctx = resolve_from_path(&opts(&[]), &path).expect("resolves");
+        assert_eq!(ctx.config.partitioner, Some(Partitioner::Murmur2Random));
+        let ctx = resolve_from_path(&opts(&["-p", "plain"]), &path).expect("resolves");
+        assert_eq!(ctx.config.partitioner, None);
+        let ctx =
+            resolve_from_path(&opts(&["--partitioner", "consistent"]), &path).expect("resolves");
+        assert_eq!(ctx.config.partitioner, Some(Partitioner::Consistent));
+
+        for p in Partitioner::ALL {
+            assert_eq!(opts(&["--partitioner", p.as_str()]).partitioner, Some(p));
+        }
+        use clap::Parser;
+        #[derive(Parser, Debug)]
+        struct Wrap {
+            #[command(flatten)]
+            g: GlobalOpts,
+        }
+        let err = Wrap::try_parse_from(["ferrika", "--partitioner", "java"])
+            .expect_err("an unknown partitioner must not parse")
+            .to_string();
+        assert!(err.contains("murmur2_random"), "{err}");
+    }
 }

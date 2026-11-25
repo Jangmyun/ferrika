@@ -139,6 +139,10 @@ fn cluster_config(
     if let Some(secs) = global.timeout {
         config.request_timeout = std::time::Duration::from_secs(secs);
     }
+    // Likewise --partitioner; it only matters on the writing side.
+    if let Some(partitioner) = global.partitioner {
+        config.partitioner = Some(partitioner);
+    }
     config
 }
 
@@ -668,6 +672,23 @@ mod tests {
         assert_eq!(src.request_timeout, std::time::Duration::from_secs(5));
     }
 
+    #[test]
+    fn partitioner_flag_applies_to_both_sides_over_their_profiles() {
+        use crate::kafka::config::Partitioner;
+        let mut store = ProfileStore::default();
+        let mut java = crate::kafka::profile::ClusterProfile::new("java", "j:9092");
+        java.partitioner = Some(Partitioner::Murmur2Random);
+        store.add(java, false);
+        let dst = cluster_config(&store, Some("java"), None, &global());
+        assert_eq!(dst.partitioner, Some(Partitioner::Murmur2Random));
+        let mut explicit = global();
+        explicit.partitioner = Some(Partitioner::Fnv1a);
+        let dst = cluster_config(&store, Some("java"), None, &explicit);
+        assert_eq!(dst.partitioner, Some(Partitioner::Fnv1a));
+        let src = cluster_config(&store, None, Some("other:9092"), &explicit);
+        assert_eq!(src.partitioner, Some(Partitioner::Fnv1a));
+    }
+
     fn global_without_timeout() -> GlobalOpts {
         GlobalOpts {
             timeout: None,
@@ -681,6 +702,7 @@ mod tests {
             bootstrap_servers: None,
             format: OutputFormat::Table,
             timeout: Some(30),
+            partitioner: None,
             resolved: None,
             write: None,
         }

@@ -144,6 +144,91 @@ impl AutoOffsetReset {
     }
 }
 
+/// How the producer picks a partition for a record without an explicit
+/// partition: librdkafka's `partitioner` setting.
+///
+/// librdkafka's default is `consistent_random` (CRC32 of the key), while the
+/// Java client hashes keys with murmur2. Records with the same key that
+/// Ferrika and a Java producer write to one topic only land on the same
+/// partition (and so keep their per-key order) with [`Self::Murmur2Random`]
+/// or [`Self::Murmur2`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Partitioner {
+    /// CRC32 hash of the key; records without a key go to a random partition
+    /// (librdkafka's default).
+    ConsistentRandom,
+    /// Java-compatible murmur2 hash of the key; records without a key go to
+    /// a random partition.
+    Murmur2Random,
+    /// Java-compatible murmur2 hash of the key; records without a key all go
+    /// to one partition.
+    Murmur2,
+    /// CRC32 hash of the key; records without a key all go to one partition.
+    Consistent,
+    /// FNV-1a hash of the key; records without a key all go to one partition.
+    Fnv1a,
+    /// FNV-1a hash of the key; records without a key go to a random partition.
+    Fnv1aRandom,
+    /// A random partition for every record.
+    Random,
+}
+
+impl Partitioner {
+    /// Every partitioner, in the order the help text lists them.
+    pub const ALL: [Partitioner; 7] = [
+        Self::ConsistentRandom,
+        Self::Murmur2Random,
+        Self::Murmur2,
+        Self::Consistent,
+        Self::Fnv1a,
+        Self::Fnv1aRandom,
+        Self::Random,
+    ];
+
+    /// The partitioner librdkafka uses when none is set.
+    pub const LIBRDKAFKA_DEFAULT: Partitioner = Self::ConsistentRandom;
+
+    /// The librdkafka name (`murmur2_random`, ...).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ConsistentRandom => "consistent_random",
+            Self::Murmur2Random => "murmur2_random",
+            Self::Murmur2 => "murmur2",
+            Self::Consistent => "consistent",
+            Self::Fnv1a => "fnv1a",
+            Self::Fnv1aRandom => "fnv1a_random",
+            Self::Random => "random",
+        }
+    }
+}
+
+impl std::fmt::Display for Partitioner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Partitioner {
+    type Err = KafkaError;
+
+    /// Parses a librdkafka partitioner name, ignoring case and surrounding
+    /// whitespace.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let wanted = s.trim();
+        Self::ALL
+            .into_iter()
+            .find(|p| p.as_str().eq_ignore_ascii_case(wanted))
+            .ok_or_else(|| {
+                let names: Vec<&str> = Self::ALL.iter().map(Partitioner::as_str).collect();
+                KafkaError::config(format!(
+                    "unknown partitioner '{wanted}' (expected one of: {})",
+                    names.join(", ")
+                ))
+            })
+    }
+}
+
 /// Comprehensive Kafka client configuration for Admin, Producer, and Consumer.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct KafkaClientConfig {
@@ -194,6 +279,10 @@ pub struct KafkaClientConfig {
     /// SASL OAUTHBEARER settings.
     #[serde(default)]
     pub oauth: OAuthConfig,
+    /// Producer partitioner; `None` leaves librdkafka's default
+    /// (`consistent_random`). Only producers use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitioner: Option<Partitioner>,
 }
 
 /// Whether an extra librdkafka property holds a credential
@@ -250,6 +339,7 @@ impl std::fmt::Debug for KafkaClientConfig {
             .field("auto_commit_interval_ms", &self.auto_commit_interval_ms)
             .field("extra_properties", &extra)
             .field("oauth", &self.oauth)
+            .field("partitioner", &self.partitioner)
             .finish()
     }
 }
@@ -287,6 +377,7 @@ impl KafkaClientConfig {
             auto_commit_interval_ms: 5000,
             extra_properties: HashMap::new(),
             oauth: OAuthConfig::default(),
+            partitioner: None,
         }
     }
 
@@ -398,6 +489,12 @@ impl KafkaClientConfig {
     /// Adds an arbitrary custom property.
     pub fn with_property(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_properties.insert(key.into(), value.into());
+        self
+    }
+
+    /// Sets the producer partitioner (see [`Partitioner`]).
+    pub fn with_partitioner(mut self, partitioner: Partitioner) -> Self {
+        self.partitioner = Some(partitioner);
         self
     }
 
@@ -574,6 +671,42 @@ impl KafkaClientConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partitioner_names_round_trip_and_unknown_ones_are_refused() {
+        for p in Partitioner::ALL {
+            assert_eq!(p.as_str().parse::<Partitioner>().unwrap(), p);
+            assert_eq!(p.to_string(), p.as_str());
+            let json = serde_json::to_string(&p).unwrap();
+            assert_eq!(json, format!("\"{}\"", p.as_str()));
+            assert_eq!(serde_json::from_str::<Partitioner>(&json).unwrap(), p);
+        }
+        assert_eq!(
+            " MURMUR2_random ".parse::<Partitioner>().unwrap(),
+            Partitioner::Murmur2Random
+        );
+        let err = "java".parse::<Partitioner>().unwrap_err().to_string();
+        assert!(err.contains("unknown partitioner 'java'"), "{err}");
+        assert!(err.contains("murmur2_random"), "{err}");
+        assert!(serde_json::from_str::<Partitioner>("\"java\"").is_err());
+        assert_eq!(
+            Partitioner::LIBRDKAFKA_DEFAULT.as_str(),
+            "consistent_random"
+        );
+    }
+
+    #[test]
+    fn a_config_without_partitioner_reads_and_writes_as_before() {
+        let c = KafkaClientConfig::new("b:9092");
+        let json = serde_json::to_value(&c).unwrap();
+        assert!(json.get("partitioner").is_none());
+        let back: KafkaClientConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.partitioner, None);
+        let c = c.with_partitioner(Partitioner::Murmur2);
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(json["partitioner"], "murmur2");
+        assert!(format!("{c:?}").contains("Murmur2"));
+    }
 
     #[test]
     fn clients_do_not_auto_create_topics_unless_asked() {
