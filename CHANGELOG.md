@@ -7,6 +7,44 @@ module is the command line's own code (argument structs, the command enum),
 not a library API; options added to commands changed it in 0.1 patch
 versions, and 0.2.0 made it crate-internal.
 
+## Unreleased
+
+### ksqlDB client (preview)
+
+- New crate `ferrika-ksql` and command `ferrika ksql`: a client for an
+  existing ksqlDB server's REST API (Ferrika does not ship ksqlDB). `info`,
+  `streams`, `tables`, `queries`, `topics`, `describe`, `query` (pull, or
+  push with `EMIT CHANGES` bounded by `--limit` / `--timeout` / Ctrl+C and
+  closed on the server) and `exec` (statements, `-f FILE`, `--dry-run`,
+  `--yes`). Tested with ksqlDB 0.29.
+- Profiles: `profile add --ksql-url URL [--ksql-user U --ksql-password-stdin]
+  [--ksql-ca-location ...] [--ksql-certificate-location ... --ksql-key-location ...]`.
+  The login is kept in the URL like the Schema Registry's, its password in
+  the OS credential store (`<profile>/ksql_url`).
+- Company policy: new `forbid` categories `ksql.create`, `ksql.drop`,
+  `ksql.insert`, `ksql.terminate` and `ksql.alter`. `ksql exec` checks every
+  write statement's categories before sending anything (`INSERT` also needs
+  `produce`, `DROP ... DELETE TOPIC` `topics.delete`, `CREATE ... AS SELECT`
+  `topics.create`, connectors `connect.change`; an unrecognised statement
+  needs all of them), refuses the whole script on one refusal, and records
+  each write before and after it runs (keywords and names only, never
+  literals). `ksql query` rows are a record export like `consume` and are
+  masked with `--mask-pii` or under enforced masking.
+- MCP: read tools `ksql_list`, `ksql_describe` and `ksql_query` (bounded,
+  masked, through the export gate, hidden under `export: forbidden`).
+
+Compatibility:
+
+- Builds that do not know the `ksql.*` categories treat a signed policy that
+  names them as invalid (strictest mode): roll such a policy out only once
+  every client knows them.
+- Library API: `ClusterProfile` gains the public fields `ksql_url`,
+  `ksql_ca_location`, `ksql_certificate_location` and `ksql_key_location`,
+  and `PolicyAction` five variants (`ALL` has 21 entries); code that builds
+  `ClusterProfile` with a struct literal or matches `PolicyAction`
+  exhaustively must add them. `ferrika_core::kafka::http::rest_tls_config`
+  is new.
+
 ## 0.2.0
 
 New: connection presets for Kafka-compatible services, `ferrika transform`,

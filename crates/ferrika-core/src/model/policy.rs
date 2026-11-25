@@ -802,10 +802,23 @@ pub enum PolicyAction {
     /// Moving messages between queues, e.g. redriving dead-lettered
     /// RabbitMQ messages to their original exchange.
     MessagesMove,
+    /// Creating ksqlDB streams, tables and types (`CREATE STREAM`, `CREATE
+    /// TABLE ... AS SELECT`, `CREATE TYPE`), which start persistent queries.
+    KsqlCreate,
+    /// Dropping ksqlDB streams, tables and types (`DROP STREAM`, `DROP TABLE`).
+    KsqlDrop,
+    /// Writing rows into a ksqlDB stream or table (`INSERT INTO`, `INSERT
+    /// VALUES`); also needs `produce`.
+    KsqlInsert,
+    /// Stopping, pausing or resuming ksqlDB persistent queries (`TERMINATE`,
+    /// `PAUSE`, `RESUME`).
+    KsqlTerminate,
+    /// Changing a ksqlDB stream's or table's columns (`ALTER`).
+    KsqlAlter,
 }
 
 impl PolicyAction {
-    pub const ALL: [PolicyAction; 16] = [
+    pub const ALL: [PolicyAction; 21] = [
         Self::TopicsCreate,
         Self::TopicsDelete,
         Self::TopicsPurge,
@@ -822,6 +835,11 @@ impl PolicyAction {
         Self::ConnectChange,
         Self::MessagesPeek,
         Self::MessagesMove,
+        Self::KsqlCreate,
+        Self::KsqlDrop,
+        Self::KsqlInsert,
+        Self::KsqlTerminate,
+        Self::KsqlAlter,
     ];
 
     /// The name used in a policy's `forbid` list.
@@ -843,6 +861,11 @@ impl PolicyAction {
             Self::ConnectChange => "connect.change",
             Self::MessagesPeek => "messages.peek",
             Self::MessagesMove => "messages.move",
+            Self::KsqlCreate => "ksql.create",
+            Self::KsqlDrop => "ksql.drop",
+            Self::KsqlInsert => "ksql.insert",
+            Self::KsqlTerminate => "ksql.terminate",
+            Self::KsqlAlter => "ksql.alter",
         }
     }
 
@@ -852,13 +875,14 @@ impl PolicyAction {
 
     /// Policy categories a change of this category also needs allowed: a
     /// RabbitMQ redrive moves messages (`messages.move`) by publishing them
-    /// again, so `forbid: ["produce"]` refuses it too. Every front end that
+    /// again, so `forbid: ["produce"]` refuses it too; a ksqlDB `INSERT`
+    /// (`ksql.insert`) writes records like `produce`. Every front end that
     /// authorises a change checks these besides the change's own category
     /// (see `ferrika_governance::policy::extra_category_refusal`).
     pub fn also_requires(self) -> &'static [PolicyAction] {
         // No wildcard arm: a new category must decide what it also needs.
         match self {
-            Self::MessagesMove => &[Self::Produce],
+            Self::MessagesMove | Self::KsqlInsert => &[Self::Produce],
             Self::TopicsCreate
             | Self::TopicsDelete
             | Self::TopicsPurge
@@ -873,7 +897,11 @@ impl PolicyAction {
             | Self::QuotaChange
             | Self::SchemaChange
             | Self::ConnectChange
-            | Self::MessagesPeek => &[],
+            | Self::MessagesPeek
+            | Self::KsqlCreate
+            | Self::KsqlDrop
+            | Self::KsqlTerminate
+            | Self::KsqlAlter => &[],
         }
     }
 
@@ -918,10 +946,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_move_needs_another_category() {
+    fn only_a_move_and_a_ksql_insert_need_another_category() {
         for action in PolicyAction::ALL {
             let extra = action.also_requires();
-            if action == PolicyAction::MessagesMove {
+            if matches!(
+                action,
+                PolicyAction::MessagesMove | PolicyAction::KsqlInsert
+            ) {
                 assert_eq!(extra, &[PolicyAction::Produce]);
             } else {
                 assert!(extra.is_empty(), "{action:?}");
@@ -943,6 +974,15 @@ mod tests {
             PolicyAction::from_id("messages.move"),
             Some(PolicyAction::MessagesMove)
         );
+        for (id, action) in [
+            ("ksql.create", PolicyAction::KsqlCreate),
+            ("ksql.drop", PolicyAction::KsqlDrop),
+            ("ksql.insert", PolicyAction::KsqlInsert),
+            ("ksql.terminate", PolicyAction::KsqlTerminate),
+            ("ksql.alter", PolicyAction::KsqlAlter),
+        ] {
+            assert_eq!(PolicyAction::from_id(id), Some(action));
+        }
     }
 
     #[test]

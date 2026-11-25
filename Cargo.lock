@@ -1058,6 +1058,7 @@ dependencies = [
  "crossterm",
  "ferrika-core",
  "ferrika-governance",
+ "ferrika-ksql",
  "ferrika-mcp",
  "ferrika-ops",
  "ferrika-rabbitmq",
@@ -1112,15 +1113,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrika-ksql"
+version = "0.2.0"
+dependencies = [
+ "ferrika-core",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
 name = "ferrika-mcp"
 version = "0.2.0"
 dependencies = [
  "ferrika-core",
  "ferrika-governance",
+ "ferrika-ksql",
  "ferrika-ops",
  "ferrika-rabbitmq",
  "jiff",
  "ring",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

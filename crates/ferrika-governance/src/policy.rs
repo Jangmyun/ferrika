@@ -1406,6 +1406,7 @@ pub fn extra_category_refusal(
             .map(|reason| {
                 let why = match action {
                     PolicyAction::MessagesMove => "republishes messages",
+                    PolicyAction::KsqlInsert => "writes records",
                     _ => "does the work of more than one category",
                 };
                 format!(

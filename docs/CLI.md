@@ -250,6 +250,20 @@ URL, so a profile's stored password only goes to that profile's broker.
 Peeking at a queue and DLQ inspect/redrive are write tools (below): a
 RabbitMQ peek takes messages and requeues them.
 
+ksqlDB (preview): `ksql_list` (`kind`: `streams`, `tables`, `queries` or
+`topics`, optional `filter`) and `ksql_describe` (`name`, `extended`) show
+metadata of the ksqlDB server of the profile the server starts with (its
+`ksql_url`, see [ksqlDB](#ksqldb-ferrika-ksql-preview)); there is no URL
+argument. `ksql_query` runs one `SELECT` (`sql`) and returns up to `limit`
+rows (20, at most 100) with the column names and types: a pull query what
+the server has now, a push query (`EMIT CHANGES`) until `limit` rows or
+`timeout_secs` (5, at most 30; `from_beginning` reads the source from its
+earliest records), after which the query is closed on the server. Rows are
+PII-masked unless `mask_pii` is false (always under enforced masking), and
+like `peek_messages` it passes the export gate and is hidden under
+`export: forbidden`. Statements that change ksqlDB are refused; there are no
+ksqlDB write tools yet.
+
 ```bash
 # Claude Code
 claude mcp add ferrika-prod -- ferrika -p prod mcp
@@ -455,6 +469,68 @@ confirm. It stops at the first failure and returns that message to the
 queue. Redriven messages keep their headers, `x-death` included, and
 get `x-ferrika-redriven-from: <queue>`. The audit log records the counts, the
 source queue and the destinations, never message bodies.
+
+### ksqlDB (`ferrika ksql`, preview)
+
+A client for an existing ksqlDB server, through its REST API (Ferrika does
+not run or ship ksqlDB). Tested with ksqlDB 0.29 (Confluent Platform 7.x
+line). The server belongs to a Kafka profile, like the Schema Registry:
+
+```bash
+ferrika profile add prod -b kafka.prod:9092 --ksql-url https://ksql.prod:8088   --ksql-user ops --ksql-password-stdin            # password to the OS credential store
+# Private CA, client certificate (PEM):
+ferrika profile add prod -b kafka.prod:9092 --ksql-url https://ksql.prod:8088   --ksql-ca-location ca.pem --ksql-certificate-location client.pem --ksql-key-location client.key
+
+ferrika ksql info                                  # version, Kafka cluster id, status
+ferrika ksql streams                               # also: tables, queries, topics
+ferrika ksql describe orders --extended
+ferrika ksql query "SELECT * FROM order_totals WHERE id = 42;"            # pull query
+ferrika ksql query "SELECT * FROM orders EMIT CHANGES;" -n 20 --timeout 30 # push query
+ferrika ksql query "SELECT * FROM orders EMIT CHANGES;" --from-beginning --mask-pii
+ferrika -f json ksql query "SELECT * FROM orders EMIT CHANGES;" -n 5
+ferrika ksql exec "CREATE STREAM big_orders AS SELECT * FROM orders WHERE amount > 100;"
+ferrika ksql exec -f migration.sql --dry-run       # categories and the policy's verdict
+ferrika ksql exec -f migration.sql --yes           # - reads the statements from stdin
+
+# A server by hand (no profile: none of its login, TLS files or read-only mark):
+FERRIKA_KSQL_PASSWORD=... ferrika ksql --ksql-url http://ksql:8088 --ksql-user ops streams
+```
+
+`query` runs one `SELECT`. A push query (`EMIT CHANGES`) prints rows as
+they arrive and stops after `-n/--limit` rows (default 100, at most
+100,000), after `--timeout` seconds, or on Ctrl+C; the query is then closed
+on the server. `-P key=value` sets query properties. `PRINT` is not
+supported: read topics with `ferrika consume`, which decodes and masks
+records. `exec` runs statements separated by `;` (comments and `;` inside
+strings and quoted names are handled); it does not run queries. It stops at
+the first failing statement; the ones after it are not run. `SET`, `UNSET`,
+`DEFINE` and `UNDEFINE` apply to the statements after them in the same
+`exec`.
+
+Under the company policy each write statement is checked for its
+categories before anything is sent, and one refusal refuses the whole
+script:
+
+| Statement | Categories |
+| --- | --- |
+| `CREATE STREAM/TABLE/TYPE` | `ksql.create`; with `AS SELECT` or a `PARTITIONS` property also `topics.create` |
+| `CREATE SOURCE/SINK CONNECTOR`, `DROP CONNECTOR` | `connect.change` |
+| `DROP STREAM/TABLE/TYPE` | `ksql.drop`; with `DELETE TOPIC` also `topics.delete` |
+| `INSERT INTO ... VALUES/SELECT` | `ksql.insert` and `produce` |
+| `TERMINATE`, `PAUSE`, `RESUME` | `ksql.terminate` |
+| `ALTER STREAM/TABLE` | `ksql.alter` |
+| anything else (or using `${variables}`) | every category above and `config.change` |
+| `SELECT`, `SHOW`/`LIST`, `DESCRIBE`, `EXPLAIN`, `ASSERT`, `SET`/`DEFINE` | none |
+
+A read-only profile refuses writes. The policy's profile and broker rules
+match the profile's name, its brokers and the ksqlDB server's `host:port`
+(with `--ksql-url` only the server's). Each write is recorded in the audit
+log before it is sent (`ksql exec`, target such as `INSERT INTO ORDERS
+VALUES`: keywords and names, never literals) and again with its result.
+`query` rows are record data: on a terminal they are viewed, redirected or
+piped they are an export like `consume` (refused under `export: forbidden`,
+recorded under `export: audited`), masked with `--mask-pii` or when the
+policy enforces masking.
 
 ### Client quotas (`ferrika quota`)
 

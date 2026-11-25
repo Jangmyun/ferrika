@@ -5,7 +5,9 @@
 //! cluster state, and peeked or previewed records never join or commit to a
 //! consumer group. Record text is PII-masked unless the caller turns masking
 //! off. RabbitMQ tools (preview) list queues, exchanges and bindings of a
-//! RabbitMQ profile without reading message bodies.
+//! RabbitMQ profile without reading message bodies. ksqlDB tools (preview)
+//! list and describe the profile's ksqlDB server's streams and tables and
+//! run bounded `SELECT` queries (rows PII-masked, through the export gate).
 //!
 //! [`WriteOptions`] add write tools (`write_tools.rs`). Each write is
 //! planned, then confirmed, then run, and passes the same company policy,
@@ -16,6 +18,7 @@
 
 mod backend;
 mod guard;
+mod ksql_tools;
 mod protocol;
 mod rabbit_tools;
 mod rabbit_writes;

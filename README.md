@@ -112,6 +112,7 @@ still starting can answer.
 | Change safety | `audit`, `history`, `undo`, `policy` |
 | AI assistants | `mcp` |
 | RabbitMQ (preview) | `rabbit` (queues, exchanges, bindings, peek, publish, DLQ inspect and redrive; separate RabbitMQ profiles) |
+| ksqlDB (preview) | `ksql` (info, streams, tables, queries, describe, pull and push queries, statements gated per statement; the server is attached to a Kafka profile) |
 
 Examples for each are in the [command reference](docs/CLI.md).
 
@@ -212,6 +213,7 @@ the crate with `-p`:
 | `crates/ferrika-mcp` | The MCP server behind `ferrika mcp`. |
 | `crates/ferrika-cli` | The `ferrika` command line. |
 | `crates/ferrika-rabbitmq` | Preview: RabbitMQ management API client, RabbitMQ profiles and AMQP dead-letter redrive behind `ferrika rabbit`. |
+| `crates/ferrika-ksql` | Preview: ksqlDB REST API client (an existing server; ksqlDB is not shipped), statement classification for the policy and masked query rows behind `ferrika ksql`. |
 
 The crates are published on [crates.io](https://crates.io/crates/ferrika-core); until 1.0 their API can change.
 

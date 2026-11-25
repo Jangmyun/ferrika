@@ -14,6 +14,7 @@ pub(crate) mod dlq;
 pub(crate) mod generator;
 pub(crate) mod health;
 pub(crate) mod history;
+pub(crate) mod ksql;
 pub(crate) mod lint;
 pub(crate) mod mcp;
 pub(crate) mod mirror;

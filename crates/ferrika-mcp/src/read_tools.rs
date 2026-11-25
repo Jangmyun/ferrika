@@ -1,7 +1,8 @@
 //! The read-only tools: cluster, topic and group inspection, peeking, the
-//! transform preview and the RabbitMQ listings. Under a policy with
-//! `export: forbidden`, `peek_messages` and `transform_preview` are not
-//! offered: they would hand records to an outside AI service.
+//! transform preview, the RabbitMQ listings and the ksqlDB tools. Under a
+//! policy with `export: forbidden`, `peek_messages`, `transform_preview` and
+//! `ksql_query` are not offered: they would hand records to an outside AI
+//! service.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -197,6 +198,8 @@ pub(super) fn tool_definitions(with_peek: bool) -> Value {
     }
     if let Some(list) = tools.as_array_mut() {
         list.extend(crate::rabbit_tools::definitions());
+        // `ksql_query` returns rows: hidden with the other record tools.
+        list.extend(crate::ksql_tools::definitions(with_peek));
     }
     tools
 }
@@ -239,6 +242,10 @@ pub(super) async fn call_tool(
         },
         rabbit if crate::rabbit_tools::RABBIT_TOOLS.contains(&rabbit) => {
             crate::rabbit_tools::call(name, &args).await
+        }
+        // `ksql_query` passes the export gate inside.
+        ksql if crate::ksql_tools::KSQL_TOOLS.contains(&ksql) => {
+            crate::ksql_tools::call(name, &args, context, policy, sink, actor).await
         }
         _ => Err(KafkaError::config(format!("Unknown tool '{name}'"))),
     };

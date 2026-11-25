@@ -60,6 +60,22 @@ pub struct ClusterProfile {
     /// Kafka Connect REST URL (http://host:8083).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect_url: Option<String>,
+    /// ksqlDB server REST URL (http://host:8088) of this cluster, for
+    /// `ferrika ksql` and the GUI. Basic-auth credentials are kept in the URL
+    /// (`https://user:pass@host`), the password in the OS credential store,
+    /// like the Schema Registry URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ksql_url: Option<String>,
+    /// CA certificate (PEM) that signs the ksqlDB server's certificate; the
+    /// OS trust store when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ksql_ca_location: Option<String>,
+    /// Client certificate (PEM) for mutual TLS with the ksqlDB server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ksql_certificate_location: Option<String>,
+    /// Client private key (PEM, unencrypted) for mutual TLS with the ksqlDB server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ksql_key_location: Option<String>,
     /// SASL OAUTHBEARER token source (OIDC when unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_method: Option<OAuthMethod>,
@@ -108,6 +124,10 @@ impl ClusterProfile {
             read_only: false,
             schema_registry_url: None,
             connect_url: None,
+            ksql_url: None,
+            ksql_ca_location: None,
+            ksql_certificate_location: None,
+            ksql_key_location: None,
             oauth_method: None,
             oauth_token_endpoint: None,
             oauth_client_id: None,
@@ -195,6 +215,11 @@ impl ClusterProfile {
             read_only: config.read_only,
             schema_registry_url: config.schema_registry_url.clone(),
             connect_url: config.connect_url.clone(),
+            // The client config knows no ksqlDB server.
+            ksql_url: None,
+            ksql_ca_location: None,
+            ksql_certificate_location: None,
+            ksql_key_location: None,
             oauth_method: config.oauth.method,
             oauth_token_endpoint: config.oauth.token_endpoint.clone(),
             oauth_client_id: config.oauth.client_id.clone(),
@@ -235,12 +260,13 @@ pub struct ProfileStore {
 
 /// Fields kept in the OS credential store. URL fields go there only when
 /// they carry a password (`https://KEY:SECRET@host`).
-const SECRET_FIELDS: [&str; 5] = [
+const SECRET_FIELDS: [&str; 6] = [
     "sasl_password",
     "ssl_key_password",
     "schema_registry_url",
     "connect_url",
     "oauth_client_secret",
+    "ksql_url",
 ];
 
 fn secret_field<'a>(profile: &'a mut ClusterProfile, field: &str) -> &'a mut Option<String> {
@@ -249,6 +275,7 @@ fn secret_field<'a>(profile: &'a mut ClusterProfile, field: &str) -> &'a mut Opt
         "ssl_key_password" => &mut profile.ssl_key_password,
         "schema_registry_url" => &mut profile.schema_registry_url,
         "oauth_client_secret" => &mut profile.oauth_client_secret,
+        "ksql_url" => &mut profile.ksql_url,
         _ => &mut profile.connect_url,
     }
 }
@@ -859,6 +886,10 @@ impl std::fmt::Debug for ClusterProfile {
             .field("read_only", &self.read_only)
             .field("schema_registry_url", &mask(&self.schema_registry_url))
             .field("connect_url", &mask(&self.connect_url))
+            .field("ksql_url", &mask(&self.ksql_url))
+            .field("ksql_ca_location", &self.ksql_ca_location)
+            .field("ksql_certificate_location", &self.ksql_certificate_location)
+            .field("ksql_key_location", &self.ksql_key_location)
             .field("oauth_method", &self.oauth_method)
             .field("oauth_token_endpoint", &self.oauth_token_endpoint)
             .field("oauth_client_id", &self.oauth_client_id)
@@ -1283,6 +1314,28 @@ ssl.truststore.location=/etc/truststore.jks
         assert_eq!(url_without_password("http://host:8081"), None);
         assert_eq!(public_part("sasl_password", "pw"), Some(None));
         assert_eq!(public_part("connect_url", "http://host:8083"), None);
+    }
+
+    #[test]
+    fn ksql_url_password_is_a_secret_field() {
+        let mut profile = ClusterProfile::new("p", "k:9092");
+        profile.ksql_url = Some("https://ops:s3cret@ksql.example.com:8088".into());
+        assert!(SECRET_FIELDS.contains(&"ksql_url"));
+        assert_eq!(
+            secret_field(&mut profile, "ksql_url").as_deref(),
+            Some("https://ops:s3cret@ksql.example.com:8088")
+        );
+        assert_eq!(
+            public_part("ksql_url", "https://ops:s3cret@ksql.example.com:8088"),
+            Some(Some("https://ops@ksql.example.com:8088".to_string()))
+        );
+        let shown = format!("{profile:?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        let store = ProfileStore {
+            profiles: [("p".to_string(), profile)].into_iter().collect(),
+            ..ProfileStore::default()
+        };
+        assert_eq!(store.plaintext_secret_profiles(), ["p"]);
     }
 
     #[test]

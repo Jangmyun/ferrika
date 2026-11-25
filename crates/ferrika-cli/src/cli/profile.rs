@@ -134,7 +134,75 @@ pub struct ProfileAddArgs {
     #[arg(long, value_name = "URL")]
     pub connect: Option<String>,
     #[command(flatten)]
+    pub ksql: KsqlProfileArgs,
+    #[command(flatten)]
     pub oauth: OAuthArgs,
+}
+
+/// The ksqlDB server of `profile add`. `Debug` is written by hand to redact
+/// the password.
+#[derive(Args, Clone, PartialEq, Eq, Default)]
+pub struct KsqlProfileArgs {
+    /// ksqlDB server URL for `ferrika ksql` and the GUI, e.g. http://ksql:8088
+    /// (port 8088 when left out)
+    #[arg(long = "ksql-url", value_name = "URL")]
+    pub ksql_url: Option<String>,
+    /// ksqlDB basic-auth user
+    #[arg(long = "ksql-user", requires = "ksql_url")]
+    pub ksql_user: Option<String>,
+    /// ksqlDB password (visible in the process list; prefer --ksql-password-stdin)
+    #[arg(long = "ksql-password", requires = "ksql_user")]
+    pub ksql_password: Option<String>,
+    /// Read the ksqlDB password from stdin: the next line after the other
+    /// passwords read from stdin
+    #[arg(
+        long = "ksql-password-stdin",
+        requires = "ksql_user",
+        conflicts_with = "ksql_password"
+    )]
+    pub ksql_password_stdin: bool,
+    /// CA certificate (PEM) of the ksqlDB server's TLS certificate (default:
+    /// the OS trust store)
+    #[arg(long = "ksql-ca-location", requires = "ksql_url", value_name = "PATH")]
+    pub ksql_ca_location: Option<String>,
+    /// Client certificate (PEM) for mutual TLS with the ksqlDB server
+    #[arg(
+        long = "ksql-certificate-location",
+        requires_all = ["ksql_url", "ksql_key_location"],
+        value_name = "PATH"
+    )]
+    pub ksql_certificate_location: Option<String>,
+    /// Client private key (PEM, unencrypted) for mutual TLS with the ksqlDB server
+    #[arg(
+        long = "ksql-key-location",
+        requires_all = ["ksql_url", "ksql_certificate_location"],
+        value_name = "PATH"
+    )]
+    pub ksql_key_location: Option<String>,
+}
+
+impl std::fmt::Debug for KsqlProfileArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KsqlProfileArgs")
+            .field("ksql_url", &redacted_url(&self.ksql_url))
+            .field("ksql_user", &self.ksql_user)
+            .field("ksql_password", &redacted(&self.ksql_password))
+            .field("ksql_password_stdin", &self.ksql_password_stdin)
+            .field("ksql_ca_location", &self.ksql_ca_location)
+            .field("ksql_certificate_location", &self.ksql_certificate_location)
+            .field("ksql_key_location", &self.ksql_key_location)
+            .finish()
+    }
+}
+
+/// The ksqlDB settings `profile add` stores: the URL with the login in it
+/// (the URL then goes to the OS credential store) and the TLS files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct KsqlSettings {
+    url: Option<String>,
+    ca_location: Option<String>,
+    certificate_location: Option<String>,
+    key_location: Option<String>,
 }
 
 /// SASL OAUTHBEARER options of `profile add`. `Debug` is written by hand
@@ -209,6 +277,7 @@ impl std::fmt::Debug for ProfileAddArgs {
                 &self.schema_registry_password_stdin,
             )
             .field("connect", &redacted_url(&self.connect))
+            .field("ksql", &self.ksql)
             .field("oauth", &self.oauth)
             .finish()
     }
@@ -262,6 +331,21 @@ pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
                 add_args.schema_registry_user.as_deref(),
                 registry_password.as_deref(),
             )?;
+            let ksql_password = if add_args.ksql.ksql_password_stdin {
+                Some(crate::cli::read_password_stdin().map_err(anyhow::Error::msg)?)
+            } else {
+                add_args.ksql.ksql_password.clone()
+            };
+            let ksql = KsqlSettings {
+                url: ksql_url(
+                    add_args.ksql.ksql_url.clone(),
+                    add_args.ksql.ksql_user.as_deref(),
+                    ksql_password.as_deref(),
+                )?,
+                ca_location: add_args.ksql.ksql_ca_location.clone(),
+                certificate_location: add_args.ksql.ksql_certificate_location.clone(),
+                key_location: add_args.ksql.ksql_key_location.clone(),
+            };
             let resolved = preset::resolve(
                 preset,
                 add_args.security_protocol.as_deref(),
@@ -294,6 +378,7 @@ pub async fn run(args: ProfileArgs, global: &GlobalOpts) -> anyhow::Result<()> {
                 add_args.read_only,
                 schema_registry,
                 add_args.connect,
+                ksql,
                 add_args.oauth,
             )?;
             if json {
@@ -475,6 +560,30 @@ fn registry_url(
     }
 }
 
+/// The ksqlDB URL with `user` and `password` added as basic auth, like
+/// [`registry_url`]. Without a user the URL is kept as given.
+fn ksql_url(
+    url: Option<String>,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    match (url, user) {
+        (Some(url), Some(user)) => {
+            let password = password.ok_or_else(|| {
+                anyhow::anyhow!("--ksql-user needs --ksql-password-stdin (or --ksql-password)")
+            })?;
+            crate::kafka::profile::url_with_basic_auth(&url, user, password)
+                .map(Some)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--ksql-user needs a ksqlDB URL like https://host:8088, without credentials in it"
+                    )
+                })
+        }
+        (url, _) => Ok(url),
+    }
+}
+
 /// Prints what a preset filled in, its notes, and settings still missing.
 fn report_preset(p: Preset, filled: &[(&'static str, String)], warnings: &[String]) {
     if filled.is_empty() {
@@ -631,7 +740,7 @@ fn handle_show(
                     }
                 }
             }
-            for field in ["schema_registry_url", "connect_url"] {
+            for field in ["schema_registry_url", "connect_url", "ksql_url"] {
                 if let Some(serde_json::Value::String(url)) = obj.get_mut(field) {
                     *url = crate::kafka::profile::mask_url_password(url, MASKED_SECRET);
                 }
@@ -768,6 +877,25 @@ fn handle_show(
         ]);
     }
 
+    if let Some(ref url) = profile.ksql_url {
+        table.add_row(vec![
+            Cell::new("ksqlDB URL").fg(Color::White),
+            Cell::new(crate::kafka::profile::mask_url_password(url, MASKED_SECRET)).fg(Color::Blue),
+        ]);
+    }
+    for (label, value) in [
+        ("ksqlDB CA Location", &profile.ksql_ca_location),
+        ("ksqlDB Certificate", &profile.ksql_certificate_location),
+        ("ksqlDB Key Location", &profile.ksql_key_location),
+    ] {
+        if let Some(value) = value {
+            table.add_row(vec![
+                Cell::new(label).fg(Color::White),
+                Cell::new(value).fg(Color::Blue),
+            ]);
+        }
+    }
+
     if let Some(ref desc) = profile.description {
         table.add_row(vec![
             Cell::new("Description").fg(Color::White),
@@ -890,6 +1018,7 @@ fn handle_add(
     read_only: bool,
     schema_registry: Option<String>,
     connect: Option<String>,
+    ksql: KsqlSettings,
     oauth: OAuthArgs,
 ) -> anyhow::Result<bool> {
     let protocol = parse_security_protocol(sec_proto)?;
@@ -913,6 +1042,10 @@ fn handle_add(
     profile.read_only = read_only;
     profile.schema_registry_url = schema_registry;
     profile.connect_url = connect;
+    profile.ksql_url = ksql.url;
+    profile.ksql_ca_location = ksql.ca_location;
+    profile.ksql_certificate_location = ksql.certificate_location;
+    profile.ksql_key_location = ksql.key_location;
     apply_oauth(&mut profile, oauth_method, oauth)?;
 
     let is_new = !store.profiles.contains_key(&name);
@@ -982,7 +1115,7 @@ fn carry_over(existing: &ClusterProfile, new: &mut ClusterProfile) -> Replaced {
     {
         new.ssl_key_password = existing.ssl_key_password.clone();
     }
-    let settings: [(&'static str, bool, bool); 6] = [
+    let settings: [(&'static str, bool, bool); 7] = [
         (
             "SASL password",
             existing.sasl_password.is_some(),
@@ -1007,6 +1140,11 @@ fn carry_over(existing: &ClusterProfile, new: &mut ClusterProfile) -> Replaced {
             "Connect URL",
             existing.connect_url.is_some(),
             new.connect_url.is_some(),
+        ),
+        (
+            "ksqlDB URL",
+            existing.ksql_url.is_some(),
+            new.ksql_url.is_some(),
         ),
         (
             "description",

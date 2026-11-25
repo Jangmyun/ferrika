@@ -86,6 +86,8 @@ pub(crate) enum Commands {
     Mcp(cli::mcp::McpArgs),
     /// RabbitMQ (preview): queues, exchanges, bindings, peek, publish, DLQ inspect/redrive, profiles
     Rabbit(cli::rabbit::RabbitArgs),
+    /// ksqlDB (preview): server info, streams, tables, queries, describe, pull and push queries, statements
+    Ksql(cli::ksql::KsqlArgs),
     /// Show the local audit log of cluster changes (GUI, CLI and MCP)
     Audit {
         /// Number of entries to show
@@ -300,6 +302,13 @@ pub fn run(mut cli: Cli) {
     // and the address (an unknown profile or no URL stops the command).
     if let Some(Commands::Rabbit(args)) = &mut cli.command {
         if let Err(err) = cli::rabbit::resolve(args) {
+            cli::exit_with_error(&err);
+        }
+    }
+    // `ksql` talks to the Kafka profile's ksqlDB server (or one named by
+    // `--ksql-url`); resolve it once, before the gates read its address.
+    if let Some(Commands::Ksql(args)) = &mut cli.command {
+        if let Err(err) = cli::ksql::resolve(args, &cli.global_opts) {
             cli::exit_with_error(&err);
         }
     }
@@ -537,6 +546,7 @@ pub fn run(mut cli: Cli) {
         Some(Commands::Undo(args)) => run_async(cli::history::run_undo(args, global)),
         Some(Commands::Mcp(args)) => run_async(cli::mcp::run(args, global)),
         Some(Commands::Rabbit(args)) => run_async(cli::rabbit::run(args, global)),
+        Some(Commands::Ksql(args)) => run_async(cli::ksql::run(args, global)),
         None => print!("{}", no_command_help()),
     }
     // The handler returned without an error (an interrupted batch too).
@@ -627,6 +637,7 @@ fn needs_profiles(command: Option<&Commands>) -> bool {
 fn gate_profile(command: Option<&Commands>, global: &cli::GlobalOpts) -> String {
     match command {
         Some(Commands::Rabbit(args)) => cli::rabbit::gate_profile(args),
+        Some(Commands::Ksql(args)) => cli::ksql::gate_profile(args),
         _ => global.resolved_profile_name().unwrap_or_default(),
     }
 }
@@ -642,6 +653,7 @@ fn gate_brokers(
 ) -> Result<String, String> {
     match command {
         Some(Commands::Rabbit(args)) => cli::rabbit::gate_address(args),
+        Some(Commands::Ksql(args)) => cli::ksql::gate_address(args, global, needed),
         _ => crate::governance::policy::brokers_for(&global.to_kafka_config(), needed),
     }
 }
@@ -805,6 +817,9 @@ fn write_action(command: &Commands) -> Option<&'static str> {
         // Each MCP write tool call passes the gate itself.
         Commands::Mcp(_) => None,
         Commands::Rabbit(args) => cli::rabbit::write_action(args),
+        // `ksql exec` runs the gate itself, once per write statement (a
+        // script can need several categories); the other subcommands read.
+        Commands::Ksql(args) => cli::ksql::write_action(args),
         Commands::Completions { .. } => None,
         Commands::Connect(args) => match &args.command {
             cli::connect::ConnectSubcommands::Pause { .. } => Some("connect pause"),
@@ -919,6 +934,10 @@ fn export_gate(command: &Commands) -> Option<ExportGate> {
         Commands::Transform(a) if !a.execute => gate(Stdout, "transform --dry-run", &a.src_topic),
         Commands::Rabbit(args) => {
             cli::rabbit::export(args).and_then(|(label, target)| gate(Stdout, label, &target))
+        }
+        // `ksql query` rows, like `consume`.
+        Commands::Ksql(args) => {
+            cli::ksql::export(args).and_then(|(label, target)| gate(Stdout, label, &target))
         }
         // Metadata or counts only, records read in, or checked elsewhere.
         Commands::Mirror(_)
@@ -1102,6 +1121,8 @@ fn write_target(command: &Commands) -> String {
             _ => String::new(),
         },
         Commands::Rabbit(args) => cli::rabbit::write_target(args),
+        // No write passes the gate in `main` (see `write_action`).
+        Commands::Ksql(_) => String::new(),
         Commands::Undo(a) => match &a.id {
             Some(id) => format!("op {id}"),
             None => "the latest undoable operation".to_string(),
@@ -1188,6 +1209,14 @@ mod tests {
         "rabbit profile use",
         "rabbit publish",
         "rabbit queues",
+        "ksql info",
+        "ksql streams",
+        "ksql tables",
+        "ksql queries",
+        "ksql topics",
+        "ksql describe",
+        "ksql query",
+        "ksql exec",
         "reassign execute",
         "reassign plan",
         "reassign rollback",
@@ -1376,6 +1405,8 @@ mod tests {
             // Gated per fix inside the command, see `lint_is_gated_per_fix`.
             | Commands::Lint(_)
             | Commands::Rabbit(_)
+            // `ksql exec` is gated per statement inside the command.
+            | Commands::Ksql(_)
             | Commands::Undo(_) => true,
             Commands::History(_)
             | Commands::Monitor(_)
@@ -1615,6 +1646,7 @@ mod tests {
             | Commands::Mirror(_)
             | Commands::Transform(_)
             | Commands::Rabbit(_)
+            | Commands::Ksql(_)
             | Commands::Mcp(_) => true,
             // Counts, sizes and offsets only; or records read in.
             Commands::Topics(_)
@@ -1723,6 +1755,62 @@ mod tests {
     /// `lint` mixes config changes, replication changes and group deletes in
     /// one run, so `main`'s single gate cannot classify it: each fix goes
     /// through the write gate on its own (`cli::lint`).
+    /// `ksql exec` can mix categories in one script, so `main`'s single
+    /// gate cannot classify it: it gates each write statement itself
+    /// (`cli::ksql`). `ksql query` rows are an export like `consume`; the
+    /// target names the query's sources, never its literals.
+    #[test]
+    fn ksql_exec_gates_itself_and_query_is_an_export() {
+        use governance::policy::ExportChannel::Stdout;
+        let url = "--ksql-url=http://ksql.prod:8088";
+        let exec = command(&["ksql", url, "exec", "DROP STREAM s DELETE TOPIC;", "--yes"]);
+        assert!(may_write(&exec));
+        assert_eq!(write_action(&exec), None);
+        assert_eq!(super::main_gate_action(&exec), None);
+        assert_eq!(export_gate(&exec), None);
+        let query = command(&[
+            "ksql",
+            url,
+            "query",
+            "SELECT * FROM kq_orders WHERE email = 'jane@example.com' EMIT CHANGES;",
+        ]);
+        assert_eq!(write_action(&query), None);
+        let gate = export_gate(&query).expect("query rows are record data");
+        assert_eq!(
+            (gate.channel, gate.label, gate.target.as_str()),
+            (Stdout, "ksql query", "SELECT FROM KQ_ORDERS (push query)")
+        );
+        for args in [
+            &["ksql", url, "info"][..],
+            &["ksql", url, "streams"][..],
+            &["ksql", url, "describe", "kq_orders"][..],
+        ] {
+            let cmd = command(args);
+            assert_eq!(write_action(&cmd), None, "{args:?}");
+            assert_eq!(export_gate(&cmd), None, "{args:?}");
+        }
+        // The gates match the server's address, and without a profile no
+        // Kafka profile's name.
+        let mut query = query;
+        let Commands::Ksql(args) = &mut query else {
+            panic!("a ksql command");
+        };
+        let global = cli::GlobalOpts {
+            profile: None,
+            bootstrap_servers: None,
+            format: cli::OutputFormat::Table,
+            timeout: None,
+            resolved: None,
+            write: None,
+        };
+        cli::ksql::resolve(args, &global).unwrap();
+        assert_eq!(super::gate_profile(Some(&query), &global), "");
+        assert_eq!(
+            super::gate_brokers(Some(&query), &global, false).unwrap(),
+            "ksql.prod:8088"
+        );
+    }
+
     #[test]
     fn lint_is_gated_per_fix() {
         for args in [

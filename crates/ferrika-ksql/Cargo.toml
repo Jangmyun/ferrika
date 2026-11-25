@@ -1,0 +1,25 @@
+[package]
+name = "ferrika-ksql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Ferrika ksqlDB client (preview): REST API client, statement classification for policy gates, PII-masked query results"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["ksqldb", "kafka", "streaming-sql", "rest-client", "devops"]
+categories = ["api-bindings", "network-programming"]
+
+# Talks to a ksqlDB server's REST API only; no Kafka client. URL parsing,
+# the TLS setup (CA file, client certificate), Base64, the profile type,
+# PII masking and the policy categories come from ferrika-core.
+[dependencies]
+ferrika-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true

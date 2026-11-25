@@ -304,6 +304,20 @@ pub fn broker_tls_config(
     build_tls_config(config.ssl_ca_location.as_deref(), client)
 }
 
+/// TLS for a REST client (the ksqlDB client, for one): the CA certificates
+/// in `ca_file` (PEM) or, without one, the OS trust store; and with `client`
+/// (certificate and unencrypted key, both PEM paths) a client certificate
+/// for mutual TLS. Without either it is the shared OS-trust-store config.
+pub fn rest_tls_config(
+    ca_file: Option<&str>,
+    client: Option<(&str, &str)>,
+) -> KafkaResult<Arc<rustls::ClientConfig>> {
+    match (ca_file, client) {
+        (None, None) => tls_config(),
+        _ => build_tls_config(ca_file, client),
+    }
+}
+
 fn build_tls_config(
     ca_file: Option<&str>,
     client: Option<(&str, &str)>,
@@ -507,6 +521,15 @@ mod tests {
         assert!(e
             .build_request("GET", "/", "x", None, &[("X-A", "v\r\nEvil: 1")])
             .is_err());
+    }
+
+    #[test]
+    fn rest_tls_config_reports_missing_files() {
+        let err = rest_tls_config(Some("/no/such/ca.pem"), None).unwrap_err();
+        assert!(err.to_string().contains("cannot read CA file"), "{err}");
+        // The PEM files are checked when given, even with the OS trust store.
+        let err = rest_tls_config(None, Some(("/no/such/c.pem", "/no/such/k.pem"))).unwrap_err();
+        assert!(err.to_string().contains("cannot read certificate"), "{err}");
     }
 
     #[test]

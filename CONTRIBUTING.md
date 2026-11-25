@@ -28,7 +28,7 @@ sign-off of every commit:
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo test -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq
+cargo test -p ferrika-core -p ferrika-governance -p ferrika-ops -p ferrika-mcp -p ferrika-cli -p ferrika-rabbitmq -p ferrika-ksql
 ```
 
 Changes that touch a command's behaviour against a real broker should also
@@ -41,10 +41,11 @@ cargo build --release -p ferrika-cli
 python3 tools/e2e/smoke.py
 ```
 
-The workspace has six crates, published together on crates.io with one
+The workspace has seven crates, published together on crates.io with one
 version: `ferrika-core` (clients, record formats, data model),
 `ferrika-governance` (company policy and audit), `ferrika-ops` (operations),
-`ferrika-mcp` (the MCP server), `ferrika-rabbitmq` (RabbitMQ, preview) and
+`ferrika-mcp` (the MCP server), `ferrika-rabbitmq` (RabbitMQ, preview),
+`ferrika-ksql` (ksqlDB client, preview) and
 `ferrika-cli` (the `ferrika` command line). Before 1.0 their API can change in a minor version; a patch version
 must not break it, so say in the pull request when a change does. Read
 [AGENTS.md](AGENTS.md) for the layout and for one rule you must keep: the policy
