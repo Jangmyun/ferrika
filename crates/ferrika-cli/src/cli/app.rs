@@ -876,7 +876,7 @@ fn write_action(command: &Commands) -> Option<&'static str> {
 /// nothing to undo and are not recorded; neither is `reassign rollback`,
 /// which only saves a plan.
 fn records_history(label: &str) -> bool {
-    const RECORDED: [&str; 8] = [
+    const RECORDED: [&str; 12] = [
         "topics ",
         "offset ",
         "user ",
@@ -885,6 +885,11 @@ fn records_history(label: &str) -> bool {
         "schema ",
         "connect ",
         "reassign execute",
+        // RabbitMQ topology, undone with `rabbit undo`.
+        "rabbit queue ",
+        "rabbit exchange ",
+        "rabbit bind",
+        "rabbit unbind",
     ];
     RECORDED.iter().any(|prefix| label.starts_with(prefix))
 }
@@ -1224,10 +1229,15 @@ mod tests {
         "quota list",
         "quota remove",
         "quota set",
+        "rabbit bind",
         "rabbit bindings",
         "rabbit dlq inspect",
         "rabbit dlq redrive",
+        "rabbit exchange declare",
+        "rabbit exchange delete",
         "rabbit exchanges",
+        "rabbit history",
+        "rabbit history show",
         "rabbit peek",
         "rabbit profile add",
         "rabbit profile list",
@@ -1235,7 +1245,12 @@ mod tests {
         "rabbit profile show",
         "rabbit profile use",
         "rabbit publish",
+        "rabbit queue declare",
+        "rabbit queue delete",
+        "rabbit queue purge",
         "rabbit queues",
+        "rabbit unbind",
+        "rabbit undo",
         "reassign execute",
         "reassign plan",
         "reassign rollback",
@@ -1581,6 +1596,13 @@ mod tests {
             "schema compat --set",
             "connect apply",
             "reassign execute",
+            "rabbit queue declare",
+            "rabbit queue delete",
+            "rabbit queue purge",
+            "rabbit exchange declare",
+            "rabbit exchange delete",
+            "rabbit bind",
+            "rabbit unbind",
         ] {
             assert!(records_history(label), "{label}");
         }
@@ -1594,6 +1616,9 @@ mod tests {
             "dlq redrive --execute",
             "bench produce",
             "reassign rollback",
+            "rabbit publish",
+            "rabbit peek",
+            "rabbit dlq redrive --execute",
         ] {
             assert!(!records_history(label), "{label}");
         }

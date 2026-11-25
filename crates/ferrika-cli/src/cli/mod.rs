@@ -39,6 +39,7 @@ pub(crate) mod quota;
 /// Everything else in it is crate-internal.
 pub mod rabbit;
 pub(crate) mod rabbit_profile;
+pub(crate) mod rabbit_topology;
 pub(crate) mod reassign;
 pub(crate) mod record;
 pub(crate) mod report;

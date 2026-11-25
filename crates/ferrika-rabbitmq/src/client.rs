@@ -17,8 +17,8 @@ use ferrika_core::kafka::http::{Endpoint, Response};
 
 use crate::error::{RabbitError, RabbitResult};
 use crate::model::{
-    peek_request, Binding, Exchange, OutgoingMessage, PeekedMessage, PublishOutcome, Queue,
-    DEFAULT_EXCHANGE,
+    peek_request, Binding, BindingDeclaration, Exchange, ExchangeDeclaration, OutgoingMessage,
+    PeekedMessage, PublishOutcome, Queue, QueueDeclaration, DEFAULT_EXCHANGE,
 };
 
 /// The management plugin's port.
@@ -142,6 +142,167 @@ impl ManagementClient {
         parse_json(&success_body(response)?)
     }
 
+    /// One queue of `vhost`, `None` when there is no such queue (or vhost).
+    pub async fn queue(&self, vhost: &str, name: &str) -> RabbitResult<Option<Queue>> {
+        self.get_optional(&queue_path(vhost, name)).await
+    }
+
+    /// One exchange of `vhost`, `None` when there is no such exchange.
+    pub async fn exchange(&self, vhost: &str, name: &str) -> RabbitResult<Option<Exchange>> {
+        self.get_optional(&exchange_path(vhost, name)).await
+    }
+
+    /// The bindings that deliver to `queue`, without the default exchange's
+    /// implicit one (which cannot be added or removed).
+    pub async fn queue_bindings(&self, vhost: &str, queue: &str) -> RabbitResult<Vec<Binding>> {
+        let bindings: Vec<Binding> = self
+            .get_json(&format!("{}/bindings", queue_path(vhost, queue)))
+            .await?;
+        Ok(bindings
+            .into_iter()
+            .filter(|b| !b.source.is_empty())
+            .collect())
+    }
+
+    /// The bindings `exchange` is the source or the destination of (an
+    /// exchange bound to itself is listed once).
+    pub async fn exchange_bindings(
+        &self,
+        vhost: &str,
+        exchange: &str,
+    ) -> RabbitResult<Vec<Binding>> {
+        let base = exchange_path(vhost, exchange);
+        let mut bindings: Vec<Binding> = self.get_json(&format!("{base}/bindings/source")).await?;
+        let to_it: Vec<Binding> = self
+            .get_json(&format!("{base}/bindings/destination"))
+            .await?;
+        for binding in to_it {
+            if !bindings.contains(&binding) {
+                bindings.push(binding);
+            }
+        }
+        Ok(bindings)
+    }
+
+    /// The bindings from exchange `source` to the destination of `binding`
+    /// (any routing key and arguments).
+    pub async fn bindings_between(
+        &self,
+        vhost: &str,
+        binding: &BindingDeclaration,
+    ) -> RabbitResult<Vec<Binding>> {
+        self.get_json(&binding_path(vhost, binding)).await
+    }
+
+    /// Declares queue `name` (`PUT /api/queues/{vhost}/{name}`). Declaring
+    /// a queue that exists with the same settings changes nothing; with
+    /// other settings the broker refuses (400, `PRECONDITION_FAILED`).
+    pub async fn declare_queue(
+        &self,
+        vhost: &str,
+        name: &str,
+        declaration: &QueueDeclaration,
+    ) -> RabbitResult<()> {
+        let body = declaration.to_request().to_string();
+        self.send_ok("PUT", &queue_path(vhost, name), Some(&body))
+            .await
+    }
+
+    /// Deletes queue `name` and its messages. With `if_empty` / `if_unused`
+    /// the broker refuses when the queue holds messages / has consumers.
+    pub async fn delete_queue(
+        &self,
+        vhost: &str,
+        name: &str,
+        if_empty: bool,
+        if_unused: bool,
+    ) -> RabbitResult<()> {
+        let path = format!(
+            "{}{}",
+            queue_path(vhost, name),
+            conditions(&[("if-empty", if_empty), ("if-unused", if_unused)])
+        );
+        self.send_ok("DELETE", &path, None).await
+    }
+
+    /// Deletes every ready message of queue `name`, keeping the queue.
+    pub async fn purge_queue(&self, vhost: &str, name: &str) -> RabbitResult<()> {
+        self.send_ok(
+            "DELETE",
+            &format!("{}/contents", queue_path(vhost, name)),
+            None,
+        )
+        .await
+    }
+
+    /// Declares exchange `name` (`PUT /api/exchanges/{vhost}/{name}`).
+    pub async fn declare_exchange(
+        &self,
+        vhost: &str,
+        name: &str,
+        declaration: &ExchangeDeclaration,
+    ) -> RabbitResult<()> {
+        let body = declaration.to_request().to_string();
+        self.send_ok("PUT", &exchange_path(vhost, name), Some(&body))
+            .await
+    }
+
+    /// Deletes exchange `name`; the broker removes its bindings with it.
+    /// With `if_unused` it refuses while the exchange is a binding's source.
+    pub async fn delete_exchange(
+        &self,
+        vhost: &str,
+        name: &str,
+        if_unused: bool,
+    ) -> RabbitResult<()> {
+        let path = format!(
+            "{}{}",
+            exchange_path(vhost, name),
+            conditions(&[("if-unused", if_unused)])
+        );
+        self.send_ok("DELETE", &path, None).await
+    }
+
+    /// Adds `binding` (adding one that exists changes nothing).
+    pub async fn bind(&self, vhost: &str, binding: &BindingDeclaration) -> RabbitResult<()> {
+        binding.validate()?;
+        let body = binding.to_request().to_string();
+        self.send_ok("POST", &binding_path(vhost, binding), Some(&body))
+            .await
+    }
+
+    /// Removes `binding`. Returns `false` when there was no such binding
+    /// (nothing changed).
+    pub async fn unbind(&self, vhost: &str, binding: &BindingDeclaration) -> RabbitResult<bool> {
+        binding.validate()?;
+        let listed = self.bindings_between(vhost, binding).await?;
+        let Some(found) = listed.iter().find(|b| binding.matches(b)) else {
+            return Ok(false);
+        };
+        let path = format!(
+            "{}/{}",
+            binding_path(vhost, binding),
+            segment(&found.properties_key)
+        );
+        self.send_ok("DELETE", &path, None).await?;
+        Ok(true)
+    }
+
+    /// GETs `path`; a 404 is `None`.
+    async fn get_optional<T: DeserializeOwned>(&self, path: &str) -> RabbitResult<Option<T>> {
+        let response = self.send("GET", path, None).await?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        parse_json(&success_body(response)?).map(Some)
+    }
+
+    /// Sends a request whose answer has no body worth reading.
+    async fn send_ok(&self, method: &str, path: &str, body: Option<&str>) -> RabbitResult<()> {
+        let response = self.send(method, path, body).await?;
+        success_body(response).map(|_| ())
+    }
+
     pub(crate) async fn get_json<T: DeserializeOwned>(&self, path: &str) -> RabbitResult<T> {
         let response = self.send("GET", path, None).await?;
         parse_json(&success_body(response)?)
@@ -155,8 +316,15 @@ impl ManagementClient {
             .map(|auth| ("Authorization", auth))
             .into_iter()
             .collect();
+        // Some DELETE resources (a queue's `contents`, the purge) offer no
+        // JSON and answer `Accept: application/json` with 406.
+        let content_type = if method == "DELETE" && body.is_none() {
+            "*/*"
+        } else {
+            "application/json"
+        };
         self.endpoint
-            .send_with_headers(method, path, "application/json", body, &headers)
+            .send_with_headers(method, path, content_type, body, &headers)
             .await
             .map_err(|e| RabbitError::Unreachable {
                 target: self.address(),
@@ -165,6 +333,41 @@ impl ManagementClient {
                     other => other.to_string(),
                 }),
             })
+    }
+}
+
+/// `/api/queues/{vhost}/{queue}`.
+fn queue_path(vhost: &str, queue: &str) -> String {
+    format!("/api/queues/{}/{}", segment(vhost), segment(queue))
+}
+
+/// `/api/exchanges/{vhost}/{exchange}`.
+fn exchange_path(vhost: &str, exchange: &str) -> String {
+    format!("/api/exchanges/{}/{}", segment(vhost), segment(exchange))
+}
+
+/// `/api/bindings/{vhost}/e/{source}/{q|e}/{destination}`.
+fn binding_path(vhost: &str, binding: &BindingDeclaration) -> String {
+    format!(
+        "/api/bindings/{}/e/{}/{}/{}",
+        segment(vhost),
+        segment(&binding.source),
+        binding.destination_type.path_letter(),
+        segment(&binding.destination)
+    )
+}
+
+/// `?if-empty=true&...` for the conditions that are set; empty for none.
+fn conditions(flags: &[(&str, bool)]) -> String {
+    let set: Vec<String> = flags
+        .iter()
+        .filter(|(_, on)| *on)
+        .map(|(name, _)| format!("{name}=true"))
+        .collect();
+    if set.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", set.join("&"))
     }
 }
 
@@ -298,6 +501,37 @@ mod tests {
     }
 
     #[test]
+    fn topology_paths_encode_every_name() {
+        use crate::model::DestinationType;
+        assert_eq!(queue_path("/", "a b"), "/api/queues/%2F/a%20b");
+        assert_eq!(exchange_path("shop", "x/y"), "/api/exchanges/shop/x%2Fy");
+        let binding = BindingDeclaration {
+            source: "shop".into(),
+            destination: "orders.q".into(),
+            destination_type: DestinationType::Queue,
+            routing_key: "k".into(),
+            arguments: Default::default(),
+        };
+        assert_eq!(
+            binding_path("/", &binding),
+            "/api/bindings/%2F/e/shop/q/orders.q"
+        );
+        let to_exchange = BindingDeclaration {
+            destination_type: DestinationType::Exchange,
+            ..binding
+        };
+        assert_eq!(
+            binding_path("/", &to_exchange),
+            "/api/bindings/%2F/e/shop/e/orders.q"
+        );
+        assert_eq!(conditions(&[("if-empty", false), ("if-unused", false)]), "");
+        assert_eq!(
+            conditions(&[("if-empty", true), ("if-unused", true)]),
+            "?if-empty=true&if-unused=true"
+        );
+    }
+
+    #[test]
     fn the_default_exchange_is_published_to_as_amq_default() {
         assert_eq!(
             publish_path("/", ""),
@@ -395,5 +629,101 @@ mod tests {
         assert!(matches!(parsed, Err(RabbitError::Response(_))));
         let routed: PublishOutcome = parse_json(r#"{"routed":false}"#).unwrap();
         assert!(!routed.routed);
+    }
+    #[tokio::test]
+    async fn topology_writes_reach_the_management_api() {
+        use crate::fake::FakeManagement;
+        use crate::model::{DestinationType, ExchangeDeclaration};
+        let fake = FakeManagement::start().await;
+        let client = fake.client();
+        assert_eq!(client.queue("/", "orders").await.unwrap(), None);
+        let declaration = QueueDeclaration {
+            kind: Some("classic".into()),
+            durable: true,
+            ..QueueDeclaration::default()
+        };
+        client
+            .declare_queue("/", "orders", &declaration)
+            .await
+            .unwrap();
+        let queue = client.queue("/", "orders").await.unwrap().unwrap();
+        assert_eq!(queue.kind, "classic");
+        assert!(queue.durable);
+        // Another declaration of the same queue is refused by the broker.
+        let other = QueueDeclaration {
+            durable: false,
+            ..declaration.clone()
+        };
+        assert!(matches!(
+            client.declare_queue("/", "orders", &other).await,
+            Err(RabbitError::Api { status: 400, .. })
+        ));
+
+        let exchange = ExchangeDeclaration {
+            kind: "topic".into(),
+            durable: true,
+            auto_delete: false,
+            internal: false,
+            arguments: Default::default(),
+        };
+        client
+            .declare_exchange("/", "shop", &exchange)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.exchange("/", "shop").await.unwrap().unwrap().kind,
+            "topic"
+        );
+        let binding = BindingDeclaration {
+            source: "shop".into(),
+            destination: "orders".into(),
+            destination_type: DestinationType::Queue,
+            routing_key: "order.*".into(),
+            arguments: Default::default(),
+        };
+        client.bind("/", &binding).await.unwrap();
+        let bound = client.queue_bindings("/", "orders").await.unwrap();
+        assert_eq!(bound.len(), 1, "the default exchange's binding is left out");
+        assert!(binding.matches(&bound[0]));
+        assert_eq!(
+            client.exchange_bindings("/", "shop").await.unwrap().len(),
+            1
+        );
+        assert!(client.unbind("/", &binding).await.unwrap());
+        assert!(!client.unbind("/", &binding).await.unwrap(), "already gone");
+
+        fake.with(|broker| broker.messages.insert(("/".into(), "orders".into()), 5));
+        assert!(matches!(
+            client.delete_queue("/", "orders", true, false).await,
+            Err(RabbitError::Api { status: 400, .. })
+        ));
+        client.purge_queue("/", "orders").await.unwrap();
+        assert_eq!(fake.with(|b| b.messages_of("/", "orders")), Some(0));
+        client
+            .delete_queue("/", "orders", true, true)
+            .await
+            .unwrap();
+        assert_eq!(client.queue("/", "orders").await.unwrap(), None);
+        client.delete_exchange("/", "shop", true).await.unwrap();
+        let writes = fake.with(|b| b.writes());
+        assert!(
+            writes.contains(
+                &"DELETE /api/queues/%2F/orders?if-empty=true&if-unused=true".to_string()
+            ),
+            "{writes:?}"
+        );
+        assert!(
+            writes.contains(&"DELETE /api/bindings/%2F/e/shop/q/orders/order.%2A".to_string()),
+            "{writes:?}"
+        );
+        // Binding to or from the default exchange is refused before any request.
+        let default = BindingDeclaration {
+            source: String::new(),
+            ..binding
+        };
+        assert!(matches!(
+            client.bind("/", &default).await,
+            Err(RabbitError::Config(_))
+        ));
     }
 }

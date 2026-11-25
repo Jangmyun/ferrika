@@ -5,7 +5,8 @@ Checks what unit tests cannot: the management API and AMQP as a live broker
 answers them. The script builds its own topology through the management API
 (an exchange, a work queue that dead-letters into a DLX and a dead-letter
 queue), then runs the CLI for profiles, listings, publish, peek, dead-letter
-inspection and redrive, read-only profiles and the audit log.
+inspection and redrive, topology changes with history and undo (queue,
+exchange, bind/unbind), read-only profiles and the audit log.
 
 Start a throw-away broker first (the management plugin is needed):
 
@@ -64,6 +65,8 @@ EX, DLX = f"{RUN}ex", f"{RUN}dlx"
 WORK, DLQ = f"{RUN}work", f"{RUN}dlq"
 RK = f"{RUN}rk"
 PROFILE, RO_PROFILE = f"{RUN}p", f"{RUN}ro"
+# Made and removed by the CLI's topology commands (cleaned up as well).
+TQ, TQ2, TX = f"{RUN}topo-q", f"{RUN}topo-q2", f"{RUN}topo-x"
 # Message bodies: must never show up in the audit log.
 BODY = f"body-{uuid.uuid4().hex[:10]}"
 FILE_STORE = os.environ.get("FERRIKA_SECRET_STORE", "").lower() == "file"
@@ -102,6 +105,13 @@ def ferrika(args, timeout=30):
 def check(name, ok, detail=""):
     results.append(bool(ok))
     print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"   [{detail}]" if detail and not ok else ""), flush=True)
+
+
+def rj(args, profile=PROFILE, timeout=60):
+    """Runs `ferrika -f json rabbit ...`; returns (rc, parsed JSON, output)."""
+    cmd = ["-f", "json", "rabbit"] + (["--rabbit-profile", profile] if profile else []) + args
+    rc, out, err = ferrika(cmd, timeout=timeout)
+    return rc, parse_json(out), out + err
 
 
 def tail(s, n=240):
@@ -318,10 +328,152 @@ def scenarios():
     check("no message body in the audit log or any config file", rc == 0 and BODY not in out and not leaked,
           f"files={leaked}")
 
+    topology()
+
     # --- profile remove ---------------------------------------------------
     for name in (PROFILE, RO_PROFILE):
         rc, out, err = run(["profile", "remove", name], profile=None)
         check(f"rabbit profile remove {name}", rc == 0, f"rc={rc} {tail(out + err)}")
+
+
+def op_of(action, name):
+    """The newest recorded operation `action` on `name` (from `rabbit history`)."""
+    rc, ops, _ = rj(["history", "-n", "200"])
+    for op in ops or []:
+        if op.get("action") == action and name in (op.get("target") or ""):
+            return op
+    return {}
+
+
+def queue_info(name):
+    return api("GET", f"queues/{VHOST}/{q(name)}", ok_missing=True)
+
+
+def wait_stats(name, n, timeout=20):
+    """Waits until the broker's statistics (refreshed every few seconds)
+    report `n` messages in queue `name`; the CLI's counts come from them."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if (queue_info(name) or {}).get("messages") == n:
+            return True
+        time.sleep(1)
+    return False
+
+
+def has_binding(source, queue, key):
+    found = api("GET", f"bindings/{VHOST}/e/{q(source)}/q/{q(queue)}", ok_missing=True) or []
+    return any(b.get("routing_key") == key for b in found)
+
+
+def topology():
+    """Queue, exchange and binding changes, their history and undo."""
+    created["queues"] += [TQ, TQ2]
+    created["exchanges"].append(TX)
+
+    # declare -> history -> undo
+    rc, out, text = rj(["queue", "declare", TQ, "--type", "quorum"])
+    info = queue_info(TQ) or {}
+    check("queue declare --type quorum", rc == 0 and (out or {}).get("declared") is True
+          and info.get("type") == "quorum", f"rc={rc} {tail(text)}")
+    op = op_of("rabbit queue declare", TQ)
+    check("rabbit history lists the declaration as undoable if empty",
+          op.get("reversibility") == "conditional" and op.get("result") == "ok"
+          and op.get("digest") == "matches", tail(op))
+    rc, out, text = rj(["queue", "declare", TQ])
+    check("declaring an existing queue is refused", rc not in (0, "timeout") and "already exists" in text,
+          f"rc={rc} {tail(text)}")
+    rc, out, text = rj(["undo", op.get("id", "none"), "--yes"])
+    check("undo of the declaration deletes the queue", rc == 0 and queue_info(TQ) is None, f"rc={rc} {tail(text)}")
+    rc, out, text = rj(["history", "show", op.get("id", "none")])
+    check("history show: the declaration is undone", rc == 0 and (out or {}).get("undone_by"), f"rc={rc} {tail(text)}")
+
+    # an exchange, a binding and a message; delete the queue, undo restores it empty with the binding
+    rc, out, text = rj(["exchange", "declare", TX, "--type", "topic"])
+    check("exchange declare --type topic", rc == 0 and (api("GET", f"exchanges/{VHOST}/{q(TX)}") or {}).get("type")
+          == "topic", f"rc={rc} {tail(text)}")
+    rc1, _, t1 = rj(["queue", "declare", TQ, "--arg", "x-max-length=100"])
+    rc2, out, t2 = rj(["bind", TX, TQ, "-k", "topo.*"])
+    check("queue declare --arg and bind", rc1 == 0 and rc2 == 0 and has_binding(TX, TQ, "topo.*")
+          and (queue_info(TQ) or {}).get("arguments", {}).get("x-max-length") == 100, tail(t1 + t2))
+    rc, _, text = run(["publish", TX, "-k", "topo.a", "-m", f"{BODY}-topo"])
+    check("publish into the bound queue", rc == 0 and len(wait_count(TQ, 1)) == 1 and wait_stats(TQ, 1),
+          f"rc={rc} {tail(text)}")
+    rc, out, text = rj(["queue", "delete", TQ, "--yes"])
+    check("queue delete --yes drops the queue and its binding",
+          rc == 0 and (out or {}).get("messages") == 1 and queue_info(TQ) is None and not has_binding(TX, TQ, "topo.*"),
+          f"rc={rc} {tail(text)}")
+    op = op_of("rabbit queue delete", TQ)
+    check("history: the deletion is partly undoable", op.get("reversibility") == "partial", tail(op))
+    rc, out, text = rj(["undo", op.get("id", "none"), "--dry-run"])
+    steps = ((out or {}).get("steps") or {}).get("steps") or []
+    check("undo --dry-run plans declare then bind, changing nothing",
+          rc == 0 and [s.get("step") for s in steps] == ["declare_queue", "bind"] and queue_info(TQ) is None,
+          f"rc={rc} {tail(text)}")
+    rc, out, text = rj(["undo", op.get("id", "none"), "--yes"])
+    info = queue_info(TQ) or {}
+    check("undo of the deletion declares the queue again, empty, with its binding and arguments",
+          rc == 0 and info.get("arguments", {}).get("x-max-length") == 100 and has_binding(TX, TQ, "topo.*")
+          and len(wait_count(TQ, 0)) == 0, f"rc={rc} {tail(text)}")
+
+    # unbind -> undo
+    rc, out, text = rj(["unbind", TX, TQ, "-k", "topo.*"])
+    gone = not has_binding(TX, TQ, "topo.*")
+    op = op_of("rabbit unbind", TQ)
+    rc2, _, text2 = rj(["undo", op.get("id", "none"), "--yes"])
+    check("unbind, then undo binds again", rc == 0 and gone and rc2 == 0 and has_binding(TX, TQ, "topo.*"),
+          f"rc={rc}/{rc2} {tail(text + text2)}")
+
+    # undo of a declaration refuses a queue holding messages; purge cannot be undone
+    rj(["queue", "declare", TQ2])
+    declared = op_of("rabbit queue declare", TQ2)
+    run(["publish", "amq.default", "-k", TQ2, "-m", f"{BODY}-q2"])
+    wait_count(TQ2, 1)
+    wait_stats(TQ2, 1)
+    rc, out, text = rj(["undo", declared.get("id", "none"), "--yes", "--force"])
+    check("undo of a declaration refuses a queue with messages, even with --force",
+          rc not in (0, "timeout") and "1 message(s)" in text and queue_info(TQ2) is not None, f"rc={rc} {tail(text)}")
+    rc, out, text = rj(["queue", "purge", TQ2, "--yes"])
+    check("queue purge --yes", rc == 0 and (out or {}).get("purged") == 1 and len(wait_count(TQ2, 0)) == 0,
+          f"rc={rc} {tail(text)}")
+    purged = op_of("rabbit queue purge", TQ2)
+    rc, out, text = rj(["undo", purged.get("id", "none"), "--yes"])
+    check("a purge is recorded but not undoable", purged.get("reversibility") == "irreversible"
+          and rc not in (0, "timeout"), f"rc={rc} {tail(text)}")
+    wait_stats(TQ2, 0)  # undo reads the broker's statistics, which lag
+    rc, out, text = rj(["undo", declared.get("id", "none"), "--yes"])
+    check("once empty, undo of the declaration deletes the queue", rc == 0 and queue_info(TQ2) is None,
+          f"rc={rc} {tail(text)}")
+
+    # delete the exchange (removes the binding), undo restores both
+    rc, out, text = rj(["exchange", "delete", TX, "--yes"])
+    check("exchange delete --yes removes its binding",
+          rc == 0 and (out or {}).get("bindings") == 1 and not has_binding(TX, TQ, "topo.*"), f"rc={rc} {tail(text)}")
+    op = op_of("rabbit exchange delete", TX)
+    rc, out, text = rj(["undo", op.get("id", "none"), "--yes"])
+    check("undo of the exchange deletion restores it and its binding",
+          rc == 0 and api("GET", f"exchanges/{VHOST}/{q(TX)}", ok_missing=True) and has_binding(TX, TQ, "topo.*"),
+          f"rc={rc} {tail(text)}")
+
+    # Kafka's undo points to rabbit undo; read-only profiles refuse
+    rc, out, err = ferrika(["undo", op.get("id", "none"), "--yes"])
+    check("ferrika undo of a RabbitMQ operation points to rabbit undo",
+          rc not in (0, "timeout") and "ferrika rabbit undo" in err, f"rc={rc} {tail(out + err)}")
+    for label, args in (("queue declare", ["queue", "declare", f"{RUN}topo-ro"]),
+                        ("queue delete", ["queue", "delete", TQ, "--yes"]),
+                        ("bind", ["bind", TX, TQ, "-k", "ro"]),
+                        ("undo", ["undo", op.get("id", "none"), "--yes"])):
+        rc, out, err = run(args, profile=RO_PROFILE)
+        check(f"read-only profile refuses {label}", rc not in (0, "timeout") and "read-only" in err,
+              f"rc={rc} {tail(out + err)}")
+    check("read-only refusals left the topology alone",
+          queue_info(TQ) is not None and queue_info(f"{RUN}topo-ro") is None and not has_binding(TX, TQ, "ro"))
+
+    rc, out, err = ferrika(["-f", "json", "audit", "--source", "cli", "-n", "500"])
+    actions = {e.get("action") for e in (parse_json(out) or []) if RUN in (e.get("target") or "")}
+    want = {"rabbit queue declare", "rabbit queue delete", "rabbit queue purge", "rabbit exchange declare",
+            "rabbit exchange delete", "rabbit bind", "rabbit unbind", "rabbit undo"}
+    check("audit log has the topology changes and undos", rc == 0 and want <= actions,
+          f"missing={sorted(want - actions)}")
 
 
 def cleanup():

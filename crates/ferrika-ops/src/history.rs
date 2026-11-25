@@ -29,6 +29,7 @@ pub mod apply;
 pub mod capture;
 pub mod conflict;
 pub mod inverse;
+pub mod rabbit;
 pub mod undo;
 
 /// File name of the journal.
@@ -1051,6 +1052,127 @@ mod tests {
         assert!(!blocked.started());
         assert_eq!(blocked.finish(true, "", None), None);
         drop(recorder);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The journal line shapes of Ferrika 0.2, which knows none of the
+    /// `rabbit_*` state kinds. A state's fields do not decide whether a line
+    /// parses there, only its kind, so the variants are empty.
+    mod v020 {
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        pub enum State {
+            TopicConfig {},
+            BrokerConfig {},
+            Topic {},
+            Replicas {},
+            GroupOffsets {},
+            Acls {},
+            Quota {},
+            Scram {},
+            SubjectCompat {},
+            SubjectVersions {},
+            Connector {},
+        }
+
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        pub struct Begin {
+            pub action: String,
+            #[serde(default)]
+            pub before: Vec<State>,
+            #[serde(default)]
+            pub after: Vec<State>,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        pub struct End {
+            pub ok: bool,
+            #[serde(default)]
+            pub after: Option<Vec<State>>,
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "ev", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        pub enum Body {
+            Begin(Box<Begin>),
+            End(End),
+            Note { text: String },
+        }
+
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        pub struct Event {
+            pub v: u32,
+            pub id: String,
+            pub time_ms: i64,
+            #[serde(flatten)]
+            pub body: Body,
+        }
+    }
+
+    #[test]
+    fn a_0_2_reader_skips_rabbit_operations_whole_and_keeps_the_others() {
+        use ferrika_core::model::history::RabbitQueueDeclaration;
+        let (dir, journal) = temp_journal("v020");
+        journal.append(&begin_event("KAFKA", 1)).unwrap();
+        journal.append(&end_event("KAFKA")).unwrap();
+        // A RabbitMQ queue deletion, as `rabbit queue delete` records it.
+        let queue = |declaration| State::RabbitQueue {
+            vhost: "/".into(),
+            name: "orders".into(),
+            declaration,
+        };
+        let mut rabbit = begin_event("RABBIT", 2);
+        if let EventBody::Begin(begin) = &mut rabbit.body {
+            begin.scope = Scope {
+                profile: "dev".into(),
+                rabbitmq: "rabbit:15672".into(),
+                ..Scope::default()
+            };
+            begin.action = "rabbit queue delete".into();
+            begin.before = vec![queue(Some(RabbitQueueDeclaration {
+                kind: "classic".into(),
+                durable: true,
+                auto_delete: false,
+                arguments: BTreeMap::new(),
+            }))];
+            begin.after = vec![queue(None)];
+        }
+        journal.append(&rabbit).unwrap();
+        let mut rabbit_end = end_event("RABBIT");
+        if let EventBody::End(end) = &mut rabbit_end.body {
+            end.after = Some(vec![queue(None)]);
+        }
+        journal.append(&rabbit_end).unwrap();
+
+        // This version reads both.
+        let ops = journal.load();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[1].begin.scope.rabbitmq, "rabbit:15672");
+
+        // 0.2 reads lines one by one and skips those it cannot parse, as
+        // `read_events` does: only the Kafka operation's lines are left, so
+        // `history`, `undo` and `audit verify` there never see the RabbitMQ
+        // one (no "edited" alarm for a scope it cannot hash).
+        let text = std::fs::read_to_string(journal.path()).unwrap();
+        let parsed: Vec<Option<v020::Event>> = text
+            .lines()
+            .map(|line| serde_json::from_str::<v020::Event>(line).ok())
+            .collect();
+        assert_eq!(parsed.len(), 4);
+        let ids: Vec<&str> = parsed
+            .iter()
+            .flatten()
+            .map(|event| event.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["KAFKA", "KAFKA"]);
+        // Its trim keeps lines it cannot parse byte for byte (see
+        // `trimming_and_rotation_keep_lines_of_unknown_kinds_and_fields_byte_for_byte`),
+        // so the RabbitMQ operation survives a 0.2 trim.
         let _ = std::fs::remove_dir_all(dir);
     }
 

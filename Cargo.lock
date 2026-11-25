@@ -1150,6 +1150,7 @@ version = "0.2.0"
 dependencies = [
  "ferrika-core",
  "ferrika-governance",
+ "ferrika-rabbitmq",
  "jiff",
  "rdkafka",
  "ring",

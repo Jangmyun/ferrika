@@ -49,6 +49,10 @@ pub mod client;
 pub mod connection;
 pub mod delivery_limit;
 pub mod error;
+/// An in-memory management API for tests (feature `test-util`).
+#[cfg(any(test, feature = "test-util"))]
+#[doc(hidden)]
+pub mod fake;
 pub mod listing;
 pub mod model;
 pub mod profile;

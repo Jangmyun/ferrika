@@ -111,7 +111,7 @@ still starting can answer.
 | Schemas and integrations | `schema`, `connect`, `acl`, `quota`, `user` |
 | Change safety | `audit`, `history`, `undo`, `policy` |
 | AI assistants | `mcp` |
-| RabbitMQ (preview) | `rabbit` (queues, exchanges, bindings, peek, publish, DLQ inspect and redrive; separate RabbitMQ profiles) |
+| RabbitMQ (preview) | `rabbit` (queues, exchanges, bindings, peek, publish, DLQ inspect and redrive; queue, exchange and binding changes with history and undo; separate RabbitMQ profiles) |
 | MQTT (preview) | `mqtt` (bounded subscribe, publish, list and clear retained messages; MQTT 3.1.1 and 5, TLS; separate MQTT profiles) |
 
 Examples for each are in the [command reference](docs/CLI.md).

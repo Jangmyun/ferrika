@@ -1,9 +1,12 @@
 # Multi-broker support: broker abstraction and RabbitMQ
 
 Status: stage 2 design with a preview implementation (`ferrika rabbit`,
-crate `ferrika-rabbitmq`), planned for 0.2.0. The product decisions of
-2026-11-22 are in [Decisions](#decisions-2026-11-22) and supersede the
-earlier proposals below where they differ. Kafka behaviour is unchanged.
+crate `ferrika-rabbitmq`), released in 0.2.0; phase 3 (topology writes with
+history and undo, CLI and library) on `feat/rabbit-topology`. The product
+decisions of 2026-11-22 are in [Decisions](#decisions-2026-11-22) and those
+of phase 3 in [Decisions (2026-11-23, phase
+3)](#decisions-2026-11-23-phase-3); they supersede the earlier proposals
+below where they differ. Kafka behaviour is unchanged.
 
 ## Goal
 
@@ -109,7 +112,10 @@ pub enum BrokerKind { Kafka, RabbitMq }
 pub struct GateTarget { pub kind: BrokerKind, pub profile: String, pub addresses: String }
 ```
 
-and a `brokers_for` per kind. This is not needed for the CLI preview.
+and a `brokers_for` per kind. This is not needed for the CLI preview, nor
+for the phase 3 topology writes, which the CLI gates through
+`gate_profile` / `gate_brokers` like the other `rabbit` commands
+(decision 18).
 
 ### New policy categories
 
@@ -137,10 +143,21 @@ the strictest mode. The policy format number is not raised for this (a new
 `forbid` value is not a new field); the CHANGELOG and `docs/POLICY.md` say
 to roll such a policy out only once every client runs 0.2.0 or later.
 
-Still proposed, for RabbitMQ topology writes (phase 3): `queues.create`,
-`queues.delete`, `queues.purge`, `bindings.change`. Until then `from_cli`
-maps unknown `rabbit ...` writes to `config.change` (the broadest
-category), as for any unknown write.
+Added after 0.2.0, for RabbitMQ topology writes (phase 3, decision 16):
+
+| Category | Covers |
+| --- | --- |
+| `queues.create` | `rabbit queue declare`; undoing a queue deletion |
+| `queues.delete` | `rabbit queue delete`; undoing a queue declaration |
+| `queues.purge` | `rabbit queue purge` |
+| `exchanges.create` | `rabbit exchange declare`; undoing an exchange deletion |
+| `exchanges.delete` | `rabbit exchange delete`; undoing an exchange declaration |
+| `bindings.change` | `rabbit bind`, `rabbit unbind`; undoing either, and restoring the bindings of a deleted queue or exchange |
+
+The same compatibility rule applies: a build that does not know them
+(0.2.0 and older) treats a policy naming them as invalid and runs in the
+strictest mode. `from_cli` still maps unknown `rabbit ...` writes to
+`config.change`.
 
 ## Crate layout
 
@@ -157,9 +174,10 @@ ferrika-cli ──> ferrika-mcp ──> ferrika-ops ──> ferrika-governance �
   gates in `cli/app.rs`. The CLI re-exports the crate as `rabbitmq`.
 - `ferrika-rabbitmq` also holds the RabbitMQ profiles (`profile`) and the
   AMQP redrive (`amqp`, behind the default feature `amqp`, with `lapin`).
-- The Kafka path is untouched. `ferrika-ops` does not depend on the new
-  crate; the DLQ redrive lives in `ferrika-rabbitmq::amqp`, called by the
-  CLI. `ferrika-mcp` uses it without the `amqp` feature for its read-only
+- The Kafka path is untouched. The DLQ redrive lives in
+  `ferrika-rabbitmq::amqp`, called by the CLI. Since phase 3 `ferrika-ops`
+  depends on the crate (without `amqp`) for the RabbitMQ history and undo
+  (`history::rabbit`, decision 21). `ferrika-mcp` uses it without the `amqp` feature for its read-only
   RabbitMQ listings.
 
 New third-party dependency: `lapin` 4.13 (MIT) with its AMQP crates
@@ -419,19 +437,44 @@ downstream), so like `dlq redrive` it is recorded in the audit log only.
 
 ## Operation history and undo for RabbitMQ (phase 3)
 
-Topology writes are undoable and fit the existing model:
+Topology writes are undoable and fit the existing model (implemented on
+`feat/rabbit-topology`):
 
-- `Scope` gains a `rabbitmq` field (management address, redacted) next to
-  `registry` and `connect`.
-- New `State` variants: `Queue { vhost, name, kind, durable, arguments }`,
-  `Exchange { vhost, name, kind, durable, internal, arguments }`,
-  `Binding { vhost, source, destination, destination_type, routing_key,
-  arguments }`, with capture (`GET` before the change) and inverse (declare
-  or delete).
-- Deleting a queue is `Partial`: undo re-declares it, the messages are gone.
-  Purge is `Irreversible`.
-- The journal format is versioned in `model::history`; new variants must
-  be skipped (not fail) by older readers before they ship.
+- `Scope` has a `rabbitmq` field: the management API's `host:port` (never
+  credentials), next to `registry` and `connect`. `same_cluster` and
+  `check_undo_target` compare it (case ignored); a Kafka scope never
+  matches a RabbitMQ one. It is part of the version 2 digest like the rest
+  of the scope.
+- New `State` variants (`kind` `rabbit_queue`, `rabbit_queue_messages`,
+  `rabbit_exchange`, `rabbit_binding`): `RabbitQueue { vhost, name,
+  declaration: Option<{type, durable, auto_delete, arguments}> }`,
+  `RabbitExchange { vhost, name, declaration: Option<{type, durable,
+  auto_delete, internal, arguments}> }`, `RabbitBinding { vhost, binding:
+  {source, destination, destination_type, routing_key, arguments}, present
+  }` and `RabbitQueueMessages { vhost, name, messages }` (a purge, its own
+  resource key so it never overlaps the queue's declaration). Capture is a
+  `GET` before the change (`ferrika_ops::history::rabbit`), the after-state
+  is read back after it, inverse declares, deletes, binds or unbinds.
+- A queue deletion records the queue and its bindings; undo declares it
+  again (with its type named, so a changed vhost default does not make it
+  another kind) and restores the bindings: `Partial`, the messages are
+  lost. An exchange deletion records the exchange and every binding from
+  and to it: `Reversible`. A declaration is `Conditional`: undo deletes the
+  queue or exchange only while it is empty and unbound. Bind and unbind
+  are `Reversible`. Purge is `Irreversible`.
+- Steps run in a fixed order (unbind, delete, declare, bind) whatever the
+  order of the recorded states.
+- Journal compatibility (checked against the 0.2.0 reader): 0.2.0
+  deserialises each line into its `State` enum, so a line holding an
+  unknown `kind` fails to parse and is skipped by `history`, `undo` and
+  `audit verify`; its trimming copies unparsed lines byte for byte. A
+  RabbitMQ line without a RabbitMQ state would parse there and show a scope
+  without the `rabbitmq` field, whose digest would not match (a false
+  "edited"). So every RabbitMQ operation records at least one `rabbit_*`
+  state, and a change whose before-state cannot be read is refused instead
+  of being recorded as not undoable (decision 20). The test
+  `a_0_2_reader_skips_rabbit_operations_whole_and_keeps_the_others`
+  (`ferrika-ops`, `history.rs`) parses a journal with the 0.2 shapes.
 
 ## Phases
 
@@ -454,8 +497,15 @@ Topology writes are undoable and fit the existing model:
    and the export gate) and `rabbit_dlq_redrive` (`messages.move` plus
    `produce`); both need the neutral gate target first, since the MCP write
    guard is built around one Kafka cluster.
-3. Topology writes (declare/delete/purge queues and exchanges, bindings)
-   with new policy categories, history and undo; MCP tools; desktop views.
+3. **CLI and library done (`feat/rabbit-topology`):** topology writes
+   (`rabbit queue declare|delete|purge`, `rabbit exchange declare|delete`,
+   `rabbit bind|unbind`) with the new policy categories, the operation
+   history and undo (`rabbit history`, `rabbit undo`), unit tests against
+   an in-memory management API (`ferrika_rabbitmq::fake`, feature
+   `test-util`) and checks against RabbitMQ 4.4.1 in
+   `tools/e2e/rabbit_smoke.py`. Still open in this phase: MCP tools and
+   desktop views (both need the neutral gate target first, see decision
+   14), and the topology categories in the MCP `mcp_write` rule.
 4. Stream queues (stream protocol or AMQP consumer with offsets).
 
 ## Decisions (2026-11-22)
@@ -563,6 +613,52 @@ with limit L and count c the message stays while c + 1 <= L. Checked on
 The AMQP redrive is not affected: it acks moved messages, and a message it
 fails to move is returned with `basic.nack` and requeue, which counts as
 one failed delivery on every version (one per failed redrive).
+
+## Decisions (2026-11-23, phase 3)
+
+16. **Exchanges get their own categories**, `exchanges.create` and
+    `exchanges.delete`, next to the proposed `queues.create`,
+    `queues.delete`, `queues.purge` and `bindings.change`. Deleting an
+    exchange silently drops what is published to it and removes its
+    bindings, which is as harmful as deleting a queue; folding it into
+    `bindings.change` or a broad `topology.change` would force operators
+    to allow one to allow the other. All six arrive together, so it is one
+    policy-format event.
+17. **CLI shape.** `rabbit queue declare|delete|purge NAME`, `rabbit
+    exchange declare|delete NAME`, `rabbit bind|unbind SOURCE DESTINATION
+    [-k KEY] [--destination-type queue|exchange] [--arg K=V]`, like
+    `topics create|delete|purge`: changes run directly, deletions and purges
+    ask first (`-y` to skip, the prompt says what undo can and cannot
+    restore). No `--execute` preview: these are single, recorded and
+    (except purge) undoable changes, as Kafka topic changes are. History
+    and undo are `rabbit history` and `rabbit undo`, which carry the
+    RabbitMQ connection options; `ferrika undo ID` on a RabbitMQ operation
+    names `ferrika rabbit undo ID` instead of connecting to Kafka, and
+    `ferrika history --all` lists both brokers' operations.
+18. **No neutral gate target yet.** The CLI gates the new writes through
+    `gate_profile` / `gate_brokers` like the other `rabbit` commands, and
+    `rabbit undo` builds its `WriteRequest` from the RabbitMQ profile and
+    addresses. `GateTarget` is left for the MCP tools and desktop views,
+    which need it to share one write guard; no public gate API changes now.
+19. **Declaring something that exists is refused**, so undoing a
+    declaration never deletes a queue or exchange this command did not
+    make. Undo of a queue declaration refuses a queue holding messages,
+    with consumers or with bindings added since, and `--force` does not
+    override it (as for an undone Kafka topic creation with records):
+    purging first is a separate, audited `queues.purge` decision. Classic
+    queues are deleted with the broker's `if-empty` / `if-unused`; RabbitMQ
+    4 refuses both flags on quorum and stream queues, so for those the
+    check reads the broker's statistics (refreshed every few seconds) just
+    before deleting.
+20. **A RabbitMQ change whose current state cannot be read is refused**
+    (nothing is changed), unlike Kafka changes, which then run and are
+    recorded as not undoable. The state read is the same management API the
+    change uses, and an entry without a RabbitMQ state would be misread by
+    0.2.0 (see the history section).
+21. **`ferrika-ops` depends on `ferrika-rabbitmq`** (without `amqp`), so the
+    RabbitMQ undo shares the Kafka undo's decision code (`check_request`,
+    `decide`, `UndoPlan`, `Step`). The dependency stays one-way
+    (ops → rabbitmq → core).
 
 ## Open questions
 

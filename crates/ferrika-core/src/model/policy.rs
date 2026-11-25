@@ -805,10 +805,22 @@ pub enum PolicyAction {
     /// Deleting messages a broker keeps, e.g. clearing an MQTT retained
     /// message (which publishes an empty retained message).
     MessagesDelete,
+    /// Declaring a RabbitMQ queue.
+    QueuesCreate,
+    /// Deleting a RabbitMQ queue (its messages are lost).
+    QueuesDelete,
+    /// Deleting every message of a RabbitMQ queue, keeping the queue.
+    QueuesPurge,
+    /// Declaring a RabbitMQ exchange.
+    ExchangesCreate,
+    /// Deleting a RabbitMQ exchange (its bindings go with it).
+    ExchangesDelete,
+    /// Adding or removing a RabbitMQ binding.
+    BindingsChange,
 }
 
 impl PolicyAction {
-    pub const ALL: [PolicyAction; 17] = [
+    pub const ALL: [PolicyAction; 23] = [
         Self::TopicsCreate,
         Self::TopicsDelete,
         Self::TopicsPurge,
@@ -826,6 +838,12 @@ impl PolicyAction {
         Self::MessagesPeek,
         Self::MessagesMove,
         Self::MessagesDelete,
+        Self::QueuesCreate,
+        Self::QueuesDelete,
+        Self::QueuesPurge,
+        Self::ExchangesCreate,
+        Self::ExchangesDelete,
+        Self::BindingsChange,
     ];
 
     /// The name used in a policy's `forbid` list.
@@ -848,6 +866,12 @@ impl PolicyAction {
             Self::MessagesPeek => "messages.peek",
             Self::MessagesMove => "messages.move",
             Self::MessagesDelete => "messages.delete",
+            Self::QueuesCreate => "queues.create",
+            Self::QueuesDelete => "queues.delete",
+            Self::QueuesPurge => "queues.purge",
+            Self::ExchangesCreate => "exchanges.create",
+            Self::ExchangesDelete => "exchanges.delete",
+            Self::BindingsChange => "bindings.change",
         }
     }
 
@@ -879,7 +903,13 @@ impl PolicyAction {
             | Self::QuotaChange
             | Self::SchemaChange
             | Self::ConnectChange
-            | Self::MessagesPeek => &[],
+            | Self::MessagesPeek
+            | Self::QueuesCreate
+            | Self::QueuesDelete
+            | Self::QueuesPurge
+            | Self::ExchangesCreate
+            | Self::ExchangesDelete
+            | Self::BindingsChange => &[],
         }
     }
 
@@ -901,6 +931,13 @@ impl PolicyAction {
             // the same way.
             "rabbit peek" | "rabbit dlq inspect" | "rabbit dlq redrive" => Self::MessagesPeek,
             "rabbit dlq redrive --execute" => Self::MessagesMove,
+            // RabbitMQ topology.
+            "rabbit queue declare" => Self::QueuesCreate,
+            "rabbit queue delete" => Self::QueuesDelete,
+            "rabbit queue purge" => Self::QueuesPurge,
+            "rabbit exchange declare" => Self::ExchangesCreate,
+            "rabbit exchange delete" => Self::ExchangesDelete,
+            "rabbit bind" | "rabbit unbind" => Self::BindingsChange,
             // Publishing to an MQTT topic writes messages like `produce`.
             "mqtt pub" => Self::Produce,
             // Clearing a retained message deletes what the broker keeps
@@ -1002,6 +1039,17 @@ mod tests {
             PolicyAction::from_cli("mqtt retained clear"),
             PolicyAction::MessagesDelete
         );
+        for (action, category) in [
+            ("rabbit queue declare", "queues.create"),
+            ("rabbit queue delete", "queues.delete"),
+            ("rabbit queue purge", "queues.purge"),
+            ("rabbit exchange declare", "exchanges.create"),
+            ("rabbit exchange delete", "exchanges.delete"),
+            ("rabbit bind", "bindings.change"),
+            ("rabbit unbind", "bindings.change"),
+        ] {
+            assert_eq!(PolicyAction::from_cli(action).id(), category, "{action}");
+        }
         // Kafka's redrive stays a produce.
         assert_eq!(
             PolicyAction::from_cli("dlq redrive --execute"),

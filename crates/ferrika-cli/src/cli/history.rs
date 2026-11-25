@@ -81,7 +81,7 @@ fn current_scope(global: &GlobalOpts, admin: Option<&KafkaAdminClient>) -> Scope
 
 /// `-n`: how many operations to list; at least 1, so a typo cannot report
 /// "No recorded operations" about a log that has some.
-fn parse_limit(raw: &str) -> Result<usize, String> {
+pub(crate) fn parse_limit(raw: &str) -> Result<usize, String> {
     match raw.trim().parse::<usize>() {
         Ok(0) => Err("must be at least 1".to_string()),
         Ok(n) => Ok(n),
@@ -91,17 +91,38 @@ fn parse_limit(raw: &str) -> Result<usize, String> {
 
 pub async fn run_history(args: HistoryArgs, global: &GlobalOpts) -> KafkaResult<()> {
     let ops = Journal::default().load();
-    let audited = crate::governance::audit::op_digests();
-    let check = |op: &Operation| undo::digest_check(op, audited.get(&op.id).map(String::as_str));
     if let Some(HistoryCommand::Show { id }) = &args.command {
-        let op = undo::find(&ops, id).map_err(KafkaError::config)?;
-        return show(op, check(op), global);
+        return show_op(&ops, id, global);
     }
     let scope = (!args.all).then(|| {
         let admin = KafkaAdminClient::new(&global.to_kafka_config()).ok();
         current_scope(global, admin.as_ref())
     });
-    let selected = select(&ops, scope.as_ref(), &args);
+    list(&ops, scope.as_ref(), &args, global)
+}
+
+/// `history show ID`: one operation of `ops` in full.
+pub(crate) fn show_op(ops: &[Operation], id: &str, global: &GlobalOpts) -> KafkaResult<()> {
+    let audited = crate::governance::audit::op_digests();
+    let op = undo::find(ops, id).map_err(KafkaError::config)?;
+    show(
+        op,
+        undo::digest_check(op, audited.get(&op.id).map(String::as_str)),
+        global,
+    )
+}
+
+/// The table (or JSON list) of the operations of `ops` that `args` selects,
+/// those of `scope` only when given.
+pub(crate) fn list(
+    ops: &[Operation],
+    scope: Option<&Scope>,
+    args: &HistoryArgs,
+    global: &GlobalOpts,
+) -> KafkaResult<()> {
+    let audited = crate::governance::audit::op_digests();
+    let check = |op: &Operation| undo::digest_check(op, audited.get(&op.id).map(String::as_str));
+    let selected = select(ops, scope, args);
     if global.format == OutputFormat::Json {
         let items: Vec<_> = selected
             .iter()
@@ -112,7 +133,7 @@ pub async fn run_history(args: HistoryArgs, global: &GlobalOpts) -> KafkaResult<
     if selected.is_empty() {
         println!(
             "No recorded operations{} ({}).",
-            if args.all {
+            if scope.is_none() {
                 ""
             } else {
                 " on this cluster (try --all)"
@@ -284,6 +305,13 @@ fn show(op: &Operation, digest: DigestCheck, global: &GlobalOpts) -> KafkaResult
 
 pub async fn run_undo(args: UndoArgs, global: &GlobalOpts) -> KafkaResult<()> {
     let ops = Journal::default().load();
+    // A RabbitMQ operation is undone through that broker's management API,
+    // with its RabbitMQ profile: say so before connecting to Kafka.
+    if let Some(op) = args.id.as_deref().and_then(|id| undo::find(&ops, id).ok()) {
+        if let Some(refusal) = rabbitmq_refusal(op) {
+            return Err(KafkaError::config(refusal));
+        }
+    }
     let config = global.to_kafka_config();
     let admin = match KafkaAdminClient::new(&config) {
         Ok(admin) => admin,
@@ -483,10 +511,24 @@ pub async fn run_undo(args: UndoArgs, global: &GlobalOpts) -> KafkaResult<()> {
     }
 }
 
+/// Why `ferrika undo` does not undo `op`: it ran on RabbitMQ, which
+/// `ferrika rabbit undo` undoes.
+fn rabbitmq_refusal(op: &Operation) -> Option<String> {
+    if op.begin.scope.rabbitmq.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Operation {} ran on {}; undo it with `ferrika rabbit undo {}` (with          --rabbit-profile or --rabbit-url naming that broker)",
+        op.id,
+        op.begin.scope.describe(),
+        op.id
+    ))
+}
+
 /// The undo plan as `-f json` prints it: the plan's fields, `refused` (the
 /// reason, or null) and `result`, the outcome text once the undo ran or
 /// found nothing to do (null for a dry run or a refusal).
-fn plan_json<T: serde::Serialize>(
+pub(crate) fn plan_json<T: serde::Serialize>(
     plan: &T,
     refusal: Option<&str>,
     result: Option<&str>,
@@ -553,7 +595,7 @@ fn record_tampered(global: &GlobalOpts, op: &str, outcome: &str) {
 }
 
 /// Prints what undo found and would do.
-fn describe_plan(op: &Operation, plan: &UndoPlan) {
+pub(crate) fn describe_plan(op: &Operation, plan: &UndoPlan) {
     println!(
         "{} {} — {} {} ({})",
         "Undo".bold(),
@@ -664,6 +706,23 @@ mod tests {
             notes: vec![],
             undone_by: None,
         }
+    }
+
+    #[test]
+    fn kafka_undo_points_rabbitmq_operations_to_rabbit_undo() {
+        let mut rabbit = op("01JBX3K8Q2M7", "", "queue orders on vhost /", true);
+        rabbit.begin.scope = Scope {
+            profile: "dev-rabbit".into(),
+            rabbitmq: "rabbit:15672".into(),
+            ..Scope::default()
+        };
+        let refusal = rabbitmq_refusal(&rabbit).unwrap();
+        assert!(
+            refusal.contains("ferrika rabbit undo 01JBX3K8Q2M7"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("RabbitMQ rabbit:15672"), "{refusal}");
+        assert_eq!(rabbitmq_refusal(&op("A", "a:9092", "t", true)), None);
     }
 
     #[test]
