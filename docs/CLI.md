@@ -820,6 +820,10 @@ ferrika mirror orders-v1 orders-v1 --src-profile prod --dst-profile staging -g o
 ferrika mirror orders-v1 orders-v1 --src-profile prod --dst-profile dev -b --mask
 ```
 
+Records are copied with their headers in order, including repeated keys and
+headers with a null value (written as null, not as an empty value; `--mask`
+leaves them null).
+
 ### Stream transform (`ferrika transform`)
 
 Copies records from a topic (on the cluster the global options select) to
@@ -840,6 +844,10 @@ binary, JSON scalars and arrays) pass through them unchanged and are counted
 as "not JSON"; a `$.` filter on them is false. A value no step changed is
 written byte for byte; a changed one is written as compact JSON. Source
 timestamps and headers are kept; the partition follows the (new) key.
+Headers with a null value are written as null in their original positions:
+`--mask` leaves them null, and `--filter` reads them as missing
+(`headers.trace exists` is false for a null `trace`). The dry run shows
+their value as `null`.
 
 Without `--execute` the command is a dry run: it prints up to 10 transformed
 records (or `-n`) as JSON lines on stdout and writes nothing; the summary

@@ -296,7 +296,12 @@ pub(super) fn preview_record(
     record: &OwnedProducerRecord,
     mask: bool,
 ) -> Value {
-    let mut headers: Vec<&str> = record.headers.iter().map(|(k, _)| k.as_str()).collect();
+    let mut headers: Vec<&str> = record
+        .headers
+        .iter()
+        .map(|(k, _)| k.as_str())
+        .chain(record.null_headers.iter().map(|(_, k)| k.as_str()))
+        .collect();
     headers.sort();
     headers.dedup();
     json!({

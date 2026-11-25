@@ -17,6 +17,10 @@ versions, and 0.2.0 made it crate-internal.
   without the field restore exactly as before. Ferrika 0.2.0 and earlier
   ignore the field and restore a version 2 dump with null-valued headers as
   empty values. `consume --save` is unchanged (it still leaves them out).
+- `mirror` and `transform` copy headers with a null value as null, in their
+  original positions (they left them out). `transform --mask` leaves them
+  null, `--filter` reads them as missing, and the dry run shows them with a
+  `null` value; the MCP transform preview lists their names.
 - Library API (breaking): `ConsumedMessage` and `OwnedProducerRecord` have a
   new `null_headers` field (position and key of each null-valued header;
   `headers` still holds only the others). New: `ConsumedMessage::all_headers`,
