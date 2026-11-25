@@ -1,0 +1,36 @@
+[package]
+name = "ferrika-mqtt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Ferrika MQTT support (preview): bounded subscriptions, publishing, retained messages and connection profiles for MQTT 3.1.1 and 5 brokers"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["mqtt", "iot", "mosquitto", "retained", "devops"]
+categories = ["network-programming", "command-line-utilities"]
+
+# The OS credential store, the config directory and PII masking come from
+# ferrika-core.
+[dependencies]
+ferrika-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+# The MQTT 3.1.1 and 5 packet codec (`mqttbytes`) of rumqttc (Apache-2.0),
+# without any of its features: its TLS features pull rustls-webpki 0.102
+# (with open advisories) and the unmaintained rustls-pemfile. The
+# connection, TLS and acknowledgements are this crate's own (`client`).
+rumqttc = { version = "0.25.1", default-features = false }
+bytes = "1"
+# TLS for mqtts://: the workspace's rustls with the ring backend (no
+# aws-lc, no OpenSSL) and the OS trust store.
+rustls.workspace = true
+rustls-native-certs.workspace = true
+tokio-rustls.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

@@ -70,6 +70,44 @@ Library (`ferrika-rabbitmq`, `ferrika-core`):
 - `ResolvedRabbit::client` and `ResolvedRabbit::amqp_target` apply the TLS
   files; `client` fails when a file cannot be read.
 
+### MQTT support (preview)
+
+Added:
+
+- MQTT support (preview): `ferrika mqtt` for MQTT 3.1.1 and 5 brokers
+  (Mosquitto, EMQX, HiveMQ, MQTT bridges), in the new crate `ferrika-mqtt`
+  behind the `ferrika-cli` cargo feature `mqtt` (on by default; a build
+  with `--no-default-features` leaves it out). `mqtt sub FILTER` shows
+  messages until `--count` (default 10) or `--duration` (default 30 s);
+  `mqtt pub TOPIC -m TEXT` publishes (QoS 1 by default, `--retain`
+  explicit; MQTT 5 user properties and content type); `mqtt retained
+  FILTER` lists retained messages; `mqtt retained clear TOPIC` deletes one
+  (asks first, `--yes` to skip; changes nothing when there is none). Table
+  and `-f json` output (`sub` writes JSON Lines). TLS with `mqtts://` and
+  the OS trust store or `--mqtt-ca-file`. Every session is clean with a
+  fresh client id and no last will; shared subscriptions (`$share/`,
+  `$queue/`) are refused. See `docs/plans/mqtt.md`.
+- MQTT profiles: `ferrika mqtt profile add|list|use|remove|show`, stored in
+  `mqtt-profiles.json` next to `profiles.json`, passwords in the OS
+  credential store (`<profile>/mqtt_password`). Broker URLs never carry
+  credentials.
+- Policy category `messages.delete` (`mqtt retained clear`), which also
+  needs `produce` allowed. `mqtt pub` is `produce`; `mqtt sub` and
+  `mqtt retained` pass the export gate and mask PII (payloads, topics, MQTT
+  5 user properties) under the policy. The policy's broker-address rules
+  match the MQTT broker's `host:port`; read-only MQTT profiles refuse `pub`
+  and `retained clear`.
+- `tools/e2e/mqtt_smoke.py` and `tools/e2e/mosquitto-setup.sh`, and a CI
+  job running them against `eclipse-mosquitto:2`.
+
+Compatibility:
+
+- A signed policy whose `forbid` names `messages.delete` is invalid for
+  builds up to 0.2.0, which then run in the strictest mode. Roll it out
+  only once every client runs a newer build.
+- `PolicyAction` has a new variant, `MessagesDelete`; code that matches it
+  exhaustively must add it.
+
 ## 0.2.0
 
 New: connection presets for Kafka-compatible services, `ferrika transform`,
