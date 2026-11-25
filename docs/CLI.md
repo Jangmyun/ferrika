@@ -888,8 +888,12 @@ ferrika offset reset billing-service -t orders-v1 --to-earliest
 # Execute reset to high watermark (skip all accumulated consumer group lag)
 ferrika offset reset billing-service -t orders-v1 --to-latest --execute
 
-# Rewind consumer group by 1,000 messages (replay historical events)
+# Rewind consumer group by 1,000 messages (replay historical events).
+# Refused if the group has no committed offset on a partition: nothing to shift from
 ferrika offset reset billing-service -t orders-v1 --shift-by -1000 --execute
+
+# The same, shifting partitions without a committed offset back from their end
+ferrika offset reset billing-service -t orders-v1 --shift-by -1000 --shift-uncommitted-from latest --execute
 
 # Reset specific partition to explicit offset
 ferrika offset reset billing-service -t orders-v1 -p 0 --to-offset 150000 --execute

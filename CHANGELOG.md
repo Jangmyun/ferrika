@@ -7,6 +7,37 @@ module is the command line's own code (argument structs, the command enum),
 not a library API; options added to commands changed it in 0.1 patch
 versions, and 0.2.0 made it crate-internal.
 
+## Unreleased
+
+Targeted at 0.3.
+
+### Breaking
+
+- `offset reset --shift-by N` no longer shifts partitions on which the group
+  has no committed offset from the low watermark without saying so. Such a
+  reset is now refused as a whole, dry run or not: the error names the
+  partitions without a commit, the command exits non-zero and no offset is
+  changed (none of the committed partitions either). To shift them anyway,
+  say where they start with the new `--shift-uncommitted-from earliest`
+  (the 0.2 behaviour: from the low watermark) or
+  `--shift-uncommitted-from latest` (from the end of the partition); it
+  needs `--shift-by` and changes nothing on committed partitions. Limiting
+  the reset to a committed partition with `-p` also works.
+- MCP `reset_consumer_group_offsets`: `{"shift": N}` is refused the same
+  way, at plan time, with the error code `uncommitted_partitions`. The new
+  `{"shift": N, "uncommitted_from": "earliest" | "latest"}` opts in.
+- Library (`ferrika-core::kafka::offset_reset`):
+  - `ResetStrategy::Shift(i64)` is now
+    `ResetStrategy::Shift { delta: i64, uncommitted: Option<UncommittedBase> }`;
+    `ResetStrategy::shift(delta)` builds the refusing form. New enum
+    `UncommittedBase { Earliest, Latest }`.
+  - `calculate_target_offset` returns `Option<i64>`: `None` for a shift on
+    a partition without a committed offset and no base.
+  - `prepare_offset_reset` refuses such a shift with the new error variant
+    `KafkaError::UncommittedShift { group, topic, partitions }`. New
+    `plan_offset_reset` and `PartitionPosition` plan a reset from offsets
+    already read, with the same refusal.
+
 ## 0.2.0
 
 New: connection presets for Kafka-compatible services, `ferrika transform`,
