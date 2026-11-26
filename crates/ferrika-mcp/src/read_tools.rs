@@ -198,6 +198,7 @@ pub(super) fn tool_definitions(with_peek: bool) -> Value {
     }
     if let Some(list) = tools.as_array_mut() {
         list.extend(crate::rabbit_tools::definitions());
+        list.extend(crate::connect_tools::definitions());
         // `ksql_query` returns rows: hidden with the other record tools.
         list.extend(crate::ksql_tools::definitions(with_peek));
     }
@@ -240,6 +241,9 @@ pub(super) async fn call_tool(
             Ok(()) => crate::transform_tools::preview(context, policy, &args).await,
             Err(e) => Err(e),
         },
+        connect if crate::connect_tools::CONNECT_TOOLS.contains(&connect) => {
+            crate::connect_tools::call(name, &args, context).await
+        }
         rabbit if crate::rabbit_tools::RABBIT_TOOLS.contains(&rabbit) => {
             crate::rabbit_tools::call(name, &args).await
         }

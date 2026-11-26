@@ -7,8 +7,8 @@ use serde::Serialize;
 
 use ferrika_core::model::acl::AclBinding;
 use ferrika_core::model::history::{
-    acl_label, Operation, PartitionReplicas, RabbitBindingKey, RabbitExchangeDeclaration,
-    RabbitQueueDeclaration, Reversibility, SchemaVersion, State,
+    acl_label, ConnectorOffset, Operation, PartitionReplicas, RabbitBindingKey,
+    RabbitExchangeDeclaration, RabbitQueueDeclaration, Reversibility, SchemaVersion, State,
 };
 use ferrika_core::model::policy::PolicyAction;
 
@@ -87,6 +87,16 @@ pub enum Step {
     ResumeConnector {
         name: String,
     },
+    /// Stops a connector (Kafka Connect 3.5+).
+    StopConnector {
+        name: String,
+    },
+    /// Sets connector offsets back (Kafka Connect 3.6+, the connector
+    /// stopped); an entry without an offset resets its partition.
+    AlterConnectorOffsets {
+        name: String,
+        offsets: Vec<ConnectorOffset>,
+    },
     /// Declares a RabbitMQ queue again (its messages are not restored).
     DeclareQueue {
         vhost: String,
@@ -137,7 +147,9 @@ impl Step {
             Self::PutConnector { .. }
             | Self::DeleteConnector { .. }
             | Self::PauseConnector { .. }
-            | Self::ResumeConnector { .. } => PolicyAction::ConnectChange,
+            | Self::ResumeConnector { .. }
+            | Self::StopConnector { .. }
+            | Self::AlterConnectorOffsets { .. } => PolicyAction::ConnectChange,
             Self::DeclareQueue { .. } => PolicyAction::QueuesCreate,
             Self::DeleteQueue { .. } => PolicyAction::QueuesDelete,
             Self::DeclareExchange { .. } => PolicyAction::ExchangesCreate,
@@ -179,7 +191,9 @@ impl Step {
             | Self::PutConnector { .. }
             | Self::DeleteConnector { .. }
             | Self::PauseConnector { .. }
-            | Self::ResumeConnector { .. } => None,
+            | Self::ResumeConnector { .. }
+            | Self::StopConnector { .. }
+            | Self::AlterConnectorOffsets { .. } => None,
         }
     }
 
@@ -268,6 +282,11 @@ impl Step {
             Self::DeleteConnector { name } => format!("delete connector {name}"),
             Self::PauseConnector { name } => format!("pause connector {name}"),
             Self::ResumeConnector { name } => format!("resume connector {name}"),
+            Self::StopConnector { name } => format!("stop connector {name}"),
+            Self::AlterConnectorOffsets { name, offsets } => format!(
+                "set the previous offsets of connector {name} on {} (the connector must be stopped)",
+                count(offsets.len(), "partition")
+            ),
             Self::DeclareQueue {
                 vhost,
                 name,
@@ -296,6 +315,26 @@ impl Step {
             Self::Unbind { vhost, binding } => {
                 format!("unbind {} on vhost {vhost}", binding.label())
             }
+        }
+    }
+}
+
+/// Whether a connector runs, is paused or is stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunState {
+    Running,
+    Paused,
+    Stopped,
+}
+
+impl RunState {
+    fn of(paused: bool, stopped: bool) -> Self {
+        if stopped {
+            Self::Stopped
+        } else if paused {
+            Self::Paused
+        } else {
+            Self::Running
         }
     }
 }
@@ -586,11 +625,13 @@ pub fn restore_steps(before: &State, current: &State) -> Result<Vec<Step>, NotRe
                 name,
                 config,
                 paused,
+                stopped,
                 secret_keys,
             },
             State::Connector {
                 config: now_config,
                 paused: now_paused,
+                stopped: now_stopped,
                 secret_keys: now_secrets,
                 ..
             },
@@ -620,15 +661,47 @@ pub fn restore_steps(before: &State, current: &State) -> Result<Vec<Step>, NotRe
                     });
                 }
                 // A re-created connector starts running.
-                let now_paused = now_config.is_some() && *now_paused;
-                if *paused && !now_paused {
-                    steps.push(Step::PauseConnector { name: name.clone() });
-                } else if !*paused && now_paused {
-                    steps.push(Step::ResumeConnector { name: name.clone() });
+                let exists = now_config.is_some();
+                let was = RunState::of(*paused, *stopped);
+                let now = RunState::of(exists && *now_paused, exists && *now_stopped);
+                if was != now {
+                    let name = name.clone();
+                    steps.push(match was {
+                        RunState::Running => Step::ResumeConnector { name },
+                        RunState::Paused => Step::PauseConnector { name },
+                        RunState::Stopped => Step::StopConnector { name },
+                    });
                 }
                 steps
             }
         },
+        (
+            State::ConnectorOffsets { name, offsets },
+            State::ConnectorOffsets {
+                offsets: now_offsets,
+                ..
+            },
+        ) => {
+            let changed: Vec<ConnectorOffset> = offsets
+                .iter()
+                .filter(|before| {
+                    let now = now_offsets
+                        .iter()
+                        .find(|n| n.partition == before.partition)
+                        .and_then(|n| n.offset.as_ref());
+                    now != before.offset.as_ref()
+                })
+                .cloned()
+                .collect();
+            if changed.is_empty() {
+                vec![]
+            } else {
+                vec![Step::AlterConnectorOffsets {
+                    name: name.clone(),
+                    offsets: changed,
+                }]
+            }
+        }
         (
             State::RabbitQueue {
                 vhost,
@@ -987,6 +1060,7 @@ mod tests {
             name: "c".into(),
             config,
             paused,
+            stopped: false,
             secret_keys: vec![],
         };
         assert_eq!(
@@ -1012,6 +1086,78 @@ mod tests {
             .unwrap(),
             vec![Step::ResumeConnector { name: "c".into() }]
         );
+    }
+
+    #[test]
+    fn connector_stop_is_undone_by_resuming_or_pausing() {
+        let config = BTreeMap::from([("connector.class".to_string(), "X".to_string())]);
+        let state = |paused, stopped| State::Connector {
+            name: "c".into(),
+            config: Some(config.clone()),
+            paused,
+            stopped,
+            secret_keys: vec![],
+        };
+        let name = || "c".to_string();
+        // Stopped a running connector: resume it.
+        assert_eq!(
+            restore_steps(&state(false, false), &state(false, true)).unwrap(),
+            vec![Step::ResumeConnector { name: name() }]
+        );
+        // Stopped a paused one: pause it again.
+        assert_eq!(
+            restore_steps(&state(true, false), &state(false, true)).unwrap(),
+            vec![Step::PauseConnector { name: name() }]
+        );
+        // Resumed a stopped one: stop it again.
+        let undo = restore_steps(&state(false, true), &state(false, false)).unwrap();
+        assert_eq!(undo, vec![Step::StopConnector { name: name() }]);
+        assert_eq!(undo[0].policy_action(), PolicyAction::ConnectChange);
+        assert!(restore_steps(&state(false, true), &state(false, true))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn connector_offsets_undo_sets_the_recorded_offsets_back() {
+        let offsets = |values: &[Option<i64>]| State::ConnectorOffsets {
+            name: "sink".into(),
+            offsets: values
+                .iter()
+                .enumerate()
+                .map(|(p, o)| ConnectorOffset::sink("orders", p as i32, *o))
+                .collect(),
+        };
+        // Partition 0 was moved, 1 unchanged, 2 had no offset before.
+        let steps = restore_steps(
+            &offsets(&[Some(10), Some(5), None]),
+            &offsets(&[Some(0), Some(5), Some(3)]),
+        )
+        .unwrap();
+        assert_eq!(
+            steps,
+            vec![Step::AlterConnectorOffsets {
+                name: "sink".into(),
+                offsets: vec![
+                    ConnectorOffset::sink("orders", 0, Some(10)),
+                    ConnectorOffset::sink("orders", 2, None),
+                ],
+            }]
+        );
+        assert_eq!(steps[0].policy_action(), PolicyAction::ConnectChange);
+        assert!(steps[0].describe().contains("2 partitions"));
+        // After a reset nothing is left: every recorded offset comes back.
+        let now = State::ConnectorOffsets {
+            name: "sink".into(),
+            offsets: vec![],
+        };
+        let steps = restore_steps(&offsets(&[Some(10), Some(5)]), &now).unwrap();
+        assert!(
+            matches!(&steps[..], [Step::AlterConnectorOffsets { offsets, .. }] if offsets.len() == 2)
+        );
+        assert!(restore_steps(&offsets(&[Some(1)]), &offsets(&[Some(1)]))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

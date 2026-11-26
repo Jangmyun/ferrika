@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::model::acl::AclBinding;
+pub use crate::model::connect::ConnectorOffset;
 use crate::model::schema::SchemaReference;
 
 /// Version of the journal line format.
@@ -363,9 +364,20 @@ pub enum State {
         config: Option<BTreeMap<String, String>>,
         #[serde(default)]
         paused: bool,
+        /// Whether the connector is stopped (Kafka Connect 3.5+, KIP-875):
+        /// no tasks run. Left out of the journal when false, so lines
+        /// recorded before it existed read the same.
+        #[serde(default, skip_serializing_if = "is_false")]
+        stopped: bool,
         /// Config keys whose values are kept out of the journal (secrets).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         secret_keys: Vec<String>,
+    },
+    /// Offsets of a Kafka Connect connector (KIP-875), limited to the
+    /// partitions an operation changes; `offset: None` = no offset.
+    ConnectorOffsets {
+        name: String,
+        offsets: Vec<ConnectorOffset>,
     },
     /// A RabbitMQ queue's declaration; `None` when there is no such queue.
     /// Ferrika 0.2 does not know the `rabbit_*` kinds and skips the journal
@@ -421,6 +433,7 @@ impl State {
                 format!("subject {subject}")
             }
             Self::Connector { name, .. } => format!("connector {name}"),
+            Self::ConnectorOffsets { name, .. } => format!("offsets of connector {name}"),
             Self::RabbitQueue { vhost, name, .. }
             | Self::RabbitQueueMessages { vhost, name, .. } => {
                 format!("queue {name} on vhost {vhost}")
@@ -450,7 +463,8 @@ impl State {
             | Self::Scram { .. }
             | Self::SubjectCompat { .. }
             | Self::SubjectVersions { .. }
-            | Self::Connector { .. } => false,
+            | Self::Connector { .. }
+            | Self::ConnectorOffsets { .. } => false,
         }
     }
 
@@ -519,12 +533,18 @@ impl State {
             Self::Connector {
                 config,
                 paused,
+                stopped,
                 secret_keys,
                 ..
             } => {
                 out.insert("exists".into(), yes_no(config.is_some()));
                 if let Some(config) = config {
                     out.insert("paused".into(), yes_no(*paused));
+                    // Only when stopped, so states recorded before Ferrika
+                    // knew stopped connectors compare as before.
+                    if *stopped {
+                        out.insert("stopped".into(), yes_no(true));
+                    }
                     for (key, value) in config {
                         let text = if secret_keys.contains(key) {
                             "(secret)".to_string()
@@ -532,6 +552,13 @@ impl State {
                             value.clone()
                         };
                         out.insert(format!("config {key}"), text);
+                    }
+                }
+            }
+            Self::ConnectorOffsets { offsets, .. } => {
+                for o in offsets {
+                    if let Some(offset) = o.offset_text() {
+                        out.insert(format!("offset {}", o.partition_text()), offset);
                     }
                 }
             }
@@ -622,6 +649,10 @@ impl State {
             Self::SubjectCompat { subject, .. } => vec![format!("subject:{subject}/compat")],
             Self::SubjectVersions { subject, .. } => vec![format!("subject:{subject}/versions")],
             Self::Connector { name, .. } => vec![format!("connector:{name}")],
+            Self::ConnectorOffsets { name, offsets } => offsets
+                .iter()
+                .map(|o| format!("connector:{name}/offset:{}", o.partition_text()))
+                .collect(),
             Self::RabbitQueue { vhost, name, .. } => vec![format!("rabbit-queue:{name}@{vhost}")],
             Self::RabbitQueueMessages { vhost, name, .. } => {
                 vec![format!("rabbit-queue-messages:{name}@{vhost}")]
@@ -649,6 +680,10 @@ fn arguments_entries(
         };
         out.insert(format!("argument {key}"), text);
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn yes_no(value: bool) -> String {
@@ -1028,6 +1063,55 @@ pub fn new_op_id(time_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connector_stop_and_offsets_states() {
+        let running = State::Connector {
+            name: "c".into(),
+            config: Some(BTreeMap::new()),
+            paused: false,
+            stopped: false,
+            secret_keys: vec![],
+        };
+        // Not stopped: written as before the field existed.
+        let line = serde_json::to_string(&running).unwrap();
+        assert!(!line.contains("stopped"), "{line}");
+        let old: State =
+            serde_json::from_str(r#"{"kind":"connector","name":"c","config":{},"paused":false}"#)
+                .unwrap();
+        assert_eq!(old, running);
+        let mut stopped = running.clone();
+        if let State::Connector { stopped: s, .. } = &mut stopped {
+            *s = true;
+        }
+        assert!(!stopped.same_as(&running));
+        assert_eq!(
+            stopped.entries().get("stopped").map(String::as_str),
+            Some("yes")
+        );
+
+        let offsets = State::ConnectorOffsets {
+            name: "sink".into(),
+            offsets: vec![
+                ConnectorOffset::sink("orders", 0, Some(5)),
+                ConnectorOffset::sink("orders", 1, None),
+            ],
+        };
+        assert_eq!(offsets.subject(), "offsets of connector sink");
+        let entries = offsets.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries
+                .get(r#"offset {"kafka_partition":0,"kafka_topic":"orders"}"#)
+                .map(String::as_str),
+            Some(r#"{"kafka_offset":5}"#)
+        );
+        assert_eq!(offsets.resource_keys().len(), 2);
+        assert!(!offsets.is_rabbitmq());
+        let line = serde_json::to_string(&offsets).unwrap();
+        assert!(line.contains(r#""kind":"connector_offsets""#), "{line}");
+        assert_eq!(serde_json::from_str::<State>(&line).unwrap(), offsets);
+    }
 
     fn config(topic: &str, key: &str, own: Option<&str>) -> State {
         State::TopicConfig {

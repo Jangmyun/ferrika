@@ -11,7 +11,8 @@ use ferrika_core::kafka::schema::SchemaRegistryClient;
 use ferrika_core::kafka::wire;
 use ferrika_core::model::acl::{AclBinding, AclFilter};
 use ferrika_core::model::history::{
-    AclPresence, ConfigValue, PartitionOffset, PartitionReplicas, SchemaVersion, State,
+    AclPresence, ConfigValue, ConnectorOffset, PartitionOffset, PartitionReplicas, SchemaVersion,
+    State,
 };
 
 /// Runs a blocking (wire protocol) call off the async threads.
@@ -385,13 +386,15 @@ pub async fn subject_versions(
 }
 
 /// Connector `name`: its config (with secret values, which the recorder
-/// moves to the credential store) and whether it is paused.
+/// moves to the credential store) and whether it is paused or stopped.
 pub async fn connector(connect: &ConnectClient, name: &str) -> KafkaResult<State> {
     let config = connect.get_config(name).await?;
-    let paused = match &config {
-        Some(_) => connect.status(name).await?.as_deref() == Some("PAUSED"),
-        None => false,
+    let state = match &config {
+        Some(_) => connect.status(name).await?,
+        None => None,
     };
+    let paused = state.as_deref() == Some("PAUSED");
+    let stopped = state.as_deref() == Some("STOPPED");
     let secret_keys = config
         .iter()
         .flatten()
@@ -402,8 +405,44 @@ pub async fn connector(connect: &ConnectClient, name: &str) -> KafkaResult<State
         name: name.to_string(),
         config,
         paused,
+        stopped,
         secret_keys,
     })
+}
+
+/// The offsets of connector `name` (Kafka Connect 3.5+): all of them, or
+/// only the partitions of `only` (each with `offset: None` when it has
+/// none), in the order of `only`.
+pub async fn connector_offsets(
+    connect: &ConnectClient,
+    name: &str,
+    only: Option<&[ConnectorOffset]>,
+) -> KafkaResult<State> {
+    let current = connect.offsets(name).await?;
+    Ok(State::ConnectorOffsets {
+        name: name.to_string(),
+        offsets: select_connector_offsets(current, only),
+    })
+}
+
+/// `current` limited to the partitions of `only` (all without it).
+pub fn select_connector_offsets(
+    current: Vec<ConnectorOffset>,
+    only: Option<&[ConnectorOffset]>,
+) -> Vec<ConnectorOffset> {
+    match only {
+        None => current,
+        Some(wanted) => wanted
+            .iter()
+            .map(|w| ConnectorOffset {
+                partition: w.partition.clone(),
+                offset: current
+                    .iter()
+                    .find(|c| c.partition == w.partition)
+                    .and_then(|c| c.offset.clone()),
+            })
+            .collect(),
+    }
 }
 
 /// Reads the resource `state` describes again, for the same items, as it
@@ -458,6 +497,9 @@ pub async fn recapture(
              (ferrika_ops::history::rabbit), not a Kafka client",
             state.subject()
         ))),
+        State::ConnectorOffsets { name, offsets } => {
+            connector_offsets(&connect(config)?, name, Some(offsets)).await
+        }
         State::Connector { name, .. } => {
             let mut state = connector(&connect(config)?, name).await?;
             // Secret values stay out of comparisons and memory alike.
@@ -489,6 +531,26 @@ mod tests {
             read_only: false,
             sensitive,
         }
+    }
+
+    #[test]
+    fn selected_connector_offsets_follow_the_wanted_partitions() {
+        let current = vec![
+            ConnectorOffset::sink("orders", 0, Some(7)),
+            ConnectorOffset::sink("orders", 1, Some(3)),
+        ];
+        let wanted = [
+            ConnectorOffset::sink("orders", 1, Some(100)),
+            ConnectorOffset::sink("orders", 2, Some(5)),
+        ];
+        assert_eq!(
+            select_connector_offsets(current.clone(), Some(&wanted)),
+            vec![
+                ConnectorOffset::sink("orders", 1, Some(3)),
+                ConnectorOffset::sink("orders", 2, None),
+            ]
+        );
+        assert_eq!(select_connector_offsets(current.clone(), None), current);
     }
 
     #[test]

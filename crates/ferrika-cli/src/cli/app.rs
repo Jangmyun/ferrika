@@ -862,6 +862,22 @@ fn write_action(command: &Commands) -> Option<&'static str> {
             cli::connect::ConnectSubcommands::RestartTask { .. } => Some("connect restart-task"),
             cli::connect::ConnectSubcommands::Apply { .. } => Some("connect apply"),
             cli::connect::ConnectSubcommands::Delete { .. } => Some("connect delete"),
+            cli::connect::ConnectSubcommands::Stop { .. } => Some("connect stop"),
+            // Connector offsets are `connect.change`: they are the
+            // connector's own state, changed through the Connect REST API
+            // like its config (which can point it at other topics too).
+            cli::connect::ConnectSubcommands::Offsets {
+                reset: true,
+                execute: true,
+                ..
+            } => Some("connect offsets --reset"),
+            cli::connect::ConnectSubcommands::Offsets {
+                set: Some(_),
+                execute: true,
+                ..
+            } => Some("connect offsets --set"),
+            // Showing the offsets, or a preview of a change.
+            cli::connect::ConnectSubcommands::Offsets { .. } => None,
             cli::connect::ConnectSubcommands::List
             | cli::connect::ConnectSubcommands::Status { .. }
             | cli::connect::ConnectSubcommands::Plugins
@@ -1156,6 +1172,8 @@ fn write_target(command: &Commands) -> String {
             | cli::connect::ConnectSubcommands::Resume { name }
             | cli::connect::ConnectSubcommands::Restart { name }
             | cli::connect::ConnectSubcommands::RestartTask { name, .. }
+            | cli::connect::ConnectSubcommands::Stop { name }
+            | cli::connect::ConnectSubcommands::Offsets { name, .. }
             | cli::connect::ConnectSubcommands::Delete { name, .. } => format!("connector {name}"),
             cli::connect::ConnectSubcommands::Apply { file, name } => match name {
                 Some(name) => format!("connector {name} from {file}"),
@@ -1199,12 +1217,14 @@ mod tests {
         "connect apply",
         "connect delete",
         "connect list",
+        "connect offsets",
         "connect pause",
         "connect plugins",
         "connect restart",
         "connect restart-task",
         "connect resume",
         "connect status",
+        "connect stop",
         "connect validate",
         "crypto audit",
         "diff",
@@ -1619,6 +1639,50 @@ mod tests {
     }
 
     #[test]
+    fn connector_stop_and_offset_changes_are_connect_changes() {
+        use model::policy::PolicyAction;
+        for (args, action) in [
+            (&["connect", "stop", "s3"][..], "connect stop"),
+            (
+                &["connect", "offsets", "s3", "--reset", "--execute"][..],
+                "connect offsets --reset",
+            ),
+            (
+                &["connect", "offsets", "s3", "--set", "o.json", "--execute"][..],
+                "connect offsets --set",
+            ),
+        ] {
+            let cmd = command(args);
+            assert!(may_write(&cmd), "{args:?}");
+            assert_eq!(write_action(&cmd), Some(action), "{args:?}");
+            assert_eq!(write_target(&cmd), "connector s3", "{args:?}");
+            assert_eq!(PolicyAction::from_cli(action), PolicyAction::ConnectChange);
+            assert!(records_history(action), "{action}");
+            assert_eq!(export_gate(&cmd), None, "{args:?}");
+        }
+        // Showing offsets and previewing a change write nothing.
+        for args in [
+            &["connect", "offsets", "s3"][..],
+            &["connect", "offsets", "s3", "--reset"][..],
+            &["connect", "offsets", "s3", "--set", "{}"][..],
+        ] {
+            assert_eq!(write_action(&command(args)), None, "{args:?}");
+        }
+        // --execute needs a change, and --reset and --set exclude each other.
+        for args in [
+            &["ferrika", "connect", "offsets", "s3", "--execute"][..],
+            &[
+                "ferrika", "connect", "offsets", "s3", "--reset", "--set", "x.json",
+            ][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(args.iter().copied()).is_err(),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn only_commands_that_record_history_get_an_operation_id() {
         for label in [
             "topics config",
@@ -1627,6 +1691,9 @@ mod tests {
             "acl delete --force",
             "schema compat --set",
             "connect apply",
+            "connect stop",
+            "connect offsets --reset",
+            "connect offsets --set",
             "reassign execute",
             "rabbit queue declare",
             "rabbit queue delete",
