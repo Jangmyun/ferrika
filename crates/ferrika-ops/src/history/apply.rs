@@ -26,7 +26,8 @@ pub struct Target<'a> {
 /// Conditions that stop undo outright, even with `--force`: a topic made
 /// by the change now holds records or committed offsets (deleting it would
 /// lose data), a group to rewind has active members, connector secrets
-/// were not kept. One message per problem.
+/// were not kept, a connector whose offsets to set back is not stopped.
+/// One message per problem.
 pub async fn blockers(steps: &[Step], target: &Target<'_>) -> Vec<String> {
     let mut problems = Vec::new();
     for step in steps {
@@ -50,6 +51,20 @@ pub async fn blockers(steps: &[Step], target: &Target<'_>) -> Vec<String> {
                         }
                     }
                     Err(e) => problems.push(format!("cannot read the state of group {group}: {e}")),
+                }
+            }
+            // Offsets change only while the connector is stopped.
+            Step::AlterConnectorOffsets { name, .. } => {
+                match connect(target.config) {
+                    Ok(client) => match client.status(name).await {
+                        Ok(Some(state)) if state == "STOPPED" => {}
+                        Ok(Some(state)) => problems.push(format!(
+                            "connector {name} is {state}; its offsets can be set back only while it is stopped (ferrika connect stop {name})"
+                        )),
+                        Ok(None) => problems.push(format!("connector {name} no longer exists")),
+                        Err(e) => problems.push(format!("cannot read the state of connector {name}: {e}")),
+                    },
+                    Err(e) => problems.push(e.to_string()),
                 }
             }
             Step::PutConnector {
@@ -302,6 +317,11 @@ pub async fn run(step: &Step, target: &Target<'_>) -> KafkaResult<()> {
                 .act(name, ferrika_core::kafka::connect::ConnectorAction::Resume)
                 .await
         }
+        Step::StopConnector { name } => connect(config)?.stop(name).await,
+        Step::AlterConnectorOffsets { name, offsets } => connect(config)?
+            .alter_offsets(name, offsets)
+            .await
+            .map(|_| ()),
         Step::DeclareQueue { .. }
         | Step::DeleteQueue { .. }
         | Step::DeclareExchange { .. }

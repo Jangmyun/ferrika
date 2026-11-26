@@ -1150,6 +1150,7 @@ mod tests {
                 ("connection.password".to_string(), secret.to_string()),
             ])),
             paused: false,
+            stopped: false,
             secret_keys: vec!["connection.password".into()],
         }
     }

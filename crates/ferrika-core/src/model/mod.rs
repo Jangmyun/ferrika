@@ -1,5 +1,6 @@
 pub mod acl;
 pub mod cluster;
+pub mod connect;
 pub mod expr;
 pub mod filter;
 pub mod format;

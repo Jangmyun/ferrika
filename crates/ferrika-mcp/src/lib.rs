@@ -8,6 +8,8 @@
 //! RabbitMQ profile without reading message bodies. ksqlDB tools (preview)
 //! list and describe the profile's ksqlDB server's streams and tables and
 //! run bounded `SELECT` queries (rows PII-masked, through the export gate).
+//! Kafka Connect tools list the profile's connectors with their tasks'
+//! failure traces, and show one connector's masked config and offsets.
 //!
 //! [`WriteOptions`] add write tools (`write_tools.rs`). Each write is
 //! planned, then confirmed, then run, and passes the same company policy,
@@ -19,6 +21,7 @@
 //! server, gated per statement like `ferrika ksql exec`.
 
 mod backend;
+mod connect_tools;
 mod guard;
 mod ksql_tools;
 mod ksql_writes;

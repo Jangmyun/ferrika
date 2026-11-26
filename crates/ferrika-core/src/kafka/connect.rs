@@ -1,6 +1,8 @@
 //! Kafka Connect REST client: list connectors with their status and config,
-//! and pause, resume or restart them. Plain HTTP (no TLS), like the Schema
-//! Registry client.
+//! pause, resume, restart or stop them, and read, alter or reset their
+//! offsets (KIP-875). Stopping and reading offsets need Kafka Connect 3.5 or
+//! later, altering and resetting offsets 3.6 or later; older workers answer
+//! with an error that says so.
 
 use std::collections::BTreeMap;
 
@@ -9,6 +11,13 @@ use serde_json::Value;
 
 use crate::error::{KafkaError, KafkaResult};
 use crate::kafka::schema::path_segment;
+pub use crate::model::connect::{all_sink, parse_offsets_json, ConnectorOffset, SinkOffset};
+
+/// What an older Connect worker lacks, for the error it causes.
+const NEEDS_STOP: &str = "Stopping a connector needs Kafka Connect 3.5 or later";
+const NEEDS_OFFSETS: &str = "Reading connector offsets needs Kafka Connect 3.5 or later";
+const NEEDS_ALTER: &str =
+    "Altering or resetting connector offsets needs Kafka Connect 3.6 or later";
 
 /// One connector with its state and tasks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +28,9 @@ pub struct ConnectorView {
     /// RUNNING, PAUSED, FAILED, UNASSIGNED, RESTARTING, STOPPED.
     pub state: String,
     pub worker: String,
+    /// The stack trace of a failed connector (its tasks have their own).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<String>,
     /// The `connector.class` config.
     pub class: String,
     pub config: BTreeMap<String, String>,
@@ -179,7 +191,61 @@ impl ConnectClient {
         parse_config_object(&success_body(response)?).map(Some)
     }
 
-    /// The state of connector `name` (RUNNING, PAUSED, ...), `None` when
+    /// Stops connector `name` (`PUT /connectors/{name}/stop`, Kafka
+    /// Connect 3.5+): its tasks shut down and release their resources, but
+    /// the config stays. `resume` starts it again; offsets can be altered
+    /// or reset only while it is stopped.
+    pub async fn stop(&self, name: &str) -> KafkaResult<()> {
+        let response = self
+            .send("PUT", &format!("{}/stop", connector_path(name)), None)
+            .await?;
+        feature_body(response, name, NEEDS_STOP).map(|_| ())
+    }
+
+    /// The offsets of connector `name` (`GET /connectors/{name}/offsets`,
+    /// Kafka Connect 3.5+). A sink connector's are its consumer group's
+    /// (see [`ConnectorOffset::as_sink`]); a source connector's are the
+    /// maps it stores. Empty when it has none yet.
+    pub async fn offsets(&self, name: &str) -> KafkaResult<Vec<ConnectorOffset>> {
+        let response = self
+            .send("GET", &format!("{}/offsets", connector_path(name)), None)
+            .await?;
+        parse_offsets_json(&feature_body(response, name, NEEDS_OFFSETS)?)
+    }
+
+    /// Sets the offsets of the partitions in `offsets` (`PATCH
+    /// /connectors/{name}/offsets`, Kafka Connect 3.6+); an entry without
+    /// an offset resets its partition. The connector must be STOPPED.
+    /// Returns the worker's message.
+    pub async fn alter_offsets(
+        &self,
+        name: &str,
+        offsets: &[ConnectorOffset],
+    ) -> KafkaResult<String> {
+        let body = serde_json::to_string(&serde_json::json!({ "offsets": offsets }))
+            .map_err(|e| err(format!("Invalid connector offsets: {e}")))?;
+        let response = self
+            .send(
+                "PATCH",
+                &format!("{}/offsets", connector_path(name)),
+                Some(&body),
+            )
+            .await?;
+        feature_body(response, name, NEEDS_ALTER).map(|body| response_message(&body))
+    }
+
+    /// Deletes every offset of connector `name` (`DELETE
+    /// /connectors/{name}/offsets`, Kafka Connect 3.6+), so it starts over
+    /// as if new. The connector must be STOPPED. Returns the worker's
+    /// message.
+    pub async fn reset_offsets(&self, name: &str) -> KafkaResult<String> {
+        let response = self
+            .send("DELETE", &format!("{}/offsets", connector_path(name)), None)
+            .await?;
+        feature_body(response, name, NEEDS_ALTER).map(|body| response_message(&body))
+    }
+
+    /// The state of connector `name` (RUNNING, PAUSED, STOPPED, ...), `None` when
     /// there is no such connector.
     pub async fn status(&self, name: &str) -> KafkaResult<Option<String>> {
         let response = self
@@ -234,6 +300,51 @@ fn success_body(response: crate::kafka::http::Response) -> KafkaResult<String> {
             response.error_message()
         )))
     }
+}
+
+/// The body of a 2xx answer to a request older workers do not know.
+/// Connect answers 404 both for an unknown connector ("Connector x not
+/// found") and for a path it does not have ("HTTP 404 Not Found"), and some
+/// versions 405 for a method it does not take: those say the worker is too
+/// old (`needs`). A 400 about the STOPPED state gets the command that stops
+/// the connector.
+fn feature_body(
+    response: crate::kafka::http::Response,
+    name: &str,
+    needs: &str,
+) -> KafkaResult<String> {
+    if response.is_success() {
+        return Ok(response.body);
+    }
+    let message = response.error_message();
+    match response.status {
+        404 if unknown_connector(&message, name) => {
+            Err(err(format!("No connector named '{name}'")))
+        }
+        404 | 405 => Err(err(format!(
+            "{needs} (the worker answered {}: {message})",
+            response.status
+        ))),
+        400 | 409 if message.contains("STOPPED") => Err(err(format!(
+            "Connector '{name}' must be STOPPED before its offsets can be changed; stop it with `ferrika connect stop {name}` (Kafka Connect said: {message})"
+        ))),
+        _ => success_body(response),
+    }
+}
+
+/// Whether a 404 message names connector `name` as missing (rather than
+/// the path being unknown to an older worker).
+fn unknown_connector(message: &str, name: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("not found") && message.contains(name) && !lower.starts_with("http 404")
+}
+
+/// The `message` of a Connect answer, or the body itself.
+fn response_message(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_else(|| body.trim().to_string())
 }
 
 /// A `GET /connectors/{name}/config` answer, values stringified.
@@ -403,6 +514,10 @@ fn parse_connectors(body: &str) -> KafkaResult<Vec<ConnectorView>> {
                     .to_lowercase(),
                 state: text(connector_status.and_then(|c| c.get("state"))),
                 worker: text(connector_status.and_then(|c| c.get("worker_id"))),
+                trace: connector_status
+                    .and_then(|c| c.get("trace"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 class: config.get("connector.class").cloned().unwrap_or_default(),
                 config,
                 tasks,
@@ -472,6 +587,13 @@ mod tests {
         assert_eq!(c.class, "io.confluent.JdbcSink");
         assert_eq!(c.running_tasks(), 1);
         assert_eq!(c.tasks[1].trace.as_deref(), Some("boom"));
+        assert_eq!(c.trace, None);
+        let failed = parse_connectors(
+            r#"{"c": {"info": {"type": "source", "config": {}},
+                      "status": {"connector": {"state": "FAILED", "worker_id": "w", "trace": "oops"}, "tasks": []}}}"#,
+        )
+        .unwrap();
+        assert_eq!(failed[0].trace.as_deref(), Some("oops"));
         assert_eq!(c.config.get("topics").map(String::as_str), Some("orders"));
     }
 
@@ -547,6 +669,179 @@ mod tests {
         assert_eq!(config.len(), 2);
         assert!(parse_config_json(r#"{"topics": "a"}"#).is_err());
         assert!(parse_config_json("not json").is_err());
+    }
+
+    /// One request the fake Connect worker received: method, path, body.
+    type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
+    /// A Kafka Connect stand-in answering `(method, path)` from `routes`
+    /// with `(status, body)`, anything else 404 "HTTP 404 Not Found" as a
+    /// worker without the endpoint does. Returns its URL and the requests.
+    async fn fake_connect(
+        routes: Vec<(&'static str, &'static str, u16, String)>,
+    ) -> (String, Seen) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen: Seen = Default::default();
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 4096];
+                let header_end = loop {
+                    if let Some(i) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break request.len(),
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                };
+                let head = String::from_utf8_lossy(&request[..header_end]).to_string();
+                let length: usize = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + length {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let body = String::from_utf8_lossy(&request[header_end..]).to_string();
+                let mut words = head.split_whitespace();
+                let method = words.next().unwrap_or("").to_string();
+                let path = words.next().unwrap_or("").to_string();
+                log.lock()
+                    .unwrap()
+                    .push((method.clone(), path.clone(), body));
+                let (status, body) = routes
+                    .iter()
+                    .find(|(m, p, _, _)| *m == method && *p == path)
+                    .map(|(_, _, s, b)| (*s, b.clone()))
+                    .unwrap_or((
+                        404,
+                        r#"{"error_code":404,"message":"HTTP 404 Not Found"}"#.to_string(),
+                    ));
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[tokio::test]
+    async fn stop_and_offsets_use_the_kip_875_endpoints() {
+        let offsets = r#"{"offsets":[
+            {"partition":{"kafka_topic":"orders","kafka_partition":0},"offset":{"kafka_offset":7}},
+            {"partition":{"kafka_topic":"orders","kafka_partition":1},"offset":{"kafka_offset":3}}]}"#;
+        let ok = r#"{"message":"The offsets for this connector have been altered successfully"}"#;
+        let (url, seen) = fake_connect(vec![
+            ("PUT", "/connectors/sink%2F1/stop", 202, String::new()),
+            (
+                "GET",
+                "/connectors/sink%2F1/offsets",
+                200,
+                offsets.to_string(),
+            ),
+            ("PATCH", "/connectors/sink%2F1/offsets", 200, ok.to_string()),
+            (
+                "DELETE",
+                "/connectors/sink%2F1/offsets",
+                200,
+                r#"{"message":"reset"}"#.to_string(),
+            ),
+        ])
+        .await;
+        let client = ConnectClient::new(&url).unwrap();
+        client.stop("sink/1").await.unwrap();
+        let read = client.offsets("sink/1").await.unwrap();
+        assert_eq!(read.len(), 2);
+        assert_eq!(
+            read[0].as_sink(),
+            Some(SinkOffset {
+                topic: "orders".into(),
+                partition: 0,
+                offset: Some(7)
+            })
+        );
+        let message = client
+            .alter_offsets(
+                "sink/1",
+                &[
+                    ConnectorOffset::sink("orders", 0, Some(1)),
+                    ConnectorOffset::sink("orders", 1, None),
+                ],
+            )
+            .await
+            .unwrap();
+        assert!(message.contains("altered successfully"), "{message}");
+        assert_eq!(client.reset_offsets("sink/1").await.unwrap(), "reset");
+        let seen = seen.lock().unwrap();
+        let patch = &seen[2];
+        assert_eq!(patch.0, "PATCH");
+        let body: Value = serde_json::from_str(&patch.2).unwrap();
+        assert_eq!(body["offsets"][0]["offset"]["kafka_offset"], 1);
+        assert_eq!(body["offsets"][1]["offset"], Value::Null);
+        assert_eq!(body["offsets"][1]["partition"]["kafka_partition"], 1);
+    }
+
+    #[tokio::test]
+    async fn older_workers_and_unknown_connectors_get_clear_errors() {
+        let (url, _) = fake_connect(vec![
+            (
+                "GET",
+                "/connectors/ghost/offsets",
+                404,
+                r#"{"error_code":404,"message":"Connector ghost not found"}"#.to_string(),
+            ),
+            (
+                "PATCH",
+                "/connectors/old/offsets",
+                405,
+                r#"{"error_code":405,"message":"HTTP 405 Method Not Allowed"}"#.to_string(),
+            ),
+            (
+                "DELETE",
+                "/connectors/running/offsets",
+                400,
+                r#"{"error_code":400,"message":"Connectors must be in the STOPPED state before their offsets can be modified."}"#.to_string(),
+            ),
+        ])
+        .await;
+        let client = ConnectClient::new(&url).unwrap();
+        // A 3.4 worker has no /stop and no /offsets: 404 "HTTP 404 Not Found".
+        let e = client.stop("old").await.unwrap_err().to_string();
+        assert!(e.contains("needs Kafka Connect 3.5"), "{e}");
+        let e = client.offsets("old").await.unwrap_err().to_string();
+        assert!(e.contains("needs Kafka Connect 3.5"), "{e}");
+        let e = client.reset_offsets("old").await.unwrap_err().to_string();
+        assert!(e.contains("needs Kafka Connect 3.6"), "{e}");
+        let e = client
+            .alter_offsets("old", &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("needs Kafka Connect 3.6") && e.contains("405"),
+            "{e}"
+        );
+        let e = client.offsets("ghost").await.unwrap_err().to_string();
+        assert!(e.contains("No connector named 'ghost'"), "{e}");
+        let e = client
+            .reset_offsets("running")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ferrika connect stop running"), "{e}");
     }
 
     #[test]

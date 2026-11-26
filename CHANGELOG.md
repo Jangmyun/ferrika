@@ -9,6 +9,59 @@ versions, and 0.2.0 made it crate-internal.
 
 ## Unreleased
 
+### Kafka Connect: stop connectors, read, reset and set their offsets
+
+Command line:
+
+- `connect stop NAME` stops a connector (Kafka Connect 3.5+, KIP-875): its
+  tasks shut down and release their resources, the config stays, and
+  `connect resume NAME` starts it again. Policy category `connect.change`;
+  `ferrika undo` resumes it (or pauses it again when it was paused).
+- `connect offsets NAME` shows a connector's offsets (Kafka Connect 3.5+):
+  sink connectors by topic, partition and offset, source connectors as the
+  partition and offset maps they store; `-f json` prints them in the shape
+  the Connect REST API uses.
+- `connect offsets NAME --reset` deletes every offset of a connector, and
+  `--set FILE|JSON` sets the offsets of the partitions given
+  (`{"offsets": [{"partition": {...}, "offset": {...}}]}`, an offset of
+  `null` resets that partition); Kafka Connect 3.6+. Like `offset reset`
+  they show the plan (current and new offset per partition) and change
+  nothing without `--execute`. Both are refused unless the connector is
+  STOPPED, with a hint to run `connect stop` first. Policy category
+  `connect.change`, audited as `connect offsets --reset` / `--set` with the
+  connector as target (no offsets in the audit log). The previous offsets
+  are recorded, so `ferrika undo` sets them back (only while the connector
+  is still stopped; undo checks that first).
+- A worker too old for these endpoints (404 or 405) gives "... needs Kafka
+  Connect 3.5 or later" (stop, reading offsets) or "3.6 or later" (resetting
+  or setting offsets) instead of a bare HTTP error.
+- `connect status` also shows the stack trace of a failed connector, not
+  only of failed tasks.
+
+MCP:
+
+- Read tools `connect_list` (connectors with type, state, class, tasks and
+  the start of failure traces; optional `filter`) and `connect_status` (one
+  connector's state, tasks with traces, config with secret values masked,
+  and offsets) for the Connect cluster of the profile the server runs with.
+
+Library:
+
+- `ferrika_core::kafka::connect::ConnectClient::stop`, `offsets`,
+  `alter_offsets` and `reset_offsets`; `ConnectorOffset` (partition and
+  offset maps, `sink()` / `as_sink()` for `SinkOffset { topic, partition,
+  offset }`), `parse_offsets_json` and `all_sink`, also in
+  `ferrika_core::model::connect`. `ConnectorView` has the connector's own
+  failure `trace`. **Changed:** `ConnectorView` and
+  `model::history::State::Connector` have a new field (`trace`,
+  `stopped`), so code that builds them with a struct literal must set it;
+  `State` has a new variant `ConnectorOffsets` and
+  `ferrika_ops::history::Step` new variants `StopConnector` and
+  `AlterConnectorOffsets`. `ferrika_ops::history::capture::connector_offsets`
+  and `select_connector_offsets` read the state an offset change records.
+  0.2 builds skip journal lines with connector offsets (a kind they do not
+  know) and read a recorded stopped connector as not stopped.
+
 ### RabbitMQ: paged listings, TLS with a private CA, quorum-queue peeks
 
 Command line:

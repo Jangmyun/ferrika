@@ -285,6 +285,42 @@ jobs:
           docker logs ksqldb | tail -100
           docker logs ksqldb-tls | tail -100
 
+  # End-to-end smoke test of `ferrika connect` (KIP-875 stop and offsets,
+  # history and undo) against a Kafka Connect worker from the apache/kafka
+  # image with the file connectors. Host networking, so the worker reaches
+  # Kafka's default advertised listener (localhost:9092).
+  e2e-connect:
+    name: End-to-end smoke test (Kafka Connect)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start Kafka and Kafka Connect
+        run: |
+          docker run -d --name kafka --network host apache/kafka:3.9.0
+          for i in $(seq 1 60); do
+            docker exec kafka /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker run -d --name connect --network host apache/kafka:3.9.0             sh -c "$(python3 tools/e2e/connect_smoke.py --print-worker-script)"
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake build-essential pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p ferrika-cli
+      - name: Wait for Kafka Connect
+        run: |
+          for i in $(seq 1 90); do
+            curl -sf http://localhost:8083/connector-plugins | grep -q FileStreamSink && exit 0
+            sleep 2
+          done
+          docker logs connect | tail -50
+          exit 1
+      - name: Kafka Connect smoke test
+        run: python3 tools/e2e/connect_smoke.py target/debug/ferrika --broker localhost:9092 --url http://localhost:8083
+      - name: Kafka Connect logs
+        if: failure()
+        run: docker logs connect | tail -100
+
   # End-to-end smoke test of `ferrika mqtt` against Mosquitto 2 with a
   # password file and a TLS listener (test CA from mosquitto-setup.sh). A
   # service container cannot mount the generated configuration.

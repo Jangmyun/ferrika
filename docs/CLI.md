@@ -272,6 +272,14 @@ only) with the counts read, kept, filtered, sampled out and not JSON. When
 the policy enforces masking a mask step is put first, so the other steps
 see only masked data. Like `peek_messages` it passes the export gate.
 
+Kafka Connect: `connect_list` lists the connectors of the Connect cluster
+of the profile the server runs with (`connect_url`; a URL cannot be passed)
+with their type, state, class, tasks and the start of failure traces
+(optional `filter`, a name substring), and `connect_status` shows one
+connector (`name`): state, tasks with traces, config with secret values
+masked, and offsets (Kafka Connect 3.5+; `offsets_error` says why when the
+worker cannot show them). Changing connectors is left to the CLI.
+
 RabbitMQ (preview): `rabbit_queues`, `rabbit_exchanges` and
 `rabbit_bindings` list a virtual host through the management API, for the
 RabbitMQ profile named by `profile` (default: the active one, see
@@ -470,7 +478,42 @@ ferrika connect status orders-jdbc-sink          # config, tasks, failure traces
 ferrika connect restart orders-jdbc-sink         # also pause / resume
 ferrika connect apply -f s3-sink.json            # create, or replace a connector's config
 ferrika connect delete s3-sink
+ferrika connect stop orders-jdbc-sink            # Connect 3.5+; `connect resume` starts it again
+ferrika connect offsets orders-jdbc-sink         # Connect 3.5+; -f json for the REST API's shape
+ferrika connect offsets orders-jdbc-sink --reset            # preview: current and new offsets
+ferrika connect offsets orders-jdbc-sink --reset --execute  # Connect 3.6+, connector stopped
+ferrika connect offsets orders-jdbc-sink --set offsets.json --execute
 ```
+
+`connect status` shows the config (secret values masked), the tasks and the
+first lines of the stack trace of a failed connector or task (`-f json` has
+them whole).
+
+A stopped connector (KIP-875) runs no tasks but keeps its config; unlike a
+paused one it releases its resources. Its offsets can then be reset
+(`--reset`: every offset deleted, the connector starts over as if new) or
+set (`--set`: the partitions given, as a JSON file or inline JSON in the
+shape `connect offsets -f json` prints). A sink connector's offsets are its
+consumer group's:
+
+```json
+{"offsets": [
+  {"partition": {"kafka_topic": "orders", "kafka_partition": 0},
+   "offset": {"kafka_offset": 1000}},
+  {"partition": {"kafka_topic": "orders", "kafka_partition": 1},
+   "offset": null}
+]}
+```
+
+A source connector's partition and offset are the maps it stores (for the
+file source, `{"filename": ...}` and `{"position": ...}`). An offset of
+`null` resets that partition. Without `--execute` the command only shows the
+plan; with it, it is refused unless the connector is STOPPED (run `connect
+stop` first). Stopping and changing offsets are `connect.change` for the
+company policy and are recorded in the history: `ferrika undo` resumes a
+stopped connector and sets changed offsets back (the connector must still be
+stopped). Workers before 3.5 (stop, reading offsets) or 3.6 (reset, set)
+answer with an error naming the version needed.
 
 ### RabbitMQ (`ferrika rabbit`, preview)
 
@@ -809,8 +852,9 @@ replaced, in `~/.ferrika/history.jsonl` (next to the audit log; config
 values live here, never in the audit log). Undo puts that state back:
 topic and broker configs, replication, offset resets and deletions,
 deleted groups (their offsets), ACLs, quotas, new SCRAM users, schema
-compatibility, versions and deleted subjects, connector configs and
-pause/resume, and new topics while they are still empty. Deleting or
+compatibility, versions and deleted subjects, connector configs,
+pause/resume/stop and connector offsets, and new topics while they are
+still empty. Deleting or
 purging topics, adding partitions, replacing or deleting passwords and
 producing cannot be undone (prompts say so).
 

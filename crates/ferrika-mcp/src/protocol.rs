@@ -175,7 +175,7 @@ impl<'a> Session<'a> {
             steps (filter, drop, rename, set, rekey, mask, sample) would write, without \
             writing. rabbit_queues, rabbit_exchanges and rabbit_bindings list a RabbitMQ \
             profile's virtual host (preview); reading RabbitMQ messages requeues them, so \
-            rabbit_peek and rabbit_dlq_inspect are write tools."
+            rabbit_peek and rabbit_dlq_inspect are write tools. connect_list and             connect_status show the profile's Kafka Connect connectors, their failed tasks'             traces and offsets."
                 .to_string();
         match &self.writes {
             Some(writes) => instructions.push_str(&writes.instructions(self.client.elicitation)),
