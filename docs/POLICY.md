@@ -677,13 +677,15 @@ direction.
 - **MCP**: `mask_pii: false` is ignored under enforced masking. The read
   tools never change the cluster. With `ferrika mcp --allow-write`, every
   write tool call (`produce_messages`, `create_topic`, `alter_topic_config`,
-  `reset_consumer_group_offsets`, `transform_execute`, and for RabbitMQ
-  `rabbit_peek`, `rabbit_dlq_inspect`, `rabbit_publish`,
+  `reset_consumer_group_offsets`, `transform_execute`, `ksql_exec`, and for
+  RabbitMQ `rabbit_peek`, `rabbit_dlq_inspect`, `rabbit_publish`,
   `rabbit_dlq_redrive`) is checked like a CLI command (`produce`,
-  `topics.create`, `config.change`, `offsets.reset`, `produce`,
-  `messages.peek`, `messages.peek`, `produce`, `messages.move` plus
-  `produce`; the RabbitMQ ones against the RabbitMQ profile and the
-  management and AMQP `host:port`, as `ferrika rabbit`): `forbid`,
+  `topics.create`, `config.change`, `offsets.reset`, `produce`, the
+  categories of each statement as for `ksql exec`, `messages.peek`,
+  `messages.peek`, `produce`, `messages.move` plus `produce`; `ksql_exec`
+  also against the ksqlDB server's `host:port`; the RabbitMQ ones against
+  the RabbitMQ profile and the management and AMQP `host:port`, as `ferrika
+  rabbit`): `forbid`,
   `read_only`, `read_only_brokers`, strictest mode and a read-only profile
   refuse it, at the plan and again right before it runs, and tools refused
   outright are not offered. Under `audit: required` a write is refused when

@@ -276,6 +276,43 @@ impl Statement {
         actions
     }
 
+    /// The value of `property` (case-insensitive, e.g. `KAFKA_TOPIC`) in the
+    /// statement's first `WITH (...)` clause, when it is given as a string
+    /// literal. `None` without such a clause or property. Used to name the
+    /// Kafka topic a `CREATE` writes to before it runs.
+    pub fn with_property(&self, property: &str) -> Option<String> {
+        let tokens = lex(&self.text).ok()?.into_iter().next()?.tokens;
+        let is_word = |t: Option<&Token>, w: &str| matches!(t, Some(Token::Word(x)) if x.eq_ignore_ascii_case(w));
+        let open = (0..tokens.len()).find(|&i| {
+            is_word(tokens.get(i), "WITH") && tokens.get(i + 1) == Some(&Token::Sym('('))
+        })? + 2;
+        let mut depth = 1;
+        let mut i = open;
+        while i < tokens.len() {
+            match &tokens[i] {
+                Token::Sym('(') => depth += 1,
+                Token::Sym(')') => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return None;
+                    }
+                }
+                Token::Word(w)
+                    if depth == 1
+                        && w.eq_ignore_ascii_case(property)
+                        && tokens.get(i + 1) == Some(&Token::Sym('=')) =>
+                {
+                    if let Some(Token::Str(value)) = tokens.get(i + 2) {
+                        return Some(value.clone());
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
     /// What the statement does in a few words, for previews and audit
     /// targets: keywords and identifiers only, never literals (an `INSERT`'s
     /// values or a `SET` value can be personal data or a secret).
@@ -845,6 +882,26 @@ mod tests {
         assert_eq!(s.object.as_deref(), Some("KQ_ORDERS"));
         assert_eq!(s.policy_actions(), [A::KsqlAlter]);
         assert_eq!(s.summary(), "ALTER STREAM KQ_ORDERS");
+    }
+
+    #[test]
+    fn with_properties_are_read_from_the_with_clause() {
+        let s = one("CREATE STREAM s (id INT) WITH (kafka_topic='orders.v1', PARTITIONS=3, VALUE_FORMAT='JSON');");
+        assert_eq!(s.with_property("KAFKA_TOPIC").as_deref(), Some("orders.v1"));
+        assert_eq!(s.with_property("value_format").as_deref(), Some("JSON"));
+        // A number is not a string literal; a missing property is None.
+        assert_eq!(s.with_property("PARTITIONS"), None);
+        assert_eq!(s.with_property("KEY_FORMAT"), None);
+        let s = one(
+            "CREATE TABLE t WITH (KAFKA_TOPIC='t_out') AS SELECT id, COUNT(*) FROM o GROUP BY id;",
+        );
+        assert_eq!(s.with_property("KAFKA_TOPIC").as_deref(), Some("t_out"));
+        // Without a WITH clause, and in a literal elsewhere, nothing is found.
+        let s = one("CREATE STREAM b AS SELECT * FROM a WHERE note = 'KAFKA_TOPIC=''x''';");
+        assert_eq!(s.with_property("KAFKA_TOPIC"), None);
+        let s =
+            one("CREATE STREAM c WITH (FORMAT='JSON') AS SELECT * FROM a WHERE x = 'KAFKA_TOPIC';");
+        assert_eq!(s.with_property("KAFKA_TOPIC"), None);
     }
 
     #[test]

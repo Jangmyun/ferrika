@@ -15,8 +15,9 @@ use std::time::Duration;
 use super::backend::{KafkaBackend, TransformRun, WriteBackend};
 use super::guard::{
     args_digest, digest, is_rabbit_tool, policy_action, GuardConfig, Limits, ToolError, WriteGuard,
-    WRITE_TOOLS,
+    KSQL_EXEC, WRITE_TOOLS,
 };
+use super::ksql_writes::{self, KsqlBackend, KsqlWork, LiveKsql};
 use super::rabbit_writes::{self, LiveRabbit, RabbitBackend, RabbitWork};
 use super::transform_tools::{self, EXECUTE_MAX};
 use super::transport::{Peer, PeerError};
@@ -45,6 +46,8 @@ pub(super) struct WriteTools {
     backend: Box<dyn WriteBackend>,
     /// The RabbitMQ brokers the `rabbit_*` tools reach.
     pub(super) rabbit: Box<dyn RabbitBackend>,
+    /// The ksqlDB server `ksql_exec` reaches (the Kafka profile's).
+    pub(super) ksql: Box<dyn KsqlBackend>,
     confirm: ConfirmMode,
     elicit_timeout: Duration,
     /// Where executed changes are recorded for `ferrika history` / `undo`;
@@ -71,6 +74,9 @@ struct Planned {
     target: String,
     /// A person confirming it types the target name back (it loses data).
     destructive: bool,
+    /// The name typed back when it is not the target's (`ksql_exec`: the
+    /// stream, table or query a statement drops or stops).
+    confirm_name: Option<String>,
     /// Why only a person may confirm it (elicitation), never a token.
     person_only: Option<String>,
     work: Work,
@@ -101,6 +107,8 @@ enum Work {
     Transform(TransformRun),
     /// A RabbitMQ write (`rabbit_writes.rs`), run by `run_rabbit`.
     Rabbit(RabbitWork),
+    /// ksqlDB statements (`ksql_writes.rs`), run by `run_ksql`.
+    Ksql(KsqlWork),
 }
 
 /// What a write did.
@@ -149,6 +157,7 @@ impl WriteTools {
             config: context.config.clone(),
         });
         let mut tools = Self::new(guard, backend);
+        tools.ksql = Box::new(LiveKsql::from_context(context));
         tools.confirm = args.confirm;
         tools.history = Some(Journal::default());
         tools
@@ -159,6 +168,7 @@ impl WriteTools {
             guard,
             backend,
             rabbit: Box::new(LiveRabbit),
+            ksql: Box::new(LiveKsql::none()),
             confirm: ConfirmMode::Auto,
             elicit_timeout: ELICIT_TIMEOUT,
             history: None,
@@ -215,7 +225,9 @@ impl WriteTools {
             }
             Work::ResetOffsets { group, plans, .. } => Change::offset_reset(group, plans),
             // Copies, like produce, cannot be taken back.
-            Work::Produce { .. } | Work::Transform(_) | Work::Rabbit(_) => return (None, None),
+            Work::Produce { .. } | Work::Transform(_) | Work::Rabbit(_) | Work::Ksql(_) => {
+                return (None, None)
+            }
         };
         let (profile, bootstrap) = self.guard.profile_and_bootstrap();
         let scope = Scope {
@@ -364,6 +376,9 @@ impl WriteTools {
         if is_rabbit_tool(tool) {
             return self.run_rabbit(tool, args, ctx).await;
         }
+        if tool == KSQL_EXEC {
+            return self.run_ksql(tool, args, ctx).await;
+        }
         self.guard.check_cooldown()?;
         let execute = execute_mode(args)?;
         let request = parse(tool, args)?;
@@ -398,7 +413,8 @@ impl WriteTools {
             Work::CreateTopic { .. }
             | Work::AlterConfig { .. }
             | Work::ResetOffsets { .. }
-            | Work::Rabbit(_) => {}
+            | Work::Rabbit(_)
+            | Work::Ksql(_) => {}
         }
         let target = planned.target.clone();
         // Refused here as it was inside the run: audited, not recorded.
@@ -482,6 +498,7 @@ impl WriteTools {
             summary: planned.summary,
             target: target.clone(),
             destructive: false,
+            confirm_name: None,
             person_only: None,
             work: Work::Rabbit(planned.work),
         };
@@ -545,23 +562,92 @@ impl WriteTools {
         }
     }
 
-    /// The guard's policy gate, with the cluster's own broker addresses
-    /// added when the policy matches by broker address. A lookup that fails
-    /// refuses: the rule cannot be checked.
-    async fn authorize(&self, tool: &'static str, target: &str) -> Result<(), ToolError> {
-        let known = if self.guard.needs_broker_metadata() {
-            self.backend.known_brokers().await.map_err(|e| {
-                ToolError::new(
-                    "policy_refused",
-                    format!(
-                        "Refused: the company policy matches broker addresses, and the \
-                         cluster's brokers could not be read to check them ({e})."
-                    ),
-                )
-            })?
+    /// [`Self::run`] for `ksql_exec`: the same plan -> confirm -> execute
+    /// flow on the ksqlDB server of the Kafka profile, gated per statement
+    /// on the profile, the server's `host:port` and the cluster's brokers
+    /// (`authorize_ksql`), before anything is sent and again before it runs.
+    async fn run_ksql(
+        &mut self,
+        tool: &'static str,
+        args: &Value,
+        ctx: &CallContext<'_>,
+    ) -> Result<(Value, bool), ToolError> {
+        self.guard.check_cooldown()?;
+        let execute = execute_mode(args)?;
+        let request = ksql_writes::parse(args)?;
+        if execute {
+            self.guard.check_rate(true)?;
         } else {
-            Vec::new()
+            self.guard.admit(false)?;
+        }
+        let server = self
+            .ksql
+            .address()
+            .map_err(|e| ToolError::new("invalid_argument", e.to_string()))?;
+        let brokers = ferrika_governance::policy::with_known_brokers(
+            &self.guard.config().bootstrap,
+            &self.known_brokers().await?,
+        );
+        let addresses = format!("{server},{brokers}");
+        self.guard.authorize_ksql(&request.statements, &addresses)?;
+        let planned = ksql_writes::plan(&self.guard, self.ksql.as_ref(), &server, &request).await?;
+        let planned = Planned {
+            plan: planned.plan,
+            summary: planned.summary,
+            target: planned.target,
+            destructive: planned.destructive,
+            confirm_name: planned.confirm_name,
+            person_only: planned.person_only,
+            work: Work::Ksql(planned.work),
         };
+        let digest = plan_digest(&planned.plan);
+        if !execute {
+            let (token, expires) = self.guard.issue_token(tool, args_digest(args), digest);
+            let person = self.asks_person(ctx.elicitation);
+            return Ok((plan_result(tool, &planned, &token, expires, person), false));
+        }
+
+        self.confirm(tool, args, &planned, &digest, ctx).await?;
+        self.guard.admit(true)?;
+        // The confirmation may have taken a while: ask the gate again.
+        self.guard.authorize_ksql(&request.statements, &addresses)?;
+        self.guard.charge_produce(request.produce_records())?;
+        let Work::Ksql(work) = planned.work else {
+            return Err(ToolError::new("write_disabled", "not a ksqlDB write"));
+        };
+        let (result, audit_warning) =
+            ksql_writes::execute(&self.guard, self.ksql.as_ref(), &server, &work).await?;
+        let done = Executed {
+            result,
+            outcome: String::new(),
+            ok: true,
+            unused_budget: 0,
+        };
+        Ok((execute_result(&done, audit_warning), true))
+    }
+
+    /// The brokers the cluster reports, when the policy matches broker
+    /// addresses (none otherwise). A lookup that fails refuses: the rule
+    /// cannot be checked.
+    async fn known_brokers(&self) -> Result<Vec<String>, ToolError> {
+        if !self.guard.needs_broker_metadata() {
+            return Ok(Vec::new());
+        }
+        self.backend.known_brokers().await.map_err(|e| {
+            ToolError::new(
+                "policy_refused",
+                format!(
+                    "Refused: the company policy matches broker addresses, and the \
+                     cluster's brokers could not be read to check them ({e})."
+                ),
+            )
+        })
+    }
+
+    /// The guard's policy gate, with the cluster's own broker addresses
+    /// added when the policy matches by broker address.
+    async fn authorize(&self, tool: &'static str, target: &str) -> Result<(), ToolError> {
+        let known = self.known_brokers().await?;
         self.guard.authorize_with(tool, target, &known)
     }
 
@@ -643,7 +729,10 @@ impl WriteTools {
             }
         }
         message.push_str("\nRun it?");
-        let name = confirm_name(&planned.target);
+        let name = planned
+            .confirm_name
+            .as_deref()
+            .unwrap_or_else(|| confirm_name(&planned.target));
         let mut properties = json!({
             "confirm": {
                 "type": "boolean",
@@ -885,6 +974,10 @@ impl WriteTools {
                 "write_disabled",
                 "RabbitMQ writes run through run_rabbit",
             )),
+            Work::Ksql(_) => Err(ToolError::new(
+                "write_disabled",
+                "ksqlDB writes run through run_ksql",
+            )),
             Work::Transform(run) => {
                 let summary = self
                     .backend
@@ -1005,6 +1098,7 @@ impl WriteTools {
             ),
             target: format!("{} -> {}", run.src_topic, run.dst_topic),
             destructive: false,
+            confirm_name: None,
             person_only: None,
             work: Work::Transform(run.clone()),
         })
@@ -1148,6 +1242,7 @@ impl WriteTools {
             ),
             target: topic.to_string(),
             destructive: false,
+            confirm_name: None,
             person_only: None,
             work: Work::Produce {
                 topic: topic.to_string(),
@@ -1249,6 +1344,7 @@ impl WriteTools {
             ),
             target: format!("{group}@{topic}"),
             destructive: false,
+            confirm_name: None,
             person_only,
             work: Work::ResetOffsets {
                 group: group.to_string(),
@@ -1333,6 +1429,7 @@ impl WriteTools {
             summary,
             target: topic.to_string(),
             destructive: false,
+            confirm_name: None,
             person_only: None,
             work: Work::CreateTopic {
                 topic: topic.to_string(),
@@ -1450,6 +1547,7 @@ impl WriteTools {
             ),
             target: topic.to_string(),
             destructive,
+            confirm_name: None,
             person_only: None,
             work: Work::AlterConfig {
                 topic: topic.to_string(),
@@ -2057,9 +2155,11 @@ pub(super) fn with_mode(mut properties: Value) -> Value {
     properties
 }
 
-/// Every write tool's definition: the Kafka ones, then the RabbitMQ ones.
+/// Every write tool's definition: the Kafka ones, `ksql_exec`, then the
+/// RabbitMQ ones (the order of [`WRITE_TOOLS`]).
 fn definitions() -> Vec<Value> {
     let mut tools = kafka_definitions();
+    tools.extend(ksql_writes::definitions());
     tools.extend(rabbit_writes::definitions());
     tools
 }
@@ -3001,7 +3101,7 @@ pub(super) mod tests {
     }
 
     /// What the fake client does with the elicitation request.
-    enum Client {
+    pub enum Client {
         Answer(Value),
         Silent,
         Cancel,
@@ -3010,7 +3110,7 @@ pub(super) mod tests {
 
     /// Calls `name` from a client with elicitation; `client` answers the
     /// confirmation. Returns the result and the elicitation request sent.
-    async fn call_asking(
+    pub async fn call_asking(
         tools: &mut WriteTools,
         name: &str,
         args: &Value,

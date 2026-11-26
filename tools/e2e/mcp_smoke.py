@@ -25,6 +25,14 @@ scope) and calls the RabbitMQ read tools and the write tools rabbit_publish,
 rabbit_peek, rabbit_dlq_inspect and rabbit_dlq_redrive (plan, confirmation
 token, execute), with --queues/--exchanges limited to this run's names.
 
+With --ksql-url (a ksqlDB server on --broker's cluster) it also adds a
+profile with that server and checks the write tool ksql_exec under
+--topics: a script that creates a stream on a topic in scope and inserts
+(plan, confirmation token, execute), ksql_query on it (masked), refusals
+for a topic outside --topics and a CREATE ... AS SELECT without
+KAFKA_TOPIC, DROP ... DELETE TOPIC needing a person, a plain DROP, and the
+audit entries.
+
 Isolation: every topic is named <prefix><run id>-... (one more, outside the
 write scope, <prefix>x<run id>-outside), and the CLI runs with its own
 FERRIKA_CONFIG_DIR (HOME and USERPROFILE too), so the user's profiles and
@@ -61,6 +69,7 @@ parser.add_argument("--rabbit-url", help="also check the RabbitMQ read tools aga
 parser.add_argument("--rabbit-user", default="guest")
 parser.add_argument("--rabbit-password", default="guest")
 parser.add_argument("--rabbit-amqp-url", help="AMQP listener for rabbit_dlq_redrive (default: the management host on 5672)")
+parser.add_argument("--ksql-url", help="also check ksql_exec against this ksqlDB server (on --broker's cluster)")
 ARGS = parser.parse_args()
 
 F = ARGS.binary
@@ -77,6 +86,10 @@ R_EX, R_DLX, R_WORK, R_DLQ, R_RK = f"{RUN}ex", f"{RUN}dlx", f"{RUN}work", f"{RUN
 R_OUT_EX, R_OUT_Q = f"{ARGS.prefix}x{HEX}-ex", f"{ARGS.prefix}x{HEX}-q"
 R_EMAILS = [f"rabbit{i}-{HEX}@example.com" for i in range(3)]
 created = {"exchanges": [], "queues": []}
+# ksqlDB: a stream on a topic in the write scope, one on the outside topic.
+K_PROFILE, K_TOPIC = f"{RUN}ksql", f"{RUN}kq"
+K_STREAM, K_OUT, K_BIG = f"kq_{HEX}_mcp", f"kq_{HEX}_out", f"kq_{HEX}_big"
+K_EMAIL = f"ksql-{HEX}@example.com"
 
 tmp = Path(tempfile.mkdtemp(prefix="ferrika-mcp-smoke-"))
 HOME = tmp / "home"
@@ -85,7 +98,8 @@ CONFIG = HOME / ".ferrika"
 ENV = dict(os.environ)
 ENV.update({"HOME": str(HOME), "USERPROFILE": str(HOME), "FERRIKA_CONFIG_DIR": str(CONFIG),
             "FERRIKA_SECRET_STORE": "file", "NO_COLOR": "1"})
-for key in ("FERRIKA_PROFILE", "FERRIKA_RABBIT_PROFILE", "FERRIKA_RABBIT_URL", "FERRIKA_RABBIT_PASSWORD"):
+for key in ("FERRIKA_PROFILE", "FERRIKA_RABBIT_PROFILE", "FERRIKA_RABBIT_URL", "FERRIKA_RABBIT_PASSWORD",
+            "FERRIKA_KSQL_URL"):
     ENV.pop(key, None)
 
 
@@ -111,8 +125,9 @@ def tail(s, n=300):
 class Mcp:
     """One `ferrika mcp` process spoken to over newline-delimited JSON-RPC."""
 
-    def __init__(self, args):
-        self.proc = subprocess.Popen([F, "-b", BROKER, "mcp", *args], stdin=subprocess.PIPE,
+    def __init__(self, args, head=None):
+        head = ["-b", BROKER] if head is None else head
+        self.proc = subprocess.Popen([F, *head, "mcp", *args], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV,
                                      text=True, encoding="utf-8", errors="replace", bufsize=1)
         self.lines = queue.Queue()
@@ -315,6 +330,100 @@ def rabbit_writes(mcp, names):
     check("the refusals left the outside queue empty", len(rabbit_get(R_OUT_Q)) == 0)
 
 
+def ksql_server(statement):
+    """Runs a statement on the ksqlDB server directly (clean-up, checks)."""
+    body = json.dumps({"ksql": statement, "streamsProperties": {}}).encode()
+    req = urllib.request.Request(f"{ARGS.ksql_url.rstrip('/')}/ksql", data=body, method="POST",
+                                 headers={"Content-Type": "application/json",
+                                          "Accept": "application/vnd.ksql.v1+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return {"error": e.read().decode(errors="replace")}
+
+
+def ksql_streams():
+    out = ksql_server("SHOW STREAMS;")
+    if not isinstance(out, list) or not out:
+        return []
+    return [s["name"] for s in out[0].get("streams", [])]
+
+
+def ksql_writes():
+    """ksql_exec on a profile with a ksqlDB server, writes limited to this
+    run's topics."""
+    rc, out = run(["profile", "add", K_PROFILE, "-b", BROKER, "--ksql-url", ARGS.ksql_url], broker=False)
+    check("profile with a ksqlDB server", rc == 0, f"rc={rc} {tail(out)}")
+    rc, out = run(["-p", K_PROFILE, "ksql", "exec", f"CREATE STREAM {K_OUT} (v STRING) WITH "
+                   f"(KAFKA_TOPIC='{OUTSIDE}', VALUE_FORMAT='JSON');", "--yes"], broker=False)
+    check("a stream on the topic outside --topics (CLI)", rc == 0, tail(out))
+    mcp = Mcp(["--allow-write", "--topics", f"{RUN}*"], ["-p", K_PROFILE])
+    try:
+        mcp.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                   "clientInfo": {"name": "ferrika-e2e", "version": "1.0"}})
+        mcp.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        names = {t.get("name") for t in mcp.request("tools/list").get("result", {}).get("tools", [])}
+        check("tools/list has ksql_exec", "ksql_exec" in names, sorted(map(str, names)))
+
+        script = (f"CREATE STREAM {K_STREAM} (id INT KEY, email STRING) WITH (KAFKA_TOPIC='{K_TOPIC}', "
+                  f"PARTITIONS=1, VALUE_FORMAT='JSON');\n"
+                  f"INSERT INTO {K_STREAM} (id, email) VALUES (1, '{K_EMAIL}');")
+        err, plan, text = mcp.call("ksql_exec", {"sql": script, "mode": "plan"})
+        listed = (((plan or {}).get("plan") or {}).get("statements") or []) if isinstance(plan, dict) else []
+        check("ksql_exec plan names the categories and the topic, never the values",
+              not err and [s.get("categories") for s in listed] == [["ksql.create", "topics.create"],
+                                                                     ["ksql.insert", "produce"]]
+              and listed[1].get("topic", {}).get("name") == K_TOPIC and K_EMAIL not in text, tail(text))
+        planned, no_token, err, data, text = confirmed(mcp, "ksql_exec", {"sql": script})
+        statuses = [s.get("status") for s in find(data, "statements") or []] if not err else []
+        check("ksql_exec: plan, token, execute creates the stream and inserts",
+              planned and no_token and not err and statuses == ["SUCCESS", "SUCCESS"]
+              and K_STREAM.upper() in ksql_streams(), tail(text))
+
+        rows, deadline = [], time.time() + 30
+        while time.time() < deadline:
+            err, data, text = mcp.call("ksql_query", {"sql": f"SELECT * FROM {K_STREAM};"})
+            rows = (data or {}).get("rows") or [] if isinstance(data, dict) else []
+            if rows:
+                break
+            time.sleep(1)
+        check("ksql_query reads the inserted row, masked", len(rows) == 1 and K_EMAIL not in text, tail(text))
+
+        err, data, text = mcp.call("ksql_exec", {"sql": f"INSERT INTO {K_OUT} (v) VALUES ('x');", "mode": "plan"})
+        check("ksql_exec into a topic outside --topics is refused", err and "outside" in text, tail(text))
+        err, data, text = mcp.call("ksql_exec", {"sql": f"CREATE STREAM {K_BIG} AS SELECT * FROM {K_STREAM};",
+                                                 "mode": "plan"})
+        check("ksql_exec CREATE ... AS SELECT without KAFKA_TOPIC is refused under --topics",
+              err and "KAFKA_TOPIC" in text and K_BIG.upper() not in ksql_streams(), tail(text))
+        err, data, text = mcp.call("ksql_exec", {"sql": f"SELECT * FROM {K_STREAM};", "mode": "plan"})
+        check("ksql_exec refuses queries", err and "ksql_query" in text, tail(text))
+
+        drop_topic = {"sql": f"DROP STREAM {K_STREAM} DELETE TOPIC;"}
+        err, plan, text = mcp.call("ksql_exec", {**drop_topic, "mode": "plan"})
+        token = ((plan or {}).get("confirmation") or {}).get("token") if isinstance(plan, dict) else None
+        destructive = ((plan or {}).get("confirmation") or {}).get("destructive") if isinstance(plan, dict) else None
+        err, data, text = mcp.call("ksql_exec", {**drop_topic, "mode": "execute", "confirmation": token})
+        check("ksql_exec DROP ... DELETE TOPIC is destructive and needs a person",
+              destructive is True and err and "elicitation_required" in text
+              and K_STREAM.upper() in ksql_streams(), tail(text))
+        planned, no_token, err, data, text = confirmed(mcp, "ksql_exec", {"sql": f"DROP STREAM {K_STREAM};"})
+        check("ksql_exec DROP STREAM with the token drops it", planned and not err
+              and K_STREAM.upper() not in ksql_streams(), tail(text))
+    finally:
+        mcp.close()
+
+
+def ksql_cleanup():
+    for name in (K_BIG, K_STREAM, K_OUT):
+        if name.upper() in ksql_streams():
+            # The topics are this run's and deleted with the others.
+            ksql_server(f"DROP STREAM IF EXISTS {name};")
+    left = [n for n in ksql_streams() if n in (K_BIG.upper(), K_STREAM.upper(), K_OUT.upper())]
+    print(f"cleanup: ksqlDB streams left: {left}")
+    return not left
+
+
 def scenarios():
     for t in (SRC, DST, OUTSIDE):
         rc, out = run(["topics", "create", t])
@@ -392,6 +501,9 @@ def scenarios():
     finally:
         mcp.close()
 
+    if ARGS.ksql_url:
+        ksql_writes()
+
     rc, out = run(["-f", "json", "audit", "--source", "mcp", "-n", "500"], broker=False)
     try:
         entries = json.loads(out)
@@ -403,13 +515,21 @@ def scenarios():
         want = {"mcp rabbit_publish", "mcp rabbit_peek", "mcp rabbit_dlq_inspect", "mcp rabbit_dlq_redrive"}
         check("audit log has the MCP RabbitMQ writes", want <= done,
               f"missing={sorted(want - done)} got={sorted(map(str, done))}")
+    if ARGS.ksql_url:
+        ksql = [(e.get("target"), e.get("outcome")) for e in entries
+                if e.get("action") == "mcp ksql_exec" and e.get("ok")]
+        want = [f"CREATE STREAM {K_STREAM.upper()}", f"INSERT INTO {K_STREAM.upper()} VALUES",
+                f"DROP STREAM {K_STREAM.upper()}"]
+        check("audit log has each ksql_exec statement with its outcome",
+              sorted(t for t, _ in ksql) == sorted(want) and all(o.startswith("ok: ") for _, o in ksql),
+              f"got={ksql}")
     actions = {e.get("action") for e in mine}
     check("audit log has the MCP transform_execute entries with the client as actor",
           any("transform_execute" in (e.get("action") or "") and e.get("ok") for e in mine)
           and all((e.get("actor") or "").startswith("mcp:ferrika-e2e") for e in mine),
           f"rc={rc} actions={sorted(map(str, actions))} {tail(out)}")
     leaked = [p.name for p in CONFIG.rglob("*") if p.is_file()
-              and any(e in p.read_text(encoding="utf-8", errors="replace") for e in EMAILS + R_EMAILS)]
+              and any(e in p.read_text(encoding="utf-8", errors="replace") for e in EMAILS + R_EMAILS + [K_EMAIL])]
     check("no record value in the audit log or any config file", not leaked, f"files={leaked}")
 
 
@@ -446,7 +566,8 @@ try:
     scenarios()
 finally:
     try:
-        clean = cleanup()
+        clean = ksql_cleanup() if ARGS.ksql_url else True
+        clean = cleanup() and clean
         if ARGS.rabbit_url:
             clean = rabbit_cleanup() and clean
     finally:

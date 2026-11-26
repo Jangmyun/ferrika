@@ -254,6 +254,32 @@ Changed:
 - MCP: read tools `ksql_list`, `ksql_describe` and `ksql_query` (bounded,
   masked, through the export gate, hidden under `export: forbidden`).
 
+### ksqlDB: MCP write tool, TLS and basic-auth tests
+
+- MCP (`ferrika mcp --allow-write`): new write tool `ksql_exec` runs
+  statements on the profile's ksqlDB server (`sql`, at most 50 statements),
+  planned, confirmed and audited like the other write tools. Every write
+  statement's categories are checked as in `ksql exec` (`INSERT` also needs
+  `produce`, `DELETE TOPIC` `topics.delete`, ...) against the profile, the
+  server's `host:port` and the brokers, and one refusal refuses the whole
+  script before anything is sent. The plan names each statement (keywords
+  and names, never literals) and the Kafka topic it creates, deletes or
+  writes; those topics must be inside `--topics`, and with `--topics` set a
+  statement whose topic cannot be named is refused. `DROP` and `TERMINATE`
+  need the name typed back when a person confirms; `DROP ... DELETE TOPIC`
+  and unrecognised statements can only be confirmed by a person. `INSERT
+  ... VALUES` counts against `--max-produce-records`. Audit entries `mcp
+  ksql_exec` per statement; `--allow-tools` accepts `ksql_exec`.
+- Library: `ferrika_ksql::statement::Statement::with_property` (a string
+  property of the `WITH` clause, such as `KAFKA_TOPIC`);
+  `ferrika_mcp::WRITE_TOOLS` gains `ksql_exec`.
+- Tests: `tools/e2e/ksql_smoke.py --tls-url ...` against a ksqlDB server
+  with HTTPS, basic authentication and required client certificates
+  (`tools/e2e/ksqldb-tls-setup.sh` writes its certificates, keystores and
+  JAAS file; CI job `e2e-ksqldb` runs it), checking that no output or audit
+  entry shows the password; `tools/e2e/mcp_smoke.py --ksql-url` covers
+  `ksql_exec`.
+
 Compatibility:
 
 - Builds that do not know the `ksql.*` categories treat a signed policy that
