@@ -35,6 +35,23 @@ python3 tools/e2e/mcp_smoke.py target/debug/ferrika --broker localhost:9092
 python3 tools/e2e/mcp_smoke.py target/debug/ferrika --broker localhost:9092 \
   --rabbit-url http://localhost:15672 --rabbit-user zz --rabbit-password zz-pw \
   --rabbit-amqp-url amqp://localhost:5672
+# Optional: also check the ksqlDB write tool ksql_exec through a profile with
+# a ksqlDB server on the same Kafka (see the ksqlDB block below).
+python3 tools/e2e/mcp_smoke.py target/debug/ferrika --broker localhost:9092 \
+  --ksql-url http://localhost:8088
+
+# ksqlDB: two servers on the same Kafka, a plain one on 8088 and one on 8089
+# that takes HTTPS only, with basic auth and a required client certificate
+# (certificates, keystores and the JAAS file from ksqldb-tls-setup.sh). CI
+# runs both in the e2e-ksqldb job, with the MCP check above.
+docker run -d --name ferrika-ksql-test --network host -e KSQL_BOOTSTRAP_SERVERS=localhost:9092 \
+  -e KSQL_LISTENERS=http://0.0.0.0:8088 confluentinc/ksqldb-server:0.29.0
+sh tools/e2e/ksqldb-tls-setup.sh /tmp/ksqldb-tls zz zz-pw
+docker run -d --name ferrika-ksql-tls-test --network host -v /tmp/ksqldb-tls:/etc/ksqldb-e2e \
+  --env-file /tmp/ksqldb-tls/ksqldb.env confluentinc/ksqldb-server:0.29.0
+python3 tools/e2e/ksql_smoke.py target/debug/ferrika --url http://localhost:8088 --broker localhost:9092 \
+  --tls-url https://localhost:8089 --tls-user zz --tls-password zz-pw --tls-ca /tmp/ksqldb-tls/ca.pem \
+  --tls-cert /tmp/ksqldb-tls/client.pem --tls-key /tmp/ksqldb-tls/client.key
 
 # RabbitMQ: profiles, queues/exchanges/bindings, publish, peek, dead-lettering,
 # dlq inspect and redrive (preview and --execute), read-only profiles, audit.

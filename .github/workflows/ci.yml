@@ -225,9 +225,12 @@ jobs:
         run: |
           python3 tools/e2e/mcp_smoke.py target/debug/ferrika --broker localhost:9092             --rabbit-url http://localhost:15672 --rabbit-user ferrika-e2e --rabbit-password ferrika-e2e-pw             --rabbit-amqp-url amqp://localhost:5672
 
-  # End-to-end smoke test of `ferrika ksql` (and the MCP ksqlDB tools)
-  # against a ksqlDB server on a throw-away Kafka. Host networking, so
-  # Kafka's default advertised listener (localhost:9092) works for ksqlDB.
+  # End-to-end smoke test of `ferrika ksql` (and the MCP ksqlDB tools,
+  # ksql_exec included) against a ksqlDB server on a throw-away Kafka, and a
+  # second ksqlDB server that takes HTTPS only with basic authentication and
+  # a required client certificate (tools/e2e/ksqldb-tls-setup.sh). Host
+  # networking, so Kafka's default advertised listener (localhost:9092)
+  # works for ksqlDB.
   e2e-ksqldb:
     name: End-to-end smoke test (ksqlDB)
     runs-on: ubuntu-latest
@@ -247,17 +250,40 @@ jobs:
             sleep 2
           done
           docker run -d --name ksqldb --network host             -e KSQL_BOOTSTRAP_SERVERS=localhost:9092 -e KSQL_LISTENERS=http://0.0.0.0:8088             -e KSQL_KSQL_SERVICE_ID=ferrika_e2e_ confluentinc/ksqldb-server:0.29.0
+          # HTTPS on 8089, basic auth, client certificates required.
+          sh tools/e2e/ksqldb-tls-setup.sh "$RUNNER_TEMP/ksqldb-tls" ferrika-e2e ferrika-e2e-pw
+          docker run -d --name ksqldb-tls --network host -v "$RUNNER_TEMP/ksqldb-tls:/etc/ksqldb-e2e" \
+            --env-file "$RUNNER_TEMP/ksqldb-tls/ksqldb.env" confluentinc/ksqldb-server:0.29.0
+          T="$RUNNER_TEMP/ksqldb-tls"
           for i in $(seq 1 90); do
-            curl -sf http://localhost:8088/info | grep -q RUNNING && exit 0
+            curl -sf http://localhost:8088/info | grep -q RUNNING \
+              && curl -sf --cacert "$T/ca.pem" --cert "$T/client.pem" --key "$T/client.key" \
+                -u ferrika-e2e:ferrika-e2e-pw https://localhost:8089/info | grep -q RUNNING \
+              && exit 0
             sleep 2
           done
           docker logs ksqldb | tail -50
+          docker logs ksqldb-tls | tail -50
           exit 1
       - name: ksqlDB smoke test
-        run: python3 tools/e2e/ksql_smoke.py target/debug/ferrika --url http://localhost:8088 --broker localhost:9092
+        # No OS credential store on the runner: the TLS profile's password
+        # stays in the profile file.
+        env:
+          FERRIKA_SECRET_STORE: file
+        run: >-
+          python3 tools/e2e/ksql_smoke.py target/debug/ferrika --url http://localhost:8088 --broker localhost:9092
+          --tls-url https://localhost:8089 --tls-user ferrika-e2e --tls-password ferrika-e2e-pw
+          --tls-ca "$RUNNER_TEMP/ksqldb-tls/ca.pem" --tls-cert "$RUNNER_TEMP/ksqldb-tls/client.pem"
+          --tls-key "$RUNNER_TEMP/ksqldb-tls/client.key"
+      - name: MCP smoke test with ksql_exec
+        env:
+          FERRIKA_SECRET_STORE: file
+        run: python3 tools/e2e/mcp_smoke.py target/debug/ferrika --broker localhost:9092 --ksql-url http://localhost:8088
       - name: ksqlDB logs
         if: failure()
-        run: docker logs ksqldb | tail -100
+        run: |
+          docker logs ksqldb | tail -100
+          docker logs ksqldb-tls | tail -100
 
   # End-to-end smoke test of `ferrika mqtt` against Mosquitto 2 with a
   # password file and a TLS listener (test CA from mosquitto-setup.sh). A

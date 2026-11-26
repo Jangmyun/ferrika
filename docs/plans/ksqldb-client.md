@@ -1,7 +1,7 @@
 # ksqlDB client
 
 Status: preview implementation (`ferrika ksql`, crate `ferrika-ksql`, MCP
-read tools). Product decision of 2026-11-25: Kafka tools commonly offer a
+read tools and the write tool `ksql_exec`). Product decision of 2026-11-25: Kafka tools commonly offer a
 client for the user's existing ksqlDB server; Ferrika does too. Ferrika does
 **not** embed, run or redistribute ksqlDB. It talks to a server the user
 already runs, over the server's public REST API. Kafka behaviour is
@@ -247,12 +247,41 @@ argument, so stored credentials go only to that server):
 | `ksql_describe` | `name`, `extended` | none |
 | `ksql_query` | `sql` (one `SELECT`), `limit` (20, max 100), `timeout_secs` (5, max 30), `from_beginning`, `mask_pii` (default true; forced under enforced masking) | export gate (channel `mcp`; hidden from `tools/list` and refused under `export: forbidden`, recorded under `audited`) |
 
-Write tools are left for a follow-up: the MCP write guard
-(`guard.rs`/`write_tools.rs`) plans, confirms and executes one change with
-one category against one Kafka cluster's topics; a ksqlDB script needs
-per-statement categories, a confirmation that shows statements, and a
-`--ksql-statements` style allow-list. `ksql_query` refuses non-`SELECT`
-statements.
+`ksql_query` refuses non-`SELECT` statements; they go through the write
+tool `ksql_exec` (`ferrika mcp --allow-write`, `ksql_writes.rs`), which
+runs a script (`sql`, at most 50 statements, 64 KiB) through the write
+guard's plan -> confirm -> execute flow:
+
+- Gate (`WriteGuard::authorize_ksql`), at the plan and again right before
+  it runs: `mcp_write: forbidden`; every category of every write statement
+  (`Statement::policy_actions`, with `also_requires`) against the Kafka
+  profile, the server's `host:port` and the cluster's brokers, exactly as
+  `ksql exec`; one refusal refuses the script (`policy.blocked`, target
+  `mcp ksql_exec <summary>`); a read-only profile; `audit: required`.
+  Nothing is sent before it passes. Queries and scripts that change
+  nothing are refused. The tool is hidden from `tools/list` when the
+  profile is read-only, AI writes are forbidden or every `ksql.*` category
+  is refused.
+- Plan: each statement's summary (never literals), access, categories and
+  the Kafka topic it creates, deletes or writes: `KAFKA_TOPIC` from the
+  `WITH` clause (`Statement::with_property`), an earlier `CREATE` of the
+  script, or `DESCRIBE` on the server. Warnings for persistent queries,
+  `TERMINATE`, connectors, topic deletion and unrecognised statements.
+- Scope: those topics pass `--topics` and are never internal. With
+  `--topics` set, a statement whose topic cannot be named (`CREATE ... AS
+  SELECT` without `KAFKA_TOPIC`, a connector, an unrecognised statement)
+  is refused, so the allow-list is the topics, not statement kinds.
+- Confirmation: `DROP`, `DROP CONNECTOR` and `TERMINATE` are destructive
+  (a person types the stream, table or query name back); `DROP ... DELETE
+  TOPIC` and unrecognised statements can only be confirmed by a person
+  (never by a token), as the MCP server offers no topic deletion either.
+- Limits: each `INSERT ... VALUES` counts one record against
+  `--max-produce-records`; persistent queries cannot be counted (the plan
+  says so).
+- Run: in order with the session (`SET`, `DEFINE`), stopping at the first
+  failure; one audit entry `mcp ksql_exec` per write with its summary and
+  outcome (`ok: SUCCESS[, query <id>]`, `KsqlError::audit_reason`, `not
+  run`). The error result lists every statement's status.
 
 ## Limits
 
@@ -288,9 +317,17 @@ the same API with an API key as basic auth (not tested).
 - `tools/e2e/ksql_smoke.py` against a real ksqlDB server (CI job
   `e2e-ksqldb`: Kafka 3.9 and ksqlDB 0.29 on host networking).
 
-Not tested end to end: basic authentication and TLS against a real server
-(they need a JAAS file and keystores in the server container); both are
-covered by unit tests of the request headers and the TLS setup.
+- The same script against a second server that takes HTTPS only, with
+  HTTP basic authentication (JAAS `PropertyFileLoginModule`) and
+  `ssl.client.authentication=REQUIRED` (mutual TLS):
+  `tools/e2e/ksqldb-tls-setup.sh` writes a throw-away CA, the server's
+  PKCS12 keystore, a truststore (with the image's `keytool`), the client
+  certificate and key and the JAAS file; the smoke test checks a profile
+  with the login, CA, certificate and key (info, statements, pull and push
+  queries, the MCP tools), refusals without the client certificate,
+  without the CA and with a wrong password, a hand-typed URL with
+  credentials, and that no output and no audit entry shows the password.
+- `tools/e2e/mcp_smoke.py --ksql-url` checks `ksql_exec` under `--topics`.
 
 ## API surface for other front ends (desktop)
 
@@ -315,12 +352,9 @@ A ksqlDB view in another front end uses:
 
 ## Follow-ups
 
-1. MCP write tool `ksql_exec` through the write guard (plan, confirm,
-   per-statement categories, allow-list of statement kinds).
-2. Desktop ksqlDB tab (private repository) on the API above.
-3. HTTP/2 transport if a server ever drops HTTP/1.1 for `/query-stream`.
-4. `--ksql-ca-location` etc. on the command for `--ksql-url` without a
+1. Desktop ksqlDB tab on the API above.
+2. HTTP/2 transport if a server ever drops HTTP/1.1 for `/query-stream`.
+3. `--ksql-ca-location` etc. on the command for `--ksql-url` without a
    profile.
-5. Basic-auth and TLS e2e against a configured server (JAAS, keystores).
-6. Pagination is not needed (ksqlDB has none); very large `SHOW` results
+4. Pagination is not needed (ksqlDB has none); very large `SHOW` results
    hit the 64 MiB cap.

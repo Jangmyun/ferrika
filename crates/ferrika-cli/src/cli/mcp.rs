@@ -10,7 +10,8 @@ use crate::error::KafkaResult;
 #[derive(Args, Debug, Clone, Default)]
 pub struct McpArgs {
     /// Offer the write tools: produce_messages, create_topic, alter_topic_config,
-    /// reset_consumer_group_offsets, transform_execute, and for RabbitMQ
+    /// reset_consumer_group_offsets, transform_execute, ksql_exec (the
+    /// profile's ksqlDB server), and for RabbitMQ
     /// profiles rabbit_peek, rabbit_dlq_inspect, rabbit_publish,
     /// rabbit_dlq_redrive. Each write is planned, confirmed and audited;
     /// company policy and a read-only profile still apply
