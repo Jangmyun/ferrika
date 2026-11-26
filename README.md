@@ -209,6 +209,17 @@ processor: no joins, windows or exactly-once delivery. See
 claude mcp add ferrika-prod -- ferrika -p prod mcp
 ```
 
+## Agent Skills
+
+[skills/](skills/README.md) holds workflows for coding agents (Claude Code
+and other Agent Skills readers) that drive the CLI: consumer lag triage,
+"why is there no data", safe offset resets, Kafka DLQ redrive, incident
+reports, config lint, topic replay and RabbitMQ DLQ redrive. Each runs
+read-only commands first, previews every change, waits for the user's
+approval and stops on a policy refusal. Copy a skill's directory into
+`~/.claude/skills/` or a project's `.claude/skills/`. A test parses every
+command in them against the CLI, so they follow its changes.
+
 ## Building
 
 The repository is a Cargo workspace. The root manifest is virtual, so select
