@@ -3,7 +3,9 @@
 //! about to alter ([`queue_declared`], [`queue_deleted`], ...), reading them
 //! again ([`recapture`]), and planning and running an undo
 //! ([`prepare_request`], [`execute_steps`]) with the same decision rules as
-//! the Kafka undo in [`super::undo`].
+//! the Kafka undo in [`super::undo`]. A front end records a change with
+//! [`start_record`] before it runs and [`finish_record`] after, which also
+//! writes the audit result entry tied to the journal line.
 //!
 //! Every RabbitMQ change records at least one `rabbit_*` state in its
 //! before-state. Ferrika 0.2 does not know those kinds, so it skips the
@@ -26,10 +28,12 @@ use ferrika_rabbitmq::model::{
     QueueDeclaration,
 };
 
+use ferrika_governance::policy::AuditSink;
+
 use super::conflict;
 use super::inverse::{self, NotReversible, Step};
 use super::undo::{self, AuditDigests, UndoFailure, UndoOptions, UndoPlan, UndoRequest};
-use super::Change;
+use super::{AuditTarget, AuditedRecord, Change, Journal};
 
 /// The scope of a change to the RabbitMQ broker whose management API is at
 /// `address` (`host:port`), made with RabbitMQ profile `profile` (may be
@@ -39,6 +43,46 @@ pub fn scope(profile: &str, address: &str) -> Scope {
         profile: profile.to_string(),
         rabbitmq: address.to_string(),
         ..Scope::default()
+    }
+}
+
+/// Starts recording a RabbitMQ topology change (`change`, from
+/// [`queue_declared`], [`binding_changed`]...) made with RabbitMQ profile
+/// `profile` on the broker whose management API is at `address`: the
+/// journal's `begin` line now, under `op` (the id the audit request entry
+/// named; a new one when `None`). Run the change, then close the record
+/// with [`finish_record`]. `audit` names the result entry as the request
+/// entry did (`profile`: the RabbitMQ profile, else the broker addresses
+/// the gate matched).
+pub fn start_record(
+    journal: Journal,
+    op: Option<String>,
+    profile: &str,
+    address: &str,
+    change: Change,
+    audit: AuditTarget,
+) -> AuditedRecord {
+    AuditedRecord::start(journal, op, scope(profile, address), change, audit, None)
+}
+
+/// Closes `record` once its change ran: on success with the before-states
+/// read back from the broker (the after-state `undo` compares against), on
+/// failure with the error, and writes the audit result entry to `sink`. A
+/// state that cannot be read back leaves the recorded after-state. Returns
+/// what [`AuditedRecord::finish`] returns.
+pub async fn finish_record<T>(
+    record: AuditedRecord,
+    sink: &impl AuditSink,
+    client: &ManagementClient,
+    result: &RabbitResult<T>,
+    success: &str,
+) -> std::io::Result<bool> {
+    match result {
+        Ok(_) => {
+            let after = recapture_all(record.recorder().before(), client).await.ok();
+            record.finish(sink, true, success, after)
+        }
+        Err(e) => record.finish(sink, false, &e.to_string(), None),
     }
 }
 
@@ -827,6 +871,79 @@ mod tests {
             routing_key: "order.*".into(),
             arguments: Map::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_recorded_change_is_read_back_and_closed_by_its_audit_entry() {
+        let fake = FakeManagement::start().await;
+        let client = fake.client();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrika-rabbit-record-{}-{}",
+            std::process::id(),
+            ferrika_core::kafka::clock::now_ms()
+        ));
+        let journal = Journal::at(dir.join("history.jsonl"));
+        let log = ferrika_governance::test_policy::MemoryLog::default();
+        let audit = AuditTarget {
+            source: "gui".into(),
+            profile: "rabbit-dev".into(),
+            action: "rabbit queue declare".into(),
+            target: "jobs".into(),
+            actor: None,
+        };
+        let declaration = QueueDeclaration {
+            kind: Some("quorum".into()),
+            durable: true,
+            ..QueueDeclaration::default()
+        };
+        let change = queue_declared(&client, "/", "jobs", &declaration)
+            .await
+            .unwrap();
+        let record = start_record(
+            journal.clone(),
+            Some("OP1".into()),
+            "rabbit-dev",
+            ADDRESS,
+            change,
+            audit.clone(),
+        );
+        let result = client.declare_queue("/", "jobs", &declaration).await;
+        assert!(finish_record(record, &log, &client, &result, "Declared")
+            .await
+            .unwrap());
+        let op = journal.load().remove(0);
+        assert_eq!(op.begin.scope, scope("rabbit-dev", ADDRESS));
+        // The after-state is the queue as the broker now has it.
+        assert!(matches!(
+            &op.after()[0],
+            State::RabbitQueue { declaration: Some(d), .. } if d.kind == "quorum"
+        ));
+        {
+            let entries = log.entries.borrow();
+            assert_eq!(entries[0].op, "OP1");
+            assert_eq!(entries[0].op_digest, op.digest());
+            assert_eq!(entries[0].outcome, "Declared");
+            assert!(entries[0].ok);
+        }
+
+        // A change that failed is closed with the error.
+        let change = queue_deleted(&client, "/", "jobs").await.unwrap();
+        let record = start_record(journal.clone(), None, "rabbit-dev", ADDRESS, change, audit);
+        let failed: RabbitResult<()> = Err(RabbitError::Api {
+            status: 500,
+            message: "boom".into(),
+        });
+        finish_record(record, &log, &client, &failed, "Deleted")
+            .await
+            .unwrap();
+        let entries = log.entries.borrow();
+        assert!(!entries[1].ok);
+        assert!(
+            entries[1].outcome.contains("boom"),
+            "{}",
+            entries[1].outcome
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

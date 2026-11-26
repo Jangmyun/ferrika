@@ -24,6 +24,8 @@ use std::path::{Path, PathBuf};
 use ferrika_core::model::history::{
     fold, Begin, End, EventBody, HistoryEvent, Operation, Reversibility, State, FORMAT_VERSION,
 };
+use ferrika_governance::audit::AuditEntry;
+use ferrika_governance::policy::AuditSink;
 
 pub mod apply;
 pub mod capture;
@@ -524,6 +526,11 @@ impl Recorder {
         self.started
     }
 
+    /// The before-state recorded in the `begin` line (secrets blanked).
+    pub fn before(&self) -> &[State] {
+        &self.begin.before
+    }
+
     /// Writes the `end` line; `after` replaces the recorded after-state
     /// when it was only known once the change ran. Returns the digest the
     /// audit entry records as `op_digest` (version 2, see
@@ -560,6 +567,116 @@ impl Recorder {
                 None
             }
         }
+    }
+}
+
+/// The audit entry that closes a recorded change: the fields of the
+/// change's audit request entry, which the result entry repeats with the
+/// outcome, the operation id and its digest (`op`, `op_digest`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AuditTarget {
+    /// Who made the change: `cli`, `gui`, `mcp`...
+    pub source: String,
+    /// The profile the request entry named (for a RabbitMQ change the
+    /// RabbitMQ profile, else the broker addresses the gate matched).
+    pub profile: String,
+    /// The request entry's action, e.g. `rabbit queue delete`.
+    pub action: String,
+    /// What was changed, e.g. a queue name.
+    pub target: String,
+    /// An agent acting for the user (an MCP client), if any.
+    pub actor: Option<String>,
+}
+
+/// One change recorded in the operation journal and closed by an audit
+/// result entry tied to it: [`AuditedRecord::start`] writes the `begin`
+/// line before the change runs, [`AuditedRecord::finish`] the `end` line
+/// and the result entry carrying the operation id and the digest
+/// (`op_digest`) that `undo` checks the journal against.
+///
+/// The request entry (written by the gate, e.g.
+/// [`ferrika_governance::policy::authorize_write`]) should name the same
+/// operation id: make it with
+/// [`ferrika_core::model::history::new_op_id`] before the gate and pass it
+/// as `op`.
+#[derive(Debug)]
+pub struct AuditedRecord {
+    recorder: Recorder,
+    audit: AuditTarget,
+}
+
+impl AuditedRecord {
+    /// Writes the `begin` line of `change` (made in `scope`) to `journal`
+    /// under `op` (a new id when `None`); `undoes` names the operation an
+    /// undo reverses. A journal that cannot be written does not stop the
+    /// change: it is logged and the change is not undoable.
+    pub fn start(
+        journal: Journal,
+        op: Option<String>,
+        scope: ferrika_core::model::history::Scope,
+        change: Change,
+        audit: AuditTarget,
+        undoes: Option<String>,
+    ) -> Self {
+        let begin = change.into_begin(
+            &audit.source,
+            scope,
+            audit.action.clone(),
+            audit.target.clone(),
+            undoes,
+        );
+        let recorder = match op {
+            Some(id) => Recorder::start_with_id(journal, id, begin),
+            None => Recorder::start(journal, begin),
+        };
+        Self { recorder, audit }
+    }
+
+    /// The operation id.
+    pub fn id(&self) -> &str {
+        self.recorder.id()
+    }
+
+    /// The journal record.
+    pub fn recorder(&self) -> &Recorder {
+        &self.recorder
+    }
+
+    /// The result entry for `outcome` with the journal's `digest`.
+    pub fn result_entry(&self, ok: bool, outcome: &str, digest: String) -> AuditEntry {
+        AuditEntry {
+            time_ms: ferrika_governance::audit::now_ms(),
+            source: self.audit.source.clone(),
+            profile: self.audit.profile.clone(),
+            action: self.audit.action.clone(),
+            target: self.audit.target.clone(),
+            outcome: outcome.to_string(),
+            ok,
+            user: String::new(),
+            actor: self.audit.actor.clone(),
+            op: self.recorder.id().to_string(),
+            op_digest: digest,
+        }
+    }
+
+    /// Writes the `end` line (`after` replaces the recorded after-state
+    /// when it was only known once the change ran), then the result entry
+    /// to `sink`. `Ok(false)` when the operation is not in the journal
+    /// (its `begin` or `end` line could not be written): then no result
+    /// entry is written, since there is no digest to tie it to, and the
+    /// caller may record the outcome on its own.
+    pub fn finish(
+        self,
+        sink: &impl AuditSink,
+        ok: bool,
+        outcome: &str,
+        after: Option<Vec<State>>,
+    ) -> std::io::Result<bool> {
+        let Some(digest) = self.recorder.finish(ok, outcome, after) else {
+            return Ok(false);
+        };
+        sink.record(&self.result_entry(ok, outcome, digest))?;
+        Ok(true)
     }
 }
 
@@ -721,6 +838,92 @@ mod tests {
                 after: None,
             }),
         }
+    }
+
+    fn audit_target() -> AuditTarget {
+        AuditTarget {
+            source: "gui".into(),
+            profile: "rabbit-dev".into(),
+            action: "rabbit queue delete".into(),
+            target: "jobs".into(),
+            actor: None,
+        }
+    }
+
+    fn topic_change() -> Change {
+        let state = |exists| State::Topic {
+            topic: "t".into(),
+            exists,
+        };
+        Change::new(
+            Reversibility::Reversible,
+            vec![state(true)],
+            vec![state(false)],
+        )
+    }
+
+    #[test]
+    fn an_audited_record_ties_the_result_entry_to_the_journal() {
+        let (dir, journal) = temp_journal("audited");
+        let log = ferrika_governance::test_policy::MemoryLog::default();
+        let record = AuditedRecord::start(
+            journal.clone(),
+            Some("01JBX3K8Q2M7".into()),
+            Scope::default(),
+            topic_change(),
+            audit_target(),
+            None,
+        );
+        assert_eq!(record.id(), "01JBX3K8Q2M7");
+        assert!(record.recorder().started());
+        assert_eq!(record.recorder().before().len(), 1);
+        assert!(record.finish(&log, true, "Deleted", None).unwrap());
+        let entries = log.entries.borrow();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        // The request entry's fields, the outcome, and the operation's key.
+        assert_eq!(
+            (
+                entry.source.as_str(),
+                entry.profile.as_str(),
+                entry.action.as_str()
+            ),
+            ("gui", "rabbit-dev", "rabbit queue delete")
+        );
+        assert_eq!(entry.target, "jobs");
+        assert_eq!(entry.outcome, "Deleted");
+        assert!(entry.ok);
+        assert_eq!(entry.op, "01JBX3K8Q2M7");
+        let op = journal.load().remove(0);
+        assert_eq!(op.id, "01JBX3K8Q2M7");
+        assert_eq!(op.begin.source, "gui");
+        assert_eq!(op.begin.action, "rabbit queue delete");
+        assert_eq!(entry.op_digest, op.digest());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn without_a_journal_no_result_entry_is_written() {
+        let (dir, _) = temp_journal("audited-broken");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The journal's directory is a file, so no line can be written.
+        let blocker = dir.join("not-a-dir");
+        std::fs::write(&blocker, "x").unwrap();
+        let journal = Journal::at(blocker.join(HISTORY_FILE));
+        let log = ferrika_governance::test_policy::MemoryLog::default();
+        let record = AuditedRecord::start(
+            journal,
+            None,
+            Scope::default(),
+            topic_change(),
+            audit_target(),
+            None,
+        );
+        assert!(!record.recorder().started());
+        assert!(!record.id().is_empty(), "a new id is made");
+        assert!(!record.finish(&log, false, "failed", None).unwrap());
+        assert!(log.entries.borrow().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

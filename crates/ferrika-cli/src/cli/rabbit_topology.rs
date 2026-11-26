@@ -47,48 +47,29 @@ pub(crate) struct Context<'a> {
     pub json: bool,
 }
 
-/// `KEY=VALUE` arguments of a declaration or binding as JSON: whole
-/// numbers and `true`/`false` as numbers and booleans, a value starting
-/// with `{`, `[` or `"` as JSON, anything else as text.
+/// `KEY=VALUE` arguments of a declaration or binding as JSON
+/// ([`crate::rabbitmq::model::parse_arguments`]).
 pub(crate) fn parse_arguments(items: &[String]) -> Result<Map<String, Value>, String> {
-    let mut out = Map::new();
-    for item in items {
-        let (key, raw) = item
-            .split_once('=')
-            .ok_or_else(|| format!("Argument '{item}' is not KEY=VALUE"))?;
-        let key = key.trim();
-        if key.is_empty() {
-            return Err(format!("Argument '{item}' has no name"));
-        }
-        let value = if let Ok(number) = raw.parse::<i64>() {
-            Value::from(number)
-        } else if raw == "true" || raw == "false" {
-            Value::from(raw == "true")
-        } else if raw.starts_with(['{', '[', '"']) {
-            serde_json::from_str(raw)
-                .map_err(|e| format!("Argument '{key}' is not valid JSON: {e}"))?
-        } else {
-            Value::from(raw)
-        };
-        out.insert(key.to_string(), value);
-    }
-    Ok(out)
+    crate::rabbitmq::model::parse_arguments(items).map_err(|e| match e {
+        crate::rabbitmq::error::RabbitError::Config(message) => message,
+        other => other.to_string(),
+    })
 }
 
-/// The binding `args` names.
+/// The binding `args` names ([`BindingDeclaration::parse`]).
 pub(crate) fn binding_of(args: &RabbitBindingArgs) -> Result<BindingDeclaration, String> {
-    let binding = BindingDeclaration {
-        source: args.source.clone(),
-        destination: args.destination.clone(),
-        destination_type: match args.destination_type {
-            BindingDestinationType::Queue => DestinationType::Queue,
-            BindingDestinationType::Exchange => DestinationType::Exchange,
-        },
-        routing_key: args.routing_key.clone(),
-        arguments: parse_arguments(&args.arguments)?,
+    let destination_type = match args.destination_type {
+        BindingDestinationType::Queue => DestinationType::Queue,
+        BindingDestinationType::Exchange => DestinationType::Exchange,
     };
-    binding.validate().map_err(|e| e.to_string())?;
-    Ok(binding)
+    BindingDeclaration::parse(
+        &args.source,
+        &args.destination,
+        destination_type,
+        &args.routing_key,
+        &args.arguments,
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn msg(error: impl std::fmt::Display) -> anyhow::Error {
@@ -149,7 +130,6 @@ impl Context<'_> {
         action: impl Future<Output = RabbitResult<T>>,
         success: &str,
     ) -> anyhow::Result<T> {
-        let states = change.before.clone();
         let pending = record::start_rabbit(
             self.global,
             self.scope()?,
@@ -159,12 +139,11 @@ impl Context<'_> {
         );
         let result = action.await;
         if let Some(pending) = pending {
-            match &result {
-                Ok(_) => {
-                    let after = history::recapture_all(&states, self.client).await.ok();
-                    pending.finish(true, success, after);
-                }
-                Err(e) => pending.finish(false, &e.to_string(), None),
+            let sink = crate::governance::policy::AuditLog;
+            if let Err(e) =
+                history::finish_record(pending.record, &sink, self.client, &result, success).await
+            {
+                tracing::warn!(%e, "Could not write the audit log");
             }
         }
         result.map_err(msg)

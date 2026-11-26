@@ -11,10 +11,11 @@ change in any release until it leaves preview.
   `https://` with the OS trust store or a private CA, and client
   certificates
 - `listing`: bounded listings for brokers with many queues: pages, a name
-  filter applied by the broker, a limit
+  filter applied by the broker, a limit, and an offset to load more
 - `delivery_limit`: whether a peek counts towards a quorum queue's
   delivery limit (RabbitMQ before 4.0), so a front end can refuse it
-- `model`: the API's responses and request bodies, and the `x-death`
+- `model`: the API's responses and request bodies (with `KEY=VALUE`
+  argument parsing for declarations and bindings), and the `x-death`
   history of dead-lettered messages
 - `profile`: named connections in `rabbit-profiles.json` next to Ferrika's
   `profiles.json`, passwords in the OS credential store

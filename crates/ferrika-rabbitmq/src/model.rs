@@ -144,6 +144,46 @@ pub fn validate_name(what: &str, name: &str) -> RabbitResult<()> {
     Ok(())
 }
 
+/// One `KEY=VALUE` argument of a queue, exchange or binding declaration
+/// (`x-max-length=1000`, `x-match=all`) as the JSON the management API
+/// takes: a whole number and `true`/`false` as a number and a boolean, a
+/// value starting with `{`, `[` or `"` as JSON, anything else as text
+/// (`x-code=42` is the number 42; `x-code="42"` the text). The key is
+/// trimmed; the value is taken as written.
+pub fn parse_argument(item: &str) -> RabbitResult<(String, Value)> {
+    let (key, raw) = item
+        .split_once('=')
+        .ok_or_else(|| RabbitError::config(format!("Argument '{item}' is not KEY=VALUE")))?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(RabbitError::config(format!(
+            "Argument '{item}' has no name"
+        )));
+    }
+    let value = if let Ok(number) = raw.parse::<i64>() {
+        Value::from(number)
+    } else if raw == "true" || raw == "false" {
+        Value::from(raw == "true")
+    } else if raw.starts_with(['{', '[', '"']) {
+        serde_json::from_str(raw)
+            .map_err(|e| RabbitError::config(format!("Argument '{key}' is not valid JSON: {e}")))?
+    } else {
+        Value::from(raw)
+    };
+    Ok((key.to_string(), value))
+}
+
+/// [`parse_argument`] for each of `items`, as the `arguments` object of a
+/// declaration or binding; a later key replaces an earlier one.
+pub fn parse_arguments<S: AsRef<str>>(items: &[S]) -> RabbitResult<Map<String, Value>> {
+    let mut out = Map::new();
+    for item in items {
+        let (key, value) = parse_argument(item.as_ref())?;
+        out.insert(key, value);
+    }
+    Ok(out)
+}
+
 /// What a binding delivers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -281,6 +321,26 @@ impl BindingDeclaration {
             routing_key: binding.routing_key.clone(),
             arguments: binding.arguments.clone(),
         })
+    }
+
+    /// A binding from user input: `KEY=VALUE` arguments
+    /// ([`parse_arguments`]), checked with [`Self::validate`].
+    pub fn parse<S: AsRef<str>>(
+        source: &str,
+        destination: &str,
+        destination_type: DestinationType,
+        routing_key: &str,
+        arguments: &[S],
+    ) -> RabbitResult<Self> {
+        let binding = Self {
+            source: source.to_string(),
+            destination: destination.to_string(),
+            destination_type,
+            routing_key: routing_key.to_string(),
+            arguments: parse_arguments(arguments)?,
+        };
+        binding.validate()?;
+        Ok(binding)
     }
 
     /// Checks the names: the default exchange has only implicit bindings.
@@ -610,6 +670,57 @@ fn object_or_empty<'de, D: Deserializer<'de>>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn arguments_parse_as_the_json_the_api_takes() {
+        let parsed = super::parse_arguments(&[
+            "x-max-length=1000",
+            " x-dead-letter-exchange =dlx",
+            "x-single-active-consumer=true",
+            r#"x-labels=["a","b"]"#,
+            r#"x-code="42""#,
+            "x-empty=",
+            "x-text=a=b",
+        ])
+        .unwrap();
+        assert_eq!(parsed["x-max-length"], 1000);
+        assert_eq!(parsed["x-dead-letter-exchange"], "dlx");
+        assert_eq!(parsed["x-single-active-consumer"], true);
+        assert_eq!(parsed["x-labels"], serde_json::json!(["a", "b"]));
+        assert_eq!(parsed["x-code"], "42");
+        assert_eq!(parsed["x-empty"], "");
+        assert_eq!(parsed["x-text"], "a=b");
+        for bad in ["novalue", "=x", " =x", "x={bad"] {
+            let err = super::parse_argument(bad).unwrap_err();
+            assert!(matches!(err, super::RabbitError::Config(_)), "{bad}: {err}");
+        }
+        let empty: [&str; 0] = [];
+        assert!(super::parse_arguments(&empty).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bindings_parse_from_user_input_and_are_checked() {
+        use super::{BindingDeclaration, DestinationType};
+        let binding = BindingDeclaration::parse(
+            "shop",
+            "audit",
+            DestinationType::Exchange,
+            "",
+            &["x-match=all".to_string()],
+        )
+        .unwrap();
+        assert_eq!(binding.destination_type, DestinationType::Exchange);
+        assert_eq!(binding.arguments["x-match"], "all");
+        let none: [&str; 0] = [];
+        assert!(
+            BindingDeclaration::parse("amq.default", "q", DestinationType::Queue, "", &none)
+                .is_err()
+        );
+        assert!(BindingDeclaration::parse("shop", "", DestinationType::Queue, "", &none).is_err());
+        assert!(
+            BindingDeclaration::parse("shop", "q", DestinationType::Queue, "", &["bad"]).is_err()
+        );
+    }
+
     use super::*;
 
     #[test]
