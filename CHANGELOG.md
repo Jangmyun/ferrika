@@ -9,6 +9,21 @@ versions, and 0.2.0 made it crate-internal.
 
 ## Unreleased
 
+### Agent Skills for coding agents
+
+- New `skills/` directory with eight Agent Skills (a `SKILL.md` each) that
+  teach coding agents such as Claude Code to drive the CLI:
+  `kafka-lag-triage`, `kafka-why-no-data`, `kafka-safe-offset-reset`,
+  `kafka-dlq-redrive`, `kafka-incident-report`, `kafka-config-lint`,
+  `kafka-topic-replay` and `rabbitmq-dlq`. They use `-f json`, read before
+  they change anything, preview every change, wait for the user's approval
+  before `--execute`, mask record data and stop on a policy refusal.
+  Install by copying a skill's directory into `~/.claude/skills/` or a
+  project's `.claude/skills/`; see `skills/README.md`.
+- A test (`crates/ferrika-cli/tests/skill_commands.rs`) parses every
+  `ferrika` command line in the skills' `bash` blocks against the CLI, so a
+  renamed command or flag fails the build.
+
 ### RabbitMQ: paged listings, TLS with a private CA, quorum-queue peeks
 
 Command line:
