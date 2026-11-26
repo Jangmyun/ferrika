@@ -9,7 +9,8 @@
 //!   and bindings of a virtual host, peeks at messages and publishes to an
 //!   exchange over HTTP(S).
 //! - [`listing`]: bounded listings ([`listing::ListQuery`]): pages, a
-//!   name filter on the broker, and a limit, for brokers with many queues.
+//!   name filter on the broker, a limit and an offset to load more, for
+//!   brokers with many queues.
 //! - [`delivery_limit`]: whether a peek counts towards a quorum queue's
 //!   delivery limit ([`delivery_limit::PeekRisk`]).
 //! - [`profile`]: named connections in `rabbit-profiles.json`, passwords in

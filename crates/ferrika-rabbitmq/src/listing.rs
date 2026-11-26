@@ -12,6 +12,11 @@
 //! - [`ManagementClient::list_bindings`]: the API does not page bindings, so
 //!   they are fetched whole (they are small: no statistics) and filtered
 //!   and cut here.
+//! - `list_queues_from`, `list_exchanges_from` and `list_bindings_from`
+//!   start at an offset into the matching entries, so a front end can load
+//!   the next entries ("load more") without fetching the ones it has:
+//!   with offset `n` the broker is asked for the page holding entry `n`,
+//!   and only the entries before it on that page are dropped.
 //!
 //! The broker matches `name` as a case-insensitive substring, or as a
 //! case-insensitive regular expression with `use_regex=true` (checked
@@ -152,6 +157,19 @@ impl<T> Listing<T> {
     pub fn truncated(&self) -> bool {
         (self.items.len() as u64) < self.matched
     }
+
+    /// For a listing fetched from `offset` (`list_*_from`): how many
+    /// matching entries come after the ones fetched.
+    pub fn remaining_after(&self, offset: usize) -> u64 {
+        self.matched
+            .saturating_sub(offset as u64 + self.items.len() as u64)
+    }
+
+    /// For a listing fetched from `offset`: the offset of the next entries
+    /// to fetch, `None` when there are no more.
+    pub fn next_offset(&self, offset: usize) -> Option<usize> {
+        (self.remaining_after(offset) > 0).then(|| offset + self.items.len())
+    }
 }
 
 /// One page as the management API returns it when `page` is given.
@@ -174,10 +192,24 @@ impl ManagementClient {
         vhost: &str,
         query: &ListQuery,
     ) -> RabbitResult<Listing<Queue>> {
+        self.list_queues_from(vhost, query, 0).await
+    }
+
+    /// [`Self::list_queues`] from the `offset`-th matching queue (0-based,
+    /// in the broker's order): at most `query.limit` of them, for loading
+    /// more after a listing of `offset` entries. See
+    /// [`Listing::next_offset`].
+    pub async fn list_queues_from(
+        &self,
+        vhost: &str,
+        query: &ListQuery,
+        offset: usize,
+    ) -> RabbitResult<Listing<Queue>> {
         self.list_paged(
             &format!("/api/queues/{}", segment(vhost)),
             query,
             QUEUE_COLUMNS,
+            offset,
         )
         .await
     }
@@ -189,10 +221,21 @@ impl ManagementClient {
         vhost: &str,
         query: &ListQuery,
     ) -> RabbitResult<Listing<Exchange>> {
+        self.list_exchanges_from(vhost, query, 0).await
+    }
+
+    /// [`Self::list_exchanges`] from the `offset`-th matching exchange.
+    pub async fn list_exchanges_from(
+        &self,
+        vhost: &str,
+        query: &ListQuery,
+        offset: usize,
+    ) -> RabbitResult<Listing<Exchange>> {
         self.list_paged(
             &format!("/api/exchanges/{}", segment(vhost)),
             query,
             EXCHANGE_COLUMNS,
+            offset,
         )
         .await
     }
@@ -205,16 +248,35 @@ impl ManagementClient {
         vhost: &str,
         query: &ListQuery,
     ) -> RabbitResult<Listing<Binding>> {
-        let matcher = query.matcher()?;
-        let bindings = self.bindings(vhost).await?;
-        Ok(cut_bindings(bindings, matcher.as_ref(), query.limit))
+        self.list_bindings_from(vhost, query, 0).await
     }
 
+    /// [`Self::list_bindings`] from the `offset`-th matching binding (all
+    /// are still fetched: the API does not page bindings).
+    pub async fn list_bindings_from(
+        &self,
+        vhost: &str,
+        query: &ListQuery,
+        offset: usize,
+    ) -> RabbitResult<Listing<Binding>> {
+        let matcher = query.matcher()?;
+        let bindings = self.bindings(vhost).await?;
+        Ok(cut_bindings(
+            bindings,
+            matcher.as_ref(),
+            offset,
+            query.limit,
+        ))
+    }
+
+    /// Entries from `offset` on, page by page: the first request asks for
+    /// the page holding entry `offset` and drops the entries before it.
     async fn list_paged<T: DeserializeOwned>(
         &self,
         path: &str,
         query: &ListQuery,
         columns: &str,
+        offset: usize,
     ) -> RabbitResult<Listing<T>> {
         query.validate()?;
         let mut listing = Listing {
@@ -222,21 +284,27 @@ impl ManagementClient {
             matched: 0,
             total: 0,
         };
-        let mut page = 1;
+        let size = query.page_size();
+        let first = offset / size + 1;
+        let mut skip = offset % size;
+        let mut page = first;
         loop {
             let fetched: Page<T> = match self
                 .get_json(&format!("{path}?{}", query.page_query(page, columns)))
                 .await
             {
                 Ok(fetched) => fetched,
-                // Entries deleted since the previous page.
+                // Entries deleted since the previous page, or an offset
+                // past the end (the broker refuses a page out of range).
                 Err(RabbitError::Api { status: 400, .. }) if page > 1 => break,
                 Err(e) => return Err(e),
             };
             listing.matched = fetched.filtered_count;
             listing.total = fetched.total_count;
             let got = fetched.items.len();
-            listing.items.extend(fetched.items);
+            listing
+                .items
+                .extend(fetched.items.into_iter().skip(std::mem::take(&mut skip)));
             if query.limit > 0 && listing.items.len() >= query.limit {
                 listing.items.truncate(query.limit);
                 break;
@@ -247,16 +315,21 @@ impl ManagementClient {
             page += 1;
         }
         // Entries created since the first page can push the count up.
-        listing.matched = listing.matched.max(listing.items.len() as u64);
+        if !listing.items.is_empty() {
+            listing.matched = listing
+                .matched
+                .max(offset as u64 + listing.items.len() as u64);
+        }
         Ok(listing)
     }
 }
 
-/// Bindings whose source or destination `matcher` matches, at most
-/// `limit` (0: all).
+/// Bindings whose source or destination `matcher` matches, from the
+/// `offset`-th on, at most `limit` (0: all).
 fn cut_bindings(
     bindings: Vec<Binding>,
     matcher: Option<&regex::Regex>,
+    offset: usize,
     limit: usize,
 ) -> Listing<Binding> {
     let total = bindings.len() as u64;
@@ -265,7 +338,7 @@ fn cut_bindings(
         .filter(|b| matcher.is_none_or(|m| m.is_match(&b.source) || m.is_match(&b.destination)))
         .collect();
     let matched = kept.len() as u64;
-    let mut items = kept;
+    let mut items: Vec<Binding> = kept.into_iter().skip(offset).collect();
     if limit > 0 {
         items.truncate(limit);
     }
@@ -342,19 +415,27 @@ mod tests {
             binding("events", "audit"),
         ];
         let substring = query(Some("orders"), false, 0).matcher().unwrap();
-        let listing = cut_bindings(bindings.clone(), substring.as_ref(), 0);
+        let listing = cut_bindings(bindings.clone(), substring.as_ref(), 0, 0);
         assert_eq!(listing.matched, 2);
         assert_eq!(listing.total, 3);
         assert!(!listing.truncated());
 
         let regex = query(Some("^DL"), true, 0).matcher().unwrap();
-        let listing = cut_bindings(bindings.clone(), regex.as_ref(), 0);
+        let listing = cut_bindings(bindings.clone(), regex.as_ref(), 0, 0);
         assert_eq!(listing.items, vec![binding("dlx", "Orders.DLQ")]);
 
-        let capped = cut_bindings(bindings, None, 2);
+        let capped = cut_bindings(bindings.clone(), None, 0, 2);
         assert_eq!(capped.items.len(), 2);
         assert_eq!(capped.matched, 3);
         assert!(capped.truncated());
+        assert_eq!(capped.next_offset(0), Some(2));
+
+        // The next ones, from an offset.
+        let rest = cut_bindings(bindings.clone(), None, 2, 2);
+        assert_eq!(rest.items, vec![binding("events", "audit")]);
+        assert_eq!(rest.remaining_after(2), 0);
+        assert_eq!(rest.next_offset(2), None);
+        assert!(cut_bindings(bindings, None, 9, 2).items.is_empty());
     }
 
     #[test]
@@ -451,6 +532,71 @@ mod tests {
             .unwrap();
         assert!(empty.items.is_empty());
         assert!(!empty.truncated());
+    }
+
+    #[tokio::test]
+    async fn listings_continue_from_an_offset_without_refetching_earlier_pages() {
+        let (url, seen) = crate::test_support::serve(paging_server(1200)).await;
+        let client = ManagementClient::new(&url).unwrap();
+
+        // Load 100, then the next 100: the second request asks for page 2.
+        let first = client
+            .list_queues_from("/", &query(None, false, 100), 0)
+            .await
+            .unwrap();
+        assert_eq!(first.items.len(), 100);
+        assert_eq!(first.next_offset(0), Some(100));
+        let next = client
+            .list_queues_from("/", &query(None, false, 100), 100)
+            .await
+            .unwrap();
+        assert_eq!(next.items[0].name, "q-0100");
+        assert_eq!(next.items[99].name, "q-0199");
+        assert_eq!(next.remaining_after(100), 1000);
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert!(seen[1].contains("page=2&page_size=100&"), "{seen:?}");
+        }
+        seen.lock().unwrap().clear();
+
+        // An offset inside a page drops only the entries before it and
+        // reads on into the next page.
+        let mid = client
+            .list_queues_from("/", &query(None, false, 100), 150)
+            .await
+            .unwrap();
+        assert_eq!(mid.items.len(), 100);
+        assert_eq!(mid.items[0].name, "q-0150");
+        assert_eq!(mid.items[99].name, "q-0249");
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert!(seen[0].contains("page=2&page_size=100&"), "{seen:?}");
+            assert!(seen[1].contains("page=3&"), "{seen:?}");
+        }
+
+        // The last entries, and past the end.
+        let tail = client
+            .list_queues_from("/", &query(None, false, 100), 1150)
+            .await
+            .unwrap();
+        assert_eq!(tail.items.len(), 50);
+        assert_eq!(tail.next_offset(1150), None);
+        let past = client
+            .list_queues_from("/", &query(None, false, 100), 5000)
+            .await
+            .unwrap();
+        assert!(past.items.is_empty());
+        assert_eq!(past.next_offset(5000), None);
+
+        // Everything from an offset (limit 0).
+        let rest = client
+            .list_queues_from("/", &ListQuery::all(), 700)
+            .await
+            .unwrap();
+        assert_eq!(rest.items.len(), 500);
+        assert_eq!(rest.items[0].name, "q-0700");
     }
 
     #[tokio::test]

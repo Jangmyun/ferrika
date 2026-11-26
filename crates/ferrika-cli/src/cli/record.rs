@@ -14,11 +14,10 @@ use colored::Colorize;
 
 use crate::cli::{GlobalOpts, WriteContext};
 use crate::error::KafkaResult;
-use crate::governance::audit::AuditEntry;
 use crate::kafka::admin::KafkaAdminClient;
 use crate::model::format::redact_url;
 use crate::model::history::{Reversibility, Scope, State};
-use crate::ops::history::{Journal, Recorder};
+use crate::ops::history::{AuditTarget, AuditedRecord, Journal};
 
 /// The suffix of confirmation prompts for changes undo cannot reverse.
 pub const CANNOT_UNDO: &str = "This cannot be undone with `ferrika undo`.";
@@ -79,12 +78,11 @@ pub fn connect_scope(global: &GlobalOpts, url: &str) -> Scope {
     }
 }
 
-/// A started record, finished with [`Pending::finish`].
+/// A started record, finished with [`Pending::finish`]: the journal
+/// record and the audit result entry that closes it
+/// ([`crate::ops::history::AuditedRecord`]).
 pub struct Pending {
-    recorder: Recorder,
-    label: String,
-    target: String,
-    profile: String,
+    pub(crate) record: AuditedRecord,
 }
 
 /// Starts recording the change `main` authorized for this run (no-op
@@ -164,16 +162,15 @@ fn start_as(
             scope.profile.clone()
         }
     });
-    let begin = change.into_begin("cli", scope, write.label.clone(), target.clone(), undoes);
-    let recorder = match id {
-        Some(id) => Recorder::start_with_id(Journal::default(), id, begin),
-        None => Recorder::start(Journal::default(), begin),
+    let audit = AuditTarget {
+        source: "cli".to_string(),
+        profile,
+        action: write.label.clone(),
+        target,
+        actor: None,
     };
     Some(Pending {
-        recorder,
-        label: write.label.clone(),
-        target,
-        profile,
+        record: AuditedRecord::start(Journal::default(), id, scope, change, audit, undoes),
     })
 }
 
@@ -182,25 +179,11 @@ impl Pending {
     /// to the audit log: the request's action, the outcome, the operation
     /// id and its digest.
     pub fn finish(self, ok: bool, outcome: &str, after: Option<Vec<State>>) {
-        let Some(digest) = self.recorder.finish(ok, outcome, after) else {
-            return;
-        };
-        crate::governance::audit::record(&self.result_entry(ok, outcome, digest));
-    }
-
-    fn result_entry(&self, ok: bool, outcome: &str, digest: String) -> AuditEntry {
-        AuditEntry {
-            time_ms: crate::governance::audit::now_ms(),
-            source: "cli".to_string(),
-            profile: self.profile.clone(),
-            action: self.label.clone(),
-            target: self.target.clone(),
-            outcome: outcome.to_string(),
-            ok,
-            user: String::new(),
-            actor: None,
-            op: self.recorder.id().to_string(),
-            op_digest: digest,
+        if let Err(e) = self
+            .record
+            .finish(&crate::governance::policy::AuditLog, ok, outcome, after)
+        {
+            tracing::warn!(%e, "Could not write the audit log");
         }
     }
 
@@ -270,26 +253,33 @@ mod tests {
             topic: v.into(),
             exists: true,
         };
-        let begin = Change::new(
-            Reversibility::Reversible,
-            vec![state("a")],
-            vec![state("b")],
-        )
-        .into_begin(
-            "cli",
-            Scope::default(),
-            "topics config".into(),
-            "orders".into(),
-            None,
-        );
-        let pending = Pending {
-            recorder: Recorder::start_with_id(journal.clone(), "01JBX3K8Q2M7".into(), begin),
-            label: "topics config".into(),
-            target: "orders".into(),
+        let audit = AuditTarget {
+            source: "cli".into(),
             profile: "dev".into(),
+            action: "topics config".into(),
+            target: "orders".into(),
+            actor: None,
         };
-        let digest = pending.recorder.finish(true, "Applied", None).unwrap();
-        let entry = pending.result_entry(true, "Applied", digest.clone());
+        let pending = Pending {
+            record: AuditedRecord::start(
+                journal.clone(),
+                Some("01JBX3K8Q2M7".into()),
+                Scope::default(),
+                Change::new(
+                    Reversibility::Reversible,
+                    vec![state("a")],
+                    vec![state("b")],
+                ),
+                audit,
+                None,
+            ),
+        };
+        let digest = pending
+            .record
+            .recorder()
+            .finish(true, "Applied", None)
+            .unwrap();
+        let entry = pending.record.result_entry(true, "Applied", digest.clone());
         // Same action as the request entry; the operation id is the key.
         assert_eq!(entry.action, "topics config");
         assert_eq!(entry.op, "01JBX3K8Q2M7");

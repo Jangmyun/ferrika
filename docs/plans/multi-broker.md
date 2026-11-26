@@ -261,6 +261,14 @@ callers that want everything in one request.
   (source or destination) and cut locally with the same matching rules.
 - Pages are not a snapshot: a queue created or deleted between two pages
   can shift an entry across the page boundary.
+- Loading more: `list_queues_from`, `list_exchanges_from` and
+  `list_bindings_from` take an offset into the matching entries. The first
+  request asks for the page that holds entry `offset` (page size as above)
+  and drops the entries before it on that page, so a front end that showed
+  `n` entries fetches the next ones without reading the first `n` again;
+  `Listing::next_offset(offset)` and `remaining_after(offset)` say whether
+  and from where to continue. An offset past the end gives an empty
+  listing.
 
 ### TLS
 
@@ -475,6 +483,16 @@ Topology writes are undoable and fit the existing model (implemented on
   of being recorded as not undoable (decision 20). The test
   `a_0_2_reader_skips_rabbit_operations_whole_and_keeps_the_others`
   (`ferrika-ops`, `history.rs`) parses a journal with the 0.2 shapes.
+- Recording from another front end: `ferrika_ops::history::rabbit::
+  start_record` writes the `begin` line under the operation id the audit
+  request entry named, and `finish_record` reads the before-states back
+  (the after-state undo compares against), writes the `end` line and the
+  audit result entry with `op` and `op_digest` to an `AuditSink`. Both sit
+  on `ferrika_ops::history::AuditedRecord` (with `AuditTarget` naming the
+  entry's source, profile, action, target and actor), which the CLI uses
+  for every recorded change. `KEY=VALUE` declaration and binding arguments
+  parse with `ferrika_rabbitmq::model::parse_arguments` and
+  `BindingDeclaration::parse`.
 
 ## Phases
 

@@ -70,6 +70,28 @@ Library (`ferrika-rabbitmq`, `ferrika-core`):
 - `ResolvedRabbit::client` and `ResolvedRabbit::amqp_target` apply the TLS
   files; `client` fails when a file cannot be read.
 
+### RabbitMQ library helpers for other front ends
+
+Additive library API (the CLI's behaviour is unchanged):
+
+- `ferrika_rabbitmq::model::parse_argument` and `parse_arguments`:
+  `KEY=VALUE` arguments of a queue, exchange or binding declaration as the
+  JSON the management API takes (numbers, booleans, JSON values, text), as
+  `ferrika rabbit ... --arg` parses them; `BindingDeclaration::parse` builds
+  and checks a binding from user input. The CLI now uses them.
+- `ferrika_rabbitmq::listing`: `ManagementClient::list_queues_from`,
+  `list_exchanges_from` and `list_bindings_from` start at an offset into the
+  matching entries, fetching only the page that holds it and the ones
+  after; `Listing::next_offset` and `remaining_after` say whether there is
+  more. `list_queues` and the others are the same calls from offset 0.
+- `ferrika_ops::history::AuditedRecord` (with `AuditTarget`): one change
+  recorded in the operation journal and closed by an audit result entry
+  carrying its `op` and `op_digest`, written to any `AuditSink`;
+  `Recorder::before`. `ferrika_ops::history::rabbit::start_record` and
+  `finish_record` do this for a RabbitMQ topology change, reading the
+  changed state back from the broker for undo. The CLI records its changes
+  through `AuditedRecord`.
+
 ### MQTT support (preview)
 
 Added:
