@@ -17,6 +17,10 @@ inspect a Kafka cluster. It is what `ferrika mcp` runs; see
   messages (masked; reading requeues them, so they are write tools),
   `rabbit_publish` publishes one message and `rabbit_dlq_redrive` moves
   dead-lettered messages back over AMQP (feature `amqp`).
+- ksqlDB (preview): `ksql_list`, `ksql_describe` and `ksql_query` (bounded,
+  masked) on the profile's ksqlDB server; with writes enabled, `ksql_exec`
+  runs statements, each gated on its policy categories like `ferrika ksql
+  exec`.
 - Write tools are opt-in. Each write is planned, confirmed, then run, and
   passes the same company policy, read-only profile and audit gate as the
   command line.

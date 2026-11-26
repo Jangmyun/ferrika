@@ -295,8 +295,8 @@ the server has now, a push query (`EMIT CHANGES`) until `limit` rows or
 earliest records), after which the query is closed on the server. Rows are
 PII-masked unless `mask_pii` is false (always under enforced masking), and
 like `peek_messages` it passes the export gate and is hidden under
-`export: forbidden`. Statements that change ksqlDB are refused; there are no
-ksqlDB write tools yet.
+`export: forbidden`. Statements that change ksqlDB are refused there; they
+go through the write tool `ksql_exec` (below).
 
 ```bash
 # Claude Code
@@ -314,8 +314,9 @@ claude mcp add ferrika-prod -- ferrika -p prod mcp
 records to an existing topic, values and keys optionally encoded with Schema Registry
 subjects: `value_subject`, `key_subject`), `create_topic`, `alter_topic_config` (set or reset keys; others
 stay), `reset_consumer_group_offsets` (the group must be Empty) and
-`transform_execute`; and four RabbitMQ (preview) write tools on a RabbitMQ
-profile (`profile`, `vhost` arguments as for the listings):
+`transform_execute`; `ksql_exec` (ksqlDB, preview; below); and four RabbitMQ
+(preview) write tools on a RabbitMQ profile (`profile`, `vhost` arguments as
+for the listings):
 
 | Tool | What it does | Policy category |
 |---|---|---|
@@ -345,6 +346,37 @@ publish to (both repeatable; default: every queue, and every exchange but
 each message's original exchange is only known as it moves.
 `rabbit_dlq_redrive` needs a build with AMQP support (the `ferrika` CLI has
 it).
+
+`ksql_exec` (`sql`: a script of at most 50 statements, 64 KiB) runs
+statements that change the ksqlDB server of the profile the server starts
+with, as `ferrika ksql exec` does: in order, with `SET`/`UNSET`/`DEFINE`/
+`UNDEFINE` applied to the statements after them, stopping at the first
+failure (the statements before it stay done; the error lists each
+statement's status). Queries are refused (use `ksql_query`), and so is a
+script that changes nothing. Every write statement needs every category it
+needs in the CLI (`ksql.create`, `ksql.drop`, `ksql.insert` and `produce`,
+`ksql.terminate`, `ksql.alter`, plus `topics.create` for `CREATE ... AS
+SELECT` or `PARTITIONS`, `topics.delete` for `DELETE TOPIC`, `connect.change`
+for connectors, all of them for an unrecognised statement), checked against
+the profile, the server's `host:port` and the cluster's brokers; one refusal
+refuses the whole script before anything is sent (`policy.blocked` naming
+that statement). The tool is left out of `tools/list` when the profile is
+read-only or the policy refuses every `ksql.*` category. The plan lists each
+statement by keywords and names only (never its literals), its access,
+categories and the Kafka topic it creates, deletes or writes (from
+`KAFKA_TOPIC`, an earlier `CREATE` in the script, or `DESCRIBE` on the
+server), with warnings for persistent queries, `TERMINATE` and topic
+deletion. Those topics must pass `--topics` and are never internal; with
+`--topics` set, a statement whose topic cannot be named (a `CREATE ... AS
+SELECT` without `KAFKA_TOPIC`, a connector, an unrecognised statement) is
+refused. `DROP`, `DROP CONNECTOR` and `TERMINATE` make the plan destructive
+(a person types the stream, table or query name back); `DROP ... DELETE
+TOPIC` and unrecognised statements can only be confirmed by a person. Each
+`INSERT ... VALUES` counts one record against `--max-produce-records`;
+persistent queries are not counted. Each write is audited as `mcp
+ksql_exec` with its summary and outcome (`ok: SUCCESS, query <id>`,
+`failed: ksqlDB error <code> (HTTP <status>)`, `not run`), never the
+server's messages.
 
 `transform_execute` takes the arguments of `transform_preview` (absolute
 `from_timestamp` only) plus `to`, an existing topic on the same cluster
@@ -399,8 +431,8 @@ for a person's confirmation in the client whatever `--confirm` says (see
 docs/POLICY.md). Internal topics (names starting with `_`) are never written; `--topics <glob>`
 (repeatable) narrows the writable topics further. Limits per session:
 `--max-writes-per-minute` (10), `--max-produce-records` (1,000, for
-`produce_messages`, `transform_execute`, `rabbit_publish` and
-`rabbit_dlq_redrive` together), plans at 60
+`produce_messages`, `transform_execute`, `ksql_exec` inserts, `rabbit_publish`
+and `rabbit_dlq_redrive` together), plans at 60
 per minute, and the same refusal 5 times in a row pauses writes for 30 s.
 `--allow-tools create_topic,produce_messages` offers only some tools.
 

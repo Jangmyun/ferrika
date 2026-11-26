@@ -10,7 +10,8 @@
 //! masking off and the policy does not enforce it. It runs one `SELECT`
 //! only, with at most [`QUERY_MAX_ROWS`] rows and [`QUERY_MAX_SECS`]
 //! seconds, and closes the query on the server when it stops. Statements
-//! that change ksqlDB are not offered over MCP yet.
+//! that change ksqlDB go through the write tool `ksql_exec`
+//! (`ksql_writes.rs`, with `--allow-write`).
 
 use std::time::Duration;
 
@@ -104,7 +105,8 @@ fn ksql_error(e: ferrika_ksql::error::KsqlError) -> KafkaError {
     KafkaError::config(e.to_string())
 }
 
-/// The ksqlDB server of the profile the MCP server runs with.
+/// The ksqlDB server of the profile the MCP server runs with (also the
+/// one `ksql_exec` writes to).
 pub(super) fn connection(context: &ResolvedContext) -> KafkaResult<KsqlConfig> {
     let profile = context
         .profile_name
@@ -193,7 +195,7 @@ fn query_statement(args: &Value) -> KafkaResult<Statement> {
     match statement.kind {
         StatementKind::Select { .. } => Ok(statement),
         _ => Err(KafkaError::config(format!(
-            "ksql_query runs one SELECT; `{}` is not one (statements that change ksqlDB are not available over MCP)",
+            "ksql_query runs one SELECT; `{}` is not one (statements that change ksqlDB go through the write tool ksql_exec)",
             statement.summary()
         ))),
     }

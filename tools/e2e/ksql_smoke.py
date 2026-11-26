@@ -9,6 +9,16 @@ DELETE TOPIC), pull and push queries (row limit, time limit, masking), a
 read-only profile, a failing script, the audit log, and the MCP tools
 ksql_list, ksql_describe and ksql_query.
 
+With --tls-url (and --tls-user, --tls-password, --tls-ca, --tls-cert,
+--tls-key) it also checks a second server that takes HTTPS only, with HTTP
+basic authentication and a required client certificate (mutual TLS): a
+profile with the login, CA, certificate and key; info, statements and
+queries through it; refusals without the client certificate, without the
+CA and with a wrong password; a hand-typed URL with credentials; the MCP
+tools on it. Every output of those runs and the audit log are checked for
+the password. tools/e2e/ksqldb-tls-setup.sh writes such a server's
+configuration (certificates, keystores, JAAS file).
+
 Start a throw-away Kafka and ksqlDB first, e.g.:
 
     docker run -d --name ferrika-kafka-test -p 9092:9092 apache/kafka:3.9.0
@@ -35,12 +45,15 @@ import json
 import os
 import queue
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import base64
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -51,12 +64,21 @@ parser.add_argument("binary", nargs="?", default=str(ROOT / "target" / "release"
 parser.add_argument("--url", default="http://localhost:8088", help="ksqlDB server (default http://localhost:8088)")
 parser.add_argument("--broker", default="localhost:9092", help="the server's Kafka cluster (default localhost:9092)")
 parser.add_argument("--prefix", default="kq_", help="name prefix of everything the run creates (default kq_)")
+parser.add_argument("--tls-url", help="also check this HTTPS server with basic auth and mutual TLS")
+parser.add_argument("--tls-user", default="ferrika-e2e")
+parser.add_argument("--tls-password", default="")
+parser.add_argument("--tls-ca", help="CA of the --tls-url server (PEM)")
+parser.add_argument("--tls-cert", help="client certificate for --tls-url (PEM)")
+parser.add_argument("--tls-key", help="client key for --tls-url (PEM, unencrypted)")
 ARGS = parser.parse_args()
+if ARGS.tls_url and not (ARGS.tls_password and ARGS.tls_ca and ARGS.tls_cert and ARGS.tls_key):
+    parser.error("--tls-url needs --tls-password, --tls-ca, --tls-cert and --tls-key")
 
 F = ARGS.binary
 URL = ARGS.url.rstrip("/")
 RUN = f"{ARGS.prefix}{uuid.uuid4().hex[:6]}_"  # unique per run
 ORDERS, BIG, TOTALS, FAIL = f"{RUN}orders", f"{RUN}big", f"{RUN}totals", f"{RUN}fail"
+SECURE = f"{RUN}secure"  # the stream made on the --tls-url server
 PROFILE, RO_PROFILE = f"{RUN}p", f"{RUN}ro"
 # Record values: must never show up in the audit log, nor unmasked when masked.
 EMAIL = f"jane.{uuid.uuid4().hex[:6]}@example.com"
@@ -105,14 +127,26 @@ def parse_json(text):
         return None
 
 
-def server(statement):
-    """Runs a statement on the server directly (set-up checks, clean-up)."""
+def tls_context():
+    """Trusts the --tls-ca and presents the client certificate."""
+    ctx = ssl.create_default_context(cafile=ARGS.tls_ca)
+    ctx.load_cert_chain(ARGS.tls_cert, ARGS.tls_key)
+    return ctx
+
+
+def server(statement, secure=False):
+    """Runs a statement on the server directly (set-up checks, clean-up);
+    `secure`: on the --tls-url server."""
     body = json.dumps({"ksql": statement, "streamsProperties": {}}).encode()
-    req = urllib.request.Request(f"{URL}/ksql", data=body, method="POST",
-                                 headers={"Content-Type": "application/json",
-                                          "Accept": "application/vnd.ksql.v1+json"})
+    headers = {"Content-Type": "application/json", "Accept": "application/vnd.ksql.v1+json"}
+    base, ctx = URL, None
+    if secure:
+        base, ctx = ARGS.tls_url.rstrip("/"), tls_context()
+        login = base64.b64encode(f"{ARGS.tls_user}:{ARGS.tls_password}".encode()).decode()
+        headers["Authorization"] = f"Basic {login}"
+    req = urllib.request.Request(f"{base}/ksql", data=body, method="POST", headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
         return {"error": e.read().decode(errors="replace")}
@@ -130,9 +164,9 @@ def close_query(query_id):
         return e.code, e.read().decode(errors="replace")
 
 
-def names(kind):
+def names(kind, secure=False):
     """Stream or table names the server has now."""
-    out = server(f"SHOW {kind.upper()};")
+    out = server(f"SHOW {kind.upper()};", secure)
     if not isinstance(out, list) or not out:
         return []
     return [s["name"] for s in out[0].get(kind, [])]
@@ -145,13 +179,13 @@ def audit_entries():
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def wait_rows(sql, n, timeout=30):
+def wait_rows(sql, n, timeout=30, profile=PROFILE, extra=()):
     """Pull-query rows, polled until there are `n` (the server materializes
     asynchronously)."""
     deadline = time.time() + timeout
     rows = []
     while time.time() < deadline:
-        rc, out, _ = ksql(["query", sql])
+        rc, out, _ = ksql(["query", sql, *extra], profile=profile)
         data = parse_json(out) if rc == 0 else None
         rows = data["rows"] if data else []
         if len(rows) >= n:
@@ -163,8 +197,8 @@ def wait_rows(sql, n, timeout=30):
 class Mcp:
     """One `ferrika mcp` process spoken to over newline-delimited JSON-RPC."""
 
-    def __init__(self, profile):
-        self.proc = subprocess.Popen([F, "-p", profile, "mcp"], stdin=subprocess.PIPE,
+    def __init__(self, profile, args=()):
+        self.proc = subprocess.Popen([F, "-p", profile, "mcp", *args], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=ENV,
                                      text=True, encoding="utf-8", errors="replace", bufsize=1)
         self.lines = queue.Queue()
@@ -351,7 +385,108 @@ def scenarios():
         mcp.close()
 
 
+def secure_scenarios():
+    """The --tls-url server: HTTPS, basic auth and a required client
+    certificate. No output and no audit entry may show the password."""
+    pw, user = ARGS.tls_password, ARGS.tls_user
+    url = ARGS.tls_url.rstrip("/")
+    host = urllib.parse.urlsplit(url).netloc
+    sec, no_cert, no_ca, bad_pw = (f"{RUN}sec", f"{RUN}nocert", f"{RUN}noca", f"{RUN}badpw")
+    outputs = []
+
+    def add(name, password, ca=True, cert=True):
+        args = ["profile", "add", name, "-b", ARGS.broker, "--ksql-url", url, "--ksql-user", user,
+                "--ksql-password-stdin"]
+        if ca:
+            args += ["--ksql-ca-location", ARGS.tls_ca]
+        if cert:
+            args += ["--ksql-certificate-location", ARGS.tls_cert, "--ksql-key-location", ARGS.tls_key]
+        rc, out, err = ferrika(args, stdin=password + "\n")
+        outputs.append(out + err)
+        return rc, out + err
+
+    def run(args, profile=sec, **kw):
+        rc, out, err = ksql(args, profile=profile, **kw)
+        outputs.append(out + err)
+        return rc, out, err
+
+    rc, out = add(sec, pw)
+    check("TLS: profile add with basic auth, CA, client certificate and key", rc == 0, tail(out))
+    for name, password, ca, cert in ((no_cert, pw, True, False), (no_ca, pw, False, True),
+                                     (bad_pw, pw + "-wrong", True, True)):
+        add(name, password, ca, cert)
+    rc, out, err = ferrika(["-f", "json", "profile", "show", sec])
+    outputs.append(out + err)
+    shown = (parse_json(out) or {}).get("ksql_url") or ""
+    check("TLS: profile show names the server without the password",
+          rc == 0 and host in shown and pw not in shown, tail(out + err))
+
+    rc, out, err = run(["info"])
+    info = parse_json(out) or {}
+    check("TLS: ksql info over HTTPS with basic auth and a client certificate",
+          rc == 0 and info.get("server_status") == "RUNNING", tail(out + err))
+    script = (f"CREATE STREAM {SECURE} (id INT KEY, email STRING) WITH (KAFKA_TOPIC='{SECURE}', "
+              f"PARTITIONS=1, VALUE_FORMAT='JSON');\n"
+              f"INSERT INTO {SECURE} (id, email) VALUES (1, '{EMAIL}');\n")
+    rc, out, err = run(["exec", script, "--yes"])
+    done = parse_json(out) or {}
+    check("TLS: ksql exec creates a stream and inserts", rc == 0 and done.get("ok") is True, tail(out + err))
+    rows = wait_rows(f"SELECT * FROM {SECURE};", 1, profile=sec, extra=["--mask-pii"])
+    outputs.append(json.dumps(rows))
+    check("TLS: a pull query reads the row, masked", len(rows) == 1 and EMAIL not in json.dumps(rows),
+          f"rows={rows}")
+    rc, out, err = run(["query", f"SELECT * FROM {SECURE} EMIT CHANGES;", "--from-beginning", "-n", "1",
+                        "--mask-pii"], timeout=90)
+    data = parse_json(out) or {}
+    check("TLS: a push query streams over HTTPS", rc == 0 and data.get("end") == "row_limit", tail(out + err))
+
+    rc, out, err = run(["info"], profile=no_cert)
+    check("TLS: without the client certificate the server refuses", rc != 0, tail(out + err))
+    rc, out, err = run(["info"], profile=no_ca)
+    check("TLS: without the CA the server certificate is not trusted",
+          rc != 0 and "certificate" in (out + err).lower(), tail(out + err))
+    rc, out, err = run(["info"], profile=bad_pw)
+    check("TLS: a wrong password is refused (HTTP 401)", rc != 0 and "401" in out + err, tail(out + err))
+    typed = url.replace("://", f"://{user}:{pw}@", 1)
+    rc, out, err = ferrika(["ksql", "--ksql-url", typed, "info"])
+    outputs.append(out + err)
+    check("TLS: a hand-typed URL with credentials fails without the CA and prints no password",
+          rc != 0 and pw not in out + err, tail(out + err))
+
+    mcp = Mcp(sec, ["--allow-write"])
+    try:
+        mcp.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                   "clientInfo": {"name": "ksql-smoke", "version": "1"}})
+        err_, data, text = mcp.call("ksql_list", {"kind": "streams", "filter": SECURE.upper()})
+        outputs.append(text)
+        check("TLS: MCP ksql_list on the HTTPS server", not err_ and data and data.get("count") == 1
+              and data.get("server") == host, tail(text))
+        args = {"sql": f"INSERT INTO {SECURE} (id, email) VALUES (2, 'x');"}
+        err_, plan, text = mcp.call("ksql_exec", {**args, "mode": "plan"})
+        outputs.append(text)
+        token = ((plan or {}).get("confirmation") or {}).get("token")
+        err_, data, text = mcp.call("ksql_exec", {**args, "mode": "execute", "confirmation": token})
+        outputs.append(text)
+        check("TLS: MCP ksql_exec plans and runs on the HTTPS server",
+              token and not err_ and (data or {}).get("executed") is True, tail(text))
+    finally:
+        mcp.close()
+        outputs.append("".join(mcp.proc.stderr.read() or "") if mcp.proc.stderr else "")
+
+    rc, out, err = run(["exec", f"DROP STREAM {SECURE} DELETE TOPIC;", "--yes"])
+    check("TLS: DROP STREAM ... DELETE TOPIC", rc == 0 and SECURE.upper() not in names("streams", True),
+          tail(out + err))
+    leaked = [i for i, o in enumerate(outputs) if pw in o]
+    check("TLS: no output shows the password", not leaked, f"outputs={leaked}")
+    log = (CONFIG / "audit.log").read_text(encoding="utf-8") if (CONFIG / "audit.log").exists() else ""
+    entries = [e for e in audit_entries() if e.get("profile") == sec]
+    check("TLS: writes are audited without the password or record values",
+          entries and pw not in log and EMAIL not in log, f"{len(entries)} entries")
+
+
 def cleanup():
+    if ARGS.tls_url and SECURE.upper() in names("streams", True):
+        server(f"DROP STREAM IF EXISTS {SECURE} DELETE TOPIC;", True)
     for name in (BIG, FAIL, ORDERS):
         if name.upper() in names("streams"):
             server(f"DROP STREAM IF EXISTS {name} DELETE TOPIC;")
@@ -373,6 +508,8 @@ except (urllib.error.URLError, OSError) as e:
 clean = False
 try:
     scenarios()
+    if ARGS.tls_url:
+        secure_scenarios()
 finally:
     try:
         clean = cleanup()

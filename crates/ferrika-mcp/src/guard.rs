@@ -19,32 +19,36 @@ use ferrika_governance::policy::{
     WriteRefusal, WriteRequest,
 };
 
-/// The write tools, in the order `tools/list` shows them. The RabbitMQ
+/// The write tools, in the order `tools/list` shows them. `ksql_exec`
+/// runs statements on the ksqlDB server of the Kafka profile. The RabbitMQ
 /// ones (`rabbit_*`) work on a RabbitMQ profile instead of the Kafka
 /// cluster; `rabbit_dlq_redrive` needs the `amqp` feature.
 #[cfg(feature = "amqp")]
-pub const WRITE_TOOLS: [&str; 9] = [
+pub const WRITE_TOOLS: [&str; 10] = [
     "produce_messages",
     "create_topic",
     "alter_topic_config",
     "reset_consumer_group_offsets",
     "transform_execute",
+    "ksql_exec",
     "rabbit_peek",
     "rabbit_dlq_inspect",
     "rabbit_publish",
     "rabbit_dlq_redrive",
 ];
 
-/// The write tools, in the order `tools/list` shows them. The RabbitMQ
+/// The write tools, in the order `tools/list` shows them. `ksql_exec`
+/// runs statements on the ksqlDB server of the Kafka profile. The RabbitMQ
 /// ones (`rabbit_*`) work on a RabbitMQ profile instead of the Kafka
 /// cluster; `rabbit_dlq_redrive` needs the `amqp` feature.
 #[cfg(not(feature = "amqp"))]
-pub const WRITE_TOOLS: [&str; 8] = [
+pub const WRITE_TOOLS: [&str; 9] = [
     "produce_messages",
     "create_topic",
     "alter_topic_config",
     "reset_consumer_group_offsets",
     "transform_execute",
+    "ksql_exec",
     "rabbit_peek",
     "rabbit_dlq_inspect",
     "rabbit_publish",
@@ -54,7 +58,9 @@ pub const WRITE_TOOLS: [&str; 8] = [
 /// its destination topic, as `ferrika transform --execute` does: `produce`.
 /// The RabbitMQ tools match `ferrika rabbit`: reading messages requeues
 /// them (`messages.peek`), a publish is `produce`, a redrive
-/// `messages.move` (which also needs `produce`).
+/// `messages.move` (which also needs `produce`). `ksql_exec` needs the
+/// categories of each statement it runs instead
+/// ([`WriteGuard::authorize_ksql`]) and never asks this.
 pub(super) fn policy_action(tool: &str) -> PolicyAction {
     match tool {
         "produce_messages" | "transform_execute" | "rabbit_publish" => PolicyAction::Produce,
@@ -65,6 +71,19 @@ pub(super) fn policy_action(tool: &str) -> PolicyAction {
         _ => PolicyAction::OffsetsReset,
     }
 }
+
+/// The ksqlDB write tool.
+pub(super) const KSQL_EXEC: &str = "ksql_exec";
+
+/// The categories only ksqlDB statements need: `ksql_exec` is hidden when
+/// the policy refuses every one of them.
+const KSQL_CATEGORIES: [PolicyAction; 5] = [
+    PolicyAction::KsqlCreate,
+    PolicyAction::KsqlDrop,
+    PolicyAction::KsqlInsert,
+    PolicyAction::KsqlTerminate,
+    PolicyAction::KsqlAlter,
+];
 
 /// Whether `tool` is a RabbitMQ write tool (gated on its RabbitMQ profile,
 /// not the Kafka one).
@@ -283,6 +302,9 @@ impl WriteGuard {
         if let Some(reason) = &self.config.profile_refusal {
             return Some(reason.clone());
         }
+        if tool == KSQL_EXEC {
+            return self.ksql_hidden_reason();
+        }
         if let Some(reason) = self.mcp_write_refusal() {
             return Some(reason);
         }
@@ -337,6 +359,23 @@ impl WriteGuard {
             .chain(action.also_requires().iter().copied())
             .find_map(|a| self.policy.check_at(self.now(), a, "", "").err())
             .map(String::from)
+    }
+
+    /// [`Self::hidden_reason`] for `ksql_exec`: `mcp_write: forbidden`, or
+    /// a policy that refuses every `ksql.*` category on this profile and its
+    /// brokers. (The server's address is added per call.)
+    fn ksql_hidden_reason(&self) -> Option<String> {
+        if let Some(reason) = self.mcp_write_refusal() {
+            return Some(reason);
+        }
+        let now = self.now();
+        let mut refusals = KSQL_CATEGORIES.iter().map(|a| {
+            self.policy
+                .check_at(now, *a, &self.config.profile, &self.config.bootstrap)
+                .err()
+        });
+        let first = refusals.next().flatten()?;
+        refusals.all(|r| r.is_some()).then(|| String::from(first))
     }
 
     /// Refuses RabbitMQ queues outside `--queues`.
@@ -576,6 +615,92 @@ impl WriteGuard {
                 let _ = self.record_result(tool, target, &m, false, None);
                 Err(ToolError::new("read_only_profile", m))
             }
+        }
+    }
+
+    /// The gate for a `ksql_exec` script, as `ferrika ksql exec` applies
+    /// it, before anything is sent: `mcp_write: forbidden`; then every
+    /// category of every write statement
+    /// ([`ferrika_ksql::statement::Statement::policy_actions`], which
+    /// includes what a category also requires, such as `produce` for an
+    /// `INSERT`) against the Kafka profile and `addresses` (the ksqlDB
+    /// server's `host:port` and the cluster's brokers); one refusal refuses
+    /// the whole script and is recorded as `policy.blocked` naming that
+    /// statement (keywords and names only, never literals). Then a
+    /// read-only profile, and an audit log that `audit: required` needs.
+    pub(super) fn authorize_ksql(
+        &self,
+        statements: &[ferrika_ksql::statement::Statement],
+        addresses: &str,
+    ) -> Result<(), ToolError> {
+        let writes: Vec<&ferrika_ksql::statement::Statement> =
+            statements.iter().filter(|s| s.is_write()).collect();
+        let first = writes.first().map(|s| s.summary()).unwrap_or_default();
+        let blocked = |summary: &str, reason: &str| {
+            let attempted = format!("mcp {KSQL_EXEC} {summary}");
+            let entry = self.entry("policy.blocked".to_string(), &attempted, reason, false);
+            if let Err(e) = self.sink.record(&entry) {
+                tracing::warn!(%e, "Could not write the audit log");
+            }
+        };
+        if let Some(reason) = self.mcp_write_refusal() {
+            blocked(&first, &reason);
+            return Err(ToolError::new("policy_refused", reason));
+        }
+        let now = self.now();
+        for statement in &writes {
+            for action in statement.policy_actions() {
+                if let Err(reason) =
+                    self.policy
+                        .check_at(now, action, &self.config.profile, addresses)
+                {
+                    let reason = String::from(reason);
+                    let summary = statement.summary();
+                    blocked(&summary, &reason);
+                    return Err(ToolError::new(
+                        "policy_refused",
+                        format!(
+                            "{reason} (`{summary}` needs `{}`). Nothing was sent.",
+                            action.id()
+                        ),
+                    ));
+                }
+            }
+        }
+        if let Some(reason) = &self.config.profile_refusal {
+            let _ = self.record_result(KSQL_EXEC, &first, reason, false, None);
+            return Err(ToolError::new("read_only_profile", reason.clone()));
+        }
+        let Some(statement) = writes.first() else {
+            return Ok(());
+        };
+        let label = format!("mcp {KSQL_EXEC}");
+        let request = WriteRequest {
+            source: "mcp",
+            action: statement
+                .policy_actions()
+                .first()
+                .copied()
+                .unwrap_or(PolicyAction::ConfigChange),
+            label: &label,
+            target: &first,
+            profile: &self.config.profile,
+            bootstrap: addresses,
+            actor: Some(&self.actor),
+            op: None,
+        };
+        match authorize_write_at(
+            self.policy,
+            &self.sink,
+            &request,
+            AuditMode::ProbeOnly,
+            now,
+            || Ok(()),
+        ) {
+            Ok(()) => Ok(()),
+            Err(WriteRefusal::Policy(m)) => Err(ToolError::new("policy_refused", m)),
+            Err(WriteRefusal::AuditUnavailable(m)) => Err(ToolError::new("audit_unavailable", m)),
+            Err(WriteRefusal::Profile(m)) => Err(ToolError::new("read_only_profile", m)),
         }
     }
 

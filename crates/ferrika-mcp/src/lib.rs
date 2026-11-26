@@ -14,11 +14,14 @@
 //! read-only profile and audit gate as the CLI and the GUI (`guard.rs`).
 //! The RabbitMQ write tools (`rabbit_writes.rs`) peek at and inspect
 //! queues (reading requeues, so it is a write), publish, and with the
-//! `amqp` feature move dead-lettered messages back.
+//! `amqp` feature move dead-lettered messages back. `ksql_exec`
+//! (`ksql_writes.rs`) runs ksqlDB statements on the profile's ksqlDB
+//! server, gated per statement like `ferrika ksql exec`.
 
 mod backend;
 mod guard;
 mod ksql_tools;
+mod ksql_writes;
 mod protocol;
 mod rabbit_tools;
 mod rabbit_writes;
