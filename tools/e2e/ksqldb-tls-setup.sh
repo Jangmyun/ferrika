@@ -55,11 +55,13 @@ openssl x509 -req -in client.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 
     -extfile client.ext -out client.pem 2>/dev/null
 rm -f server.csr server.ext client.csr client.ext ca.srl
 
-# The truststore the server checks client certificates against.
+# The truststore the server checks client certificates against, written
+# as the calling user so the file is ours (the image runs as another one).
 rm -f truststore.p12
-docker run --rm -v "$PWD:/w" --entrypoint keytool "$IMAGE" -importcert -noprompt \
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/w" --entrypoint keytool "$IMAGE" \
+    -importcert -noprompt \
     -alias ferrika-e2e-ca -file /w/ca.pem -keystore /w/truststore.p12 -storetype PKCS12 \
-    -storepass "$STORE_PASS" >/dev/null
+    -storepass "$STORE_PASS"
 
 # HTTP basic authentication: one user with the role the server admits.
 printf '%s: %s,admin\n' "$USER" "$PASS" > password.properties
